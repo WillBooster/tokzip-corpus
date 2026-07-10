@@ -12,244 +12,279 @@
 
 namespace Composer\Util;
 
-use Composer\Composer;
-use Composer\CaBundle\CaBundle;
-use Composer\Downloader\TransportException;
-use Composer\Repository\PlatformRepository;
-use Composer\Util\Http\ProxyManager;
-use Psr\Log\LoggerInterface;
+use Composer\Pcre\Preg;
 
 /**
- * Allows the creation of a basic context supporting http proxy
+ * Platform helper for uniform platform-specific tests.
  *
- * @author Jordan Alliot <jordan.alliot@gmail.com>
- * @author Markus Tacker <m@coderbyheart.de>
+ * @author Niels Keurentjes <niels.keurentjes@omines.com>
  */
-final class StreamContextFactory
+class Platform
 {
+    /** @var ?bool */
+    private static $isVirtualBoxGuest = null;
+    /** @var ?bool */
+    private static $isWindowsSubsystemForLinux = null;
+
     /**
-     * Creates a context supporting HTTP proxies
+     * getcwd() equivalent which always returns a string
      *
-     * @param non-empty-string $url URL the context is to be used for
-     * @phpstan-param array{http?: array{follow_location?: int, max_redirects?: int, header?: string|array<string>}} $defaultOptions
-     * @param  mixed[]           $defaultOptions Options to merge with the default
-     * @param  mixed[]           $defaultParams  Parameters to specify on the context
-     * @throws \RuntimeException if https proxy required and OpenSSL uninstalled
-     * @return resource          Default context
+     * @throws \RuntimeException
      */
-    public static function getContext(string $url, array $defaultOptions = [], array $defaultParams = [])
+    public static function getCwd(bool $allowEmpty = false): string
     {
-        $options = ['http' => [
-            // specify defaults again to try and work better with curlwrappers enabled
-            'follow_location' => 1,
-            'max_redirects' => 20,
-        ]];
+        $cwd = getcwd();
 
-        $options = array_replace_recursive($options, self::initOptions($url, $defaultOptions));
-        unset($defaultOptions['http']['header']);
-        $options = array_replace_recursive($options, $defaultOptions);
-
-        if (isset($options['http']['header'])) {
-            $options['http']['header'] = self::fixHttpHeaderField($options['http']['header']);
+        // fallback to realpath('') just in case this works but odds are it would break as well if we are in a case where getcwd fails
+        if (false === $cwd) {
+            $cwd = realpath('');
         }
 
-        return stream_context_create($options, $defaultParams);
+        // crappy state, assume '' and hopefully relative paths allow things to continue
+        if (false === $cwd) {
+            if ($allowEmpty) {
+                return '';
+            }
+
+            throw new \RuntimeException('Could not determine the current working directory');
+        }
+
+        return $cwd;
     }
 
     /**
-     * @param non-empty-string $url
-     * @param mixed[] $options
-     * @param bool    $forCurl When true, will not add proxy values as these are handled separately
-     * @phpstan-return array{http: array{header: string[], proxy?: string, request_fulluri: bool}, ssl?: mixed[]}
-     * @return array formatted as a stream context array
+     * getenv() equivalent but reads from the runtime global variables first
+     *
+     * @param non-empty-string $name
+     *
+     * @return string|false
      */
-    public static function initOptions(string $url, array $options, bool $forCurl = false): array
+    public static function getEnv(string $name)
     {
-        // Make sure the headers are in an array form
-        if (!isset($options['http']['header'])) {
-            $options['http']['header'] = [];
+        if (array_key_exists($name, $_SERVER)) {
+            return (string) $_SERVER[$name];
         }
-        if (is_string($options['http']['header'])) {
-            $options['http']['header'] = explode("\r\n", $options['http']['header']);
+        if (array_key_exists($name, $_ENV)) {
+            return (string) $_ENV[$name];
         }
 
-        // Add stream proxy options if there is a proxy
-        if (!$forCurl) {
-            $proxy = ProxyManager::getInstance()->getProxyForRequest($url);
-            $proxyOptions = $proxy->getContextOptions();
-            if ($proxyOptions !== null) {
-                $isHttpsRequest = 0 === strpos($url, 'https://');
+        return getenv($name);
+    }
 
-                if ($proxy->isSecure()) {
-                    if (!extension_loaded('openssl')) {
-                        throw new TransportException('You must enable the openssl extension to use a secure proxy.');
-                    }
-                    if ($isHttpsRequest) {
-                        throw new TransportException('You must enable the curl extension to make https requests through a secure proxy.');
-                    }
-                } elseif ($isHttpsRequest && !extension_loaded('openssl')) {
-                    throw new TransportException('You must enable the openssl extension to make https requests through a proxy.');
-                }
+    /**
+     * putenv() equivalent but updates the runtime global variables too
+     */
+    public static function putEnv(string $name, string $value): void
+    {
+        $value = (string) $value;
+        putenv($name . '=' . $value);
+        $_SERVER[$name] = $_ENV[$name] = $value;
+    }
 
-                // Header will be a Proxy-Authorization string or not set
-                if (isset($proxyOptions['http']['header'])) {
-                    $options['http']['header'][] = $proxyOptions['http']['header'];
-                    unset($proxyOptions['http']['header']);
-                }
-                $options = array_replace_recursive($options, $proxyOptions);
+    /**
+     * putenv('X') equivalent but updates the runtime global variables too
+     */
+    public static function clearEnv(string $name): void
+    {
+        putenv($name);
+        unset($_SERVER[$name], $_ENV[$name]);
+    }
+
+    /**
+     * Parses tildes and environment variables in paths.
+     */
+    public static function expandPath(string $path): string
+    {
+        if (Preg::isMatch('#^~[\\/]#', $path)) {
+            return self::getUserDirectory() . substr($path, 1);
+        }
+
+        return Preg::replaceCallback('#^(\$|(?P<percent>%))(?P<var>\w++)(?(percent)%)(?P<path>.*)#', static function ($matches): string {
+            assert(is_string($matches['var']));
+            assert('' !== $matches['var']);
+
+            // Treat HOME as an alias for USERPROFILE on Windows for legacy reasons
+            if (Platform::isWindows() && $matches['var'] === 'HOME') {
+                return (Platform::getEnv('HOME') ?: Platform::getEnv('USERPROFILE')) . $matches['path'];
+            }
+
+            return Platform::getEnv($matches['var']) . $matches['path'];
+        }, $path);
+    }
+
+    /**
+     * @throws \RuntimeException If the user home could not reliably be determined
+     * @return string            The formal user home as detected from environment parameters
+     */
+    public static function getUserDirectory(): string
+    {
+        if (false !== ($home = self::getEnv('HOME'))) {
+            return $home;
+        }
+
+        if (self::isWindows() && false !== ($home = self::getEnv('USERPROFILE'))) {
+            return $home;
+        }
+
+        if (\function_exists('posix_getuid') && \function_exists('posix_getpwuid')) {
+            $info = posix_getpwuid(posix_getuid());
+
+            return $info['dir'];
+        }
+
+        throw new \RuntimeException('Could not determine user directory');
+    }
+
+    /**
+     * @return bool Whether the host machine is running on the Windows Subsystem for Linux (WSL)
+     */
+    public static function isWindowsSubsystemForLinux(): bool
+    {
+        if (null === self::$isWindowsSubsystemForLinux) {
+            self::$isWindowsSubsystemForLinux = false;
+
+            // while WSL will be hosted within windows, WSL itself cannot be windows based itself.
+            if (self::isWindows()) {
+                return self::$isWindowsSubsystemForLinux = false;
+            }
+
+            if (
+                !ini_get('open_basedir')
+                && is_readable('/proc/version')
+                && false !== stripos((string)Silencer::call('file_get_contents', '/proc/version'), 'microsoft')
+                && !file_exists('/.dockerenv') // Docker and Podman running inside WSL should not be seen as WSL
+                && !file_exists('/run/.containerenv')
+                && !file_exists('/var/run/.containerenv')
+            ) {
+                return self::$isWindowsSubsystemForLinux = true;
             }
         }
 
-        if (defined('HHVM_VERSION')) {
-            $phpVersion = 'HHVM ' . HHVM_VERSION;
-        } else {
-            $phpVersion = 'PHP ' . PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '.' . PHP_RELEASE_VERSION;
-        }
-
-        if ($forCurl) {
-            $curl = curl_version();
-            $httpVersion = 'cURL '.$curl['version'];
-        } else {
-            $httpVersion = 'streams';
-        }
-
-        if (!isset($options['http']['header']) || false === stripos(implode('', $options['http']['header']), 'user-agent')) {
-            $platformPhpVersion = PlatformRepository::getPlatformPhpVersion();
-            $options['http']['header'][] = sprintf(
-                'User-Agent: Composer/%s (%s; %s; %s; %s%s%s)',
-                Composer::getVersion(),
-                function_exists('php_uname') ? php_uname('s') : 'Unknown',
-                function_exists('php_uname') ? php_uname('r') : 'Unknown',
-                $phpVersion,
-                $httpVersion,
-                $platformPhpVersion ? '; Platform-PHP '.$platformPhpVersion : '',
-                Platform::getEnv('CI') ? '; CI' : ''
-            );
-        }
-
-        return $options;
+        return self::$isWindowsSubsystemForLinux;
     }
 
     /**
-     * @param mixed[] $options
-     *
-     * @return mixed[]
+     * @return bool Whether the host machine is running a Windows OS
      */
-    public static function getTlsDefaults(array $options, ?LoggerInterface $logger = null): array
+    public static function isWindows(): bool
     {
-        $ciphers = implode(':', [
-            'ECDHE-RSA-AES128-GCM-SHA256',
-            'ECDHE-ECDSA-AES128-GCM-SHA256',
-            'ECDHE-RSA-AES256-GCM-SHA384',
-            'ECDHE-ECDSA-AES256-GCM-SHA384',
-            'DHE-RSA-AES128-GCM-SHA256',
-            'DHE-DSS-AES128-GCM-SHA256',
-            'kEDH+AESGCM',
-            'ECDHE-RSA-AES128-SHA256',
-            'ECDHE-ECDSA-AES128-SHA256',
-            'ECDHE-RSA-AES128-SHA',
-            'ECDHE-ECDSA-AES128-SHA',
-            'ECDHE-RSA-AES256-SHA384',
-            'ECDHE-ECDSA-AES256-SHA384',
-            'ECDHE-RSA-AES256-SHA',
-            'ECDHE-ECDSA-AES256-SHA',
-            'DHE-RSA-AES128-SHA256',
-            'DHE-RSA-AES128-SHA',
-            'DHE-DSS-AES128-SHA256',
-            'DHE-RSA-AES256-SHA256',
-            'DHE-DSS-AES256-SHA',
-            'DHE-RSA-AES256-SHA',
-            'AES128-GCM-SHA256',
-            'AES256-GCM-SHA384',
-            'AES128-SHA256',
-            'AES256-SHA256',
-            'AES128-SHA',
-            'AES256-SHA',
-            'AES',
-            'CAMELLIA',
-            'DES-CBC3-SHA',
-            '!aNULL',
-            '!eNULL',
-            '!EXPORT',
-            '!DES',
-            '!RC4',
-            '!MD5',
-            '!PSK',
-            '!aECDH',
-            '!EDH-DSS-DES-CBC3-SHA',
-            '!EDH-RSA-DES-CBC3-SHA',
-            '!KRB5-DES-CBC3-SHA',
-        ]);
+        return \defined('PHP_WINDOWS_VERSION_BUILD');
+    }
 
-        /**
-         * CN_match and SNI_server_name are only known once a URL is passed.
-         * They will be set in the getOptionsForUrl() method which receives a URL.
-         *
-         * cafile or capath can be overridden by passing in those options to constructor.
-         */
-        $defaults = [
-            'ssl' => [
-                'ciphers' => $ciphers,
-                'verify_peer' => true,
-                'verify_depth' => 7,
-                'SNI_enabled' => true,
-                'capture_peer_cert' => true,
-            ],
-        ];
-
-        if (isset($options['ssl'])) {
-            $defaults['ssl'] = array_replace_recursive($defaults['ssl'], $options['ssl']);
+    /**
+     * @return int    return a guaranteed binary length of the string, regardless of silly mbstring configs
+     */
+    public static function strlen(string $str): int
+    {
+        static $useMbString = null;
+        if (null === $useMbString) {
+            $useMbString = \function_exists('mb_strlen') && ini_get('mbstring.func_overload');
         }
 
-        /**
-         * Attempt to find a local cafile or throw an exception if none pre-set
-         * The user may go download one if this occurs.
-         */
-        if (!isset($defaults['ssl']['cafile']) && !isset($defaults['ssl']['capath'])) {
-            $result = CaBundle::getSystemCaRootBundlePath($logger);
+        if ($useMbString) {
+            return mb_strlen($str, '8bit');
+        }
 
-            if (is_dir($result)) {
-                $defaults['ssl']['capath'] = $result;
-            } else {
-                $defaults['ssl']['cafile'] = $result;
+        return \strlen($str);
+    }
+
+    /**
+     * @param  ?resource $fd Open file descriptor or null to default to STDOUT
+     */
+    public static function isTty($fd = null): bool
+    {
+        if ($fd === null) {
+            $fd = defined('STDOUT') ? STDOUT : fopen('php://stdout', 'w');
+            if ($fd === false) {
+                return false;
             }
         }
 
-        if (isset($defaults['ssl']['cafile']) && (!Filesystem::isReadable($defaults['ssl']['cafile']) || !CaBundle::validateCaFile($defaults['ssl']['cafile'], $logger))) {
-            throw new TransportException('The configured cafile was not valid or could not be read.');
+        // detect msysgit/mingw and assume this is a tty because detection
+        // does not work correctly, see https://github.com/composer/composer/issues/9690
+        if (in_array(strtoupper(self::getEnv('MSYSTEM') ?: ''), ['MINGW32', 'MINGW64'], true)) {
+            return true;
         }
 
-        if (isset($defaults['ssl']['capath']) && (!is_dir($defaults['ssl']['capath']) || !Filesystem::isReadable($defaults['ssl']['capath']))) {
-            throw new TransportException('The configured capath was not valid or could not be read.');
+        // modern cross-platform function, includes the fstat
+        // fallback so if it is present we trust it
+        if (function_exists('stream_isatty')) {
+            return stream_isatty($fd);
         }
 
-        /**
-         * Disable TLS compression to prevent CRIME attacks where supported.
-         */
-        $defaults['ssl']['disable_compression'] = true;
+        // only trusting this if it is positive, otherwise prefer fstat fallback
+        if (function_exists('posix_isatty') && posix_isatty($fd)) {
+            return true;
+        }
 
-        return $defaults;
+        $stat = @fstat($fd);
+        // Check if formatted mode is S_IFCHR
+        return $stat ? 0020000 === ($stat['mode'] & 0170000) : false;
     }
 
     /**
-     * A bug in PHP prevents the headers from correctly being sent when a content-type header is present and
-     * NOT at the end of the array
-     *
-     * This method fixes the array by moving the content-type header to the end
-     *
-     * @link https://bugs.php.net/bug.php?id=61548
-     * @param  string|string[] $header
-     * @return string[]
+     * @return bool Whether the current command is for bash completion
      */
-    private static function fixHttpHeaderField($header): array
+    public static function isInputCompletionProcess(): bool
     {
-        if (!is_array($header)) {
-            $header = explode("\r\n", $header);
-        }
-        uasort($header, static function ($el): int {
-            return stripos($el, 'content-type') === 0 ? 1 : -1;
-        });
+        return '_complete' === ($_SERVER['argv'][1] ?? null);
+    }
 
-        return $header;
+    public static function workaroundFilesystemIssues(): void
+    {
+        if (self::isVirtualBoxGuest()) {
+            usleep(200000);
+        }
+    }
+
+    /**
+     * Attempts detection of VirtualBox guest VMs
+     *
+     * This works based on the process' user being "vagrant", the COMPOSER_RUNTIME_ENV env var being set to "virtualbox", or lsmod showing the virtualbox guest additions are loaded
+     */
+    private static function isVirtualBoxGuest(): bool
+    {
+        if (null === self::$isVirtualBoxGuest) {
+            self::$isVirtualBoxGuest = false;
+            if (self::isWindows()) {
+                return self::$isVirtualBoxGuest;
+            }
+
+            if (function_exists('posix_getpwuid') && function_exists('posix_geteuid')) {
+                $processUser = posix_getpwuid(posix_geteuid());
+                if ($processUser && $processUser['name'] === 'vagrant') {
+                    return self::$isVirtualBoxGuest = true;
+                }
+            }
+
+            if (self::getEnv('COMPOSER_RUNTIME_ENV') === 'virtualbox') {
+                return self::$isVirtualBoxGuest = true;
+            }
+
+            if (defined('PHP_OS_FAMILY') && PHP_OS_FAMILY === 'Linux') {
+                $process = new ProcessExecutor();
+                try {
+                    if (0 === $process->execute('lsmod | grep vboxguest', $ignoredOutput)) {
+                        return self::$isVirtualBoxGuest = true;
+                    }
+                } catch (\Exception $e) {
+                    // noop
+                }
+            }
+        }
+
+        return self::$isVirtualBoxGuest;
+    }
+
+    /**
+     * @return 'NUL'|'/dev/null'
+     */
+    public static function getDevNull(): string
+    {
+        if (self::isWindows()) {
+            return 'NUL';
+        }
+
+        return '/dev/null';
     }
 }

@@ -10,613 +10,662 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Downloader;
+namespace Composer\Util\Http;
 
 use Composer\Config;
+use Composer\Downloader\MaxFileSizeExceededException;
 use Composer\IO\IOInterface;
-use Composer\Package\PackageInterface;
+use Composer\Downloader\TransportException;
 use Composer\Pcre\Preg;
-use Composer\Util\Filesystem;
-use Composer\Util\Git as GitUtil;
-use Composer\Util\Url;
 use Composer\Util\Platform;
-use Composer\Util\ProcessExecutor;
-use Composer\Cache;
-use React\Promise\PromiseInterface;
+use Composer\Util\StreamContextFactory;
+use Composer\Util\AuthHelper;
+use Composer\Util\Url;
+use Composer\Util\HttpDownloader;
+use React\Promise\Promise;
+use Symfony\Component\HttpFoundation\IpUtils;
 
 /**
+ * @internal
  * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @author Nicolas Grekas <p@tchwork.com>
+ * @phpstan-type Attributes array{retryAuthFailure: bool, redirects: int<0, max>, retries: int<0, max>, storeAuth: 'prompt'|bool, ipResolve: 4|6|null}
+ * @phpstan-type Job array{url: non-empty-string, origin: string, attributes: Attributes, options: mixed[], progress: mixed[], curlHandle: \CurlHandle, filename: string|null, headerHandle: resource, bodyHandle: resource, resolve: callable, reject: callable, primaryIp: string}
  */
-class GitDownloader extends VcsDownloader implements DvcsDownloaderInterface
+class CurlDownloader
 {
-    /**
-     * @var bool[]
-     * @phpstan-var array<string, bool>
-     */
-    private $hasStashedChanges = [];
-    /**
-     * @var bool[]
-     * @phpstan-var array<string, bool>
-     */
-    private $hasDiscardedChanges = [];
-    /**
-     * @var GitUtil
-     */
-    private $gitUtil;
-    /**
-     * @var array
-     * @phpstan-var array<int, array<string, bool>>
-     */
-    private $cachedPackages = [];
+    /** @var ?resource */
+    private $multiHandle;
+    /** @var ?resource */
+    private $shareHandle;
+    /** @var Job[] */
+    private $jobs = [];
+    /** @var IOInterface */
+    private $io;
+    /** @var Config */
+    private $config;
+    /** @var AuthHelper */
+    private $authHelper;
+    /** @var float */
+    private $selectTimeout = 5.0;
+    /** @var int */
+    private $maxRedirects = 20;
+    /** @var int */
+    private $maxRetries = 3;
+    /** @var array<int, string[]> */
+    protected $multiErrors = [
+        CURLM_BAD_HANDLE => ['CURLM_BAD_HANDLE', 'The passed-in handle is not a valid CURLM handle.'],
+        CURLM_BAD_EASY_HANDLE => ['CURLM_BAD_EASY_HANDLE', "An easy handle was not good/valid. It could mean that it isn't an easy handle at all, or possibly that the handle already is in used by this or another multi handle."],
+        CURLM_OUT_OF_MEMORY => ['CURLM_OUT_OF_MEMORY', 'You are doomed.'],
+        CURLM_INTERNAL_ERROR => ['CURLM_INTERNAL_ERROR', 'This can only be returned if libcurl bugs. Please report it to us!'],
+    ];
 
-    public function __construct(IOInterface $io, Config $config, ?ProcessExecutor $process = null, ?Filesystem $fs = null)
+    /** @var mixed[] */
+    private static $options = [
+        'http' => [
+            'method' => CURLOPT_CUSTOMREQUEST,
+            'content' => CURLOPT_POSTFIELDS,
+            'header' => CURLOPT_HTTPHEADER,
+            'timeout' => CURLOPT_TIMEOUT,
+        ],
+        'ssl' => [
+            'cafile' => CURLOPT_CAINFO,
+            'capath' => CURLOPT_CAPATH,
+            'verify_peer' => CURLOPT_SSL_VERIFYPEER,
+            'verify_peer_name' => CURLOPT_SSL_VERIFYHOST,
+            'local_cert' => CURLOPT_SSLCERT,
+            'local_pk' => CURLOPT_SSLKEY,
+            'passphrase' => CURLOPT_SSLKEYPASSWD,
+        ],
+    ];
+
+    /** @var array<string, true> */
+    private static $timeInfo = [
+        'total_time' => true,
+        'namelookup_time' => true,
+        'connect_time' => true,
+        'pretransfer_time' => true,
+        'starttransfer_time' => true,
+        'redirect_time' => true,
+    ];
+
+    /**
+     * @param mixed[] $options
+     */
+    public function __construct(IOInterface $io, Config $config, array $options = [], bool $disableTls = false)
     {
-        parent::__construct($io, $config, $process, $fs);
-        $this->gitUtil = new GitUtil($this->io, $this->config, $this->process, $this->filesystem);
+        $this->io = $io;
+        $this->config = $config;
+
+        $this->multiHandle = $mh = curl_multi_init();
+        if (function_exists('curl_multi_setopt')) {
+            curl_multi_setopt($mh, CURLMOPT_PIPELINING, PHP_VERSION_ID >= 70400 ? /* CURLPIPE_MULTIPLEX */ 2 : /*CURLPIPE_HTTP1 | CURLPIPE_MULTIPLEX*/ 3);
+            if (defined('CURLMOPT_MAX_HOST_CONNECTIONS') && !defined('HHVM_VERSION')) {
+                curl_multi_setopt($mh, CURLMOPT_MAX_HOST_CONNECTIONS, 8);
+            }
+        }
+
+        if (function_exists('curl_share_init')) {
+            $this->shareHandle = $sh = curl_share_init();
+            curl_share_setopt($sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
+            curl_share_setopt($sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+            curl_share_setopt($sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+        }
+
+        $this->authHelper = new AuthHelper($io, $config);
     }
 
     /**
-     * @inheritDoc
-     */
-    protected function doDownload(PackageInterface $package, string $path, string $url, ?PackageInterface $prevPackage = null): PromiseInterface
-    {
-        // Do not create an extra local cache when repository is already local
-        if (Filesystem::isLocalPath($url)) {
-            return \React\Promise\resolve(null);
-        }
-
-        GitUtil::cleanEnv();
-
-        $cachePath = $this->config->get('cache-vcs-dir').'/'.Preg::replace('{[^a-z0-9.]}i', '-', $url).'/';
-        $gitVersion = GitUtil::getVersion($this->process);
-
-        // --dissociate option is only available since git 2.3.0-rc0
-        if ($gitVersion && version_compare($gitVersion, '2.3.0-rc0', '>=') && Cache::isUsable($cachePath)) {
-            $this->io->writeError("  - Syncing <info>" . $package->getName() . "</info> (<comment>" . $package->getFullPrettyVersion() . "</comment>) into cache");
-            $this->io->writeError(sprintf('    Cloning to cache at %s', ProcessExecutor::escape($cachePath)), true, IOInterface::DEBUG);
-            $ref = $package->getSourceReference();
-            if ($this->gitUtil->fetchRefOrSyncMirror($url, $cachePath, $ref, $package->getPrettyVersion()) && is_dir($cachePath)) {
-                $this->cachedPackages[$package->getId()][$ref] = true;
-            }
-        } elseif (null === $gitVersion) {
-            throw new \RuntimeException('git was not found in your PATH, skipping source download');
-        }
-
-        return \React\Promise\resolve(null);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    protected function doInstall(PackageInterface $package, string $path, string $url): PromiseInterface
-    {
-        GitUtil::cleanEnv();
-        $path = $this->normalizePath($path);
-        $cachePath = $this->config->get('cache-vcs-dir').'/'.Preg::replace('{[^a-z0-9.]}i', '-', $url).'/';
-        $ref = $package->getSourceReference();
-        $flag = Platform::isWindows() ? '/D ' : '';
-
-        if (!empty($this->cachedPackages[$package->getId()][$ref])) {
-            $msg = "Cloning ".$this->getShortHash($ref).' from cache';
-
-            $cloneFlags = '--dissociate --reference %cachePath% ';
-            $transportOptions = $package->getTransportOptions();
-            if (isset($transportOptions['git']['single_use_clone']) && $transportOptions['git']['single_use_clone']) {
-                $cloneFlags = '';
-            }
-
-            $command =
-                'git clone --no-checkout %cachePath% %path% ' . $cloneFlags
-                . '&& cd '.$flag.'%path% '
-                . '&& git remote set-url origin -- %sanitizedUrl% && git remote add composer -- %sanitizedUrl%';
-        } else {
-            $msg = "Cloning ".$this->getShortHash($ref);
-            $command = 'git clone --no-checkout -- %url% %path% && cd '.$flag.'%path% && git remote add composer -- %url% && git fetch composer && git remote set-url origin -- %sanitizedUrl% && git remote set-url composer -- %sanitizedUrl%';
-            if (Platform::getEnv('COMPOSER_DISABLE_NETWORK')) {
-                throw new \RuntimeException('The required git reference for '.$package->getName().' is not in cache and network is disabled, aborting');
-            }
-        }
-
-        $this->io->writeError($msg);
-
-        $commandCallable = static function (string $url) use ($path, $command, $cachePath): string {
-            return str_replace(
-                ['%url%', '%path%', '%cachePath%', '%sanitizedUrl%'],
-                [
-                    ProcessExecutor::escape($url),
-                    ProcessExecutor::escape($path),
-                    ProcessExecutor::escape($cachePath),
-                    ProcessExecutor::escape(Preg::replace('{://([^@]+?):(.+?)@}', '://', $url)),
-                ],
-                $command
-            );
-        };
-
-        $this->gitUtil->runCommand($commandCallable, $url, $path, true);
-        $sourceUrl = $package->getSourceUrl();
-        if ($url !== $sourceUrl && $sourceUrl !== null) {
-            $this->updateOriginUrl($path, $sourceUrl);
-        } else {
-            $this->setPushUrl($path, $url);
-        }
-
-        if ($newRef = $this->updateToCommit($package, $path, (string) $ref, $package->getPrettyVersion())) {
-            if ($package->getDistReference() === $package->getSourceReference()) {
-                $package->setDistReference($newRef);
-            }
-            $package->setSourceReference($newRef);
-        }
-
-        return \React\Promise\resolve(null);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    protected function doUpdate(PackageInterface $initial, PackageInterface $target, string $path, string $url): PromiseInterface
-    {
-        GitUtil::cleanEnv();
-        $path = $this->normalizePath($path);
-        if (!$this->hasMetadataRepository($path)) {
-            throw new \RuntimeException('The .git directory is missing from '.$path.', see https://getcomposer.org/commit-deps for more information');
-        }
-
-        $cachePath = $this->config->get('cache-vcs-dir').'/'.Preg::replace('{[^a-z0-9.]}i', '-', $url).'/';
-        $ref = $target->getSourceReference();
-
-        if (!empty($this->cachedPackages[$target->getId()][$ref])) {
-            $msg = "Checking out ".$this->getShortHash($ref).' from cache';
-            $command = '(git rev-parse --quiet --verify %ref% || (git remote set-url composer -- %cachePath% && git fetch composer && git fetch --tags composer)) && git remote set-url composer -- %sanitizedUrl%';
-        } else {
-            $msg = "Checking out ".$this->getShortHash($ref);
-            $command = '(git remote set-url composer -- %url% && git rev-parse --quiet --verify %ref% || (git fetch composer && git fetch --tags composer)) && git remote set-url composer -- %sanitizedUrl%';
-            if (Platform::getEnv('COMPOSER_DISABLE_NETWORK')) {
-                throw new \RuntimeException('The required git reference for '.$target->getName().' is not in cache and network is disabled, aborting');
-            }
-        }
-
-        $this->io->writeError($msg);
-
-        $commandCallable = static function ($url) use ($ref, $command, $cachePath): string {
-            return str_replace(
-                ['%url%', '%ref%', '%cachePath%', '%sanitizedUrl%'],
-                [
-                    ProcessExecutor::escape($url),
-                    ProcessExecutor::escape($ref.'^{commit}'),
-                    ProcessExecutor::escape($cachePath),
-                    ProcessExecutor::escape(Preg::replace('{://([^@]+?):(.+?)@}', '://', $url)),
-                ],
-                $command
-            );
-        };
-
-        $this->gitUtil->runCommand($commandCallable, $url, $path);
-        if ($newRef = $this->updateToCommit($target, $path, (string) $ref, $target->getPrettyVersion())) {
-            if ($target->getDistReference() === $target->getSourceReference()) {
-                $target->setDistReference($newRef);
-            }
-            $target->setSourceReference($newRef);
-        }
-
-        $updateOriginUrl = false;
-        if (
-            0 === $this->process->execute('git remote -v', $output, $path)
-            && Preg::isMatch('{^origin\s+(?P<url>\S+)}m', $output, $originMatch)
-            && Preg::isMatch('{^composer\s+(?P<url>\S+)}m', $output, $composerMatch)
-        ) {
-            if ($originMatch['url'] === $composerMatch['url'] && $composerMatch['url'] !== $target->getSourceUrl()) {
-                $updateOriginUrl = true;
-            }
-        }
-        if ($updateOriginUrl && $target->getSourceUrl() !== null) {
-            $this->updateOriginUrl($path, $target->getSourceUrl());
-        }
-
-        return \React\Promise\resolve(null);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getLocalChanges(PackageInterface $package, string $path): ?string
-    {
-        GitUtil::cleanEnv();
-        if (!$this->hasMetadataRepository($path)) {
-            return null;
-        }
-
-        $command = 'git status --porcelain --untracked-files=no';
-        if (0 !== $this->process->execute($command, $output, $path)) {
-            throw new \RuntimeException('Failed to execute ' . $command . "\n\n" . $this->process->getErrorOutput());
-        }
-
-        $output = trim($output);
-
-        return strlen($output) > 0 ? $output : null;
-    }
-
-    public function getUnpushedChanges(PackageInterface $package, string $path): ?string
-    {
-        GitUtil::cleanEnv();
-        $path = $this->normalizePath($path);
-        if (!$this->hasMetadataRepository($path)) {
-            return null;
-        }
-
-        $command = 'git show-ref --head -d';
-        if (0 !== $this->process->execute($command, $output, $path)) {
-            throw new \RuntimeException('Failed to execute ' . $command . "\n\n" . $this->process->getErrorOutput());
-        }
-
-        $refs = trim($output);
-        if (!Preg::isMatchStrictGroups('{^([a-f0-9]+) HEAD$}mi', $refs, $match)) {
-            // could not match the HEAD for some reason
-            return null;
-        }
-
-        $headRef = $match[1];
-        if (!Preg::isMatchAllStrictGroups('{^'.$headRef.' refs/heads/(.+)$}mi', $refs, $matches)) {
-            // not on a branch, we are either on a not-modified tag or some sort of detached head, so skip this
-            return null;
-        }
-
-        $candidateBranches = $matches[1];
-        // use the first match as branch name for now
-        $branch = $candidateBranches[0];
-        $unpushedChanges = null;
-        $branchNotFoundError = false;
-
-        // do two passes, as if we find anything we want to fetch and then re-try
-        for ($i = 0; $i <= 1; $i++) {
-            $remoteBranches = [];
-
-            // try to find matching branch names in remote repos
-            foreach ($candidateBranches as $candidate) {
-                if (Preg::isMatchAllStrictGroups('{^[a-f0-9]+ refs/remotes/((?:[^/]+)/'.preg_quote($candidate).')$}mi', $refs, $matches)) {
-                    foreach ($matches[1] as $match) {
-                        $branch = $candidate;
-                        $remoteBranches[] = $match;
-                    }
-                    break;
-                }
-            }
-
-            // if it doesn't exist, then we assume it is an unpushed branch
-            // this is bad as we have no reference point to do a diff so we just bail listing
-            // the branch as being unpushed
-            if (count($remoteBranches) === 0) {
-                $unpushedChanges = 'Branch ' . $branch . ' could not be found on any remote and appears to be unpushed';
-                $branchNotFoundError = true;
-            } else {
-                // if first iteration found no remote branch but it has now found some, reset $unpushedChanges
-                // so we get the real diff output no matter its length
-                if ($branchNotFoundError) {
-                    $unpushedChanges = null;
-                }
-                foreach ($remoteBranches as $remoteBranch) {
-                    $command = ['git', 'diff', '--name-status', $remoteBranch.'...'.$branch, '--'];
-                    if (0 !== $this->process->execute($command, $output, $path)) {
-                        throw new \RuntimeException('Failed to execute ' . implode(' ', $command) . "\n\n" . $this->process->getErrorOutput());
-                    }
-
-                    $output = trim($output);
-                    // keep the shortest diff from all remote branches we compare against
-                    if ($unpushedChanges === null || strlen($output) < strlen($unpushedChanges)) {
-                        $unpushedChanges = $output;
-                    }
-                }
-            }
-
-            // first pass and we found unpushed changes, fetch from all remotes to make sure we have up to date
-            // remotes and then try again as outdated remotes can sometimes cause false-positives
-            if ($unpushedChanges && $i === 0) {
-                $this->process->execute('git fetch --all', $output, $path);
-
-                // update list of refs after fetching
-                $command = 'git show-ref --head -d';
-                if (0 !== $this->process->execute($command, $output, $path)) {
-                    throw new \RuntimeException('Failed to execute ' . $command . "\n\n" . $this->process->getErrorOutput());
-                }
-                $refs = trim($output);
-            }
-
-            // abort after first pass if we didn't find anything
-            if (!$unpushedChanges) {
-                break;
-            }
-        }
-
-        return $unpushedChanges;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    protected function cleanChanges(PackageInterface $package, string $path, bool $update): PromiseInterface
-    {
-        GitUtil::cleanEnv();
-        $path = $this->normalizePath($path);
-
-        $unpushed = $this->getUnpushedChanges($package, $path);
-        if ($unpushed && ($this->io->isInteractive() || $this->config->get('discard-changes') !== true)) {
-            throw new \RuntimeException('Source directory ' . $path . ' has unpushed changes on the current branch: '."\n".$unpushed);
-        }
-
-        if (null === ($changes = $this->getLocalChanges($package, $path))) {
-            return \React\Promise\resolve(null);
-        }
-
-        if (!$this->io->isInteractive()) {
-            $discardChanges = $this->config->get('discard-changes');
-            if (true === $discardChanges) {
-                return $this->discardChanges($path);
-            }
-            if ('stash' === $discardChanges) {
-                if (!$update) {
-                    return parent::cleanChanges($package, $path, $update);
-                }
-
-                return $this->stashChanges($path);
-            }
-
-            return parent::cleanChanges($package, $path, $update);
-        }
-
-        $changes = array_map(static function ($elem): string {
-            return '    '.$elem;
-        }, Preg::split('{\s*\r?\n\s*}', $changes));
-        $this->io->writeError('    <error>'.$package->getPrettyName().' has modified files:</error>');
-        $this->io->writeError(array_slice($changes, 0, 10));
-        if (count($changes) > 10) {
-            $this->io->writeError('    <info>' . (count($changes) - 10) . ' more files modified, choose "v" to view the full list</info>');
-        }
-
-        while (true) {
-            switch ($this->io->ask('    <info>Discard changes [y,n,v,d,'.($update ? 's,' : '').'?]?</info> ', '?')) {
-                case 'y':
-                    $this->discardChanges($path);
-                    break 2;
-
-                case 's':
-                    if (!$update) {
-                        goto help;
-                    }
-
-                    $this->stashChanges($path);
-                    break 2;
-
-                case 'n':
-                    throw new \RuntimeException('Update aborted');
-
-                case 'v':
-                    $this->io->writeError($changes);
-                    break;
-
-                case 'd':
-                    $this->viewDiff($path);
-                    break;
-
-                case '?':
-                default:
-                    help :
-                    $this->io->writeError([
-                        '    y - discard changes and apply the '.($update ? 'update' : 'uninstall'),
-                        '    n - abort the '.($update ? 'update' : 'uninstall').' and let you manually clean things up',
-                        '    v - view modified files',
-                        '    d - view local modifications (diff)',
-                    ]);
-                    if ($update) {
-                        $this->io->writeError('    s - stash changes and try to reapply them after the update');
-                    }
-                    $this->io->writeError('    ? - print help');
-                    break;
-            }
-        }
-
-        return \React\Promise\resolve(null);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    protected function reapplyChanges(string $path): void
-    {
-        $path = $this->normalizePath($path);
-        if (!empty($this->hasStashedChanges[$path])) {
-            unset($this->hasStashedChanges[$path]);
-            $this->io->writeError('    <info>Re-applying stashed changes</info>');
-            if (0 !== $this->process->execute('git stash pop', $output, $path)) {
-                throw new \RuntimeException("Failed to apply stashed changes:\n\n".$this->process->getErrorOutput());
-            }
-        }
-
-        unset($this->hasDiscardedChanges[$path]);
-    }
-
-    /**
-     * Updates the given path to the given commit ref
+     * @param mixed[]  $options
+     * @param non-empty-string $url
      *
-     * @throws \RuntimeException
-     * @return null|string       if a string is returned, it is the commit reference that was checked out if the original could not be found
+     * @return int internal job id
      */
-    protected function updateToCommit(PackageInterface $package, string $path, string $reference, string $prettyVersion): ?string
+    public function download(callable $resolve, callable $reject, string $origin, string $url, array $options, ?string $copyTo = null): int
     {
-        $force = !empty($this->hasDiscardedChanges[$path]) || !empty($this->hasStashedChanges[$path]) ? '-f ' : '';
-
-        // This uses the "--" sequence to separate branch from file parameters.
-        //
-        // Otherwise git tries the branch name as well as file name.
-        // If the non-existent branch is actually the name of a file, the file
-        // is checked out.
-        $template = 'git checkout '.$force.'%s -- && git reset --hard %1$s --';
-        $branch = Preg::replace('{(?:^dev-|(?:\.x)?-dev$)}i', '', $prettyVersion);
-
-        $branches = null;
-        if (0 === $this->process->execute('git branch -r', $output, $path)) {
-            $branches = $output;
+        $attributes = [];
+        if (isset($options['retry-auth-failure'])) {
+            $attributes['retryAuthFailure'] = $options['retry-auth-failure'];
+            unset($options['retry-auth-failure']);
         }
 
-        // check whether non-commitish are branches or tags, and fetch branches with the remote name
-        $gitRef = $reference;
-        if (!Preg::isMatch('{^[a-f0-9]{40}$}', $reference)
-            && null !== $branches
-            && Preg::isMatch('{^\s+composer/'.preg_quote($reference).'$}m', $branches)
+        return $this->initDownload($resolve, $reject, $origin, $url, $options, $copyTo, $attributes);
+    }
+
+    /**
+     * @param mixed[]  $options
+     *
+     * @param array{retryAuthFailure?: bool, redirects?: int<0, max>, retries?: int<0, max>, storeAuth?: 'prompt'|bool, ipResolve?: 4|6|null} $attributes
+     * @param non-empty-string $url
+     *
+     * @return int internal job id
+     */
+    private function initDownload(callable $resolve, callable $reject, string $origin, string $url, array $options, ?string $copyTo = null, array $attributes = []): int
+    {
+        $attributes = array_merge([
+            'retryAuthFailure' => true,
+            'redirects' => 0,
+            'retries' => 0,
+            'storeAuth' => false,
+            'ipResolve' => null,
+        ], $attributes);
+
+        if ($attributes['ipResolve'] === null && Platform::getEnv('COMPOSER_IPRESOLVE') === '4') {
+            $attributes['ipResolve'] = 4;
+        } elseif ($attributes['ipResolve'] === null && Platform::getEnv('COMPOSER_IPRESOLVE') === '6') {
+            $attributes['ipResolve'] = 6;
+        }
+
+        $originalOptions = $options;
+
+        // check URL can be accessed (i.e. is not insecure), but allow insecure Packagist calls to $hashed providers as file integrity is verified with sha256
+        if (!Preg::isMatch('{^http://(repo\.)?packagist\.org/p/}', $url) || (false === strpos($url, '$') && false === strpos($url, '%24'))) {
+            $this->config->prohibitUrlByConfig($url, $this->io, $options);
+        }
+
+        $curlHandle = curl_init();
+        $headerHandle = fopen('php://temp/maxmemory:32768', 'w+b');
+        if (false === $headerHandle) {
+            throw new \RuntimeException('Failed to open a temp stream to store curl headers');
+        }
+
+        if ($copyTo !== null) {
+            $bodyTarget = $copyTo.'~';
+        } else {
+            $bodyTarget = 'php://temp/maxmemory:524288';
+        }
+
+        $errorMessage = '';
+        set_error_handler(static function (int $code, string $msg) use (&$errorMessage): bool {
+            if ($errorMessage) {
+                $errorMessage .= "\n";
+            }
+            $errorMessage .= Preg::replace('{^fopen\(.*?\): }', '', $msg);
+
+            return true;
+        });
+        $bodyHandle = fopen($bodyTarget, 'w+b');
+        restore_error_handler();
+        if (false === $bodyHandle) {
+            throw new TransportException('The "'.$url.'" file could not be written to '.($copyTo ?? 'a temporary file').': '.$errorMessage);
+        }
+
+        curl_setopt($curlHandle, CURLOPT_URL, $url);
+        curl_setopt($curlHandle, CURLOPT_FOLLOWLOCATION, false);
+        curl_setopt($curlHandle, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($curlHandle, CURLOPT_TIMEOUT, max((int) ini_get("default_socket_timeout"), 300));
+        curl_setopt($curlHandle, CURLOPT_WRITEHEADER, $headerHandle);
+        curl_setopt($curlHandle, CURLOPT_FILE, $bodyHandle);
+        curl_setopt($curlHandle, CURLOPT_ENCODING, ""); // let cURL set the Accept-Encoding header to what it supports
+        curl_setopt($curlHandle, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+
+        if ($attributes['ipResolve'] === 4) {
+            curl_setopt($curlHandle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+        } elseif ($attributes['ipResolve'] === 6) {
+            curl_setopt($curlHandle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V6);
+        }
+
+        if (function_exists('curl_share_init')) {
+            curl_setopt($curlHandle, CURLOPT_SHARE, $this->shareHandle);
+        }
+
+        if (!isset($options['http']['header'])) {
+            $options['http']['header'] = [];
+        }
+
+        $options['http']['header'] = array_diff($options['http']['header'], ['Connection: close']);
+        $options['http']['header'][] = 'Connection: keep-alive';
+
+        $version = curl_version();
+        $features = $version['features'];
+        if (0 === strpos($url, 'https://') && \defined('CURL_VERSION_HTTP2') && \defined('CURL_HTTP_VERSION_2_0') && (CURL_VERSION_HTTP2 & $features) !== 0) {
+            curl_setopt($curlHandle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+        }
+
+        // curl 8.7.0 - 8.7.1 has a bug whereas automatic accept-encoding header results in an error when reading the response
+        // https://github.com/composer/composer/issues/11913
+        if (isset($version['version']) && in_array($version['version'], ['8.7.0', '8.7.1'], true) && \defined('CURL_VERSION_LIBZ') && (CURL_VERSION_LIBZ & $features) !== 0) {
+            curl_setopt($curlHandle, CURLOPT_ENCODING, "gzip");
+        }
+
+        $options['http']['header'] = $this->authHelper->addAuthenticationHeader($options['http']['header'], $origin, $url);
+        $options = StreamContextFactory::initOptions($url, $options, true);
+
+        foreach (self::$options as $type => $curlOptions) {
+            foreach ($curlOptions as $name => $curlOption) {
+                if (isset($options[$type][$name])) {
+                    if ($type === 'ssl' && $name === 'verify_peer_name') {
+                        curl_setopt($curlHandle, $curlOption, $options[$type][$name] === true ? 2 : $options[$type][$name]);
+                    } else {
+                        curl_setopt($curlHandle, $curlOption, $options[$type][$name]);
+                    }
+                }
+            }
+        }
+
+        $proxy = ProxyManager::getInstance()->getProxyForRequest($url);
+        curl_setopt_array($curlHandle, $proxy->getCurlOptions($options['ssl'] ?? []));
+
+        $progress = array_diff_key(curl_getinfo($curlHandle), self::$timeInfo);
+
+        $this->jobs[(int) $curlHandle] = [
+            'url' => $url,
+            'origin' => $origin,
+            'attributes' => $attributes,
+            'options' => $originalOptions,
+            'progress' => $progress,
+            'curlHandle' => $curlHandle,
+            'filename' => $copyTo,
+            'headerHandle' => $headerHandle,
+            'bodyHandle' => $bodyHandle,
+            'resolve' => $resolve,
+            'reject' => $reject,
+            'primaryIp' => '',
+        ];
+
+        $usingProxy = $proxy->getStatus(' using proxy (%s)');
+        $ifModified = false !== stripos(implode(',', $options['http']['header']), 'if-modified-since:') ? ' if modified' : '';
+        if ($attributes['redirects'] === 0 && $attributes['retries'] === 0) {
+            $this->io->writeError('Downloading ' . Url::sanitize($url) . $usingProxy . $ifModified, true, IOInterface::DEBUG);
+        }
+
+        $this->checkCurlResult(curl_multi_add_handle($this->multiHandle, $curlHandle));
+        // TODO progress
+
+        return (int) $curlHandle;
+    }
+
+    public function abortRequest(int $id): void
+    {
+        if (isset($this->jobs[$id], $this->jobs[$id]['curlHandle'])) {
+            $job = $this->jobs[$id];
+            curl_multi_remove_handle($this->multiHandle, $job['curlHandle']);
+            curl_close($job['curlHandle']);
+            if (is_resource($job['headerHandle'])) {
+                fclose($job['headerHandle']);
+            }
+            if (is_resource($job['bodyHandle'])) {
+                fclose($job['bodyHandle']);
+            }
+            if (null !== $job['filename']) {
+                @unlink($job['filename'].'~');
+            }
+            unset($this->jobs[$id]);
+        }
+    }
+
+    public function tick(): void
+    {
+        static $timeoutWarning = false;
+
+        if (count($this->jobs) === 0) {
+            return;
+        }
+
+        $active = true;
+        $this->checkCurlResult(curl_multi_exec($this->multiHandle, $active));
+        if (-1 === curl_multi_select($this->multiHandle, $this->selectTimeout)) {
+            // sleep in case select returns -1 as it can happen on old php versions or some platforms where curl does not manage to do the select
+            usleep(150);
+        }
+
+        while ($progress = curl_multi_info_read($this->multiHandle)) {
+            $curlHandle = $progress['handle'];
+            $result = $progress['result'];
+            $i = (int) $curlHandle;
+            if (!isset($this->jobs[$i])) {
+                continue;
+            }
+
+            $progress = curl_getinfo($curlHandle);
+            if (false === $progress) {
+                throw new \RuntimeException('Failed getting info from curl handle '.$i.' ('.$this->jobs[$i]['url'].')');
+            }
+            $job = $this->jobs[$i];
+            unset($this->jobs[$i]);
+            $error = curl_error($curlHandle);
+            $errno = curl_errno($curlHandle);
+            curl_multi_remove_handle($this->multiHandle, $curlHandle);
+            curl_close($curlHandle);
+
+            $headers = null;
+            $statusCode = null;
+            $response = null;
+            try {
+                // TODO progress
+                if (CURLE_OK !== $errno || $error || $result !== CURLE_OK) {
+                    $errno = $errno ?: $result;
+                    if (!$error && function_exists('curl_strerror')) {
+                        $error = curl_strerror($errno);
+                    }
+                    $progress['error_code'] = $errno;
+
+                    if (
+                        (!isset($job['options']['http']['method']) || $job['options']['http']['method'] === 'GET')
+                        && (
+                            in_array($errno, [7 /* CURLE_COULDNT_CONNECT */, 16 /* CURLE_HTTP2 */, 92 /* CURLE_HTTP2_STREAM */, 6 /* CURLE_COULDNT_RESOLVE_HOST */], true)
+                            || (in_array($errno, [56 /* CURLE_RECV_ERROR */, 35 /* CURLE_SSL_CONNECT_ERROR */], true) && str_contains((string) $error, 'Connection reset by peer'))
+                        ) && $job['attributes']['retries'] < $this->maxRetries
+                    ) {
+                        $attributes = ['retries' => $job['attributes']['retries'] + 1];
+                        if ($errno === 7 && !isset($job['attributes']['ipResolve'])) { // CURLE_COULDNT_CONNECT, retry forcing IPv4 if no IP stack was selected
+                            $attributes['ipResolve'] = 4;
+                        }
+                        $this->io->writeError('Retrying ('.($job['attributes']['retries'] + 1).') ' . Url::sanitize($job['url']) . ' due to curl error '. $errno, true, IOInterface::DEBUG);
+                        $this->restartJobWithDelay($job, $job['url'], $attributes);
+                        continue;
+                    }
+
+                    // TODO: Remove this as soon as https://github.com/curl/curl/issues/10591 is resolved
+                    if ($errno === 55 /* CURLE_SEND_ERROR */) {
+                        $this->io->writeError('Retrying ('.($job['attributes']['retries'] + 1).') ' . Url::sanitize($job['url']) . ' due to curl error '. $errno, true, IOInterface::DEBUG);
+                        $this->restartJobWithDelay($job, $job['url'], ['retries' => $job['attributes']['retries'] + 1]);
+                        continue;
+                    }
+
+                    if ($errno === 28 /* CURLE_OPERATION_TIMEDOUT */ && PHP_VERSION_ID >= 70300 && $progress['namelookup_time'] === 0.0 && !$timeoutWarning) {
+                        $timeoutWarning = true;
+                        $this->io->writeError('<warning>A connection timeout was encountered. If you intend to run Composer without connecting to the internet, run the command again prefixed with COMPOSER_DISABLE_NETWORK=1 to make Composer run in offline mode.</warning>');
+                    }
+
+                    throw new TransportException('curl error '.$errno.' while downloading '.Url::sanitize($progress['url']).': '.$error);
+                }
+                $statusCode = $progress['http_code'];
+                rewind($job['headerHandle']);
+                $headers = explode("\r\n", rtrim(stream_get_contents($job['headerHandle'])));
+                fclose($job['headerHandle']);
+
+                if ($statusCode === 0) {
+                    throw new \LogicException('Received unexpected http status code 0 without error for '.Url::sanitize($progress['url']).': headers '.var_export($headers, true).' curl info '.var_export($progress, true));
+                }
+
+                // prepare response object
+                if (null !== $job['filename']) {
+                    $contents = $job['filename'].'~';
+                    if ($statusCode >= 300) {
+                        rewind($job['bodyHandle']);
+                        $contents = stream_get_contents($job['bodyHandle']);
+                    }
+                    $response = new CurlResponse(['url' => $job['url']], $statusCode, $headers, $contents, $progress);
+                    $this->io->writeError('['.$statusCode.'] '.Url::sanitize($job['url']), true, IOInterface::DEBUG);
+                } else {
+                    $maxFileSize = $job['options']['max_file_size'] ?? null;
+                    rewind($job['bodyHandle']);
+                    if ($maxFileSize !== null) {
+                        $contents = stream_get_contents($job['bodyHandle'], $maxFileSize);
+                        // Gzipped responses with missing Content-Length header cannot be detected during the file download
+                        // because $progress['size_download'] refers to the gzipped size downloaded, not the actual file size
+                        if ($contents !== false && Platform::strlen($contents) >= $maxFileSize) {
+                            throw new MaxFileSizeExceededException('Maximum allowed download size reached. Downloaded ' . Platform::strlen($contents) . ' of allowed ' .  $maxFileSize . ' bytes');
+                        }
+                    } else {
+                        $contents = stream_get_contents($job['bodyHandle']);
+                    }
+
+                    $response = new CurlResponse(['url' => $job['url']], $statusCode, $headers, $contents, $progress);
+                    $this->io->writeError('['.$statusCode.'] '.Url::sanitize($job['url']), true, IOInterface::DEBUG);
+                }
+                fclose($job['bodyHandle']);
+
+                if ($response->getStatusCode() >= 400 && $response->getHeader('content-type') === 'application/json') {
+                    HttpDownloader::outputWarnings($this->io, $job['origin'], json_decode($response->getBody(), true));
+                }
+
+                $result = $this->isAuthenticatedRetryNeeded($job, $response);
+                if ($result['retry']) {
+                    $this->restartJob($job, $job['url'], ['storeAuth' => $result['storeAuth'], 'retries' => $job['attributes']['retries'] + 1]);
+                    continue;
+                }
+
+                // handle 3xx redirects, 304 Not Modified is excluded
+                if ($statusCode >= 300 && $statusCode <= 399 && $statusCode !== 304 && $job['attributes']['redirects'] < $this->maxRedirects) {
+                    $location = $this->handleRedirect($job, $response);
+                    if ($location) {
+                        $this->restartJob($job, $location, ['redirects' => $job['attributes']['redirects'] + 1]);
+                        continue;
+                    }
+                }
+
+                // fail 4xx and 5xx responses and capture the response
+                if ($statusCode >= 400 && $statusCode <= 599) {
+                    if (
+                        (!isset($job['options']['http']['method']) || $job['options']['http']['method'] === 'GET')
+                        && in_array($statusCode, [423, 425, 500, 502, 503, 504, 507, 510], true)
+                        && $job['attributes']['retries'] < $this->maxRetries
+                    ) {
+                        $this->io->writeError('Retrying ('.($job['attributes']['retries'] + 1).') ' . Url::sanitize($job['url']) . ' due to status code '. $statusCode, true, IOInterface::DEBUG);
+                        $this->restartJobWithDelay($job, $job['url'], ['retries' => $job['attributes']['retries'] + 1]);
+                        continue;
+                    }
+
+                    throw $this->failResponse($job, $response, $response->getStatusMessage());
+                }
+
+                if ($job['attributes']['storeAuth'] !== false) {
+                    $this->authHelper->storeAuth($job['origin'], $job['attributes']['storeAuth']);
+                }
+
+                // resolve promise
+                if (null !== $job['filename']) {
+                    rename($job['filename'].'~', $job['filename']);
+                    $job['resolve']($response);
+                } else {
+                    $job['resolve']($response);
+                }
+            } catch (\Exception $e) {
+                if ($e instanceof TransportException) {
+                    if (null !== $headers) {
+                        $e->setHeaders($headers);
+                        $e->setStatusCode($statusCode);
+                    }
+                    if (null !== $response) {
+                        $e->setResponse($response->getBody());
+                    }
+                    $e->setResponseInfo($progress);
+                }
+
+                $this->rejectJob($job, $e);
+            }
+        }
+
+        foreach ($this->jobs as $i => $curlHandle) {
+            $curlHandle = $this->jobs[$i]['curlHandle'];
+            $progress = array_diff_key(curl_getinfo($curlHandle), self::$timeInfo);
+
+            if ($this->jobs[$i]['progress'] !== $progress) {
+                $this->jobs[$i]['progress'] = $progress;
+
+                if (isset($this->jobs[$i]['options']['max_file_size'])) {
+                    // Compare max_file_size with the content-length header this value will be -1 until the header is parsed
+                    if ($this->jobs[$i]['options']['max_file_size'] < $progress['download_content_length']) {
+                        $this->rejectJob($this->jobs[$i], new MaxFileSizeExceededException('Maximum allowed download size reached. Content-length header indicates ' . $progress['download_content_length'] . ' bytes. Allowed ' .  $this->jobs[$i]['options']['max_file_size'] . ' bytes'));
+                    }
+
+                    // Compare max_file_size with the download size in bytes
+                    if ($this->jobs[$i]['options']['max_file_size'] < $progress['size_download']) {
+                        $this->rejectJob($this->jobs[$i], new MaxFileSizeExceededException('Maximum allowed download size reached. Downloaded ' . $progress['size_download'] . ' of allowed ' .  $this->jobs[$i]['options']['max_file_size'] . ' bytes'));
+                    }
+                }
+
+                if (isset($progress['primary_ip']) && $progress['primary_ip'] !== $this->jobs[$i]['primaryIp']) {
+                    if (
+                        isset($this->jobs[$i]['options']['prevent_ip_access_callable']) &&
+                        is_callable($this->jobs[$i]['options']['prevent_ip_access_callable']) &&
+                        $this->jobs[$i]['options']['prevent_ip_access_callable']($progress['primary_ip'])
+                    ) {
+                        $this->rejectJob($this->jobs[$i], new TransportException(sprintf('IP "%s" is blocked for "%s".', $progress['primary_ip'], $progress['url'])));
+                    }
+
+                    $this->jobs[$i]['primaryIp'] = (string) $progress['primary_ip'];
+                }
+
+                // TODO progress
+            }
+        }
+    }
+
+    /**
+     * @param  Job    $job
+     */
+    private function handleRedirect(array $job, Response $response): string
+    {
+        if ($locationHeader = $response->getHeader('location')) {
+            if (parse_url($locationHeader, PHP_URL_SCHEME)) {
+                // Absolute URL; e.g. https://example.com/composer
+                $targetUrl = $locationHeader;
+            } elseif (parse_url($locationHeader, PHP_URL_HOST)) {
+                // Scheme relative; e.g. //example.com/foo
+                $targetUrl = parse_url($job['url'], PHP_URL_SCHEME).':'.$locationHeader;
+            } elseif ('/' === $locationHeader[0]) {
+                // Absolute path; e.g. /foo
+                $urlHost = parse_url($job['url'], PHP_URL_HOST);
+
+                // Replace path using hostname as an anchor.
+                $targetUrl = Preg::replace('{^(.+(?://|@)'.preg_quote($urlHost).'(?::\d+)?)(?:[/\?].*)?$}', '\1'.$locationHeader, $job['url']);
+            } else {
+                // Relative path; e.g. foo
+                // This actually differs from PHP which seems to add duplicate slashes.
+                $targetUrl = Preg::replace('{^(.+/)[^/?]*(?:\?.*)?$}', '\1'.$locationHeader, $job['url']);
+            }
+        }
+
+        if (!empty($targetUrl)) {
+            $this->io->writeError(sprintf('Following redirect (%u) %s', $job['attributes']['redirects'] + 1, Url::sanitize($targetUrl)), true, IOInterface::DEBUG);
+
+            return $targetUrl;
+        }
+
+        throw new TransportException('The "'.$job['url'].'" file could not be downloaded, got redirect without Location ('.$response->getStatusMessage().')');
+    }
+
+    /**
+     * @param  Job                                          $job
+     * @return array{retry: bool, storeAuth: 'prompt'|bool}
+     */
+    private function isAuthenticatedRetryNeeded(array $job, Response $response): array
+    {
+        if (in_array($response->getStatusCode(), [401, 403]) && $job['attributes']['retryAuthFailure']) {
+            $result = $this->authHelper->promptAuthIfNeeded($job['url'], $job['origin'], $response->getStatusCode(), $response->getStatusMessage(), $response->getHeaders(), $job['attributes']['retries']);
+
+            if ($result['retry']) {
+                return $result;
+            }
+        }
+
+        $locationHeader = $response->getHeader('location');
+        $needsAuthRetry = false;
+
+        // check for bitbucket login page asking to authenticate
+        if (
+            $job['origin'] === 'bitbucket.org'
+            && !$this->authHelper->isPublicBitBucketDownload($job['url'])
+            && substr($job['url'], -4) === '.zip'
+            && (!$locationHeader || substr($locationHeader, -4) !== '.zip')
+            && Preg::isMatch('{^text/html\b}i', $response->getHeader('content-type'))
         ) {
-            $command = sprintf('git checkout '.$force.'-B %s %s -- && git reset --hard %2$s --', ProcessExecutor::escape($branch), ProcessExecutor::escape('composer/'.$reference));
-            if (0 === $this->process->execute($command, $output, $path)) {
-                return null;
+            $needsAuthRetry = 'Bitbucket requires authentication and it was not provided';
+        }
+
+        // check for gitlab 404 when downloading archives
+        if (
+            $response->getStatusCode() === 404
+            && in_array($job['origin'], $this->config->get('gitlab-domains'), true)
+            && false !== strpos($job['url'], 'archive.zip')
+        ) {
+            $needsAuthRetry = 'GitLab requires authentication and it was not provided';
+        }
+
+        if ($needsAuthRetry) {
+            if ($job['attributes']['retryAuthFailure']) {
+                $result = $this->authHelper->promptAuthIfNeeded($job['url'], $job['origin'], 401, null, [], $job['attributes']['retries']);
+                if ($result['retry']) {
+                    return $result;
+                }
             }
+
+            throw $this->failResponse($job, $response, $needsAuthRetry);
         }
 
-        // try to checkout branch by name and then reset it so it's on the proper branch name
-        if (Preg::isMatch('{^[a-f0-9]{40}$}', $reference)) {
-            // add 'v' in front of the branch if it was stripped when generating the pretty name
-            if (null !== $branches && !Preg::isMatch('{^\s+composer/'.preg_quote($branch).'$}m', $branches) && Preg::isMatch('{^\s+composer/v'.preg_quote($branch).'$}m', $branches)) {
-                $branch = 'v' . $branch;
-            }
-
-            $command = sprintf('git checkout %s --', ProcessExecutor::escape($branch));
-            $fallbackCommand = sprintf('git checkout '.$force.'-B %s %s --', ProcessExecutor::escape($branch), ProcessExecutor::escape('composer/'.$branch));
-            $resetCommand = sprintf('git reset --hard %s --', ProcessExecutor::escape($reference));
-
-            if (0 === $this->process->execute("($command || $fallbackCommand) && $resetCommand", $output, $path)) {
-                return null;
-            }
-        }
-
-        $command = sprintf($template, ProcessExecutor::escape($gitRef));
-        if (0 === $this->process->execute($command, $output, $path)) {
-            return null;
-        }
-
-        $exceptionExtra = '';
-
-        // reference was not found (prints "fatal: reference is not a tree: $ref")
-        if (false !== strpos($this->process->getErrorOutput(), $reference)) {
-            $this->io->writeError('    <warning>'.$reference.' is gone (history was rewritten?)</warning>');
-            $exceptionExtra = "\nIt looks like the commit hash is not available in the repository, maybe ".($package->isDev() ? 'the commit was removed from the branch' : 'the tag was recreated').'? Run "composer update '.$package->getPrettyName().'" to resolve this.';
-        }
-
-        throw new \RuntimeException(Url::sanitize('Failed to execute ' . $command . "\n\n" . $this->process->getErrorOutput() . $exceptionExtra));
-    }
-
-    protected function updateOriginUrl(string $path, string $url): void
-    {
-        $this->process->execute(sprintf('git remote set-url origin -- %s', ProcessExecutor::escape($url)), $output, $path);
-        $this->setPushUrl($path, $url);
-    }
-
-    protected function setPushUrl(string $path, string $url): void
-    {
-        // set push url for github projects
-        if (Preg::isMatch('{^(?:https?|git)://'.GitUtil::getGitHubDomainsRegex($this->config).'/([^/]+)/([^/]+?)(?:\.git)?$}', $url, $match)) {
-            $protocols = $this->config->get('github-protocols');
-            $pushUrl = 'git@'.$match[1].':'.$match[2].'/'.$match[3].'.git';
-            if (!in_array('ssh', $protocols, true)) {
-                $pushUrl = 'https://' . $match[1] . '/'.$match[2].'/'.$match[3].'.git';
-            }
-            $cmd = sprintf('git remote set-url --push origin -- %s', ProcessExecutor::escape($pushUrl));
-            $this->process->execute($cmd, $ignoredOutput, $path);
-        }
+        return ['retry' => false, 'storeAuth' => false];
     }
 
     /**
-     * @inheritDoc
+     * @param  Job    $job
+     * @param non-empty-string $url
+     *
+     * @param  array{retryAuthFailure?: bool, redirects?: int<0, max>, storeAuth?: 'prompt'|bool, retries?: int<1, max>, ipResolve?: 4|6} $attributes
      */
-    protected function getCommitLogs(string $fromReference, string $toReference, string $path): string
+    private function restartJob(array $job, string $url, array $attributes = []): void
     {
-        $path = $this->normalizePath($path);
-        $command = sprintf('git log %s..%s --pretty=format:"%%h - %%an: %%s"'.GitUtil::getNoShowSignatureFlag($this->process), ProcessExecutor::escape($fromReference), ProcessExecutor::escape($toReference));
-
-        if (0 !== $this->process->execute($command, $output, $path)) {
-            throw new \RuntimeException('Failed to execute ' . $command . "\n\n" . $this->process->getErrorOutput());
+        if (null !== $job['filename']) {
+            @unlink($job['filename'].'~');
         }
 
-        return $output;
+        $attributes = array_merge($job['attributes'], $attributes);
+        $origin = Url::getOrigin($this->config, $url);
+
+        $this->initDownload($job['resolve'], $job['reject'], $origin, $url, $job['options'], $job['filename'], $attributes);
     }
 
     /**
-     * @phpstan-return PromiseInterface<void|null>
-     * @throws \RuntimeException
+     * @param  Job    $job
+     * @param non-empty-string $url
+     *
+     * @param  array{retryAuthFailure?: bool, redirects?: int<0, max>, storeAuth?: 'prompt'|bool, retries: int<1, max>, ipResolve?: 4|6} $attributes
      */
-    protected function discardChanges(string $path): PromiseInterface
+    private function restartJobWithDelay(array $job, string $url, array $attributes): void
     {
-        $path = $this->normalizePath($path);
-        if (0 !== $this->process->execute('git clean -df && git reset --hard', $output, $path)) {
-            throw new \RuntimeException("Could not reset changes\n\n:".$output);
-        }
+        if ($attributes['retries'] >= 3) {
+            usleep(500000); // half a second delay for 3rd retry and beyond
+        } elseif ($attributes['retries'] >= 2) {
+            usleep(100000); // 100ms delay for 2nd retry
+        } // no sleep for the first retry
 
-        $this->hasDiscardedChanges[$path] = true;
-
-        return \React\Promise\resolve(null);
+        $this->restartJob($job, $url, $attributes);
     }
 
     /**
-     * @phpstan-return PromiseInterface<void|null>
-     * @throws \RuntimeException
+     * @param  Job                $job
      */
-    protected function stashChanges(string $path): PromiseInterface
+    private function failResponse(array $job, Response $response, string $errorMessage): TransportException
     {
-        $path = $this->normalizePath($path);
-        if (0 !== $this->process->execute('git stash --include-untracked', $output, $path)) {
-            throw new \RuntimeException("Could not stash changes\n\n:".$output);
+        if (null !== $job['filename']) {
+            @unlink($job['filename'].'~');
         }
 
-        $this->hasStashedChanges[$path] = true;
+        $details = '';
+        if (in_array(strtolower((string) $response->getHeader('content-type')), ['application/json', 'application/json; charset=utf-8'], true)) {
+            $details = ':'.PHP_EOL.substr($response->getBody(), 0, 200).(strlen($response->getBody()) > 200 ? '...' : '');
+        }
 
-        return \React\Promise\resolve(null);
+        return new TransportException('The "'.$job['url'].'" file could not be downloaded ('.$errorMessage.')' . $details, $response->getStatusCode());
     }
 
     /**
-     * @throws \RuntimeException
+     * @param  Job                $job
      */
-    protected function viewDiff(string $path): void
+    private function rejectJob(array $job, \Exception $e): void
     {
-        $path = $this->normalizePath($path);
-        if (0 !== $this->process->execute('git diff HEAD', $output, $path)) {
-            throw new \RuntimeException("Could not view diff\n\n:".$output);
+        if (is_resource($job['headerHandle'])) {
+            fclose($job['headerHandle']);
         }
-
-        $this->io->writeError($output);
+        if (is_resource($job['bodyHandle'])) {
+            fclose($job['bodyHandle']);
+        }
+        if (null !== $job['filename']) {
+            @unlink($job['filename'].'~');
+        }
+        $job['reject']($e);
     }
 
-    protected function normalizePath(string $path): string
+    private function checkCurlResult(int $code): void
     {
-        if (Platform::isWindows() && strlen($path) > 0) {
-            $basePath = $path;
-            $removed = [];
-
-            while (!is_dir($basePath) && $basePath !== '\\') {
-                array_unshift($removed, basename($basePath));
-                $basePath = dirname($basePath);
-            }
-
-            if ($basePath === '\\') {
-                return $path;
-            }
-
-            $path = rtrim(realpath($basePath) . '/' . implode('/', $removed), '/');
+        if ($code !== CURLM_OK && $code !== CURLM_CALL_MULTI_PERFORM) {
+            throw new \RuntimeException(
+                isset($this->multiErrors[$code])
+                ? "cURL error: {$code} ({$this->multiErrors[$code][0]}): cURL message: {$this->multiErrors[$code][1]}"
+                : 'Unexpected cURL error: ' . $code
+            );
         }
-
-        return $path;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    protected function hasMetadataRepository(string $path): bool
-    {
-        $path = $this->normalizePath($path);
-
-        return is_dir($path.'/.git');
-    }
-
-    protected function getShortHash(string $reference): string
-    {
-        if (!$this->io->isVerbose() && Preg::isMatch('{^[0-9a-f]{40}$}', $reference)) {
-            return substr($reference, 0, 10);
-        }
-
-        return $reference;
     }
 }

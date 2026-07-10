@@ -1,882 +1,375 @@
-require 'spec_helper'
+# frozen_string_literal: true
 
-RSpec.describe Sinatra::Namespace do
-  verbs = [:get, :head, :post, :put, :delete, :options, :patch]
+require 'sinatra/base'
+require 'mustermann'
 
-  def mock_app(&block)
-    super do
-      register Sinatra::Namespace
-      class_eval(&block)
+module Sinatra
+  # = Sinatra::Namespace
+  #
+  # <tt>Sinatra::Namespace</tt> is an extension that adds namespaces to an
+  # application.  This namespaces will allow you to share a path prefix for the
+  # routes within the namespace, and define filters, conditions and error
+  # handlers exclusively for them.  Besides that, you can also register helpers
+  # and extensions that will be used only within the namespace.
+  #
+  # == Usage
+  #
+  # Once you have loaded the extension (see below), you can use the +namespace+
+  # method to define namespaces in your application.
+  #
+  # You can define a namespace by a path prefix:
+  #
+  #     namespace '/blog' do
+  #       get { haml :blog }
+  #       get '/:entry_permalink' do
+  #         @entry = Entry.find_by_permalink!(params[:entry_permalink])
+  #         haml :entry
+  #       end
+  #
+  #       # More blog routes...
+  #     end
+  #
+  # by a condition:
+  #
+  #     namespace :host_name => 'localhost' do
+  #       get('/admin/dashboard') { haml :dashboard }
+  #       get('/admin/login')     { haml :login }
+  #
+  #       # More admin routes...
+  #     end
+  #
+  # or both:
+  #
+  #     namespace '/admin', :host_name => 'localhost' do
+  #       get('/dashboard')  { haml :dashboard }
+  #       get('/login')      { haml :login }
+  #       post('/login')     { login_user }
+  #
+  #       # More admin routes...
+  #     end
+  #
+  # Regex is also accepted:
+  #
+  #     namespace /\/posts\/([^\/&?]+)\// do
+  #       get { haml :blog }
+  #
+  #       # More blog routes...
+  #     end
+  #
+  # When you define a filter or an error handler, or register an extension or a
+  # set of helpers within a namespace, they only affect the routes defined in
+  # it.  For instance, lets define a before filter to prevent the access of
+  # unauthorized users to the admin section of the application:
+  #
+  #     namespace '/admin' do
+  #       helpers AdminHelpers
+  #       before  { authenticate unless request.path_info == '/admin/login' }
+  #
+  #       get '/dashboard' do
+  #         # Only authenticated users can access here...
+  #         haml :dashboard
+  #       end
+  #
+  #       # More admin routes...
+  #     end
+  #
+  #     get '/' do
+  #       # Any user can access here...
+  #       haml :index
+  #     end
+  #
+  # Well, they actually also affect the nested namespaces:
+  #
+  #     namespace '/admin' do
+  #       helpers AdminHelpers
+  #       before  { authenticate unless request.path_info == '/admin/login' }
+  #
+  #       namespace '/users' do
+  #         get do
+  #           # Only authenticated users can access here...
+  #           @users = User.all
+  #           haml :users
+  #         end
+  #
+  #         # More user admin routes...
+  #       end
+  #
+  #       # More admin routes...
+  #     end
+  #
+  # Redirecting within the namespace can be done using redirect_to:
+  #
+  #     namespace '/admin' do
+  #       get '/foo'  do
+  #         redirect_to '/bar' # Redirects to /admin/bar
+  #       end
+  #
+  #       get '/foo' do
+  #         redirect '/bar' # Redirects to /bar
+  #       end
+  #     end
+  #
+  # === Classic Application Setup
+  #
+  # To be able to use namespaces in a classic application all you need to do is
+  # require the extension:
+  #
+  #     require "sinatra"
+  #     require "sinatra/namespace"
+  #
+  #     namespace '/users' do
+  #     end
+  #
+  # === Modular Application Setup
+  #
+  # To be able to use namespaces in a modular application all you need to do is
+  # require the extension, and then, register it:
+  #
+  #     require "sinatra/base"
+  #     require "sinatra/namespace"
+  #
+  #     class MyApp < Sinatra::Base
+  #       register Sinatra::Namespace
+  #
+  #       namespace '/users' do
+  #       end
+  #     end
+  #
+  # === Within an extension
+  #
+  # To be able to use namespaces within an extension, you need to first create
+  # an extension. This includes defining the `registered(app)` method in the
+  # module.
+  #
+  #     require 'sinatra/base' # For creating Sinatra extensions
+  #     require 'sinatra/namespace' # To create namespaces
+  #
+  #     module Zomg # Keep everything under "Zomg" namespace for sanity
+  #       module Routes # Define a new "Routes" module
+  #
+  #         def self.registered(app)
+  #           # First, register the Namespace extension
+  #           app.register Sinatra::Namespace
+  #
+  #           # This defines an `/api` namespace on the application
+  #           app.namespace '/api' do
+  #             get '/users' do
+  #               # do something with `GET "/api/users"`
+  #             end
+  #           end
+  #
+  #         end
+  #       end
+  #
+  #       # Lastly, register the extension to use in our app
+  #       Sinatra.register Routes
+  #     end
+  #
+  # In order to use this extension, is the same as any other Sinatra extension:
+  #
+  #     module Zomg
+  #       # Define our app class, we use modular app for this example
+  #       class App < Sinatra::Base
+  #         # this gives us all the namespaces we defined earlier
+  #         register Routes
+  #
+  #         get '/' do
+  #           "Welcome to my application!"
+  #         end
+  #       end
+  #     end
+  #
+  #     Zomg::App.run! # Don't forget to start your app ;)
+  #
+  # Phew! That was a mouthful.
+  #
+  # I hope that helps you use `Sinatra::Namespace` in every way imaginable!
+  #
+  module Namespace
+    def self.new(base, pattern, conditions = {}, &block)
+      Module.new do
+        # quelch uninitialized variable warnings, since these get used by compile method.
+        @pattern = nil
+        @conditions = nil
+        extend NamespacedMethods
+        include InstanceMethods
+        @base = base
+        @extensions = []
+        @errors = {}
+        @pattern, @conditions = compile(pattern, conditions)
+        @templates            = Hash.new { |_h, k| @base.templates[k] }
+        namespace = self
+        before { extend(@namespace = namespace) }
+        class_eval(&block)
+      end
+    end
+
+    module InstanceMethods
+      def settings
+        @namespace
+      end
+
+      def template_cache
+        super.fetch(:nested, @namespace) { TemplateCache.new }
+      end
+
+      def redirect_to(uri, *args)
+        redirect("#{@namespace.pattern}#{uri}", *args)
+      end
+    end
+
+    module SharedMethods
+      def namespace(pattern, conditions = {}, &block)
+        Sinatra::Namespace.new(self, pattern, conditions, &block)
+      end
+    end
+
+    module NamespacedMethods
+      include SharedMethods
+      attr_reader :base, :templates
+
+      ALLOWED_ENGINES = %i[
+        erb erubi haml hamlit builder nokogiri sass scss
+        liquid markdown rdoc asciidoc markaby
+        rabl slim yajl
+      ]
+
+      def self.prefixed(*names)
+        names.each { |n| define_method(n) { |*a, &b| prefixed(n, *a, &b) } }
+      end
+
+      prefixed :before, :after, :delete, :get, :head, :options, :patch, :post, :put
+
+      def helpers(*extensions, &block)
+        class_eval(&block) if block_given?
+        include(*extensions) if extensions.any?
+      end
+
+      def register(*extensions, &block)
+        extensions << Module.new(&block) if block_given?
+        @extensions += extensions
+        extensions.each do |extension|
+          extend extension
+          extension.registered(self) if extension.respond_to?(:registered)
+        end
+      end
+
+      def invoke_hook(name, *args)
+        @extensions.each { |e| e.send(name, *args) if e.respond_to?(name) }
+      end
+
+      def not_found(&block)
+        error(Sinatra::NotFound, &block)
+      end
+
+      def errors
+        base.errors.merge(namespace_errors)
+      end
+
+      def namespace_errors
+        @errors
+      end
+
+      def error(*codes, &block)
+        args  = Sinatra::Base.send(:compile!, 'ERROR', /.*/, block)
+        codes = codes.map { |c| Array(c) }.flatten
+        codes << Exception if codes.empty?
+        codes << Sinatra::NotFound if codes.include?(404)
+
+        codes.each do |c|
+          errors = @errors[c] ||= []
+          errors << args
+        end
+      end
+
+      def respond_to(*args)
+        return @conditions[:provides] || base.respond_to if args.empty?
+
+        @conditions[:provides] = args
+      end
+
+      def set(key, value = self, &block)
+        return key.each { |k, v| set(k, v) } if key.respond_to?(:each) && block.nil? && (value == self)
+        raise ArgumentError, "may not set #{key}" unless ([:views] + ALLOWED_ENGINES).include?(key)
+
+        block ||= proc { value }
+        singleton_class.send(:define_method, key, &block)
+      end
+
+      def enable(*opts)
+        opts.each { |key| set(key, true) }
+      end
+
+      def disable(*opts)
+        opts.each { |key| set(key, false) }
+      end
+
+      def template(name, &block)
+        first_location = caller_locations.first
+        filename = first_location.path
+        line = first_location.lineno
+        templates[name] = [block, filename, line]
+      end
+
+      def layout(name = :layout, &block)
+        template name, &block
+      end
+
+      def pattern
+        @pattern
+      end
+
+      private
+
+      def app
+        base.respond_to?(:base) ? base.base : base
+      end
+
+      def compile(pattern, conditions, default_pattern = nil)
+        if pattern.respond_to? :to_hash
+          conditions = conditions.merge pattern.to_hash
+          pattern = nil
+        end
+        base_pattern = @pattern
+        base_conditions = @conditions
+        pattern ||= default_pattern
+        [prefixed_path(base_pattern, pattern),
+         (base_conditions || {}).merge(conditions)]
+      end
+
+      def prefixed_path(a, b)
+        return a || b || /.*/ unless a && b
+        return Mustermann.new(b) if a == /.*/
+
+        Mustermann.new(a) + Mustermann.new(b)
+      end
+
+      def prefixed(method, pattern = nil, conditions = {}, &block)
+        default = %r{(?:/.*)?} if (method == :before) || (method == :after)
+        pattern, conditions = compile pattern, conditions, default
+        result = base.send(method, pattern, **conditions, &block)
+        invoke_hook :route_added, method.to_s.upcase, pattern, block
+        result
+      end
+
+      def method_missing(method, *args, &block)
+        base.send(method, *args, &block)
+      end
+
+      def respond_to?(method, include_private = false)
+        super || base.respond_to?(method, include_private)
+      end
+    end
+
+    module BaseMethods
+      include SharedMethods
+    end
+
+    def self.extended(base)
+      base.extend BaseMethods
     end
   end
 
-  def namespace(*args, &block)
-    mock_app { namespace(*args, &block) }
-  end
-
-  verbs.each do |verb|
-    describe "HTTP #{verb.to_s.upcase}" do
-
-      it 'prefixes the path with the namespace' do
-        namespace('/foo') { send(verb, '/bar') { 'baz' }}
-        expect(send(verb, '/foo/bar')).to be_ok
-        expect(body).to eq('baz') unless verb == :head
-        expect(send(verb, '/foo/baz')).not_to be_ok
-      end
-
-      describe 'redirect_to' do
-        it 'redirect within namespace' do
-          namespace('/foo') { send(verb, '/bar') { redirect_to '/foo_bar' }}
-          expect(send(verb, '/foo/bar')).to be_redirect
-          expect(send(verb, '/foo/bar').location).to include("/foo/foo_bar")
-        end
-      end
-
-      context 'when namespace is a string' do
-        it 'accepts routes with no path' do
-          namespace('/foo') { send(verb) { 'bar' } }
-          expect(send(verb, '/foo')).to be_ok
-          expect(body).to eq('bar') unless verb == :head
-        end
-
-        it 'accepts the path as a named parameter' do
-          namespace('/foo') { send(verb, '/:bar') { params[:bar] }}
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('bar') unless verb == :head
-          expect(send(verb, '/foo/baz')).to be_ok
-          expect(body).to eq('baz') unless verb == :head
-        end
-
-        it 'accepts the path as a regular expression' do
-          namespace('/foo') { send(verb, /\/\d\d/) { 'bar' }}
-          expect(send(verb, '/foo/12')).to be_ok
-          expect(body).to eq 'bar' unless verb == :head
-          expect(send(verb, '/foo/123')).not_to be_ok
-        end
-      end
-
-      context 'when namespace is a named parameter' do
-        it 'accepts routes with no path' do
-          namespace('/:foo') { send(verb) { 'bar' } }
-          expect(send(verb, '/foo')).to be_ok
-          expect(body).to eq('bar') unless verb == :head
-        end
-
-        it 'sets the parameter correctly' do
-          namespace('/:foo') { send(verb, '/bar') { params[:foo] }}
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('foo') unless verb == :head
-          expect(send(verb, '/fox/bar')).to be_ok
-          expect(body).to eq('fox') unless verb == :head
-          expect(send(verb, '/foo/baz')).not_to be_ok
-        end
-
-        it 'accepts the path as a named parameter' do
-          namespace('/:foo') { send(verb, '/:bar') { params[:bar] }}
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('bar') unless verb == :head
-          expect(send(verb, '/foo/baz')).to be_ok
-          expect(body).to eq('baz') unless verb == :head
-        end
-
-        it 'accepts the path as regular expression' do
-          namespace('/:foo') { send(verb, %r{/bar}) { params[:foo] }}
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('foo') unless verb == :head
-          expect(send(verb, '/fox/bar')).to be_ok
-          expect(body).to eq('fox') unless verb == :head
-          expect(send(verb, '/foo/baz')).not_to be_ok
-        end
-      end
-
-      context 'when namespace is a regular expression' do
-        it 'accepts routes with no path' do
-          namespace(%r{/foo}) { send(verb) { 'bar' } }
-          expect(send(verb, '/foo')).to be_ok
-          expect(body).to eq('bar') unless verb == :head
-        end
-
-        it 'accepts the path as a named parameter' do
-          namespace(%r{/foo}) { send(verb, '/:bar') { params[:bar] }}
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('bar') unless verb == :head
-          expect(send(verb, '/foo/baz')).to be_ok
-          expect(body).to eq('baz') unless verb == :head
-        end
-
-        it 'accepts the path as a regular expression' do
-          namespace(/\/\d\d/) { send(verb, /\/\d\d/) { 'foo' }}
-          expect(send(verb, '/23/12')).to be_ok
-          expect(body).to eq('foo') unless verb == :head
-          expect(send(verb, '/123/12')).not_to be_ok
-        end
-
-        describe "before/after filters" do
-          it 'trigger before filter' do
-            ran = false
-            namespace(/\/foo\/([^\/&?]+)\/bar\/([^\/&?]+)\//) { before { ran = true };}
-
-            send(verb, '/bar/')
-            expect(ran).to eq(false)
-
-            send(verb, '/foo/1/bar/1/')
-            expect(ran).to eq(true)
-          end
-
-          it 'trigger after filter' do
-            ran = false
-            namespace(/\/foo\/([^\/&?]+)\/bar\/([^\/&?]+)\//) { after { ran = true };}
-
-            send(verb, '/bar/')
-            expect(ran).to eq(false)
-
-            send(verb, '/foo/1/bar/1/')
-            expect(ran).to eq(true)
-          end
-        end
-
-        describe 'helpers' do
-          it 'are defined using the helpers method' do
-            namespace(/\/foo\/([^\/&?]+)\/bar\/([^\/&?]+)\//) do
-              helpers do
-                def foo
-                  'foo'
-                end
-              end
-
-              send verb, '' do
-                foo.to_s
-              end
-            end
-
-            expect(send(verb, '/foo/1/bar/1/')).to be_ok
-            expect(body).to eq('foo') unless verb == :head
-          end
-        end
-      end
-
-      context 'when namespace is a splat' do
-        it 'accepts the path as a splat' do
-          namespace('/*') { send(verb, '/*') { params[:splat].join ' - ' }}
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('foo - bar') unless verb == :head
-        end
-      end
-
-      describe 'before-filters' do
-        specify 'are triggered' do
-          ran = false
-          namespace('/foo') { before { ran = true }}
-          send(verb, '/foo')
-          expect(ran).to be true
-        end
-
-        specify 'are not triggered for a different namespace' do
-          ran = false
-          namespace('/foo') { before { ran = true }}
-          send(verb, '/fox')
-          expect(ran).to be false
-        end
-      end
-
-      describe 'after-filters' do
-        specify 'are triggered' do
-          ran = false
-          namespace('/foo') { after { ran = true }}
-          send(verb, '/foo')
-          expect(ran).to be true
-        end
-
-        specify 'are not triggered for a different namespace' do
-          ran = false
-          namespace('/foo') { after { ran = true }}
-          send(verb, '/fox')
-          expect(ran).to be false
-        end
-      end
-
-      describe 'conditions' do
-        context 'when the namespace has no prefix' do
-          specify 'are accepted in the namespace' do
-            mock_app do
-              namespace(:host_name => 'example.com') { send(verb) { 'yes' }}
-              send(verb, '/') { 'no' }
-            end
-            send(verb, '/', {}, 'HTTP_HOST' => 'example.com')
-            expect(last_response).to be_ok
-            expect(body).to eq('yes') unless verb == :head
-            send(verb, '/', {}, 'HTTP_HOST' => 'example.org')
-            expect(last_response).to be_ok
-            expect(body).to eq('no') unless verb == :head
-          end
-
-          specify 'are accepted in the route definition' do
-            namespace :host_name => 'example.com' do
-              send(verb, '/foo', :provides => :txt) { 'ok' }
-            end
-            expect(send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/plain')).to be_ok
-            expect(send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/html')).not_to be_ok
-            expect(send(verb, '/foo', {}, 'HTTP_HOST' => 'example.org', 'HTTP_ACCEPT' => 'text/plain')).not_to be_ok
-          end
-
-          specify 'are accepted in the before-filter' do
-            ran = false
-            namespace :provides => :txt do
-              before('/foo', :host_name => 'example.com') { ran = true }
-              send(verb, '/*') { 'ok' }
-            end
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.org', 'HTTP_ACCEPT' => 'text/plain')
-            expect(ran).to be false
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/html')
-            expect(ran).to be false
-            send(verb, '/bar', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/plain')
-            expect(ran).to be false
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/plain')
-            expect(ran).to be true
-          end
-
-          specify 'are accepted in the after-filter' do
-            ran = false
-            namespace :provides => :txt do
-              after('/foo', :host_name => 'example.com') { ran = true }
-              send(verb, '/*') { 'ok' }
-            end
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.org', 'HTTP_ACCEPT' => 'text/plain')
-            expect(ran).to be false
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/html')
-            expect(ran).to be false
-            send(verb, '/bar', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/plain')
-            expect(ran).to be false
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/plain')
-            expect(ran).to be true
-          end
-        end
-
-        context 'when the namespace is a string' do
-          specify 'are accepted in the namespace' do
-            namespace '/foo', :host_name => 'example.com' do
-              send(verb) { 'ok' }
-            end
-            expect(send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com')).to be_ok
-            expect(send(verb, '/foo', {}, 'HTTP_HOST' => 'example.org')).not_to be_ok
-          end
-
-          specify 'are accepted in the before-filter' do
-            namespace '/foo' do
-              before { @yes = nil }
-              before(:host_name => 'example.com') { @yes = 'yes' }
-              send(verb) { @yes || 'no' }
-            end
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com')
-            expect(last_response).to be_ok
-            expect(body).to eq('yes') unless verb == :head
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.org')
-            expect(last_response).to be_ok
-            expect(body).to eq('no') unless verb == :head
-          end
-
-          specify 'are accepted in the after-filter' do
-            ran = false
-            namespace '/foo' do
-              before(:host_name => 'example.com') { ran = true }
-              send(verb) { 'ok' }
-            end
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.org')
-            expect(ran).to be false
-            send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com')
-            expect(ran).to be true
-          end
-
-          specify 'are accepted in the route definition' do
-            namespace '/foo' do
-              send(verb, :host_name => 'example.com') { 'ok' }
-            end
-            expect(send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com')).to be_ok
-            expect(send(verb, '/foo', {}, 'HTTP_HOST' => 'example.org')).not_to be_ok
-          end
-
-          context 'when the namespace has a condition' do
-            specify 'are accepted in the before-filter' do
-              ran = false
-              namespace '/', :provides => :txt do
-                before(:host_name => 'example.com') { ran = true }
-                send(verb) { 'ok' }
-              end
-              send(verb, '/', {}, 'HTTP_HOST' => 'example.org', 'HTTP_ACCEPT' => 'text/plain')
-              expect(ran).to be false
-              send(verb, '/', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/html')
-              expect(ran).to be false
-              send(verb, '/', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/plain')
-              expect(ran).to be true
-            end
-
-            specify 'are accepted in the filters' do
-              ran = false
-              namespace '/f', :provides => :txt do
-                before('oo', :host_name => 'example.com') { ran = true }
-                send(verb, '/*') { 'ok' }
-              end
-              send(verb, '/foo', {}, 'HTTP_HOST' => 'example.org', 'HTTP_ACCEPT' => 'text/plain')
-              expect(ran).to be false
-              send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/html')
-              expect(ran).to be false
-              send(verb, '/far', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/plain')
-              expect(ran).to be false
-              send(verb, '/foo', {}, 'HTTP_HOST' => 'example.com', 'HTTP_ACCEPT' => 'text/plain')
-              expect(ran).to be true
-            end
-          end
-        end
-      end
-
-      describe 'helpers' do
-        it 'are defined using the helpers method' do
-          namespace '/foo' do
-            helpers do
-              def magic
-                42
-              end
-            end
-
-            send verb, '/bar' do
-              magic.to_s
-            end
-          end
-
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('42') unless verb == :head
-        end
-
-        it 'can be defined as normal methods' do
-          namespace '/foo' do
-            def magic
-              42
-            end
-
-            send verb, '/bar' do
-              magic.to_s
-            end
-          end
-
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('42') unless verb == :head
-        end
-
-        it 'can be defined using module mixins' do
-          mixin = Module.new do
-            def magic
-              42
-            end
-          end
-
-          namespace '/foo' do
-            helpers mixin
-            send verb, '/bar' do
-              magic.to_s
-            end
-          end
-
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('42') unless verb == :head
-        end
-
-        specify 'are unavailable outside the namespace where they are defined' do
-          mock_app do
-            namespace '/foo' do
-              def magic
-                42
-              end
-
-              send verb, '/bar' do
-                magic.to_s
-              end
-            end
-
-            send verb, '/' do
-              magic.to_s
-            end
-          end
-
-          expect { send verb, '/' }.to raise_error(NameError)
-        end
-
-        specify 'are unavailable outside the namespace that they are mixed into' do
-          mixin = Module.new do
-            def magic
-              42
-            end
-          end
-
-          mock_app do
-            namespace '/foo' do
-              helpers mixin
-              send verb, '/bar' do
-                magic.to_s
-              end
-            end
-
-            send verb, '/' do
-              magic.to_s
-            end
-          end
-
-          expect { send verb, '/' }.to raise_error(NameError)
-        end
-
-        specify 'are available to nested namespaces' do
-          mock_app do
-            helpers do
-              def magic
-                42
-              end
-            end
-
-            namespace '/foo' do
-              send verb, '/bar' do
-                magic.to_s
-              end
-            end
-          end
-
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('42') unless verb == :head
-        end
-
-        specify 'can call super from nested definitions' do
-          mock_app do
-            helpers do
-              def magic
-                42
-              end
-            end
-
-            namespace '/foo' do
-              def magic
-                super - 19
-              end
-
-              send verb, '/bar' do
-                magic.to_s
-              end
-            end
-          end
-
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('23') unless verb == :head
-        end
-      end
-
-      describe 'nesting' do
-        it 'routes to nested namespaces' do
-          namespace '/foo' do
-            namespace '/bar' do
-              send(verb, '/baz') { 'OKAY!!11!'}
-            end
-          end
-
-          expect(send(verb, '/foo/bar/baz')).to be_ok
-          expect(body).to eq('OKAY!!11!') unless verb == :head
-        end
-
-        it 'works correctly if deep nesting' do
-          namespace '/a' do
-            namespace '/b' do
-              namespace '/c' do
-                send(verb, '') { 'hey' }
-              end
-            end
-          end
-
-          expect(send(verb, '/a/b/c')).to be_ok
-          expect(body).to eq('hey') unless verb == :head
-        end
-
-        it 'exposes helpers to nested namespaces' do
-          namespace '/foo' do
-            helpers do
-              def magic
-                42
-              end
-            end
-
-            namespace '/bar' do
-              send verb, '/baz' do
-                magic.to_s
-              end
-            end
-          end
-
-          expect(send(verb, '/foo/bar/baz')).to be_ok
-          expect(body).to eq('42') unless verb == :head
-        end
-
-        specify 'does not provide access to nested helper methods' do
-          namespace '/foo' do
-            namespace '/bar' do
-              def magic
-                42
-              end
-
-              send verb, '/baz' do
-                magic.to_s
-              end
-            end
-
-            send verb do
-              magic.to_s
-            end
-          end
-
-          expect { send verb, '/foo' }.to raise_error(NameError)
-        end
-
-        it 'accepts a nested namespace as a named parameter' do
-          namespace('/:a') { namespace('/:b') { send(verb) { params[:a] }}}
-          expect(send(verb, '/foo/bar')).to be_ok
-          expect(body).to eq('foo') unless verb == :head
-        end
-      end
-
-      describe 'error handling' do
-        it 'can be customized using the not_found block' do
-          namespace('/de') do
-            not_found { 'nicht gefunden' }
-          end
-          expect(send(verb, '/foo').status).to eq 404
-          expect(last_response.body).not_to    eq 'nicht gefunden' unless verb == :head
-          expect(get('/en/foo').status).to     eq 404
-          expect(last_response.body).not_to    eq 'nicht gefunden' unless verb == :head
-          expect(get('/de/foo').status).to     eq 404
-          expect(last_response.body).to        eq 'nicht gefunden' unless verb == :head
-        end
-
-        it 'can be customized for specific error codes' do
-          namespace('/de') do
-            error(404) { 'nicht gefunden' }
-          end
-          expect(send(verb, '/foo').status).to eq 404
-          expect(last_response.body).not_to    eq 'nicht gefunden' unless verb == :head
-          expect(get('/en/foo').status).to     eq 404
-          expect(last_response.body).not_to    eq 'nicht gefunden' unless verb == :head
-          expect(get('/de/foo').status).to     eq 404
-          expect(last_response.body).to        eq 'nicht gefunden' unless verb == :head
-        end
-
-        it 'falls back to the handler defined in the base app' do
-          mock_app do
-            error(404) { 'not found...' }
-            namespace('/en') do
-            end
-            namespace('/de') do
-              error(404) { 'nicht gefunden' }
-            end
-          end
-          expect(send(verb, '/foo').status).to eq 404
-          expect(last_response.body).to        eq 'not found...' unless verb == :head
-          expect(get('/en/foo').status).to     eq 404
-          expect(last_response.body).to        eq 'not found...' unless verb == :head
-          expect(get('/de/foo').status).to     eq 404
-          expect(last_response.body).to        eq 'nicht gefunden' unless verb == :head
-        end
-
-        it 'can be customized for specific Exception classes' do
-          mock_app do
-            class AError < StandardError; end
-            class BError < AError; end
-
-            error(AError) do
-              body('auth failed')
-              401
-            end
-
-            namespace('/en') do
-              get '/foo' do
-                raise BError
-              end
-            end
-
-            namespace('/de') do
-              error(AError) do
-                body('methode nicht erlaubt')
-                406
-              end
-
-              get '/foo' do
-                raise BError
-              end
-            end
-          end
-          expect(get('/en/foo').status).to     eq 401
-          expect(last_response.body).to        eq 'auth failed' unless verb == :head
-          expect(get('/de/foo').status).to     eq 406
-          expect(last_response.body).to        eq 'methode nicht erlaubt' unless verb == :head
-        end
-
-        it "allows custom error handlers when namespace is declared as /en/:id. Issue #119" do
-          mock_app {
-            class CError < StandardError;
-            end
-
-            error { raise "should not come here" }
-
-            namespace('/en/:id') do
-              error(CError) { 201 }
-              get '/?' do
-                raise CError
-              end
-            end
-          }
-
-          expect(get('/en/1').status).to eq(201)
-        end
-      end
-
-      unless verb == :head
-        describe 'templates' do
-          specify 'default to the base app\'s template' do
-            mock_app do
-              template(:foo) { 'hi' }
-              send(verb, '/') { erb :foo }
-              namespace '/foo' do
-                send(verb) { erb :foo }
-              end
-            end
-
-            expect(send(verb, '/').body).to eq 'hi'
-            expect(send(verb, '/foo').body).to eq 'hi'
-          end
-
-          specify 'can be nested' do
-            mock_app do
-              template(:foo) { 'hi' }
-              send(verb, '/') { erb :foo }
-              namespace '/foo' do
-                template(:foo) { 'ho' }
-                send(verb) { erb :foo }
-              end
-            end
-
-            expect(send(verb, '/').body).to eq 'hi'
-            expect(send(verb, '/foo').body).to eq 'ho'
-          end
-
-          specify 'can use a custom views directory' do
-            mock_app do
-              set :views, File.expand_path('namespace', __dir__)
-              send(verb, '/') { erb :foo }
-              namespace('/foo') do
-                set :views, File.expand_path('namespace/nested', __dir__)
-                send(verb) { erb :foo }
-              end
-            end
-
-            expect(send(verb, '/').body).to eq "hi\n"
-            expect(send(verb, '/foo').body).to eq "ho\n"
-          end
-
-          specify 'default to the base app\'s layout' do
-            mock_app do
-              layout { 'he said: <%= yield %>' }
-              template(:foo) { 'hi' }
-              send(verb, '/') { erb :foo }
-              namespace '/foo' do
-                template(:foo) { 'ho' }
-                send(verb) { erb :foo }
-              end
-            end
-
-            expect(send(verb, '/').body).to eq 'he said: hi'
-            expect(send(verb, '/foo').body).to eq 'he said: ho'
-          end
-
-          specify 'can define nested layouts' do
-            mock_app do
-              layout { 'Hello <%= yield %>!' }
-              template(:foo) { 'World' }
-              send(verb, '/') { erb :foo }
-              namespace '/foo' do
-                layout { 'Hi <%= yield %>!' }
-                send(verb) { erb :foo }
-              end
-            end
-
-            expect(send(verb, '/').body).to eq 'Hello World!'
-            expect(send(verb, '/foo').body).to eq 'Hi World!'
-          end
-
-          specify 'can render strings' do
-            mock_app do
-              namespace '/foo' do
-                send(verb) { erb 'foo' }
-              end
-            end
-
-            expect(send(verb, '/foo').body).to eq 'foo'
-          end
-
-          specify 'can render strings nested' do
-            mock_app do
-              namespace '/foo' do
-                namespace '/bar' do
-                  send(verb) { erb 'bar' }
-                end
-              end
-            end
-
-            expect(send(verb, '/foo/bar').body).to eq 'bar'
-          end
-        end
-      end
-
-      describe 'extensions' do
-        specify 'provide read access to settings' do
-          value = nil
-          mock_app do
-            set :foo, 42
-            namespace '/foo' do
-              value = foo
-            end
-          end
-          expect(value).to eq 42
-        end
-
-        specify 'can be registered within a namespace' do
-          a = b = nil
-          extension = Module.new { define_method(:views) { 'CUSTOM!!!' } }
-          mock_app do
-            namespace '/' do
-              register extension
-              a = views
-            end
-            b = views
-          end
-          expect(a).to eq 'CUSTOM!!!'
-          expect(b).not_to eq 'CUSTOM!!!'
-        end
-
-        specify 'trigger the route_added hook' do
-          route = nil
-          extension = Module.new
-          extension.singleton_class.class_eval do
-            define_method(:route_added) { |*r| route = r }
-          end
-          mock_app do
-            namespace '/f' do
-              register extension
-              get('oo') { }
-            end
-            get('/bar') { }
-          end
-          expect(route[1]).to eq(Mustermann.new '/foo')
-        end
-
-        specify 'prevent app-global settings from being changed' do
-          expect { namespace('/') { set :foo, :bar }}.to raise_error(ArgumentError)
-        end
-      end
-    end
-  end
-
-  describe 'settings' do
-    it 'provides access to top-level settings' do
-      mock_app do
-        set :foo, 'ok'
-
-        namespace '/foo' do
-          get '/bar' do
-            settings.foo
-          end
-        end
-      end
-
-      expect(get('/foo/bar').status).to eq(200)
-      expect(last_response.body).to eq('ok')
-    end
-
-    it 'sets hashes correctly' do
-      mock_app do
-        namespace '/foo' do
-          set erb: 'o', haml: 'k'
-          get '/bar' do
-            settings.erb + settings.haml
-          end
-        end
-      end
-
-      expect(get('/foo/bar').status).to eq(200)
-      expect(last_response.body).to eq('ok')
-    end
-
-    it 'uses some repro' do
-      mock_app do
-        set :foo, 42
-
-        namespace '/foo' do
-          get '/bar' do
-            #settings.respond_to?(:foo).to_s
-            settings.foo.to_s
-          end
-        end
-      end
-
-      expect(get('/foo/bar').status).to eq(200)
-      expect(last_response.body).to eq('42')
-    end
-
-    it 'allows checking setting existence with respond_to?' do
-      mock_app do
-        set :foo, 42
-
-        namespace '/foo' do
-          get '/bar' do
-            settings.respond_to?(:foo).to_s
-          end
-        end
-      end
-
-      expect(get('/foo/bar').status).to eq(200)
-      expect(last_response.body).to eq('true')
-    end
-
-    it 'avoids executing filters even if prefix matches with other namespace' do
-      mock_app do
-        helpers do
-          def dump_args(*args)
-            args.inspect
-          end
-        end
-
-        namespace '/foo' do
-          helpers do
-            def dump_args(*args)
-              super(:foo, *args)
-            end
-          end
-          get('') { dump_args }
-        end
-
-        namespace '/foo-bar' do
-          helpers do
-            def dump_args(*args)
-              super(:foo_bar, *args)
-            end
-          end
-          get('') { dump_args }
-        end
-      end
-
-      get '/foo-bar'
-      expect(last_response.body).to eq('[:foo_bar]')
-    end
-  end
-
-  it 'forbids unknown engine settings' do
-    expect {
-      mock_app do
-        namespace '/foo' do
-          set :unknownsetting
-        end
-      end
-    }.to raise_error(ArgumentError, 'may not set unknownsetting')
-  end
+  register Sinatra::Namespace
+  Delegator.delegate :namespace
 end

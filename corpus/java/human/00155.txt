@@ -1,293 +1,159 @@
-package com.example;
+/*
+ * Copyright (C) 2010 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
-import static com.example.TestExecutor.same;
+package com.google.gson.internal;
 
-import com.example.GenericClasses.DummyClass;
-import com.example.GenericClasses.GenericClass;
-import com.example.GenericClasses.GenericUsingGenericClass;
-import com.example.GenericClasses.UsingGenericClass;
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.reflect.TypeToken;
-import java.util.Arrays;
-import java.util.List;
-import java.util.function.BiConsumer;
-import java.util.function.Supplier;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonIOException;
+import com.google.gson.JsonNull;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonSyntaxException;
+import com.google.gson.internal.bind.TypeAdapters;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
+import com.google.gson.stream.JsonWriter;
+import com.google.gson.stream.MalformedJsonException;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.Writer;
+import java.util.Objects;
 
-public class Main {
-  private Main() {}
-
-  /**
-   * Main entrypoint, called by {@code ShrinkingIT.test()}.
-   *
-   * <p>To be safe let all tests put their output to the consumer and let integration test verify
-   * it; don't perform any relevant assertions in this code because code shrinkers could affect it.
-   *
-   * @param outputConsumer consumes the test output: {@code name, content} pairs
-   */
-  public static void runTests(BiConsumer<String, String> outputConsumer) {
-    // Create the TypeToken instances on demand because creation of them can fail when
-    // generic signatures were erased
-    testTypeTokenWriteRead(
-        outputConsumer, "anonymous", () -> new TypeToken<List<ClassWithAdapter>>() {});
-    testTypeTokenWriteRead(
-        outputConsumer,
-        "manual",
-        () -> TypeToken.getParameterized(List.class, ClassWithAdapter.class));
-
-    testNamedFields(outputConsumer);
-    testSerializedName(outputConsumer);
-
-    testConstructorNoArgs(outputConsumer);
-    testConstructorHasArgs(outputConsumer);
-    testUnreferencedConstructorNoArgs(outputConsumer);
-    testUnreferencedConstructorHasArgs(outputConsumer);
-
-    testNoJdkUnsafe(outputConsumer);
-
-    testEnum(outputConsumer);
-    testEnumSerializedName(outputConsumer);
-
-    testExposeAnnotation(outputConsumer);
-    testVersionAnnotations(outputConsumer);
-    testJsonAdapterAnnotation(outputConsumer);
-
-    testGenericClasses(outputConsumer);
+/** Reads and writes GSON parse trees over streams. */
+public final class Streams {
+  private Streams() {
+    throw new UnsupportedOperationException();
   }
 
-  private static void testTypeTokenWriteRead(
-      BiConsumer<String, String> outputConsumer,
-      String description,
-      Supplier<TypeToken<?>> typeTokenSupplier) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-
-    TestExecutor.run(
-        outputConsumer,
-        "Write: TypeToken " + description,
-        () ->
-            gson.toJson(Arrays.asList(new ClassWithAdapter(1)), typeTokenSupplier.get().getType()));
-    TestExecutor.run(
-        outputConsumer,
-        "Read: TypeToken " + description,
-        () -> {
-          Object deserialized = gson.fromJson("[{\"custom\": 3}]", typeTokenSupplier.get());
-          return deserialized.toString();
-        });
+  /** Takes a reader in any state and returns the next value as a JsonElement. */
+  public static JsonElement parse(JsonReader reader) throws JsonParseException {
+    boolean isEmpty = true;
+    try {
+      JsonToken unused = reader.peek();
+      isEmpty = false;
+      return TypeAdapters.JSON_ELEMENT.read(reader);
+    } catch (EOFException e) {
+      /*
+       * For compatibility with JSON 1.5 and earlier, we return a JsonNull for
+       * empty documents instead of throwing.
+       */
+      if (isEmpty) {
+        return JsonNull.INSTANCE;
+      }
+      // The stream ended prematurely so it is likely a syntax error.
+      throw new JsonSyntaxException(e);
+    } catch (MalformedJsonException e) {
+      throw new JsonSyntaxException(e);
+    } catch (IOException e) {
+      throw new JsonIOException(e);
+    } catch (NumberFormatException e) {
+      throw new JsonSyntaxException(e);
+    }
   }
 
-  /**
-   * Calls {@link Gson#toJson}, but (hopefully) in a way which prevents code shrinkers from
-   * understanding that reflection is used for {@code obj}.
-   */
-  private static String toJson(Gson gson, Object obj) {
-    return gson.toJson(same(obj));
+  /** Writes the JSON element to the writer, recursively. */
+  public static void write(JsonElement element, JsonWriter writer) throws IOException {
+    TypeAdapters.JSON_ELEMENT.write(writer, element);
   }
 
-  /**
-   * Calls {@link Gson#fromJson}, but (hopefully) in a way which prevents code shrinkers from
-   * understanding that reflection is used for {@code c}.
-   */
-  private static <T> T fromJson(Gson gson, String json, Class<T> c) {
-    return gson.fromJson(json, same(c));
+  public static Writer writerForAppendable(Appendable appendable) {
+    return appendable instanceof Writer ? (Writer) appendable : new AppendableWriter(appendable);
   }
 
-  private static void testNamedFields(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    TestExecutor.run(
-        outputConsumer, "Write: Named fields", () -> toJson(gson, new ClassWithNamedFields(2)));
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Named fields",
-        () -> {
-          ClassWithNamedFields deserialized =
-              fromJson(gson, "{\"myField\": 3}", ClassWithNamedFields.class);
-          return Integer.toString(deserialized.myField);
-        });
-  }
+  /** Adapts an {@link Appendable} so it can be passed anywhere a {@link Writer} is used. */
+  private static final class AppendableWriter extends Writer {
+    private final Appendable appendable;
+    private final CurrentWrite currentWrite = new CurrentWrite();
 
-  private static void testSerializedName(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    TestExecutor.run(
-        outputConsumer,
-        "Write: SerializedName",
-        () -> toJson(gson, new ClassWithSerializedName(2)));
-    TestExecutor.run(
-        outputConsumer,
-        "Read: SerializedName",
-        () -> {
-          ClassWithSerializedName deserialized =
-              fromJson(gson, "{\"myField\": 3}", ClassWithSerializedName.class);
-          return Integer.toString(deserialized.i);
-        });
-  }
+    AppendableWriter(Appendable appendable) {
+      this.appendable = appendable;
+    }
 
-  private static void testConstructorNoArgs(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    TestExecutor.run(
-        outputConsumer,
-        "Write: No args constructor",
-        () -> toJson(gson, new ClassWithNoArgsConstructor()));
-    TestExecutor.run(
-        outputConsumer,
-        "Read: No args constructor; initial constructor value",
-        () -> {
-          ClassWithNoArgsConstructor deserialized =
-              fromJson(gson, "{}", ClassWithNoArgsConstructor.class);
-          return Integer.toString(deserialized.i);
-        });
-    TestExecutor.run(
-        outputConsumer,
-        "Read: No args constructor; custom value",
-        () -> {
-          ClassWithNoArgsConstructor deserialized =
-              fromJson(gson, "{\"myField\": 3}", ClassWithNoArgsConstructor.class);
-          return Integer.toString(deserialized.i);
-        });
-  }
+    @SuppressWarnings("UngroupedOverloads") // this is intentionally ungrouped, see comment below
+    @Override
+    public void write(char[] chars, int offset, int length) throws IOException {
+      currentWrite.setChars(chars);
+      appendable.append(currentWrite, offset, offset + length);
+    }
 
-  private static void testConstructorHasArgs(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    TestExecutor.run(
-        outputConsumer,
-        "Write: Constructor with args",
-        () -> toJson(gson, new ClassWithHasArgsConstructor(2)));
-    // This most likely relies on JDK Unsafe (unless the shrinker rewrites the constructor in some
-    // way)
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Constructor with args",
-        () -> {
-          ClassWithHasArgsConstructor deserialized =
-              fromJson(gson, "{\"myField\": 3}", ClassWithHasArgsConstructor.class);
-          return Integer.toString(deserialized.i);
-        });
-  }
+    @Override
+    public void flush() {}
 
-  private static void testUnreferencedConstructorNoArgs(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    // No write because we're not referencing this class's constructor.
+    @Override
+    public void close() {}
 
-    // This runs the no-args constructor.
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Unreferenced no args constructor; initial constructor value",
-        () -> {
-          ClassWithUnreferencedNoArgsConstructor deserialized =
-              fromJson(gson, "{}", ClassWithUnreferencedNoArgsConstructor.class);
-          return Integer.toString(deserialized.i);
-        });
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Unreferenced no args constructor; custom value",
-        () -> {
-          ClassWithUnreferencedNoArgsConstructor deserialized =
-              fromJson(gson, "{\"myField\": 3}", ClassWithUnreferencedNoArgsConstructor.class);
-          return Integer.toString(deserialized.i);
-        });
-  }
+    // Override these methods for better performance
+    // They would otherwise unnecessarily create Strings or char arrays
 
-  private static void testUnreferencedConstructorHasArgs(
-      BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    // No write because we're not referencing this class's constructor.
+    @Override
+    public void write(int i) throws IOException {
+      appendable.append((char) i);
+    }
 
-    // This most likely relies on JDK Unsafe (unless the shrinker rewrites the constructor in some
-    // way)
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Unreferenced constructor with args",
-        () -> {
-          ClassWithUnreferencedHasArgsConstructor deserialized =
-              fromJson(gson, "{\"myField\": 3}", ClassWithUnreferencedHasArgsConstructor.class);
-          return Integer.toString(deserialized.i);
-        });
-  }
+    @Override
+    public void write(String str, int off, int len) throws IOException {
+      // Appendable.append turns null -> "null", which is not desired here
+      Objects.requireNonNull(str);
+      appendable.append(str, off, off + len);
+    }
 
-  private static void testNoJdkUnsafe(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().disableJdkUnsafe().create();
-    TestExecutor.run(
-        outputConsumer,
-        "Read: No JDK Unsafe; initial constructor value",
-        () -> {
-          ClassWithNoArgsConstructor deserialized =
-              fromJson(gson, "{}", ClassWithNoArgsConstructor.class);
-          return Integer.toString(deserialized.i);
-        });
-    TestExecutor.run(
-        outputConsumer,
-        "Read: No JDK Unsafe; custom value",
-        () -> {
-          ClassWithNoArgsConstructor deserialized =
-              fromJson(gson, "{\"myField\": 3}", ClassWithNoArgsConstructor.class);
-          return Integer.toString(deserialized.i);
-        });
-  }
+    @Override
+    public Writer append(CharSequence csq) throws IOException {
+      appendable.append(csq);
+      return this;
+    }
 
-  private static void testEnum(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    TestExecutor.run(outputConsumer, "Write: Enum", () -> toJson(gson, EnumClass.FIRST));
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Enum",
-        () -> fromJson(gson, "\"SECOND\"", EnumClass.class).toString());
-  }
+    @Override
+    public Writer append(CharSequence csq, int start, int end) throws IOException {
+      appendable.append(csq, start, end);
+      return this;
+    }
 
-  private static void testEnumSerializedName(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    TestExecutor.run(
-        outputConsumer,
-        "Write: Enum SerializedName",
-        () -> toJson(gson, EnumClassWithSerializedName.FIRST));
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Enum SerializedName",
-        () -> fromJson(gson, "\"two\"", EnumClassWithSerializedName.class).toString());
-  }
+    /** A mutable char sequence pointing at a single char[]. */
+    private static class CurrentWrite implements CharSequence {
+      private char[] chars;
+      private String cachedString;
 
-  private static void testExposeAnnotation(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().excludeFieldsWithoutExposeAnnotation().create();
-    TestExecutor.run(
-        outputConsumer, "Write: @Expose", () -> toJson(gson, new ClassWithExposeAnnotation()));
-  }
+      void setChars(char[] chars) {
+        this.chars = chars;
+        this.cachedString = null;
+      }
 
-  private static void testVersionAnnotations(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setVersion(1).create();
-    TestExecutor.run(
-        outputConsumer,
-        "Write: Version annotations",
-        () -> toJson(gson, new ClassWithVersionAnnotations()));
-  }
+      @Override
+      public int length() {
+        return chars.length;
+      }
 
-  private static void testJsonAdapterAnnotation(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    TestExecutor.run(
-        outputConsumer,
-        "Write: JsonAdapter on fields",
-        () -> toJson(gson, new ClassWithJsonAdapterAnnotation(1, 2, 3, 4)));
+      @Override
+      public char charAt(int i) {
+        return chars[i];
+      }
 
-    String json = "{\"f1\": 1, \"f2\": 2, \"f3\": {\"s\": \"3\"}, \"f4\": 4}";
-    TestExecutor.run(
-        outputConsumer,
-        "Read: JsonAdapter on fields",
-        () -> fromJson(gson, json, ClassWithJsonAdapterAnnotation.class).toString());
-  }
+      @Override
+      public CharSequence subSequence(int start, int end) {
+        return new String(chars, start, end - start);
+      }
 
-  private static void testGenericClasses(BiConsumer<String, String> outputConsumer) {
-    Gson gson = new Gson();
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Generic TypeToken",
-        () -> gson.fromJson("{\"t\": 1}", new TypeToken<GenericClass<DummyClass>>() {}).toString());
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Using Generic",
-        () -> fromJson(gson, "{\"g\": {\"t\": 1}}", UsingGenericClass.class).toString());
-    TestExecutor.run(
-        outputConsumer,
-        "Read: Using Generic TypeToken",
-        () ->
-            gson.fromJson(
-                    "{\"g\": {\"t\": 1}}", new TypeToken<GenericUsingGenericClass<DummyClass>>() {})
-                .toString());
+      // Must return string representation to satisfy toString() contract
+      @Override
+      public String toString() {
+        if (cachedString == null) {
+          cachedString = new String(chars);
+        }
+        return cachedString;
+      }
+    }
   }
 }

@@ -1,279 +1,290 @@
 const std = @import("std");
-const InternPool = @import("InternPool.zig");
+const Ast = std.zig.Ast;
+const Token = std.zig.Token;
 
-const FormatDegibberishData = struct {
-    ip: *InternPool,
-    ty: InternPool.Index,
-};
+const Analyser = @import("../analysis.zig");
+const DocumentStore = @import("../DocumentStore.zig");
+const types = @import("../lsp.zig");
+const ast = @import("../ast.zig");
+const offsets = @import("../offsets.zig");
 
-pub fn fmtDegibberish(ip: *InternPool, ty: InternPool.Index) std.fmt.Formatter(formatDegibberish) {
-    const data = FormatDegibberishData{ .ip = ip, .ty = ty };
-    return .{ .data = data };
+const data = @import("version_data");
+
+fn fnProtoToSignatureInfo(
+    analyser: *Analyser,
+    arena: std.mem.Allocator,
+    commas: u32,
+    skip_self_param: bool,
+    func_type: Analyser.Type,
+    markup_kind: types.MarkupKind,
+) !types.SignatureInformation {
+    const fn_node_handle = func_type.data.other; // this assumes that function types can only be Ast nodes
+    const fn_node = fn_node_handle.node;
+    const fn_handle = fn_node_handle.handle;
+    const tree = fn_handle.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, fn_node).?;
+
+    const label = Analyser.getFunctionSignature(tree, proto);
+    const proto_comments = try Analyser.getDocComments(arena, tree, fn_node);
+
+    const arg_idx = if (skip_self_param) blk: {
+        const has_self_param = try analyser.hasSelfParam(func_type);
+        break :blk commas + @intFromBool(has_self_param);
+    } else commas;
+
+    var params = std.ArrayListUnmanaged(types.ParameterInformation){};
+    var param_it = proto.iterate(&tree);
+    while (ast.nextFnParam(&param_it)) |param| {
+        const param_comments = if (param.first_doc_comment) |dc|
+            try Analyser.collectDocComments(arena, tree, dc, false)
+        else
+            null;
+
+        try params.append(arena, .{
+            .label = .{ .string = ast.paramSlice(tree, param, false) },
+            .documentation = if (param_comments) |comment| .{ .MarkupContent = .{
+                .kind = markup_kind,
+                .value = comment,
+            } } else null,
+        });
+    }
+    return types.SignatureInformation{
+        .label = label,
+        .documentation = if (proto_comments) |comment| .{ .MarkupContent = .{
+            .kind = markup_kind,
+            .value = comment,
+        } } else null,
+        .parameters = params.items,
+        .activeParameter = if (arg_idx < params.items.len) arg_idx else null,
+    };
 }
 
-fn formatDegibberish(data: FormatDegibberishData, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) @TypeOf(writer).Error!void {
-    if (fmt.len != 0) std.fmt.invalidFmtError(fmt, data.ty);
-    _ = options;
+pub fn getSignatureInfo(
+    analyser: *Analyser,
+    arena: std.mem.Allocator,
+    handle: *DocumentStore.Handle,
+    absolute_index: usize,
+    markup_kind: types.MarkupKind,
+) !?types.SignatureInformation {
+    const document_scope = try handle.getDocumentScope();
+    const innermost_block = Analyser.innermostBlockScope(document_scope, absolute_index);
+    const tree = handle.tree;
+    const token_tags = tree.tokens.items(.tag);
 
-    const ip = data.ip;
-    var ty = data.ty;
+    // Use the innermost scope to determine the earliest token we would need
+    //   to scan up to find a function or builtin call
+    const first_token = tree.firstToken(innermost_block);
+    // We start by finding the token that includes the current cursor position
+    const last_token = blk: {
+        const last_token = offsets.sourceIndexToTokenIndex(tree, absolute_index);
+        switch (token_tags[last_token]) {
+            .l_brace, .l_paren, .l_bracket => break :blk last_token,
+            else => break :blk last_token -| 1,
+        }
+    };
 
-    while (ty != .none) {
-        switch (ip.indexToKey(ty)) {
-            .simple_type,
-            .int_type,
-            => try writer.print("{}", .{ty.fmt(ip)}),
+    // We scan the tokens from last to first, adding and removing open and close
+    //   delimiter tokens to a stack, while keeping track of commas corresponding
+    //   to each of the blocks in a stack.
+    // When we encounter a dangling left parenthesis token, we continue scanning
+    //   backwards for a compatible possible function call lhs expression or a
+    //   single builtin token.
+    // When a function call expression is detected, it is resolved to a declaration
+    //   or a function type and the resulting function prototype is converted into
+    //   a signature information object.
+    const StackSymbol = enum {
+        l_paren,
+        r_paren,
+        l_brace,
+        r_brace,
+        l_bracket,
+        r_bracket,
 
-            .pointer_type => |pointer_info| {
-                // ignored attributes:
-                // - address_space
-                // - is_allowzero
-                // - is_volatile
-                // - packed_offset
-
-                if (pointer_info.sentinel != .none) {
-                    try writer.print("{} terminated ", .{pointer_info.sentinel.fmt(ip)});
+        fn from(tag: Token.Tag) @This() {
+            return switch (tag) {
+                .l_paren => .l_paren,
+                .r_paren => .r_paren,
+                .l_brace => .l_brace,
+                .r_brace => .r_brace,
+                .l_bracket => .l_bracket,
+                .r_bracket => .r_bracket,
+                else => unreachable,
+            };
+        }
+    };
+    var symbol_stack = try std.ArrayListUnmanaged(StackSymbol).initCapacity(arena, 8);
+    var curr_commas: u32 = 0;
+    var comma_stack = try std.ArrayListUnmanaged(u32).initCapacity(arena, 4);
+    var curr_token = last_token;
+    while (curr_token >= first_token and curr_token != 0) : (curr_token -= 1) {
+        switch (token_tags[curr_token]) {
+            .comma => curr_commas += 1,
+            .l_brace => {
+                curr_commas = comma_stack.popOrNull() orelse 0;
+                if (symbol_stack.items.len != 0) {
+                    const peek_sym = symbol_stack.items[symbol_stack.items.len - 1];
+                    switch (peek_sym) {
+                        .r_brace => {
+                            _ = symbol_stack.pop();
+                            continue;
+                        },
+                        .r_bracket, .r_paren => {
+                            return null;
+                        },
+                        else => {},
+                    }
+                }
+                try symbol_stack.append(arena, .l_brace);
+            },
+            .l_bracket => {
+                curr_commas = comma_stack.popOrNull() orelse 0;
+                if (symbol_stack.items.len != 0) {
+                    const peek_sym = symbol_stack.items[symbol_stack.items.len - 1];
+                    switch (peek_sym) {
+                        .r_bracket => {
+                            _ = symbol_stack.pop();
+                            continue;
+                        },
+                        .r_brace, .r_paren => {
+                            return null;
+                        },
+                        else => {},
+                    }
+                }
+                try symbol_stack.append(arena, .l_bracket);
+            },
+            .l_paren => {
+                const paren_commas = curr_commas;
+                curr_commas = comma_stack.popOrNull() orelse 0;
+                if (symbol_stack.items.len != 0) {
+                    const peek_sym = symbol_stack.items[symbol_stack.items.len - 1];
+                    switch (peek_sym) {
+                        .r_paren => {
+                            _ = symbol_stack.pop();
+                            continue;
+                        },
+                        .r_brace, .r_bracket => {
+                            return null;
+                        },
+                        else => {},
+                    }
                 }
 
-                // single pointer
-                const size_prefix = switch (pointer_info.flags.size) {
-                    .One => "single-item pointer",
-                    .Many => "many-item pointer",
-                    .Slice => "slice (pointer + length)",
-                    .C => "C pointer",
+                // Try to find a function expression or a builtin identifier
+                if (curr_token == first_token)
+                    return null;
+
+                const expr_last_token = curr_token - 1;
+                if (token_tags[expr_last_token] == .builtin) {
+                    // Builtin token, find the builtin and construct signature information.
+                    for (data.builtins) |builtin| {
+                        if (std.mem.eql(u8, builtin.name, tree.tokenSlice(expr_last_token))) {
+                            const param_infos = try arena.alloc(
+                                types.ParameterInformation,
+                                builtin.arguments.len,
+                            );
+                            for (param_infos, builtin.arguments) |*info, argument| {
+                                info.* = .{
+                                    .label = .{ .string = argument },
+                                    .documentation = null,
+                                };
+                            }
+                            return types.SignatureInformation{
+                                .label = builtin.signature,
+                                .documentation = .{ .string = builtin.documentation },
+                                .parameters = param_infos,
+                                .activeParameter = paren_commas,
+                            };
+                        }
+                    }
+                    return null;
+                }
+                // Scan for a function call lhs expression.
+                var state: union(enum) {
+                    any,
+                    in_bracket: u32,
+                    in_paren: u32,
+                } = .any;
+                var i = expr_last_token;
+                const expr_first_token = while (i > first_token) : (i -= 1) {
+                    switch (state) {
+                        .in_bracket => |*count| if (token_tags[i] == .r_bracket) {
+                            count.* += 1;
+                        } else if (token_tags[i] == .l_bracket) {
+                            count.* -= 1;
+                            if (count.* == 0)
+                                state = .any;
+                        },
+                        .in_paren => |*count| if (token_tags[i] == .r_paren) {
+                            count.* += 1;
+                        } else if (token_tags[i] == .l_paren) {
+                            count.* -= 1;
+                            if (count.* == 0)
+                                state = .any;
+                        },
+                        .any => switch (token_tags[i]) {
+                            .r_bracket => state = .{ .in_bracket = 1 },
+                            .r_paren => state = .{ .in_paren = 1 },
+                            .identifier,
+                            .period,
+                            .question_mark,
+                            .period_asterisk,
+                            => {},
+                            else => break i + 1,
+                        },
+                    }
+                } else first_token + 1;
+                if (state != .any or expr_first_token > expr_last_token) {
+                    try symbol_stack.append(arena, .l_paren);
+                    continue;
+                }
+
+                const loc = offsets.tokensToLoc(tree, expr_first_token, expr_last_token);
+
+                var ty = try analyser.getFieldAccessType(handle, loc.start, loc) orelse continue;
+
+                if (try analyser.resolveFuncProtoOfCallable(ty)) |func_type| {
+                    return try fnProtoToSignatureInfo(
+                        analyser,
+                        arena,
+                        paren_commas,
+                        false,
+                        func_type,
+                        markup_kind,
+                    );
+                }
+
+                const name_loc = Analyser.identifierLocFromPosition(loc.end - 1, handle) orelse {
+                    try symbol_stack.append(arena, .l_paren);
+                    continue;
+                };
+                const name = offsets.locToSlice(handle.tree.source, name_loc);
+
+                const skip_self_param = !ty.is_type_val;
+                ty = try analyser.resolveFieldAccess(ty, name) orelse {
+                    try symbol_stack.append(arena, .l_paren);
+                    continue;
                 };
 
-                try writer.writeAll(size_prefix);
-
-                if (pointer_info.flags.alignment != 0) {
-                    try writer.print(" with alignment {d}", .{pointer_info.flags.alignment});
+                if (try analyser.resolveFuncProtoOfCallable(ty)) |func_type| {
+                    return try fnProtoToSignatureInfo(
+                        analyser,
+                        arena,
+                        paren_commas,
+                        skip_self_param,
+                        func_type,
+                        markup_kind,
+                    );
                 }
-
-                try writer.writeAll(" to ");
-
-                if (pointer_info.flags.is_const) {
-                    try writer.writeAll("const ");
-                }
-
-                ty = pointer_info.elem_type;
-                continue;
             },
-            .array_type => |array_info| {
-                if (array_info.sentinel != .none) {
-                    try writer.print("{} terminated ", .{array_info.sentinel.fmt(ip)});
-                }
-                try writer.print("array {d} of ", .{array_info.len});
-                ty = array_info.child;
-                continue;
+            .r_brace, .r_paren, .r_bracket => |tag| {
+                try comma_stack.append(arena, curr_commas);
+                curr_commas = 0;
+                try symbol_stack.append(arena, StackSymbol.from(tag));
             },
-            .struct_type => try writer.print("struct {}", .{ty.fmt(ip)}),
-            .optional_type => |optional_info| {
-                try writer.writeAll("optional of ");
-                ty = optional_info.payload_type;
-                continue;
-            },
-            .error_union_type => |error_union_info| {
-                try writer.writeAll("error union with ");
-                try writer.print("{}", .{fmtDegibberish(ip, error_union_info.error_set_type)});
-                try writer.writeAll(" and payload ");
-                ty = error_union_info.payload_type;
-                continue;
-            },
-            .error_set_type => |error_set_info| {
-                try writer.writeAll("error set of (");
-                for (0..error_set_info.names.len) |i| {
-                    if (i != 0) try writer.writeByte(',');
-                    const name = error_set_info.names.at(@intCast(i), ip);
-                    try writer.print("{}", .{InternPool.fmtId(ip, name)});
-                }
-                try writer.writeAll(")");
-            },
-            .enum_type => try writer.print("enum {}", .{ty.fmt(ip)}),
-            .function_type => |function_info| {
-                try writer.writeAll("function (");
-                for (0..function_info.args.len) |i| {
-                    if (i != 0) try writer.writeAll(", ");
-                    const arg_ty = function_info.args.at(@intCast(i), ip);
-                    try writer.print("{}", .{fmtDegibberish(ip, arg_ty)});
-                }
-                try writer.writeAll(") returning ");
-                ty = function_info.return_type;
-                continue;
-            },
-            .union_type => try writer.print("union {}", .{ty.fmt(ip)}),
-            .tuple_type => |tuple_info| {
-                std.debug.assert(tuple_info.types.len == tuple_info.values.len);
-                try writer.writeAll("tuple of (");
-                for (0..tuple_info.types.len) |i| {
-                    if (i != 0) try writer.writeAll(", ");
-                    const field_ty = tuple_info.types.at(@intCast(i), ip);
-                    try writer.print("{}", .{fmtDegibberish(ip, field_ty)});
-                }
-                try writer.writeAll(")");
-            },
-            .vector_type => |vector_info| {
-                try writer.print("vector {d} of ", .{vector_info.len});
-                ty = vector_info.child;
-                continue;
-            },
-            .anyframe_type => |anyframe_info| {
-                try writer.writeAll("function frame returning ");
-                ty = anyframe_info.child;
-                continue;
-            },
-
-            .simple_value,
-            .int_u64_value,
-            .int_i64_value,
-            .int_big_value,
-            .float_16_value,
-            .float_32_value,
-            .float_64_value,
-            .float_80_value,
-            .float_128_value,
-            .float_comptime_value,
-            .optional_value,
-            .slice,
-            .aggregate,
-            .union_value,
-            .error_value,
-            .null_value,
-            .undefined_value,
-            .unknown_value,
-            => unreachable,
+            else => {},
         }
-        break;
     }
-}
-
-test "degibberish - simple types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    try std.testing.expectFmt("u32", "{}", .{fmtDegibberish(&ip, .u32_type)});
-    try std.testing.expectFmt("comptime_float", "{}", .{fmtDegibberish(&ip, .comptime_float_type)});
-}
-
-test "degibberish - pointer types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    try std.testing.expectFmt("many-item pointer to u8", "{}", .{fmtDegibberish(&ip, .manyptr_u8_type)});
-    try std.testing.expectFmt("many-item pointer to const u8", "{}", .{fmtDegibberish(&ip, .manyptr_const_u8_type)});
-    try std.testing.expectFmt("0 terminated many-item pointer to const u8", "{}", .{fmtDegibberish(&ip, .manyptr_const_u8_sentinel_0_type)});
-    try std.testing.expectFmt("single-item pointer to const comptime_int", "{}", .{fmtDegibberish(&ip, .single_const_pointer_to_comptime_int_type)});
-    try std.testing.expectFmt("slice (pointer + length) to const u8", "{}", .{fmtDegibberish(&ip, .slice_const_u8_type)});
-    try std.testing.expectFmt("0 terminated slice (pointer + length) to const u8", "{}", .{fmtDegibberish(&ip, .slice_const_u8_sentinel_0_type)});
-}
-
-test "degibberish - array types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    const @"[3:0]u8" = try ip.get(gpa, .{ .array_type = .{ .len = 3, .child = .u8_type, .sentinel = .zero_u8 } });
-    const @"[0]u32" = try ip.get(gpa, .{ .array_type = .{ .len = 0, .child = .u32_type } });
-
-    try std.testing.expectFmt("0 terminated array 3 of u8", "{}", .{fmtDegibberish(&ip, @"[3:0]u8")});
-    try std.testing.expectFmt("array 0 of u32", "{}", .{fmtDegibberish(&ip, @"[0]u32")});
-}
-
-test "degibberish - optional types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    const @"?u32" = try ip.get(gpa, .{ .optional_type = .{ .payload_type = .u32_type } });
-
-    try std.testing.expectFmt("optional of u32", "{}", .{fmtDegibberish(&ip, @"?u32")});
-}
-
-test "degibberish - error union types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    const foo_string = try ip.string_pool.getOrPutString(gpa, "foo");
-    const bar_string = try ip.string_pool.getOrPutString(gpa, "bar");
-    const baz_string = try ip.string_pool.getOrPutString(gpa, "baz");
-
-    const @"error{foo,bar,baz}" = try ip.get(gpa, .{ .error_set_type = .{
-        .names = try ip.getStringSlice(gpa, &.{ foo_string, bar_string, baz_string }),
-        .owner_decl = .none,
-    } });
-
-    const @"error{foo,bar,baz}!u32" = try ip.get(gpa, .{ .error_union_type = .{
-        .error_set_type = @"error{foo,bar,baz}",
-        .payload_type = .u32_type,
-    } });
-
-    try std.testing.expectFmt("error union with error set of (foo,bar,baz) and payload u32", "{}", .{fmtDegibberish(&ip, @"error{foo,bar,baz}!u32")});
-}
-
-test "degibberish - error set types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    const foo_string = try ip.string_pool.getOrPutString(gpa, "foo");
-    const bar_string = try ip.string_pool.getOrPutString(gpa, "bar");
-    const baz_string = try ip.string_pool.getOrPutString(gpa, "baz");
-
-    const @"error{foo,bar,baz}" = try ip.get(gpa, .{ .error_set_type = .{
-        .names = try ip.getStringSlice(gpa, &.{ foo_string, bar_string, baz_string }),
-        .owner_decl = .none,
-    } });
-
-    try std.testing.expectFmt("error set of (foo,bar,baz)", "{}", .{fmtDegibberish(&ip, @"error{foo,bar,baz}")});
-}
-
-test "degibberish - function types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    const @"fn(u32, void) type" = try ip.get(gpa, .{ .function_type = .{
-        .args = try ip.getIndexSlice(gpa, &.{ .u32_type, .void_type }),
-        .return_type = .type_type,
-    } });
-
-    try std.testing.expectFmt("function () returning noreturn", "{}", .{fmtDegibberish(&ip, .fn_noreturn_no_args_type)});
-    try std.testing.expectFmt("function () returning void", "{}", .{fmtDegibberish(&ip, .fn_void_no_args_type)});
-    try std.testing.expectFmt("function (u32, void) returning type", "{}", .{fmtDegibberish(&ip, @"fn(u32, void) type")});
-}
-
-test "degibberish - tuple types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    const @"struct{u32, comptime_float, c_int}" = try ip.get(gpa, .{ .tuple_type = .{
-        .types = try ip.getIndexSlice(gpa, &.{ .u32_type, .comptime_float_type, .c_int_type }),
-        .values = try ip.getIndexSlice(gpa, &.{ .none, .none, .none }),
-    } });
-
-    try std.testing.expectFmt("tuple of (u32, comptime_float, c_int)", "{}", .{fmtDegibberish(&ip, @"struct{u32, comptime_float, c_int}")});
-}
-
-test "degibberish - vector types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    const @"@Vector(3, u8)" = try ip.get(gpa, .{ .vector_type = .{ .len = 3, .child = .u8_type } });
-    const @"@Vector(0, u32)" = try ip.get(gpa, .{ .vector_type = .{ .len = 0, .child = .u32_type } });
-
-    try std.testing.expectFmt("vector 3 of u8", "{}", .{fmtDegibberish(&ip, @"@Vector(3, u8)")});
-    try std.testing.expectFmt("vector 0 of u32", "{}", .{fmtDegibberish(&ip, @"@Vector(0, u32)")});
-}
-
-test "degibberish - anyframe types" {
-    const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
-    defer ip.deinit(gpa);
-
-    const @"anyframe->u32" = try ip.get(gpa, .{ .anyframe_type = .{ .child = .u32_type } });
-    try std.testing.expectFmt("function frame returning u32", "{}", .{fmtDegibberish(&ip, @"anyframe->u32")});
+    return null;
 }

@@ -10,125 +10,92 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Json;
+namespace Composer\Advisory;
 
-use Composer\Pcre\Preg;
+use Composer\Semver\Constraint\ConstraintInterface;
+use DateTimeImmutable;
 
-/**
- * Formats json strings used for php < 5.4 because the json_encode doesn't
- * supports the flags JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE
- * in these versions
- *
- * @author Konstantin Kudryashiv <ever.zet@gmail.com>
- * @author Jordi Boggiano <j.boggiano@seld.be>
- *
- * @deprecated Use json_encode or JsonFile::encode() with modern JSON_* flags to configure formatting - this class will be removed in 3.0
- */
-class JsonFormatter
+class SecurityAdvisory extends PartialSecurityAdvisory
 {
     /**
-     * This code is based on the function found at:
-     *  http://recursive-design.com/blog/2008/03/11/format-json-with-php/
-     *
-     * Originally licensed under MIT by Dave Perrett <mail@recursive-design.com>
-     *
-     * @param  bool   $unescapeUnicode Un escape unicode
-     * @param  bool   $unescapeSlashes Un escape slashes
+     * @var string
+     * @readonly
      */
-    public static function format(string $json, bool $unescapeUnicode, bool $unescapeSlashes): string
+    public $title;
+
+    /**
+     * @var string|null
+     * @readonly
+     */
+    public $cve;
+
+    /**
+     * @var string|null
+     * @readonly
+     */
+    public $link;
+
+    /**
+     * @var DateTimeImmutable
+     * @readonly
+     */
+    public $reportedAt;
+
+    /**
+     * @var non-empty-array<array{name: string, remoteId: string}>
+     * @readonly
+     */
+    public $sources;
+
+    /**
+     * @var string|null
+     * @readonly
+     */
+    public $severity;
+
+    /**
+     * @param non-empty-array<array{name: string, remoteId: string}> $sources
+     */
+    public function __construct(string $packageName, string $advisoryId, ConstraintInterface $affectedVersions, string $title, array $sources, DateTimeImmutable $reportedAt, ?string $cve = null, ?string $link = null, ?string $severity = null)
     {
-        $result = '';
-        $pos = 0;
-        $strLen = strlen($json);
-        $indentStr = '    ';
-        $newLine = "\n";
-        $outOfQuotes = true;
-        $buffer = '';
-        $noescape = true;
+        parent::__construct($packageName, $advisoryId, $affectedVersions);
 
-        for ($i = 0; $i < $strLen; $i++) {
-            // Grab the next character in the string
-            $char = substr($json, $i, 1);
+        $this->title = $title;
+        $this->sources = $sources;
+        $this->reportedAt = $reportedAt;
+        $this->cve = $cve;
+        $this->link = $link;
+        $this->severity = $severity;
+    }
 
-            // Are we inside a quoted string?
-            if ('"' === $char && $noescape) {
-                $outOfQuotes = !$outOfQuotes;
-            }
+    /**
+     * @internal
+     */
+    public function toIgnoredAdvisory(?string $ignoreReason): IgnoredSecurityAdvisory
+    {
+        return new IgnoredSecurityAdvisory(
+            $this->packageName,
+            $this->advisoryId,
+            $this->affectedVersions,
+            $this->title,
+            $this->sources,
+            $this->reportedAt,
+            $this->cve,
+            $this->link,
+            $ignoreReason,
+            $this->severity
+        );
+    }
 
-            if (!$outOfQuotes) {
-                $buffer .= $char;
-                $noescape = '\\' === $char ? !$noescape : true;
-                continue;
-            }
-            if ('' !== $buffer) {
-                if ($unescapeSlashes) {
-                    $buffer = str_replace('\\/', '/', $buffer);
-                }
+    /**
+     * @return mixed
+     */
+    #[\ReturnTypeWillChange]
+    public function jsonSerialize()
+    {
+        $data = parent::jsonSerialize();
+        $data['reportedAt'] = $data['reportedAt']->format(DATE_RFC3339);
 
-                if ($unescapeUnicode && function_exists('mb_convert_encoding')) {
-                    // https://stackoverflow.com/questions/2934563/how-to-decode-unicode-escape-sequences-like-u00ed-to-proper-utf-8-encoded-cha
-                    $buffer = Preg::replaceCallback('/(\\\\+)u([0-9a-f]{4})/i', static function ($match): string {
-                        assert(is_string($match[1]));
-                        assert(is_string($match[2]));
-                        $l = strlen($match[1]);
-
-                        if ($l % 2) {
-                            $code = hexdec($match[2]);
-                            // 0xD800..0xDFFF denotes UTF-16 surrogate pair which won't be unescaped
-                            // see https://github.com/composer/composer/issues/7510
-                            if (0xD800 <= $code && 0xDFFF >= $code) {
-                                return (string) $match[0];
-                            }
-
-                            return str_repeat('\\', $l - 1) . mb_convert_encoding(
-                                pack('H*', $match[2]),
-                                'UTF-8',
-                                'UCS-2BE'
-                            );
-                        }
-
-                        return (string) $match[0];
-                    }, $buffer);
-                }
-
-                $result .= $buffer.$char;
-                $buffer = '';
-                continue;
-            }
-
-            if (':' === $char) {
-                // Add a space after the : character
-                $char .= ' ';
-            } elseif ('}' === $char || ']' === $char) {
-                $pos--;
-                $prevChar = substr($json, $i - 1, 1);
-
-                if ('{' !== $prevChar && '[' !== $prevChar) {
-                    // If this character is the end of an element,
-                    // output a new line and indent the next line
-                    $result .= $newLine;
-                    $result .= str_repeat($indentStr, $pos);
-                } else {
-                    // Collapse empty {} and []
-                    $result = rtrim($result);
-                }
-            }
-
-            $result .= $char;
-
-            // If the last character was the beginning of an element,
-            // output a new line and indent the next line
-            if (',' === $char || '{' === $char || '[' === $char) {
-                $result .= $newLine;
-
-                if ('{' === $char || '[' === $char) {
-                    $pos++;
-                }
-
-                $result .= str_repeat($indentStr, $pos);
-            }
-        }
-
-        return $result;
+        return $data;
     }
 }

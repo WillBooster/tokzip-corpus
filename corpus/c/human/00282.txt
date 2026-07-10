@@ -1,3 +1,5 @@
+#ifndef HEADER_CURL_VQUIC_TLS_H
+#define HEADER_CURL_VQUIC_TLS_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -21,147 +23,78 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+
 #include "curl_setup.h"
-#include <curl/curl.h>
-#include "testutil.h"
-#include "memdebug.h"
+#include "bufq.h"
+#include "vtls/openssl.h"
 
-#if defined(_WIN32)
+#if defined(USE_HTTP3) && \
+  (defined(USE_OPENSSL) || defined(USE_GNUTLS) || defined(USE_WOLFSSL))
 
-struct timeval tutil_tvnow(void)
-{
-  /*
-  ** GetTickCount() is available on _all_ Windows versions from W95 up
-  ** to nowadays. Returns milliseconds elapsed since last system boot,
-  ** increases monotonically and wraps once 49.7 days have elapsed.
-  */
-  struct timeval now;
-  DWORD milliseconds = GetTickCount();
-  now.tv_sec = (long)(milliseconds / 1000);
-  now.tv_usec = (long)((milliseconds % 1000) * 1000);
-  return now;
-}
+#include "vtls/wolfssl.h"
 
-#elif defined(HAVE_CLOCK_GETTIME_MONOTONIC)
-
-struct timeval tutil_tvnow(void)
-{
-  /*
-  ** clock_gettime() is granted to be increased monotonically when the
-  ** monotonic clock is queried. Time starting point is unspecified, it
-  ** could be the system start-up time, the Epoch, or something else,
-  ** in any case the time starting point does not change once that the
-  ** system has started up.
-  */
-  struct timeval now;
-  struct timespec tsnow;
-  if(0 == clock_gettime(CLOCK_MONOTONIC, &tsnow)) {
-    now.tv_sec = tsnow.tv_sec;
-    now.tv_usec = (int)(tsnow.tv_nsec / 1000);
-  }
-  /*
-  ** Even when the configure process has truly detected monotonic clock
-  ** availability, it might happen that it is not actually available at
-  ** run-time. When this occurs simply fallback to other time source.
-  */
-#ifdef HAVE_GETTIMEOFDAY
-  else
-    (void)gettimeofday(&now, NULL);
-#else
-  else {
-    now.tv_sec = time(NULL);
-    now.tv_usec = 0;
-  }
+struct curl_tls_ctx {
+#ifdef USE_OPENSSL
+  struct ossl_ctx ossl;
+#elif defined(USE_GNUTLS)
+  struct gtls_ctx gtls;
+#elif defined(USE_WOLFSSL)
+  struct wolfssl_ctx wssl;
 #endif
-  return now;
-}
+};
 
-#elif defined(HAVE_GETTIMEOFDAY)
-
-struct timeval tutil_tvnow(void)
-{
-  /*
-  ** gettimeofday() is not granted to be increased monotonically, due to
-  ** clock drifting and external source time synchronization it can jump
-  ** forward or backward in time.
-  */
-  struct timeval now;
-  (void)gettimeofday(&now, NULL);
-  return now;
-}
-
-#else
-
-struct timeval tutil_tvnow(void)
-{
-  /*
-  ** time() returns the value of time in seconds since the Epoch.
-  */
-  struct timeval now;
-  now.tv_sec = time(NULL);
-  now.tv_usec = 0;
-  return now;
-}
-
-#endif
-
-/*
- * Make sure that the first argument is the more recent time, as otherwise
- * we'll get a weird negative time-diff back...
- *
- * Returns: the time difference in number of milliseconds.
+/**
+ * Callback passed to `Curl_vquic_tls_init()` that can
+ * do early initializations on the not otherwise configured TLS
+ * instances created. This varies by TLS backend:
+ * - openssl/wolfssl: SSL_CTX* has just been created
+ * - gnutls: gtls_client_init() has run
  */
-long tutil_tvdiff(struct timeval newer, struct timeval older)
-{
-  return (long)(newer.tv_sec-older.tv_sec)*1000+
-    (long)(newer.tv_usec-older.tv_usec)/1000;
-}
+typedef CURLcode Curl_vquic_tls_ctx_setup(struct Curl_cfilter *cf,
+                                          struct Curl_easy *data,
+                                          void *cb_user_data);
 
-/*
- * Same as tutil_tvdiff but with full usec resolution.
- *
- * Returns: the time difference in seconds with subsecond resolution.
+/**
+ * Initialize the QUIC TLS instances based of the SSL configurations
+ * for the connection filter, transfer and peer.
+ * @param ctx         the TLS context to initialize
+ * @param cf          the connection filter involved
+ * @param data        the transfer involved
+ * @param peer        the peer that will be connected to
+ * @param alpn        the ALPN string in protocol format ((len+bytes+)+),
+ *                    may be NULL
+ * @param alpn_len    the overall number of bytes in `alpn`
+ * @param cb_setup    optional callback for very early TLS config
+ ± @param cb_user_data user_data param for callback
+ * @param ssl_user_data  optional pointer to set in TLS application context
  */
-double tutil_tvdiff_secs(struct timeval newer, struct timeval older)
-{
-  if(newer.tv_sec != older.tv_sec)
-    return (double)(newer.tv_sec-older.tv_sec)+
-      (double)(newer.tv_usec-older.tv_usec)/1000000.0;
-  return (double)(newer.tv_usec-older.tv_usec)/1000000.0;
-}
+CURLcode Curl_vquic_tls_init(struct curl_tls_ctx *ctx,
+                             struct Curl_cfilter *cf,
+                             struct Curl_easy *data,
+                             struct ssl_peer *peer,
+                             const char *alpn, size_t alpn_len,
+                             Curl_vquic_tls_ctx_setup *cb_setup,
+                             void *cb_user_data,
+                             void *ssl_user_data);
 
-#ifdef _WIN32
-HMODULE win32_load_system_library(const TCHAR *filename)
-{
-#ifdef CURL_WINDOWS_APP
-  (void)filename;
-  return NULL;
-#else
-  size_t filenamelen = _tcslen(filename);
-  size_t systemdirlen = GetSystemDirectory(NULL, 0);
-  size_t written;
-  TCHAR *path;
+/**
+ * Cleanup all data that has been initialized.
+ */
+void Curl_vquic_tls_cleanup(struct curl_tls_ctx *ctx);
 
-  if(!filenamelen || filenamelen > 32768 ||
-     !systemdirlen || systemdirlen > 32768)
-    return NULL;
+CURLcode Curl_vquic_tls_before_recv(struct curl_tls_ctx *ctx,
+                                    struct Curl_cfilter *cf,
+                                    struct Curl_easy *data);
 
-  /* systemdirlen includes null character */
-  path = malloc(sizeof(TCHAR) * (systemdirlen + 1 + filenamelen));
-  if(!path)
-    return NULL;
+/**
+ * After the QUIC basic handshake has been, verify that the peer
+ * (and its certificate) fulfill our requirements.
+ */
+CURLcode Curl_vquic_tls_verify_peer(struct curl_tls_ctx *ctx,
+                                    struct Curl_cfilter *cf,
+                                    struct Curl_easy *data,
+                                    struct ssl_peer *peer);
 
-  /* if written >= systemdirlen then nothing was written */
-  written = GetSystemDirectory(path, (unsigned int)systemdirlen);
-  if(!written || written >= systemdirlen)
-    return NULL;
+#endif /* !USE_HTTP3 && (USE_OPENSSL || USE_GNUTLS || USE_WOLFSSL) */
 
-  if(path[written - 1] != _T('\\'))
-    path[written++] = _T('\\');
-
-  _tcscpy(path + written, filename);
-
-  return LoadLibrary(path);
-#endif
-}
-#endif
+#endif /* HEADER_CURL_VQUIC_TLS_H */

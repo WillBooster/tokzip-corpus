@@ -21,338 +21,153 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-#include "curlcheck.h"
+#include "test.h"
 
-#include "tool_cfgable.h"
-#include "tool_doswin.h"
+/*
+  Check range/resume returned error codes and data presence.
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+  The input parameters are:
+  - CURLOPT_RANGE/CURLOPT_RESUME_FROM
+  - CURLOPT_FAILONERROR
+  - Returned http code (2xx/416)
+  - Content-Range header present in reply.
 
-#include "memdebug.h" /* LAST include file */
+*/
 
-static CURLcode unit_setup(void)
-{
-  return CURLE_OK;
-}
+#include "memdebug.h"
 
-static void unit_stop(void)
-{
+#define F_RESUME        (1 << 0)        /* resume/range. */
+#define F_HTTP416       (1 << 1)        /* Server returns http code 416. */
+#define F_FAIL          (1 << 2)        /* Fail on error. */
+#define F_CONTENTRANGE  (1 << 3)        /* Server sends content-range hdr. */
+#define F_IGNOREBODY    (1 << 4)        /* Body should be ignored. */
 
-}
-
-#if defined(_WIN32) || defined(MSDOS)
-
-static char *getflagstr(int flags)
-{
-  char *buf = malloc(256);
-  if(buf) {
-    msnprintf(buf, 256, "%s,%s,%s,%s",
-              ((flags & SANITIZE_ALLOW_COLONS) ?
-               "SANITIZE_ALLOW_COLONS" : ""),
-              ((flags & SANITIZE_ALLOW_PATH) ?
-               "SANITIZE_ALLOW_PATH" : ""),
-              ((flags & SANITIZE_ALLOW_RESERVED) ?
-               "SANITIZE_ALLOW_RESERVED" : ""),
-              ((flags & SANITIZE_ALLOW_TRUNCATE) ?
-               "SANITIZE_ALLOW_TRUNCATE" : ""));
-  }
-  return buf;
-}
-
-static char *getcurlcodestr(int cc)
-{
-  char *buf = malloc(256);
-  if(buf) {
-    msnprintf(buf, 256, "%s (%d)",
-              (cc == SANITIZE_ERR_OK ? "SANITIZE_ERR_OK" :
-               cc == SANITIZE_ERR_BAD_ARGUMENT ? "SANITIZE_ERR_BAD_ARGUMENT" :
-               cc == SANITIZE_ERR_INVALID_PATH ? "SANITIZE_ERR_INVALID_PATH" :
-               cc == SANITIZE_ERR_OUT_OF_MEMORY ? "SANITIZE_ERR_OUT_OF_MEMORY":
-               "unexpected error code - add name"),
-              cc);
-  }
-  return buf;
-}
-
-struct data {
-  const char *input;
-  int flags;
-  const char *expected_output;
-  SANITIZEcode expected_result;
+struct testparams {
+  unsigned int flags; /* ORed flags as above. */
+  CURLcode result; /* Code that should be returned by curl_easy_perform(). */
 };
 
-UNITTEST_START
-{ /* START sanitize_file_name */
-  struct data data[] = {
-    { "", 0,
-      "", SANITIZE_ERR_OK
-    },
-    { "normal filename", 0,
-      "normal filename", SANITIZE_ERR_OK
-    },
-    { "control\tchar", 0,
-      "control_char", SANITIZE_ERR_OK
-    },
-    { "banned*char", 0,
-      "banned_char", SANITIZE_ERR_OK
-    },
-    { "f:foo", 0,
-      "f_foo", SANITIZE_ERR_OK
-    },
-    { "f:foo", SANITIZE_ALLOW_COLONS,
-      "f:foo", SANITIZE_ERR_OK
-    },
-    { "f:foo", SANITIZE_ALLOW_PATH,
-      "f:foo", SANITIZE_ERR_OK
-    },
-    { "f:\\foo", 0,
-      "f__foo", SANITIZE_ERR_OK
-    },
-    { "f:\\foo", SANITIZE_ALLOW_PATH,
-      "f:\\foo", SANITIZE_ERR_OK
-    },
-    { "f:/foo", 0,
-      "f__foo", SANITIZE_ERR_OK
-    },
-    { "f:/foo", SANITIZE_ALLOW_PATH,
-      "f:/foo", SANITIZE_ERR_OK
-    },
-#ifndef MSDOS
-    { "\\\\?\\C:\\foo", SANITIZE_ALLOW_PATH,
-      "\\\\?\\C:\\foo", SANITIZE_ERR_OK
-    },
-    { "\\\\?\\C:\\foo", 0,
-      "____C__foo", SANITIZE_ERR_OK
-    },
-#endif
-    { "foo:bar", 0,
-      "foo_bar", SANITIZE_ERR_OK
-    },
-    { "foo|<>/bar\\\":?*baz", 0,
-      "foo____bar_____baz", SANITIZE_ERR_OK
-    },
-    { "f:foo::$DATA", 0,
-      "f_foo__$DATA", SANITIZE_ERR_OK
-    },
-    { "con . air", 0,
-      "con _ air", SANITIZE_ERR_OK
-    },
-    { "con.air", 0,
-      "con_air", SANITIZE_ERR_OK
-    },
-    { "con:/x", 0,
-      "con__x", SANITIZE_ERR_OK
-    },
-    { "file . . . .  ..  .", 0,
-      "file", SANITIZE_ERR_OK
-    },
-    { "foo . . ? . . ", 0,
-      "foo . . _", SANITIZE_ERR_OK
-    },
-    { "com1", 0,
-      "_com1", SANITIZE_ERR_OK
-    },
-    { "com1", SANITIZE_ALLOW_RESERVED,
-      "com1", SANITIZE_ERR_OK
-    },
-    { "f:\\com1", 0,
-      "f__com1", SANITIZE_ERR_OK
-    },
-    { "f:\\com1", SANITIZE_ALLOW_PATH,
-      "f:\\_com1", SANITIZE_ERR_OK
-    },
-    { "f:\\com1", SANITIZE_ALLOW_RESERVED,
-      "f__com1", SANITIZE_ERR_OK
-    },
-    { "f:\\com1", SANITIZE_ALLOW_RESERVED | SANITIZE_ALLOW_COLONS,
-      "f:_com1", SANITIZE_ERR_OK
-    },
-    { "f:\\com1", SANITIZE_ALLOW_RESERVED | SANITIZE_ALLOW_PATH,
-      "f:\\com1", SANITIZE_ERR_OK
-    },
-    { "com1:\\com1", SANITIZE_ALLOW_PATH,
-      "_com1:\\_com1", SANITIZE_ERR_OK
-    },
-    { "com1:\\com1", SANITIZE_ALLOW_RESERVED | SANITIZE_ALLOW_PATH,
-      "com1:\\com1", SANITIZE_ERR_OK
-    },
-    { "com1:\\com1", SANITIZE_ALLOW_RESERVED,
-      "com1__com1", SANITIZE_ERR_OK
-    },
-#ifndef MSDOS
-    { "\\com1", SANITIZE_ALLOW_PATH,
-      "\\_com1", SANITIZE_ERR_OK
-    },
-    { "\\\\com1", SANITIZE_ALLOW_PATH,
-      "\\\\com1", SANITIZE_ERR_OK
-    },
-    { "\\\\?\\C:\\com1", SANITIZE_ALLOW_PATH,
-      "\\\\?\\C:\\com1", SANITIZE_ERR_OK
-    },
-#endif
-    { "CoM1", 0,
-      "_CoM1", SANITIZE_ERR_OK
-    },
-    { "CoM1", SANITIZE_ALLOW_RESERVED,
-      "CoM1", SANITIZE_ERR_OK
-    },
-    { "COM56", 0,
-      "COM56", SANITIZE_ERR_OK
-    },
-    /* At the moment we expect a maximum path length of 259. I assume MSDOS
-       has variable max path lengths depending on compiler that are shorter
-       so currently these "good" truncate tests won't run on MSDOS */
-#ifndef MSDOS
-    { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        SANITIZE_ALLOW_TRUNCATE,
-      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFFFF", SANITIZE_ERR_OK
-    },
-    { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFF\\FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        SANITIZE_ALLOW_TRUNCATE | SANITIZE_ALLOW_PATH,
-      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFF\\FFFFF", SANITIZE_ERR_OK
-    },
-    { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFF\\FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        SANITIZE_ALLOW_TRUNCATE,
-      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFF_F", SANITIZE_ERR_OK
-    },
-#endif /* !MSDOS */
-    { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        0,
-      NULL, SANITIZE_ERR_INVALID_PATH
-    },
-    { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFFF\\FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        SANITIZE_ALLOW_TRUNCATE,
-      NULL, SANITIZE_ERR_INVALID_PATH
-    },
-    { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFFFFFFFFFFFFFFFFFFFFFFFF\\FFFFFFFFFFFFFFFFFFFFFFFF",
-        SANITIZE_ALLOW_TRUNCATE | SANITIZE_ALLOW_PATH,
-      NULL, SANITIZE_ERR_INVALID_PATH
-    },
-    { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FFF\\FFFFFFFFFFFFFFFFFFFFF:FFFFFFFFFFFFFFFFFFFFFFFF",
-        SANITIZE_ALLOW_TRUNCATE | SANITIZE_ALLOW_PATH,
-      NULL, SANITIZE_ERR_INVALID_PATH
-    },
-    { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      "FF\\F:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        SANITIZE_ALLOW_TRUNCATE | SANITIZE_ALLOW_PATH,
-      NULL, SANITIZE_ERR_INVALID_PATH
-    },
-    { NULL, 0,
-      NULL, SANITIZE_ERR_BAD_ARGUMENT
-    },
-  };
+static const struct testparams params[] = {
+  { 0,                                                             CURLE_OK },
+  {                                 F_CONTENTRANGE,                CURLE_OK },
+  {                        F_FAIL,                                 CURLE_OK },
+  {                        F_FAIL | F_CONTENTRANGE,                CURLE_OK },
+  {            F_HTTP416,                                          CURLE_OK },
+  {            F_HTTP416 |          F_CONTENTRANGE,                CURLE_OK },
+  {            F_HTTP416 | F_FAIL |                  F_IGNOREBODY,
+                                                  CURLE_HTTP_RETURNED_ERROR },
+  {            F_HTTP416 | F_FAIL | F_CONTENTRANGE | F_IGNOREBODY,
+                                                  CURLE_HTTP_RETURNED_ERROR },
+  { F_RESUME |                                       F_IGNOREBODY,
+                                                          CURLE_RANGE_ERROR },
+  { F_RESUME |                      F_CONTENTRANGE,                CURLE_OK },
+  { F_RESUME |             F_FAIL |                  F_IGNOREBODY,
+                                                          CURLE_RANGE_ERROR },
+  { F_RESUME |             F_FAIL | F_CONTENTRANGE,                CURLE_OK },
+  { F_RESUME | F_HTTP416 |                           F_IGNOREBODY, CURLE_OK },
+  { F_RESUME | F_HTTP416 |          F_CONTENTRANGE | F_IGNOREBODY, CURLE_OK },
+  { F_RESUME | F_HTTP416 | F_FAIL |                  F_IGNOREBODY, CURLE_OK },
+  { F_RESUME | F_HTTP416 | F_FAIL | F_CONTENTRANGE | F_IGNOREBODY,
+                                                                   CURLE_OK }
+};
 
+static int      hasbody;
+
+static size_t writedata(char *data, size_t size, size_t nmemb, void *userdata)
+{
+  (void) data;
+  (void) userdata;
+
+  if(size && nmemb)
+    hasbody = 1;
+  return size * nmemb;
+}
+
+static int onetest(CURL *curl, const char *url, const struct testparams *p,
+                   size_t num)
+{
+  CURLcode res;
+  unsigned int replyselector;
+  char urlbuf[256];
+
+  replyselector = (p->flags & F_CONTENTRANGE)? 1: 0;
+  if(p->flags & F_HTTP416)
+    replyselector += 2;
+  msnprintf(urlbuf, sizeof(urlbuf), "%s%04u", url, replyselector);
+  test_setopt(curl, CURLOPT_URL, urlbuf);
+  test_setopt(curl, CURLOPT_VERBOSE, 1L);
+  test_setopt(curl, CURLOPT_RESUME_FROM, (p->flags & F_RESUME)? 3: 0);
+  test_setopt(curl, CURLOPT_RANGE, !(p->flags & F_RESUME)?
+                                   "3-1000000": (char *) NULL);
+  test_setopt(curl, CURLOPT_FAILONERROR, (p->flags & F_FAIL)? 1: 0);
+  hasbody = 0;
+  res = curl_easy_perform(curl);
+  if(res != p->result) {
+    printf("%zd: bad error code (%d): resume=%s, fail=%s, http416=%s, "
+           "content-range=%s, expected=%d\n", num, res,
+           (p->flags & F_RESUME)? "yes": "no",
+           (p->flags & F_FAIL)? "yes": "no",
+           (p->flags & F_HTTP416)? "yes": "no",
+           (p->flags & F_CONTENTRANGE)? "yes": "no",
+           p->result);
+    return 1;
+  }
+  if(hasbody && (p->flags & F_IGNOREBODY)) {
+    printf("body should be ignored and is not: resume=%s, fail=%s, "
+           "http416=%s, content-range=%s\n",
+           (p->flags & F_RESUME)? "yes": "no",
+           (p->flags & F_FAIL)? "yes": "no",
+           (p->flags & F_HTTP416)? "yes": "no",
+           (p->flags & F_CONTENTRANGE)? "yes": "no");
+    return 1;
+  }
+  return 0;
+
+test_cleanup:
+
+  return 1;
+}
+
+/* for debugging: */
+/* #define SINGLETEST 9 */
+
+CURLcode test(char *URL)
+{
+  CURLcode res;
+  CURL *curl;
   size_t i;
+  int status = 0;
 
-  for(i = 0; i < sizeof(data) / sizeof(data[0]); ++i) {
-    char *output = NULL;
-    char *flagstr = NULL;
-    char *received_ccstr = NULL;
-    char *expected_ccstr = NULL;
-    SANITIZEcode res;
+  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+    fprintf(stderr, "curl_global_init() failed\n");
+    return TEST_ERR_MAJOR_BAD;
+  }
 
-    res = sanitize_file_name(&output, data[i].input, data[i].flags);
-
-    if(res == data[i].expected_result &&
-       ((!output && !data[i].expected_output) ||
-        (output && data[i].expected_output &&
-         !strcmp(output, data[i].expected_output)))) { /* OK */
-      free(output);
-      continue;
+  for(i = 0; i < sizeof(params) / sizeof(params[0]); i++) {
+    curl = curl_easy_init();
+    if(!curl) {
+      fprintf(stderr, "curl_easy_init() failed\n");
+      curl_global_cleanup();
+      return TEST_ERR_MAJOR_BAD;
     }
 
-    flagstr = getflagstr(data[i].flags);
-    abort_unless(flagstr, "out of memory");
-    received_ccstr = getcurlcodestr(res);
-    abort_unless(received_ccstr, "out of memory");
-    expected_ccstr = getcurlcodestr(data[i].expected_result);
-    abort_unless(expected_ccstr, "out of memory");
+    test_setopt(curl, CURLOPT_WRITEFUNCTION, writedata);
 
-    unitfail++;
-    fprintf(stderr, "\n"
-            "%s:%d sanitize_file_name failed.\n"
-            "input: %s\n"
-            "flags: %s\n"
-            "output: %s\n"
-            "result: %s\n"
-            "expected output: %s\n"
-            "expected result: %s\n",
-            __FILE__, __LINE__,
-            data[i].input,
-            flagstr,
-            (output ? output : "(null)"),
-            received_ccstr,
-            (data[i].expected_output ? data[i].expected_output : "(null)"),
-            expected_ccstr);
-
-    free(output);
-    free(flagstr);
-    free(received_ccstr);
-    free(expected_ccstr);
+#ifdef SINGLETEST
+    if(SINGLETEST == i)
+#endif
+      status |= onetest(curl, URL, params + i, i);
+    curl_easy_cleanup(curl);
   }
-} /* END sanitize_file_name */
 
-#else
-UNITTEST_START
-{
-  fprintf(stderr, "Skipped test not for this platform\n");
+  curl_global_cleanup();
+  printf("%d\n", status);
+  return (CURLcode)status;
+
+test_cleanup:
+
+  curl_easy_cleanup(curl);
+  curl_global_cleanup();
+
+  return res;
 }
-#endif /* _WIN32 || MSDOS */
-
-UNITTEST_STOP

@@ -1,208 +1,134 @@
-# frozen_string_literal: true
+require_relative 'test_helper'
+require 'stringio'
 
-module Sinatra
-  # A poor man's ActiveSupport::HashWithIndifferentAccess, with all the Rails-y
-  # stuff removed.
-  #
-  # Implements a hash where keys <tt>:foo</tt> and <tt>"foo"</tt> are
-  # considered to be the same.
-  #
-  #   rgb = Sinatra::IndifferentHash.new
-  #
-  #   rgb[:black]    =  '#000000' # symbol assignment
-  #   rgb[:black]  # => '#000000' # symbol retrieval
-  #   rgb['black'] # => '#000000' # string retrieval
-  #
-  #   rgb['white']   =  '#FFFFFF' # string assignment
-  #   rgb[:white]  # => '#FFFFFF' # symbol retrieval
-  #   rgb['white'] # => '#FFFFFF' # string retrieval
-  #
-  # Internally, symbols are mapped to strings when used as keys in the entire
-  # writing interface (calling e.g. <tt>[]=</tt>, <tt>merge</tt>). This mapping
-  # belongs to the public interface. For example, given:
-  #
-  #   hash = Sinatra::IndifferentHash.new
-  #   hash[:a] = 1
-  #
-  # You are guaranteed that the key is returned as a string:
-  #
-  #   hash.keys # => ["a"]
-  #
-  # Technically other types of keys are accepted:
-  #
-  #   hash = Sinatra::IndifferentHash
-  #   hash[:a] = 1
-  #   hash[0] = 0
-  #   hash # => { "a"=>1, 0=>0 }
-  #
-  # But this class is intended for use cases where strings or symbols are the
-  # expected keys and it is convenient to understand both as the same. For
-  # example the +params+ hash in Sinatra.
-  class IndifferentHash < Hash
-    def self.[](*args)
-      new.merge!(Hash[*args])
+class RequestTest < Minitest::Test
+  it 'responds to #user_agent' do
+    request = Sinatra::Request.new({'HTTP_USER_AGENT' => 'Test'})
+    assert request.respond_to?(:user_agent)
+    assert_equal 'Test', request.user_agent
+  end
+
+  it 'parses POST params when Content-Type is form-dataish' do
+    request = Sinatra::Request.new(
+      'REQUEST_METHOD' => 'PUT',
+      'CONTENT_TYPE' => 'application/x-www-form-urlencoded',
+      'rack.input' => StringIO.new('foo=bar')
+    )
+    assert_equal 'bar', request.params['foo']
+  end
+
+  it 'raises Sinatra::BadRequest when multipart/form-data request has no content' do
+    request = Sinatra::Request.new(
+      'REQUEST_METHOD' => 'POST',
+      'CONTENT_TYPE' => 'multipart/form-data; boundary=dummy',
+      'rack.input' => StringIO.new('')
+    )
+    assert_raises(Sinatra::BadRequest) { request.params }
+  end
+
+  it 'is secure when the url scheme is https' do
+    request = Sinatra::Request.new('rack.url_scheme' => 'https')
+    assert request.secure?
+  end
+
+  it 'is not secure when the url scheme is http' do
+    request = Sinatra::Request.new('rack.url_scheme' => 'http')
+    assert !request.secure?
+  end
+
+  it 'respects X-Forwarded-Proto header for proxied SSL' do
+    request = Sinatra::Request.new('HTTP_X_FORWARDED_PROTO' => 'https')
+    assert request.secure?
+  end
+
+  it 'is possible to marshal params' do
+    request = Sinatra::Request.new(
+      'REQUEST_METHOD' => 'PUT',
+      'CONTENT_TYPE' => 'application/x-www-form-urlencoded',
+      'rack.input' => StringIO.new('foo=bar')
+    )
+    Sinatra::IndifferentHash[request.params]
+    dumped = Marshal.dump(request.params)
+    assert_equal 'bar', Marshal.load(dumped)['foo']
+  end
+
+  it "exposes the preferred type's parameters" do
+    request = Sinatra::Request.new(
+      'HTTP_ACCEPT' => 'image/jpeg; compress=0.25'
+    )
+    assert_equal({ 'compress' => '0.25' }, request.preferred_type.params)
+  end
+
+  it "raises Sinatra::BadRequest when params contain conflicting types" do
+    request = Sinatra::Request.new 'QUERY_STRING' => 'foo=&foo[]='
+    assert_raises(Sinatra::BadRequest) { request.params }
+  end
+
+  it "makes accept types behave like strings" do
+    request = Sinatra::Request.new('HTTP_ACCEPT' => 'image/jpeg; compress=0.25')
+    assert                     request.accept?('image/jpeg')
+    assert_equal 'image/jpeg', request.preferred_type.to_s
+    assert_equal 'image/jpeg; compress=0.25', request.preferred_type.to_s(true)
+    assert_equal 'image/jpeg', request.preferred_type.to_str
+    assert_equal 'image',      request.preferred_type.split('/').first
+
+    String.instance_methods.each do |method|
+      next unless "".respond_to? method
+      assert request.preferred_type.respond_to?(method), "responds to #{method}"
     end
+  end
 
-    def default(*args)
-      args.map!(&method(:convert_key))
+  it "accepts types when wildcards are requested" do
+    request = Sinatra::Request.new('HTTP_ACCEPT' => 'image/*')
+    assert request.accept?('image/jpeg')
+  end
 
-      super(*args)
-    end
+  it "properly decodes MIME type parameters" do
+    request = Sinatra::Request.new(
+      'HTTP_ACCEPT' => 'image/jpeg;unquoted=0.25;quoted="0.25";chartest="\";,\x"'
+    )
+    expected = { 'unquoted' => '0.25', 'quoted' => '0.25', 'chartest' => '";,x' }
+    assert_equal(expected, request.preferred_type.params)
+  end
 
-    def default=(value)
-      super(convert_value(value))
-    end
+  it 'accepts */* when HTTP_ACCEPT is not present in the request' do
+    request = Sinatra::Request.new Hash.new
+    assert_equal 1, request.accept.size
+    assert request.accept?('text/html')
+    assert_equal '*/*', request.preferred_type.to_s
+    assert_equal '*/*', request.preferred_type.to_s(true)
+  end
 
-    def assoc(key)
-      super(convert_key(key))
-    end
+  it 'accepts */* when HTTP_ACCEPT is blank in the request' do
+    request = Sinatra::Request.new 'HTTP_ACCEPT' => ''
+    assert_equal 1, request.accept.size
+    assert request.accept?('text/html')
+    assert_equal '*/*', request.preferred_type.to_s
+    assert_equal '*/*', request.preferred_type.to_s(true)
+  end
 
-    def rassoc(value)
-      super(convert_value(value))
-    end
+  it 'will not accept types not specified in HTTP_ACCEPT when HTTP_ACCEPT is provided' do
+    request = Sinatra::Request.new 'HTTP_ACCEPT' => 'application/json'
+    assert !request.accept?('text/html')
+  end
 
-    def fetch(key, *args)
-      args.map!(&method(:convert_value))
+  it 'will accept types that fulfill HTTP_ACCEPT parameters' do
+    request = Sinatra::Request.new 'HTTP_ACCEPT' => 'application/rss+xml; version="http://purl.org/rss/1.0/"'
 
-      super(convert_key(key), *args)
-    end
+    assert request.accept?('application/rss+xml; version="http://purl.org/rss/1.0/"')
+    assert request.accept?('application/rss+xml; version="http://purl.org/rss/1.0/"; charset=utf-8')
+    assert !request.accept?('application/rss+xml; version="https://cyber.harvard.edu/rss/rss.html"')
+  end
 
-    def [](key)
-      super(convert_key(key))
-    end
+  it 'will accept more generic types that include HTTP_ACCEPT parameters' do
+    request = Sinatra::Request.new 'HTTP_ACCEPT' => 'application/rss+xml; charset=utf-8; version="http://purl.org/rss/1.0/"'
 
-    def []=(key, value)
-      super(convert_key(key), convert_value(value))
-    end
+    assert request.accept?('application/rss+xml')
+    assert request.accept?('application/rss+xml; version="http://purl.org/rss/1.0/"')
+  end
 
-    alias store []=
-
-    def key(value)
-      super(convert_value(value))
-    end
-
-    def key?(key)
-      super(convert_key(key))
-    end
-
-    alias has_key? key?
-    alias include? key?
-    alias member? key?
-
-    def value?(value)
-      super(convert_value(value))
-    end
-
-    alias has_value? value?
-
-    def delete(key)
-      super(convert_key(key))
-    end
-
-    # Added in Ruby 2.3
-    def dig(key, *other_keys)
-      super(convert_key(key), *other_keys)
-    end
-
-    def fetch_values(*keys)
-      keys.map!(&method(:convert_key))
-
-      super(*keys)
-    end
-
-    def slice(*keys)
-      keys.map!(&method(:convert_key))
-
-      self.class[super(*keys)]
-    end
-
-    def values_at(*keys)
-      keys.map!(&method(:convert_key))
-
-      super(*keys)
-    end
-
-    def merge!(*other_hashes)
-      other_hashes.each do |other_hash|
-        if other_hash.is_a?(self.class)
-          super(other_hash)
-        else
-          other_hash.each_pair do |key, value|
-            key = convert_key(key)
-            value = yield(key, self[key], value) if block_given? && key?(key)
-            self[key] = convert_value(value)
-          end
-        end
-      end
-
-      self
-    end
-
-    alias update merge!
-
-    def merge(*other_hashes, &block)
-      dup.merge!(*other_hashes, &block)
-    end
-
-    def replace(other_hash)
-      super(other_hash.is_a?(self.class) ? other_hash : self.class[other_hash])
-    end
-
-    def transform_values(&block)
-      dup.transform_values!(&block)
-    end
-
-    def transform_values!
-      super
-      super(&method(:convert_value))
-    end
-
-    def transform_keys(&block)
-      dup.transform_keys!(&block)
-    end
-
-    def transform_keys!
-      super
-      super(&method(:convert_key))
-    end
-
-    def select(*args, &block)
-      return to_enum(:select) unless block_given?
-
-      dup.tap { |hash| hash.select!(*args, &block) }
-    end
-
-    def reject(*args, &block)
-      return to_enum(:reject) unless block_given?
-
-      dup.tap { |hash| hash.reject!(*args, &block) }
-    end
-
-    def compact
-      dup.tap(&:compact!)
-    end
-
-    def except(*keys)
-      keys.map!(&method(:convert_key))
-
-      super(*keys)
-    end if Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("3.0")
-
-    private
-
-    def convert_key(key)
-      key.is_a?(Symbol) ? key.to_s : key
-    end
-
-    def convert_value(value)
-      case value
-      when Hash
-        value.is_a?(self.class) ? value : self.class[value]
-      when Array
-        value.map(&method(:convert_value))
-      else
-        value
-      end
-    end
+  it 'will accept types matching HTTP_ACCEPT when parameters in arbitrary order' do
+    request = Sinatra::Request.new 'HTTP_ACCEPT' => 'application/rss+xml; charset=utf-8; version="http://purl.org/rss/1.0/"'
+    assert request.accept?('application/rss+xml; version="http://purl.org/rss/1.0/"; charset=utf-8')
   end
 end

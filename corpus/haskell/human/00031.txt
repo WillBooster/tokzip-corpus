@@ -1,167 +1,532 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TypeApplications #-}
-{-# OPTIONS_GHC -Wno-orphans #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP          #-}
+{-# LANGUAGE MultiWayIf   #-}
 
-module UnitTests.OptionalFields.Manual (omitManual) where
+module Data.Aeson.Internal.UnescapeFromText
+  ( unescapeFromText
+  ) where
 
-#if !MIN_VERSION_base(4,11,0)
-import Data.Semigroup ((<>))
+import           Control.Exception           (throwIO, try)
+import           Data.Bits                   (shiftL, shiftR, (.&.), (.|.))
+import           Data.Text.Encoding.Error    (UnicodeException (..))
+import           Data.Text.Internal          (Text (..))
+import           Data.Text.Unsafe            (unsafeDupablePerformIO)
+
+import           Data.Aeson.Internal.Prelude
+
+import qualified Data.Primitive              as P
+import qualified Data.Text.Array             as A
+import qualified Data.Text.Internal          as T
+
+#if !MIN_VERSION_text(2,0,0)
+import           Data.Word                   (Word16)
 #endif
 
-import UnitTests.OptionalFields.Common
+-- | Unescape JSON text literal.
+--
+-- This function is exporeted mostly for testing and benchmarking purposes.
+unescapeFromText :: Text -> Either UnicodeException Text
+unescapeFromText = unsafeDupablePerformIO . try . unescapeFromTextIO
+
+throwDecodeError :: IO a
+throwDecodeError =
+  let desc = "Data.Text.Internal.Encoding.decodeUtf8: Invalid UTF-8 stream"
+   in throwIO (DecodeError desc Nothing)
 
 -------------------------------------------------------------------------------
--- Ordinary
+-- unescapeTextIO
 -------------------------------------------------------------------------------
 
--- lax
-instance ToJSON RecordA where
-  toJSON     RecordA {..} = Object $ "required" .?= required <> "optional" .?= optional <> "default_" .?= default_
-  toEncoding RecordA {..} = pairs  $ "required" .?= required <> "optional" .?= optional <> "default_" .?= default_
+type Offset = Int
 
-instance FromJSON RecordA where
-    parseJSON = withObject "RecordA" $ \obj -> pure RecordA
-        <*> obj .:!= "required"
-        <*> obj .:!= "optional"
-        <*> obj .:!= "default_"
+unescapeFromTextIO :: Text -> IO Text
 
--- strict
-instance ToJSON RecordB where
-  toJSON     RecordB {..} = Object $ "required" .= required <> "optional" .= optional <> "default_" .= default_
-  toEncoding RecordB {..} = pairs  $ "required" .= required <> "optional" .= optional <> "default_" .= default_
+#if MIN_VERSION_text(2,0,0)
 
-instance FromJSON RecordB where
-    parseJSON = withObject "RecordB" $ \obj -> pure RecordB
-        <*> obj .: "required"
-        <*> obj .: "optional"
-        <*> obj .: "default_"
+unescapeFromTextIO (Text src begin len) = do
+    let end :: Offset
+        end = begin + len
 
--- default: encoding strict, decoding lax
-instance ToJSON RecordC where
-  toJSON     RecordC {..} = Object $ "required" .= required <> "optional" .= optional <> "default_" .= default_
-  toEncoding RecordC {..} = pairs  $ "required" .= required <> "optional" .= optional <> "default_" .= default_
+    arr <- P.newPrimArray len
 
-instance FromJSON RecordC where
-    parseJSON = withObject "RecordC" $ \obj -> pure RecordC
-        <*> obj .:!= "required"
-        <*> obj .:!= "optional"
-        <*> obj .:!= "default_"
+    let write3bytes :: Int -> Word8 -> Word8 -> Word8 -> Offset -> IO Text
+        write3bytes !out !b1 !b2 !b3 !inp = do
+          P.writePrimArray arr out b1
+          write2bytes (out + 1) b2 b3 inp
 
--------------------------------------------------------------------------------
--- Higher
--------------------------------------------------------------------------------
+        write2bytes :: Int -> Word8 -> Word8 -> Offset -> IO Text
+        write2bytes !out !b1 !b2 !inp = do
+          P.writePrimArray arr out b1
+          write1byte (out + 1) b2 inp
 
-instance ToJSON1 HRecordA where
-  liftToJSON     o f _ HRecordA {..} = Object $ "required" .?= required <> explicitToFieldOmit o f "optional" optional <> "default_" .?= default_
-  liftToEncoding o f _ HRecordA {..} = pairs  $ "required" .?= required <> explicitToFieldOmit o f "optional" optional <> "default_" .?= default_
+        write1byte :: Int -> Word8 -> Offset -> IO Text
+        write1byte !out !b1 !inp = do
+          P.writePrimArray arr out b1
+          state_start (out + 1) inp
 
-instance ToJSON a => ToJSON (HRecordA a) where
-  toJSON = toJSON1
-  toEncoding = toEncoding1
+        writeCodePoint :: Int -> Offset -> Word32 -> IO Text
+        writeCodePoint !out !inp !acc
+          | acc <= 127 = do
+            P.writePrimArray arr out (fromIntegral acc :: Word8)
+            state_start (out + 1) (inp + 1)
 
-instance FromJSON1 HRecordA where
-  liftParseJSON o f _ = withObject "HRecordA" $ \obj -> pure HRecordA
-    <*> obj .:!= "required"
-    <*> explicitParseFieldOmit o f obj "optional"
-    <*> obj .:!= "default_"
+          | acc <= 2047 = do
+            let b1 = fromIntegral (shiftR acc 6 .|. 192) :: Word8
+            let b2 = fromIntegral ((acc .&. 63) .|. 128) :: Word8
+            P.writePrimArray arr out b1
+            write1byte (out + 1) b2 (inp + 1)
 
-instance FromJSON a => FromJSON (HRecordA a) where
-    parseJSON = parseJSON1
+          | acc <= 65535 = do
+            let b1 = fromIntegral (shiftR acc 12 .|. 224) :: Word8
+            let b2 = fromIntegral ((shiftR acc 6 .&. 63) .|.  128) :: Word8
+            let b3 = fromIntegral ((acc .&. 63) .|. 128) :: Word8
+            P.writePrimArray arr out b1
+            write2bytes (out + 1) b2 b3 (inp + 1)
 
+          | otherwise = do
+            let b1 = fromIntegral (shiftR acc 18 .|. 240) :: Word8
+            let b2 = fromIntegral ((shiftR acc 12 .&. 63) .|. 128) :: Word8
+            let b3 = fromIntegral ((shiftR acc 6 .&. 63) .|. 128) :: Word8
+            let b4 = fromIntegral ((acc .&. 63) .|. 128) :: Word8
+            P.writePrimArray arr out b1
+            write3bytes (out + 1) b2 b3 b4 (inp + 1)
 
-instance ToJSON1 HRecordB where
-  liftToJSON     _o f _ HRecordB {..} = Object $ "required" .= required <> explicitToField f "optional" optional <> "default_" .= default_
-  liftToEncoding _o f _ HRecordB {..} = pairs  $ "required" .= required <> explicitToField f "optional" optional <> "default_" .= default_
+        state_sudone :: Int -> Offset -> Word32 -> Word32 -> IO Text
+        state_sudone !out !inp !hi !lo
+          | 56320 <= lo, lo <= 57343
+          = writeCodePoint out inp (65536 + (shiftL (hi - 55296) 10 .|.  (lo - 56320)))
 
-instance ToJSON a => ToJSON (HRecordB a) where
-  toJSON = toJSON1
-  toEncoding = toEncoding1
+          | otherwise
+          = throwDecodeError
 
-instance FromJSON1 HRecordB where
-  liftParseJSON _o f _ = withObject "HRecordB" $ \obj -> pure HRecordB
-    <*> obj .: "required"
-    <*> explicitParseField f obj "optional"
-    <*> obj .: "default_"
+        state_su4 :: Int -> Offset -> Word32 -> Word32 -> IO Text
+        state_su4 !out !inp !hi !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_sudone out inp hi (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_sudone out inp hi (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_sudone out inp hi (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
 
-instance FromJSON a => FromJSON (HRecordB a) where
-    parseJSON = parseJSON1
+        state_su3 :: Int -> Offset -> Word32 -> Word32 -> IO Text
+        state_su3 !out !inp !hi !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_su4 out (inp + 1) hi (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_su4 out (inp + 1) hi (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_su4 out (inp + 1) hi (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
 
+        state_su2 :: Int -> Offset -> Word32 -> Word32 -> IO Text
+        state_su2 !out !inp !hi !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_su3 out (inp + 1) hi (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_su3 out (inp + 1) hi (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_su3 out (inp + 1) hi (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
 
-instance ToJSON1 HRecordC where
-  liftToJSON     _o f _ HRecordC {..} = Object $ "required" .= required <> explicitToField f "optional" optional <> "default_" .= default_
-  liftToEncoding _o f _ HRecordC {..} = pairs  $ "required" .= required <> explicitToField f "optional" optional <> "default_" .= default_
+        state_su1 :: Int -> Offset -> Word32 -> IO Text
+        state_su1 !out !inp !hi
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_su2 out (inp + 1) hi (fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_su2 out (inp + 1) hi (fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_su2 out (inp + 1) hi (fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
 
-instance ToJSON a => ToJSON (HRecordC a) where
-  toJSON = toJSON1
-  toEncoding = toEncoding1
+        state_su :: Int -> Offset -> Word32 -> IO Text
+        state_su !out !inp !hi
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            case w8 of
+              117 -> state_su1 out (inp + 1) hi
+              _   -> throwDecodeError
 
-instance FromJSON1 HRecordC where
-  liftParseJSON o f _ = withObject "HRecordC" $ \obj -> pure HRecordC
-    <*> obj .:!= "required"
-    <*> explicitParseFieldOmit o f obj "optional"
-    <*> obj .:!= "default_"
+        state_ss :: Int -> Offset -> Word32 -> IO Text
+        state_ss !out !inp !hi
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            case w8 of
+              92 -> state_su out (inp + 1) hi
+              _  -> throwDecodeError
 
-instance FromJSON a => FromJSON (HRecordC a) where
-    parseJSON = parseJSON1
+        state_udone :: Int -> Offset -> Word32 -> IO Text
+        state_udone !out !inp !acc
+          | acc < 55296 || acc > 57343 =
+            writeCodePoint out inp acc
 
--------------------------------------------------------------------------------
--- Tests
--------------------------------------------------------------------------------
+          | acc < 56320 =
+            state_ss out (inp + 1) acc
 
-omitManual :: TestTree
-omitManual = testGroup "Omit optional fields (Manual)"
-  [ testGroup "ordinary"
-    [ testGroup "omitNothingFields = True"
-      [ testCase "JSON should include non-optional value." $ encodeCase helloWorldRecA helloWorldObj
-      , testCase "JSON should not include optional value." $ encodeCase helloRecA helloObj
-      , testCase "JSON decode including non-optional value" $ decodeCase helloWorldRecA helloWorldObj
-      , testCase "JSON decode not including optional value" $ decodeCase helloRecA helloObj
-      , testCase "JSON decode including optional value" $ decodeCase helloRecA helloNullObj
-      , testCase "JSON decode including optional value 2" $ counterCase (Proxy @RecordA) helloNullObj2
-      ]
-    , testGroup "omitNothingFields = False"
-      [ testCase "JSON should include non-optional value." $ encodeCase helloWorldRecB helloWorldObj
-      , testCase "JSON should include optional value." $ encodeCase helloRecB helloNullObj
-      , testCase "JSON decode including non-optional value" $ decodeCase helloWorldRecB helloWorldObj
-      , testCase "JSON decode not including optional value" $ counterCase (Proxy @RecordB) helloObj
-      , testCase "JSON decode including optional value" $ decodeCase helloRecB helloNullObj
-      , testCase "JSON decode including optional value 2" $ counterCase (Proxy @RecordB) helloNullObj2 -- fails because Default instance expects only numbers
-      ]
-    , testGroup "defaultOptions"
-      [ testCase "JSON should include non-optional value." $ encodeCase helloWorldRecC helloWorldObj
-      , testCase "JSON should include optional value." $ encodeCase helloRecC helloNullObj
-      , testCase "JSON decode including non-optional value" $ decodeCase helloWorldRecC helloWorldObj
-      , testCase "JSON decode not including optional value" $ decodeCase helloRecC helloObj
-      , testCase "JSON decode including optional value" $ decodeCase helloRecC helloNullObj
-      , testCase "JSON decode including optional value 2" $ counterCase (Proxy @RecordC) helloNullObj2
-      ]
-    ]
-  , testGroup "higher"
-    [ testGroup "omitNothingFields = True, higher"
-      [ testCase "JSON should include non-optional value." $ encodeCase helloWorldHRecA helloWorldObj
-      , testCase "JSON should not include optional value." $ encodeCase helloHRecA helloObj
-      , testCase "JSON decode including non-optional value" $ decodeCase helloWorldHRecA helloWorldObj
-      , testCase "JSON decode not including optional value" $ decodeCase helloHRecA helloObj
-      , testCase "JSON decode including optional value" $ decodeCase helloHRecA helloNullObj
-      , testCase "JSON decode including optional value 2" $ counterCase (Proxy @HRecordA') helloNullObj2
-      ]
-    , testGroup "omitNothingFields = False, higher"
-      [ testCase "JSON should include non-optional value." $ encodeCase helloWorldHRecB helloWorldObj
-      , testCase "JSON should include optional value." $ encodeCase helloHRecB helloNullObj
-      , testCase "JSON decode including non-optional value" $ decodeCase helloWorldHRecB helloWorldObj
-      , testCase "JSON decode not including optional value" $ counterCase (Proxy @HRecordB') helloObj
-      , testCase "JSON decode including optional value" $ decodeCase helloHRecB helloNullObj
-      , testCase "JSON decode including optional value 2" $ counterCase (Proxy @HRecordB') helloNullObj2
-      ]
-    , testGroup "defaultOptions, higher"
-      [ testCase "JSON should include non-optional value." $ encodeCase helloWorldHRecC helloWorldObj
-      , testCase "JSON should include optional value." $ encodeCase helloHRecC helloNullObj
-      , testCase "JSON decode including non-optional value" $ decodeCase helloWorldHRecC helloWorldObj
-      , testCase "JSON decode not including optional value" $ decodeCase helloHRecC helloObj
-      , testCase "JSON decode including optional value" $ decodeCase helloHRecC helloNullObj
-      , testCase "JSON decode including optional value 2" $ counterCase (Proxy @HRecordC') helloNullObj2
-      ]
-    ]
-  ]
+          | otherwise =
+            throwDecodeError
+
+        state_u4 :: Int -> Offset -> Word32 -> IO Text
+        state_u4 !out !inp !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_udone out inp (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_udone out inp (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_udone out inp (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_u3 :: Int -> Offset -> Word32 -> IO Text
+        state_u3 !out !inp !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_u4 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_u4 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_u4 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_u2 :: Int -> Offset -> Word32 -> IO Text
+        state_u2 !out !inp !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_u3 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_u3 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_u3 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_u1 :: Int -> Offset -> IO Text
+        state_u1 !out !inp
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_u2 out (inp + 1) (fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_u2 out (inp + 1) (fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_u2 out (inp + 1) (fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_escape :: Int -> Offset -> IO Text
+        state_escape !out !inp
+          | inp == end = throwDecodeError
+          | otherwise  = do
+            let !w8 = A.unsafeIndex src inp
+            case w8 of
+              34 -> do
+                P.writePrimArray arr out 34
+                state_start (out + 1) (inp + 1)
+
+              92 -> do
+                P.writePrimArray arr out 92
+                state_start (out + 1) (inp + 1)
+
+              47 -> do
+                P.writePrimArray arr out 47
+                state_start (out + 1) (inp + 1)
+
+              98 -> do
+                P.writePrimArray arr out 8
+                state_start (out + 1) (inp + 1)
+
+              102 -> do
+                P.writePrimArray arr out 12
+                state_start (out + 1) (inp + 1)
+
+              110 -> do
+                P.writePrimArray arr out 10
+                state_start (out + 1) (inp + 1)
+
+              114 -> do
+                P.writePrimArray arr out 13
+                state_start (out + 1) (inp + 1)
+
+              116 -> do
+                P.writePrimArray arr out 9
+                state_start (out + 1) (inp + 1)
+
+              117 ->
+                state_u1 out (inp + 1)
+
+              _ -> throwDecodeError
+
+        state_start :: Int -> Offset -> IO Text
+        state_start !out !inp
+          | inp == end = do
+            P.shrinkMutablePrimArray arr out
+            frozenArr <- P.unsafeFreezePrimArray arr
+            return $ case frozenArr of
+              P.PrimArray ba -> T.Text (A.ByteArray ba) 0 out
+
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | w8 == 92  -> state_escape out (inp + 1)
+            -- because we are deserialising __valid__ text,
+            -- we can simply copy everything else.
+               | otherwise -> do
+                 P.writePrimArray arr out w8
+                 state_start (out + 1) (inp + 1)
+
+    -- start the state machine
+    state_start (0 :: Int) begin
+#else
+
+unescapeFromTextIO (Text src begin len) = do
+    let end :: Offset
+        end = begin + len
+
+    arr <- P.newPrimArray len
+
+    let state_sudone :: Int -> Offset -> Word32 -> IO Text
+        state_sudone !out !inp !lo
+          | 56320 <= lo, lo <= 57343 = do
+            P.writePrimArray arr out (fromIntegral lo)
+            state_start (out + 1) (inp + 1)
+
+          | otherwise =
+            throwDecodeError
+
+        state_su4 :: Int -> Offset -> Word32 -> IO Text
+        state_su4 !out !inp !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_sudone out inp (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_sudone out inp (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_sudone out inp (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_su3 :: Int -> Offset -> Word32 -> IO Text
+        state_su3 !out !inp  !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_su4 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_su4 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_su4 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise -> throwDecodeError
+
+        state_su2 :: Int -> Offset -> Word32 -> IO Text
+        state_su2 !out !inp !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_su3 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_su3 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_su3 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_su1 :: Int -> Offset -> IO Text
+        state_su1 !out !inp
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_su2 out (inp + 1) (fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_su2 out (inp + 1) (fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_su2 out (inp + 1) (fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        -- high surrogate u
+        state_su :: Int -> Offset -> IO Text
+        state_su !out !inp
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            case w8 of
+              117 -> state_su1 out (inp + 1)
+              _   -> throwDecodeError
+
+        -- high surrogate slash
+        state_ss :: Int -> Offset -> IO Text
+        state_ss !out !inp
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            case w8 of
+              92 -> state_su out (inp + 1)
+              _  -> throwDecodeError
+
+        state_udone :: Int -> Offset -> Word32 -> IO Text
+        state_udone !out !inp !acc
+          -- we know that codepoint in acc is in BMP
+          | acc < 55296 || acc > 57343 = do
+            P.writePrimArray arr out (fromIntegral acc)
+            state_start (out + 1) (inp + 1)
+
+          -- hi surrogate,
+          -- we write it immediately (UTF16 as an output!)
+          | acc < 56320 = do
+            P.writePrimArray arr out (fromIntegral acc)
+            state_ss (out + 1) (inp + 1)
+
+          | otherwise =
+            throwDecodeError
+
+        state_u4 :: Int -> Offset -> Word32 -> IO Text
+        state_u4 !out !inp !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_udone out inp (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_udone out inp (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_udone out inp (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_u3 :: Int -> Offset -> Word32 -> IO Text
+        state_u3 !out !inp !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_u4 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_u4 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_u4 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_u2 :: Int -> Offset -> Word32 -> IO Text
+        state_u2 !out !inp !acc
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_u3 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_u3 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_u3 out (inp + 1) (shiftL acc 4 .|. fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_u1 :: Int -> Offset -> IO Text
+        state_u1 !out !inp
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | 48 <= w8, w8 <= 57 ->
+                 state_u2 out (inp + 1) (fromIntegral (w8 - 48))
+               | 65 <= w8, w8 <= 70 ->
+                 state_u2 out (inp + 1) (fromIntegral (w8 - 55))
+               | 97 <= w8, w8 <= 102 ->
+                 state_u2 out (inp + 1) (fromIntegral (w8 - 87))
+               | otherwise ->
+                 throwDecodeError
+
+        state_escape :: Int -> Offset -> IO Text
+        state_escape out inp
+          | inp == end = throwDecodeError
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            case w8 of
+              34 -> do
+                P.writePrimArray arr out 34
+                state_start (out + 1) (inp + 1)
+
+              92 -> do
+                P.writePrimArray arr out 92
+                state_start (out + 1) (inp + 1)
+
+              47 -> do
+                P.writePrimArray arr out 47
+                state_start (out + 1) (inp + 1)
+
+              98 -> do
+                P.writePrimArray arr out 8
+                state_start (out + 1) (inp + 1)
+
+              102 -> do
+                P.writePrimArray arr out 12
+                state_start (out + 1) (inp + 1)
+
+              110 -> do
+                P.writePrimArray arr out 10
+                state_start (out + 1) (inp + 1)
+
+              114 -> do
+                P.writePrimArray arr out 13
+                state_start (out + 1) (inp + 1)
+
+              116 -> do
+                P.writePrimArray arr out 9
+                state_start (out + 1) (inp + 1)
+
+              117 ->
+                state_u1 out (inp + 1)
+
+              _ -> throwDecodeError
+
+        state_start :: Int -> Offset -> IO Text
+        state_start !out !inp
+          | inp == end = do
+            P.shrinkMutablePrimArray arr out
+            frozenArr <- P.unsafeFreezePrimArray arr
+            return $ case frozenArr of
+              P.PrimArray ba -> T.Text (A.Array ba) 0 out
+
+          | otherwise = do
+            let !w8 = A.unsafeIndex src inp
+            if | w8 == 92 -> state_escape out (inp + 1)
+            -- because we are deserialising __valid__ text,
+            -- we can simply copy everything else.
+               | otherwise -> do
+                  P.writePrimArray arr out (fromIntegral w8 :: Word16)
+                  state_start (out + 1) (inp + 1)
+
+    -- start the state machine
+    state_start (0 :: Int) begin
+
+#endif

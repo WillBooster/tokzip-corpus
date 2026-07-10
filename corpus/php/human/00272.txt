@@ -10,158 +10,95 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\DependencyResolver;
+namespace Composer\Console;
+
+use Closure;
+use Composer\Pcre\Preg;
+use Symfony\Component\Console\Formatter\OutputFormatter;
+use Symfony\Component\Console\Formatter\OutputFormatterStyle;
 
 /**
- * The RuleWatchGraph efficiently propagates decisions to other rules
- *
- * All rules generated for solving a SAT problem should be inserted into the
- * graph. When a decision on a literal is made, the graph can be used to
- * propagate the decision to all other rules involving the literal, leading to
- * other trivial decisions resulting from unit clauses.
- *
- * @author Nils Adermann <naderman@naderman.de>
+ * @author Jordi Boggiano <j.boggiano@seld.be>
  */
-class RuleWatchGraph
+class HtmlOutputFormatter extends OutputFormatter
 {
-    /** @var array<int, RuleWatchChain> */
-    protected $watchChains = [];
+    /** @var array<int, string> */
+    private static $availableForegroundColors = [
+        30 => 'black',
+        31 => 'red',
+        32 => 'green',
+        33 => 'yellow',
+        34 => 'blue',
+        35 => 'magenta',
+        36 => 'cyan',
+        37 => 'white',
+    ];
+    /** @var array<int, string> */
+    private static $availableBackgroundColors = [
+        40 => 'black',
+        41 => 'red',
+        42 => 'green',
+        43 => 'yellow',
+        44 => 'blue',
+        45 => 'magenta',
+        46 => 'cyan',
+        47 => 'white',
+    ];
+    /** @var array<int, string> */
+    private static $availableOptions = [
+        1 => 'bold',
+        4 => 'underscore',
+        //5 => 'blink',
+        //7 => 'reverse',
+        //8 => 'conceal'
+    ];
 
     /**
-     * Inserts a rule node into the appropriate chains within the graph
-     *
-     * The node is prepended to the watch chains for each of the two literals it
-     * watches.
-     *
-     * Assertions are skipped because they only depend on a single package and
-     * have no alternative literal that could be true, so there is no need to
-     * watch changes in any literals.
-     *
-     * @param RuleWatchNode $node The rule node to be inserted into the graph
+     * @param array<string, OutputFormatterStyle> $styles Array of "name => FormatterStyle" instances
      */
-    public function insert(RuleWatchNode $node): void
+    public function __construct(array $styles = [])
     {
-        if ($node->getRule()->isAssertion()) {
-            return;
-        }
-
-        if (!$node->getRule() instanceof MultiConflictRule) {
-            foreach ([$node->watch1, $node->watch2] as $literal) {
-                if (!isset($this->watchChains[$literal])) {
-                    $this->watchChains[$literal] = new RuleWatchChain;
-                }
-
-                $this->watchChains[$literal]->unshift($node);
-            }
-        } else {
-            foreach ($node->getRule()->getLiterals() as $literal) {
-                if (!isset($this->watchChains[$literal])) {
-                    $this->watchChains[$literal] = new RuleWatchChain;
-                }
-
-                $this->watchChains[$literal]->unshift($node);
-            }
-        }
+        parent::__construct(true, $styles);
     }
 
-    /**
-     * Propagates a decision on a literal to all rules watching the literal
-     *
-     * If a decision, e.g. +A has been made, then all rules containing -A, e.g.
-     * (-A|+B|+C) now need to satisfy at least one of the other literals, so
-     * that the rule as a whole becomes true, since with +A applied the rule
-     * is now (false|+B|+C) so essentially (+B|+C).
-     *
-     * This means that all rules watching the literal -A need to be updated to
-     * watch 2 other literals which can still be satisfied instead. So literals
-     * that conflict with previously made decisions are not an option.
-     *
-     * Alternatively it can occur that a unit clause results: e.g. if in the
-     * above example the rule was (-A|+B), then A turning true means that
-     * B must now be decided true as well.
-     *
-     * @param  int       $decidedLiteral The literal which was decided (A in our example)
-     * @param  int       $level          The level at which the decision took place and at which
-     *                                   all resulting decisions should be made.
-     * @param  Decisions $decisions      Used to check previous decisions and to
-     *                                   register decisions resulting from propagation
-     * @return Rule|null If a conflict is found the conflicting rule is returned
-     */
-    public function propagateLiteral(int $decidedLiteral, int $level, Decisions $decisions): ?Rule
+    public function format(?string $message): ?string
     {
-        // we invert the decided literal here, example:
-        // A was decided => (-A|B) now requires B to be true, so we look for
-        // rules which are fulfilled by -A, rather than A.
-        $literal = -$decidedLiteral;
+        $formatted = parent::format($message);
 
-        if (!isset($this->watchChains[$literal])) {
+        if ($formatted === null) {
             return null;
         }
 
-        $chain = $this->watchChains[$literal];
+        $clearEscapeCodes = '(?:39|49|0|22|24|25|27|28)';
 
-        $chain->rewind();
-        while ($chain->valid()) {
-            $node = $chain->current();
-            if (!$node->getRule() instanceof MultiConflictRule) {
-                $otherWatch = $node->getOtherWatch($literal);
-
-                if (!$node->getRule()->isDisabled() && !$decisions->satisfy($otherWatch)) {
-                    $ruleLiterals = $node->getRule()->getLiterals();
-
-                    $alternativeLiterals = array_filter($ruleLiterals, static function ($ruleLiteral) use ($literal, $otherWatch, $decisions): bool {
-                        return $literal !== $ruleLiteral &&
-                            $otherWatch !== $ruleLiteral &&
-                            !$decisions->conflict($ruleLiteral);
-                    });
-
-                    if (\count($alternativeLiterals) > 0) {
-                        reset($alternativeLiterals);
-                        $this->moveWatch($literal, current($alternativeLiterals), $node);
-                        continue;
-                    }
-
-                    if ($decisions->conflict($otherWatch)) {
-                        return $node->getRule();
-                    }
-
-                    $decisions->decide($otherWatch, $level, $node->getRule());
-                }
-            } else {
-                foreach ($node->getRule()->getLiterals() as $otherLiteral) {
-                    if ($literal !== $otherLiteral && !$decisions->satisfy($otherLiteral)) {
-                        if ($decisions->conflict($otherLiteral)) {
-                            return $node->getRule();
-                        }
-
-                        $decisions->decide($otherLiteral, $level, $node->getRule());
-                    }
-                }
-            }
-
-            $chain->next();
-        }
-
-        return null;
+        return Preg::replaceCallback("{\033\[([0-9;]+)m(.*?)\033\[(?:".$clearEscapeCodes.";)*?".$clearEscapeCodes."m}s", Closure::fromCallable([$this, 'formatHtml']), $formatted);
     }
 
     /**
-     * Moves a rule node from one watch chain to another
-     *
-     * The rule node's watched literals are updated accordingly.
-     *
-     * @param int           $fromLiteral A literal the node used to watch
-     * @param int           $toLiteral   A literal the node should watch now
-     * @param RuleWatchNode $node        The rule node to be moved
+     * @param array<string|null> $matches
      */
-    protected function moveWatch(int $fromLiteral, int $toLiteral, RuleWatchNode $node): void
+    private function formatHtml(array $matches): string
     {
-        if (!isset($this->watchChains[$toLiteral])) {
-            $this->watchChains[$toLiteral] = new RuleWatchChain;
+        assert(is_string($matches[1]));
+        $out = '<span style="';
+        foreach (explode(';', $matches[1]) as $code) {
+            if (isset(self::$availableForegroundColors[(int) $code])) {
+                $out .= 'color:'.self::$availableForegroundColors[(int) $code].';';
+            } elseif (isset(self::$availableBackgroundColors[(int) $code])) {
+                $out .= 'background-color:'.self::$availableBackgroundColors[(int) $code].';';
+            } elseif (isset(self::$availableOptions[(int) $code])) {
+                switch (self::$availableOptions[(int) $code]) {
+                    case 'bold':
+                        $out .= 'font-weight:bold;';
+                        break;
+
+                    case 'underscore':
+                        $out .= 'text-decoration:underline;';
+                        break;
+                }
+            }
         }
 
-        $node->moveWatch($fromLiteral, $toLiteral);
-        $this->watchChains[$fromLiteral]->remove();
-        $this->watchChains[$toLiteral]->unshift($node);
+        return $out.'">'.$matches[2].'</span>';
     }
 }

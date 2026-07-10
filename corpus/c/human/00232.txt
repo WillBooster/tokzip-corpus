@@ -21,112 +21,84 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-#include "curlcheck.h"
+/* <DESC>
+ * HTTP Multipart formpost with file upload and two additional parts.
+ * </DESC>
+ */
+/* Example code that uploads a filename 'foo' to a remote script that accepts
+ * "HTML form based" (as described in RFC 1738) uploads using HTTP POST.
+ *
+ * The imaginary form we fill in looks like:
+ *
+ * <form method="post" enctype="multipart/form-data" action="examplepost.cgi">
+ * Enter file: <input type="file" name="sendfile" size="40">
+ * Enter filename: <input type="text" name="filename" size="30">
+ * <input type="submit" value="send" name="submit">
+ * </form>
+ *
+ */
 
-#ifdef HAVE_NETINET_IN_H
-#  include <netinet/in.h>
-#endif
-#ifdef HAVE_NETDB_H
-#  include <netdb.h>
-#endif
-#ifdef HAVE_ARPA_INET_H
-#  include <arpa/inet.h>
-#endif
+#include <stdio.h>
+#include <string.h>
 
-#define ENABLE_CURLX_PRINTF
-#include "curlx.h"
+#include <curl/curl.h>
 
-#include "hash.h"
-#include "hostip.h"
-
-#include "memdebug.h" /* LAST include file */
-
-static struct Curl_easy *data;
-static struct Curl_hash hp;
-static char *data_key;
-static struct Curl_dns_entry *data_node;
-
-static CURLcode unit_setup(void)
+int main(int argc, char *argv[])
 {
-  data = curl_easy_init();
-  if(!data) {
-    curl_global_cleanup();
-    return CURLE_OUT_OF_MEMORY;
+  CURL *curl;
+  CURLcode res;
+
+  curl_mime *form = NULL;
+  curl_mimepart *field = NULL;
+  struct curl_slist *headerlist = NULL;
+  static const char buf[] = "Expect:";
+
+  curl_global_init(CURL_GLOBAL_ALL);
+
+  curl = curl_easy_init();
+  if(curl) {
+    /* Create the form */
+    form = curl_mime_init(curl);
+
+    /* Fill in the file upload field */
+    field = curl_mime_addpart(form);
+    curl_mime_name(field, "sendfile");
+    curl_mime_filedata(field, "postit2.c");
+
+    /* Fill in the filename field */
+    field = curl_mime_addpart(form);
+    curl_mime_name(field, "filename");
+    curl_mime_data(field, "postit2.c", CURL_ZERO_TERMINATED);
+
+    /* Fill in the submit field too, even if this is rarely needed */
+    field = curl_mime_addpart(form);
+    curl_mime_name(field, "submit");
+    curl_mime_data(field, "send", CURL_ZERO_TERMINATED);
+
+    /* initialize custom header list (stating that Expect: 100-continue is not
+       wanted */
+    headerlist = curl_slist_append(headerlist, buf);
+    /* what URL that receives this POST */
+    curl_easy_setopt(curl, CURLOPT_URL, "https://example.com/examplepost.cgi");
+    if((argc == 2) && (!strcmp(argv[1], "noexpectheader")))
+      /* only disable 100-continue header if explicitly requested */
+      curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerlist);
+    curl_easy_setopt(curl, CURLOPT_MIMEPOST, form);
+
+    /* Perform the request, res gets the return code */
+    res = curl_easy_perform(curl);
+    /* Check for errors */
+    if(res != CURLE_OK)
+      fprintf(stderr, "curl_easy_perform() failed: %s\n",
+              curl_easy_strerror(res));
+
+    /* always cleanup */
+    curl_easy_cleanup(curl);
+
+    /* then cleanup the form */
+    curl_mime_free(form);
+    /* free slist */
+    curl_slist_free_all(headerlist);
   }
-
-  Curl_init_dnscache(&hp, 7);
-  return CURLE_OK;
+  return 0;
 }
-
-static void unit_stop(void)
-{
-  if(data_node) {
-    Curl_freeaddrinfo(data_node->addr);
-    free(data_node);
-  }
-  free(data_key);
-  Curl_hash_destroy(&hp);
-
-  curl_easy_cleanup(data);
-  curl_global_cleanup();
-}
-
-static struct Curl_addrinfo *fake_ai(void)
-{
-  static struct Curl_addrinfo *ai;
-  static const char dummy[]="dummy";
-  size_t namelen = sizeof(dummy); /* including the null-terminator */
-
-  ai = calloc(1, sizeof(struct Curl_addrinfo) + sizeof(struct sockaddr_in) +
-              namelen);
-  if(!ai)
-    return NULL;
-
-  ai->ai_addr = (void *)((char *)ai + sizeof(struct Curl_addrinfo));
-  ai->ai_canonname = (void *)((char *)ai->ai_addr +
-                              sizeof(struct sockaddr_in));
-  memcpy(ai->ai_canonname, dummy, namelen);
-
-  ai->ai_family = AF_INET;
-  ai->ai_addrlen = sizeof(struct sockaddr_in);
-
-  return ai;
-}
-
-static CURLcode create_node(void)
-{
-  data_key = aprintf("%s:%d", "dummy", 0);
-  if(!data_key)
-    return CURLE_OUT_OF_MEMORY;
-
-  data_node = calloc(1, sizeof(struct Curl_dns_entry));
-  if(!data_node)
-    return CURLE_OUT_OF_MEMORY;
-
-  data_node->addr = fake_ai();
-  if(!data_node->addr)
-    return CURLE_OUT_OF_MEMORY;
-
-  return CURLE_OK;
-}
-
-
-UNITTEST_START
-
-  struct Curl_dns_entry *nodep;
-  size_t key_len;
-
-  /* Test 1305 exits without adding anything to the hash */
-  if(strcmp(arg, "1305") != 0) {
-    CURLcode rc = create_node();
-    abort_unless(rc == CURLE_OK, "data node creation failed");
-    key_len = strlen(data_key);
-
-    data_node->inuse = 1; /* hash will hold the reference */
-    nodep = Curl_hash_add(&hp, data_key, key_len + 1, data_node);
-    abort_unless(nodep, "insertion into hash failed");
-    /* Freeing will now be done by Curl_hash_destroy */
-    data_node = NULL;
-  }
-
-UNITTEST_STOP

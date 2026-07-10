@@ -1,1063 +1,520 @@
-// Formatting library for C++ - time formatting tests
+// Formatting library for C++ - module tests
 //
 // Copyright (c) 2012 - present, Victor Zverovich
 // All rights reserved.
 //
 // For the license information refer to format.h.
+//
+// Copyright (c) 2021 - present, Daniela Engert
+// All Rights Reserved
+// {fmt} module.
 
-#include "fmt/chrono.h"
-
-#include <algorithm>
-#include <ctime>
-#include <vector>
-
-#include "gtest-extra.h"  // EXPECT_THROW_MSG
-#include "util.h"         // get_locale
-
-using fmt::runtime;
-using testing::Contains;
-
-template <typename Duration>
-using sys_time = std::chrono::time_point<std::chrono::system_clock, Duration>;
-
-#if defined(__MINGW32__) && !defined(_UCRT)
-// Only C89 conversion specifiers when using MSVCRT instead of UCRT
-#  define FMT_HAS_C99_STRFTIME 0
-#else
-#  define FMT_HAS_C99_STRFTIME 1
+#ifdef _MSC_FULL_VER
+// hide some implementation bugs in msvc
+// that are not essential to users of the module.
+#  define FMT_HIDE_MODULE_BUGS
 #endif
 
-#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
-using days = std::chrono::days;
+#include <bit>
+#include <chrono>
+#include <exception>
+#include <iterator>
+#include <locale>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <string_view>
+#include <system_error>
+
+#if (__has_include(<fcntl.h>) || defined(__APPLE__) || \
+     defined(__linux__)) &&                              \
+    (!defined(WINAPI_FAMILY) || (WINAPI_FAMILY == WINAPI_FAMILY_DESKTOP_APP))
+#  include <fcntl.h>
+#  define FMT_USE_FCNTL 1
 #else
-using days = std::chrono::duration<std::chrono::hours::rep, std::ratio<86400>>;
+#  define FMT_USE_FCNTL 0
+#endif
+#if defined(_WIN32) && !defined(__MINGW32__)
+#  define FMT_POSIX(call) _##call
+#else
+#  define FMT_POSIX(call) call
 #endif
 
-auto make_tm() -> std::tm {
-  auto time = std::tm();
-  time.tm_mday = 1;
-  return time;
+import fmt;
+
+// check for macros leaking from BMI
+static bool macro_leaked =
+#if defined(FMT_CORE_H_) || defined(FMT_FORMAT_H_)
+    true;
+#else
+    false;
+#endif
+
+#define FMT_OS_H_  // don't pull in os.h, neither directly nor indirectly
+#include "gtest-extra.h"
+
+// an implicitly exported namespace must be visible [module.interface]/2.2
+TEST(module_test, namespace) {
+  using namespace fmt;
+  using namespace fmt::literals;
+  ASSERT_TRUE(true);
 }
 
-auto make_hour(int h) -> std::tm {
-  auto time = make_tm();
-  time.tm_hour = h;
-  return time;
+namespace detail {
+bool oops_detail_namespace_is_visible;
 }
 
-auto make_minute(int m) -> std::tm {
-  auto time = make_tm();
-  time.tm_min = m;
-  return time;
+namespace fmt {
+bool namespace_detail_invisible() {
+#if defined(FMT_HIDE_MODULE_BUGS) && defined(_MSC_FULL_VER) && \
+    _MSC_FULL_VER <= 193700000
+  // bug in msvc up to at least 17.7:
+
+  // the namespace is visible even when it is neither
+  // implicitly nor explicitly exported
+  return true;
+#else
+  using namespace detail;
+  // this fails to compile if fmt::detail is visible
+  return !oops_detail_namespace_is_visible;
+#endif
+}
+}  // namespace fmt
+
+// the non-exported namespace 'detail' must be invisible [module.interface]/2
+TEST(module_test, detail_namespace) {
+  EXPECT_TRUE(fmt::namespace_detail_invisible());
 }
 
-auto make_second(int s) -> std::tm {
-  auto time = make_tm();
-  time.tm_sec = s;
-  return time;
+// macros must not be imported from a *named* module  [cpp.import]/5.1
+TEST(module_test, macros) {
+#if defined(FMT_HIDE_MODULE_BUGS) && defined(_MSC_FULL_VER) && \
+    _MSC_FULL_VER <= 192930130
+  // bug in msvc up to 16.11-pre2:
+  // include-guard macros leak from BMI
+  // and even worse: they cannot be #undef-ined
+  macro_leaked = false;
+#endif
+  EXPECT_FALSE(macro_leaked);
 }
 
-std::string system_strftime(const std::string& format, const std::tm* timeptr,
-                            std::locale* locptr = nullptr) {
-  auto loc = locptr ? *locptr : std::locale::classic();
-  auto& facet = std::use_facet<std::time_put<char>>(loc);
-  std::ostringstream os;
-  os.imbue(loc);
-  facet.put(os, os, ' ', timeptr, format.c_str(),
-            format.c_str() + format.size());
+// The following is less about functional testing (that's done elsewhere)
+// but rather visibility of all client-facing overloads, reachability of
+// non-exported entities, name lookup and overload resolution within
+// template instantitions.
+// Exercise all exported entities of the API at least once.
+// Instantiate as many code paths as possible.
+
+TEST(module_test, to_string) {
+  EXPECT_EQ("42", fmt::to_string(42));
+  EXPECT_EQ("42", fmt::to_string(42.0));
+
+  EXPECT_EQ(L"42", fmt::to_wstring(42));
+  EXPECT_EQ(L"42", fmt::to_wstring(42.0));
+}
+
+TEST(module_test, format) {
+  EXPECT_EQ("42", fmt::format("{:}", 42));
+  EXPECT_EQ("-42", fmt::format("{0}", -42.0));
+
+  EXPECT_EQ(L"42", fmt::format(L"{:}", 42));
+  EXPECT_EQ(L"-42", fmt::format(L"{0}", -42.0));
+}
+
+TEST(module_test, format_to) {
+  std::string s;
+  fmt::format_to(std::back_inserter(s), "{}", 42);
+  EXPECT_EQ("42", s);
+
+  char buffer[4] = {0};
+  fmt::format_to(buffer, "{}", 42);
+  EXPECT_EQ("42", std::string_view(buffer));
+
+  fmt::memory_buffer mb;
+  fmt::format_to(std::back_inserter(mb), "{}", 42);
+  EXPECT_EQ("42", std::string_view(buffer));
+
+  std::wstring w;
+  fmt::format_to(std::back_inserter(w), L"{}", 42);
+  EXPECT_EQ(L"42", w);
+
+  wchar_t wbuffer[4] = {0};
+  fmt::format_to(wbuffer, L"{}", 42);
+  EXPECT_EQ(L"42", std::wstring_view(wbuffer));
+
+  fmt::wmemory_buffer wb;
+  fmt::format_to(std::back_inserter(wb), L"{}", 42);
+  EXPECT_EQ(L"42", std::wstring_view(wbuffer));
+}
+
+TEST(module_test, formatted_size) {
+  EXPECT_EQ(2u, fmt::formatted_size("{}", 42));
+  EXPECT_EQ(2u, fmt::formatted_size(L"{}", 42));
+}
+
+TEST(module_test, format_to_n) {
+  std::string s;
+  auto result = fmt::format_to_n(std::back_inserter(s), 1, "{}", 42);
+  EXPECT_EQ(2u, result.size);
+  char buffer[4] = {0};
+  fmt::format_to_n(buffer, 3, "{}", 12345);
+
+  std::wstring w;
+  auto wresult = fmt::format_to_n(std::back_inserter(w), 1, L"{}", 42);
+  EXPECT_EQ(2u, wresult.size);
+  wchar_t wbuffer[4] = {0};
+  fmt::format_to_n(wbuffer, 3, L"{}", 12345);
+}
+
+TEST(module_test, format_args) {
+  auto no_args = fmt::format_args();
+  EXPECT_FALSE(no_args.get(1));
+
+  fmt::basic_format_args args = fmt::make_format_args(42);
+  EXPECT_TRUE(args.max_size() > 0);
+  auto arg0 = args.get(0);
+  EXPECT_TRUE(arg0);
+  decltype(arg0) arg_none;
+  EXPECT_FALSE(arg_none);
+  EXPECT_TRUE(arg0.type() != arg_none.type());
+}
+
+TEST(module_test, wformat_args) {
+  auto no_args = fmt::wformat_args();
+  EXPECT_FALSE(no_args.get(1));
+  fmt::basic_format_args args = fmt::make_wformat_args(42);
+  EXPECT_TRUE(args.get(0));
+}
+
+TEST(module_test, dynamic_format_args) {
+  fmt::dynamic_format_arg_store<fmt::format_context> dyn_store;
+  dyn_store.push_back(fmt::arg("a42", 42));
+  fmt::basic_format_args args = dyn_store;
+  EXPECT_FALSE(args.get(3));
+  EXPECT_TRUE(args.get(fmt::string_view("a42")));
+
+  fmt::dynamic_format_arg_store<fmt::wformat_context> wdyn_store;
+  wdyn_store.push_back(fmt::arg(L"a42", 42));
+  fmt::basic_format_args wargs = wdyn_store;
+  EXPECT_FALSE(wargs.get(3));
+  EXPECT_TRUE(wargs.get(fmt::wstring_view(L"a42")));
+}
+
+TEST(module_test, vformat) {
+  EXPECT_EQ("42", fmt::vformat("{}", fmt::make_format_args(42)));
+  EXPECT_EQ(L"42",
+            fmt::vformat(fmt::wstring_view(L"{}"), fmt::make_wformat_args(42)));
+}
+
+TEST(module_test, vformat_to) {
+  auto store = fmt::make_format_args(42);
+  std::string s;
+  fmt::vformat_to(std::back_inserter(s), "{}", store);
+  EXPECT_EQ("42", s);
+
+  char buffer[4] = {0};
+  fmt::vformat_to(buffer, "{:}", store);
+  EXPECT_EQ("42", std::string_view(buffer));
+
+  auto wstore = fmt::make_wformat_args(42);
+  std::wstring w;
+  fmt::vformat_to(std::back_inserter(w), L"{}", wstore);
+  EXPECT_EQ(L"42", w);
+
+  wchar_t wbuffer[4] = {0};
+  fmt::vformat_to(wbuffer, L"{:}", wstore);
+  EXPECT_EQ(L"42", std::wstring_view(wbuffer));
+}
+
+TEST(module_test, vformat_to_n) {
+  auto store = fmt::make_format_args(12345);
+  std::string s;
+  auto result = fmt::vformat_to_n(std::back_inserter(s), 1, "{}", store);
+  char buffer[4] = {0};
+  fmt::vformat_to_n(buffer, 3, "{:}", store);
+
+  auto wstore = fmt::make_wformat_args(12345);
+  std::wstring w;
+  auto wresult = fmt::vformat_to_n(std::back_inserter(w), 1,
+                                   fmt::wstring_view(L"{}"), wstore);
+  wchar_t wbuffer[4] = {0};
+  fmt::vformat_to_n(wbuffer, 3, fmt::wstring_view(L"{:}"), wstore);
+}
+
+std::string as_string(std::wstring_view text) {
+  return {reinterpret_cast<const char*>(text.data()),
+          text.size() * sizeof(text[0])};
+}
+
+TEST(module_test, print) {
+  EXPECT_WRITE(stdout, fmt::print("{}µ", 42), "42µ");
+  EXPECT_WRITE(stderr, fmt::print(stderr, "{}µ", 4.2), "4.2µ");
+  EXPECT_WRITE(stdout, fmt::print(L"{}µ", 42), as_string(L"42µ"));
+  EXPECT_WRITE(stderr, fmt::print(stderr, L"{}µ", 4.2), as_string(L"4.2µ"));
+}
+
+TEST(module_test, vprint) {
+  EXPECT_WRITE(stdout, fmt::vprint("{:}µ", fmt::make_format_args(42)), "42µ");
+  EXPECT_WRITE(stderr, fmt::vprint(stderr, "{}", fmt::make_format_args(4.2)),
+               "4.2");
+  EXPECT_WRITE(stdout, fmt::vprint(L"{:}µ", fmt::make_wformat_args(42)),
+               as_string(L"42µ"));
+  EXPECT_WRITE(stderr, fmt::vprint(stderr, L"{}", fmt::make_wformat_args(42)),
+               as_string(L"42"));
+}
+
+TEST(module_test, named_args) {
+  EXPECT_EQ("42", fmt::format("{answer}", fmt::arg("answer", 42)));
+  EXPECT_EQ(L"42", fmt::format(L"{answer}", fmt::arg(L"answer", 42)));
+}
+
+TEST(module_test, literals) {
+  using namespace fmt::literals;
+  EXPECT_EQ("42", fmt::format("{answer}", "answer"_a = 42));
+  EXPECT_EQ(L"42", fmt::format(L"{answer}", L"answer"_a = 42));
+}
+
+TEST(module_test, locale) {
+  auto store = fmt::make_format_args(4.2);
+  const auto classic = std::locale::classic();
+  EXPECT_EQ("4.2", fmt::format(classic, "{:L}", 4.2));
+  EXPECT_EQ("4.2", fmt::vformat(classic, "{:L}", store));
+  std::string s;
+  fmt::vformat_to(std::back_inserter(s), classic, "{:L}", store);
+  EXPECT_EQ("4.2", s);
+  EXPECT_EQ("4.2", fmt::format("{:L}", 4.2));
+
+  auto wstore = fmt::make_wformat_args(4.2);
+  EXPECT_EQ(L"4.2", fmt::format(classic, L"{:L}", 4.2));
+  EXPECT_EQ(L"4.2", fmt::vformat(classic, L"{:L}", wstore));
+  std::wstring w;
+  fmt::vformat_to(std::back_inserter(w), classic, L"{:L}", wstore);
+  EXPECT_EQ(L"4.2", w);
+  EXPECT_EQ(L"4.2", fmt::format(L"{:L}", 4.2));
+}
+
+TEST(module_test, string_view) {
+  fmt::string_view nsv("fmt");
+  EXPECT_EQ("fmt", nsv);
+  EXPECT_TRUE(fmt::string_view("fmt") == nsv);
+
+  fmt::wstring_view wsv(L"fmt");
+  EXPECT_EQ(L"fmt", wsv);
+  EXPECT_TRUE(fmt::wstring_view(L"fmt") == wsv);
+}
+
+TEST(module_test, memory_buffer) {
+  fmt::basic_memory_buffer<char, fmt::inline_buffer_size> buffer;
+  fmt::format_to(std::back_inserter(buffer), "{}", "42");
+  EXPECT_EQ("42", to_string(buffer));
+  fmt::memory_buffer nbuffer(std::move(buffer));
+  EXPECT_EQ("42", to_string(nbuffer));
+  buffer = std::move(nbuffer);
+  EXPECT_EQ("42", to_string(buffer));
+  nbuffer.clear();
+  EXPECT_EQ(0u, to_string(nbuffer).size());
+
+  fmt::wmemory_buffer wbuffer;
+  EXPECT_EQ(0u, to_string(wbuffer).size());
+}
+
+TEST(module_test, is_char) {
+  EXPECT_TRUE(fmt::is_char<char>());
+  EXPECT_TRUE(fmt::is_char<wchar_t>());
+  EXPECT_TRUE(fmt::is_char<char8_t>());
+  EXPECT_TRUE(fmt::is_char<char16_t>());
+  EXPECT_TRUE(fmt::is_char<char32_t>());
+  EXPECT_FALSE(fmt::is_char<signed char>());
+}
+
+TEST(module_test, ptr) {
+  uintptr_t answer = 42;
+  auto p = std::bit_cast<int*>(answer);
+  EXPECT_EQ("0x2a", fmt::to_string(fmt::ptr(p)));
+  std::unique_ptr<int> up(p);
+  EXPECT_EQ("0x2a", fmt::to_string(fmt::ptr(up)));
+  up.release();
+  auto sp = std::make_shared<int>(0);
+  p = sp.get();
+  EXPECT_EQ(fmt::to_string(fmt::ptr(p)), fmt::to_string(fmt::ptr(sp)));
+}
+
+TEST(module_test, errors) {
+  auto store = fmt::make_format_args(42);
+  EXPECT_THROW(throw fmt::format_error("oops"), std::exception);
+  EXPECT_THROW(throw fmt::vsystem_error(0, "{}", store), std::system_error);
+  EXPECT_THROW(throw fmt::system_error(0, "{}", 42), std::system_error);
+
+  fmt::memory_buffer buffer;
+  fmt::format_system_error(buffer, 0, "oops");
+  auto oops = to_string(buffer);
+  EXPECT_TRUE(oops.size() > 0);
+  EXPECT_WRITE(stderr, fmt::report_system_error(0, "oops"), oops + '\n');
+
 #ifdef _WIN32
-  // Workaround a bug in older versions of Universal CRT.
-  auto str = os.str();
-  if (str == "-0000") str = "+0000";
-  return str;
+  EXPECT_THROW(throw fmt::vwindows_error(0, "{}", store), std::system_error);
+  EXPECT_THROW(throw fmt::windows_error(0, "{}", 42), std::system_error);
+  output_redirect redirect(stderr);
+  fmt::report_windows_error(0, "oops");
+  EXPECT_TRUE(redirect.restore_and_read().size() > 0);
+#endif
+}
+
+TEST(module_test, error_code) {
+  EXPECT_EQ("generic:42",
+            fmt::format("{0}", std::error_code(42, std::generic_category())));
+  EXPECT_EQ("system:42",
+            fmt::format("{0}", std::error_code(42, fmt::system_category())));
+  EXPECT_EQ(L"generic:42",
+            fmt::format(L"{0}", std::error_code(42, std::generic_category())));
+}
+
+TEST(module_test, format_int) {
+  fmt::format_int sanswer(42);
+  EXPECT_EQ("42", fmt::string_view(sanswer.data(), sanswer.size()));
+  fmt::format_int uanswer(42u);
+  EXPECT_EQ("42", fmt::string_view(uanswer.data(), uanswer.size()));
+}
+
+struct test_formatter : fmt::formatter<char> {
+  bool check() { return true; }
+};
+
+TEST(module_test, formatter) { EXPECT_TRUE(test_formatter{}.check()); }
+
+TEST(module_test, join) {
+  int arr[3] = {1, 2, 3};
+  std::vector<double> vec{1.0, 2.0, 3.0};
+  std::initializer_list<int> il{1, 2, 3};
+  auto sep = fmt::string_view(", ");
+  EXPECT_EQ("1, 2, 3", to_string(fmt::join(arr + 0, arr + 3, sep)));
+  EXPECT_EQ("1, 2, 3", to_string(fmt::join(arr, sep)));
+  EXPECT_EQ("1, 2, 3", to_string(fmt::join(vec.begin(), vec.end(), sep)));
+  EXPECT_EQ("1, 2, 3", to_string(fmt::join(vec, sep)));
+  EXPECT_EQ("1, 2, 3", to_string(fmt::join(il, sep)));
+
+  auto wsep = fmt::wstring_view(L", ");
+  EXPECT_EQ(L"1, 2, 3", fmt::format(L"{}", fmt::join(arr + 0, arr + 3, wsep)));
+  EXPECT_EQ(L"1, 2, 3", fmt::format(L"{}", fmt::join(arr, wsep)));
+  EXPECT_EQ(L"1, 2, 3", fmt::format(L"{}", fmt::join(il, wsep)));
+}
+
+TEST(module_test, time) {
+  auto time_now = std::time(nullptr);
+  EXPECT_TRUE(fmt::localtime(time_now).tm_year > 120);
+  EXPECT_TRUE(fmt::gmtime(time_now).tm_year > 120);
+  auto chrono_now = std::chrono::system_clock::now();
+  EXPECT_TRUE(fmt::gmtime(chrono_now).tm_year > 120);
+}
+
+TEST(module_test, time_point) {
+  auto now = std::chrono::system_clock::now();
+  std::string_view past("2021-05-20 10:30:15");
+  EXPECT_TRUE(past < fmt::format("{:%Y-%m-%d %H:%M:%S}", now));
+  std::wstring_view wpast(L"2021-05-20 10:30:15");
+  EXPECT_TRUE(wpast < fmt::format(L"{:%Y-%m-%d %H:%M:%S}", now));
+}
+
+TEST(module_test, time_duration) {
+  using us = std::chrono::duration<double, std::micro>;
+  EXPECT_EQ("42s", fmt::format("{}", std::chrono::seconds{42}));
+  EXPECT_EQ("4.2µs", fmt::format("{:3.1}", us{4.234}));
+  EXPECT_EQ("4.2µs", fmt::format(std::locale::classic(), "{:L}", us{4.2}));
+
+  EXPECT_EQ(L"42s", fmt::format(L"{}", std::chrono::seconds{42}));
+  EXPECT_EQ(L"4.2µs", fmt::format(L"{:3.1}", us{4.234}));
+  EXPECT_EQ(L"4.2µs", fmt::format(std::locale::classic(), L"{:L}", us{4.2}));
+}
+
+TEST(module_test, weekday) {
+  EXPECT_EQ("Mon", fmt::format(std::locale::classic(), "{}", fmt::weekday(1)));
+}
+
+TEST(module_test, printf) {
+  EXPECT_WRITE(stdout, fmt::printf("%f", 42.123456), "42.123456");
+  EXPECT_WRITE(stdout, fmt::printf("%d", 42), "42");
+  EXPECT_WRITE(stdout, fmt::printf(L"%f", 42.123456), as_string(L"42.123456"));
+  EXPECT_WRITE(stdout, fmt::printf(L"%d", 42), as_string(L"42"));
+}
+
+TEST(module_test, fprintf) {
+  EXPECT_WRITE(stderr, fmt::fprintf(stderr, "%d", 42), "42");
+  EXPECT_WRITE(stderr, fmt::fprintf(stderr, L"%d", 42), as_string(L"42"));
+}
+
+TEST(module_test, sprintf) {
+  EXPECT_EQ("42", fmt::sprintf("%d", 42));
+  EXPECT_EQ(L"42", fmt::sprintf(L"%d", 42));
+}
+
+TEST(module_test, vprintf) {
+  EXPECT_WRITE(stdout, fmt::vprintf("%d", fmt::make_printf_args(42)), "42");
+  EXPECT_WRITE(stdout, fmt::vprintf(L"%d", fmt::make_wprintf_args(42)),
+               as_string(L"42"));
+}
+
+TEST(module_test, vfprintf) {
+  auto args = fmt::make_printf_args(42);
+  EXPECT_WRITE(stderr, fmt::vfprintf(stderr, "%d", args), "42");
+  auto wargs = fmt::make_wprintf_args(42);
+  EXPECT_WRITE(stderr, fmt::vfprintf(stderr, L"%d", wargs), as_string(L"42"));
+}
+
+TEST(module_test, vsprintf) {
+  EXPECT_EQ("42", fmt::vsprintf("%d", fmt::make_printf_args(42)));
+  EXPECT_EQ(L"42", fmt::vsprintf(L"%d", fmt::make_wprintf_args(42)));
+}
+
+TEST(module_test, color) {
+  auto fg_check = fg(fmt::rgb(255, 200, 30));
+  auto bg_check = bg(fmt::color::dark_slate_gray) | fmt::emphasis::italic;
+  auto emphasis_check = fmt::emphasis::underline | fmt::emphasis::bold;
+  EXPECT_EQ("\x1B[30m42\x1B[0m",
+            fmt::format(fg(fmt::terminal_color::black), "{}", 42));
+  EXPECT_EQ(L"\x1B[30m42\x1B[0m",
+            fmt::format(fg(fmt::terminal_color::black), L"{}", 42));
+}
+
+TEST(module_test, cstring_view) {
+  auto s = "fmt";
+  EXPECT_EQ(s, fmt::cstring_view(s).c_str());
+  auto w = L"fmt";
+  EXPECT_EQ(w, fmt::wcstring_view(w).c_str());
+}
+
+TEST(module_test, buffered_file) {
+  EXPECT_TRUE(fmt::buffered_file{}.get() == nullptr);
+}
+
+TEST(module_test, output_file) {
+#ifdef __clang__
+  fmt::println("\033[0;33m[=disabled=] {}\033[0;0m",
+               "Clang 16.0 emits multiple copies of vtables");
 #else
-  return os.str();
+  fmt::ostream out = fmt::output_file("module-test", fmt::buffer_size = 1);
+  out.close();
 #endif
 }
 
-FMT_CONSTEXPR std::tm make_tm(int year, int mon, int mday, int hour, int min,
-                              int sec) {
-  auto tm = std::tm();
-  tm.tm_sec = sec;
-  tm.tm_min = min;
-  tm.tm_hour = hour;
-  tm.tm_mday = mday;
-  tm.tm_mon = mon - 1;
-  tm.tm_year = year - 1900;
-  return tm;
+struct custom_context {
+  using char_type = char;
+  using parse_context_type = fmt::format_parse_context;
+};
+
+TEST(module_test, custom_context) {
+  fmt::basic_format_arg<custom_context> custom_arg;
+  EXPECT_TRUE(!custom_arg);
 }
 
-TEST(chrono_test, format_tm) {
-  auto tm = std::tm();
-  tm.tm_year = 116;
-  tm.tm_mon = 3;
-  tm.tm_mday = 25;
-  tm.tm_hour = 11;
-  tm.tm_min = 22;
-  tm.tm_sec = 33;
-  EXPECT_EQ(fmt::format("The date is {:%Y-%m-%d %H:%M:%S}.", tm),
-            "The date is 2016-04-25 11:22:33.");
-  EXPECT_EQ(fmt::format("{:%Y}", tm), "2016");
-  EXPECT_EQ(fmt::format("{:%C}", tm), "20");
-  EXPECT_EQ(fmt::format("{:%C%y}", tm), fmt::format("{:%Y}", tm));
-  EXPECT_EQ(fmt::format("{:%e}", tm), "25");
-  EXPECT_EQ(fmt::format("{:%D}", tm), "04/25/16");
-  EXPECT_EQ(fmt::format("{:%F}", tm), "2016-04-25");
-  EXPECT_EQ(fmt::format("{:%T}", tm), "11:22:33");
-
-  // Short year
-  tm.tm_year = 999 - 1900;
-  tm.tm_mon = 0;   // for %G
-  tm.tm_mday = 2;  // for %G
-  tm.tm_wday = 3;  // for %G
-  tm.tm_yday = 1;  // for %G
-  EXPECT_EQ(fmt::format("{:%Y}", tm), "0999");
-  EXPECT_EQ(fmt::format("{:%C%y}", tm), "0999");
-  EXPECT_EQ(fmt::format("{:%G}", tm), "0999");
-
-  tm.tm_year = 27 - 1900;
-  EXPECT_EQ(fmt::format("{:%Y}", tm), "0027");
-  EXPECT_EQ(fmt::format("{:%C%y}", tm), "0027");
-
-  // Overflow year
-  tm.tm_year = 2147483647;
-  EXPECT_EQ(fmt::format("{:%Y}", tm), "2147485547");
-
-  tm.tm_year = -2147483648;
-  EXPECT_EQ(fmt::format("{:%Y}", tm), "-2147481748");
-
-  // for week on the year
-  // https://www.cl.cam.ac.uk/~mgk25/iso-time.html
-  std::vector<std::tm> tm_list = {
-      make_tm(1975, 12, 29, 12, 14, 16),  // W01
-      make_tm(1977, 1, 2, 12, 14, 16),    // W53
-      make_tm(1999, 12, 27, 12, 14, 16),  // W52
-      make_tm(1999, 12, 31, 12, 14, 16),  // W52
-      make_tm(2000, 1, 1, 12, 14, 16),    // W52
-      make_tm(2000, 1, 2, 12, 14, 16),    // W52
-      make_tm(2000, 1, 3, 12, 14, 16)     // W1
-  };
-
-#if !FMT_HAS_C99_STRFTIME
-  GTEST_SKIP() << "Skip the rest of this test because it relies on strftime() "
-                  "conforming to C99, but on this platform, MINGW + MSVCRT, "
-                  "the function conforms only to C89.";
-#endif
-
-  const std::string iso_week_spec = "%Y-%m-%d: %G %g %V";
-  for (auto ctm : tm_list) {
-    // Calculate tm_yday, tm_wday, etc.
-    std::time_t t = std::mktime(&ctm);
-    tm = *std::localtime(&t);
-
-    auto fmt_spec = fmt::format("{{:{}}}", iso_week_spec);
-    EXPECT_EQ(system_strftime(iso_week_spec, &tm),
-              fmt::format(fmt::runtime(fmt_spec), tm));
-  }
-
-  // Every day from 1970-01-01
-  std::time_t time_now = std::time(nullptr);
-  for (std::time_t t = 6 * 3600; t < time_now; t += 86400) {
-    tm = *std::localtime(&t);
-
-    auto fmt_spec = fmt::format("{{:{}}}", iso_week_spec);
-    EXPECT_EQ(system_strftime(iso_week_spec, &tm),
-              fmt::format(fmt::runtime(fmt_spec), tm));
-  }
-}
-
-// MSVC:
-//  minkernel\crts\ucrt\src\appcrt\time\wcsftime.cpp(971) : Assertion failed:
-//  timeptr->tm_year >= -1900 && timeptr->tm_year <= 8099
-#ifndef _WIN32
-TEST(chrono_test, format_tm_future) {
-  auto tm = std::tm();
-  tm.tm_year = 10445;  // 10000+ years
-  tm.tm_mon = 3;
-  tm.tm_mday = 25;
-  tm.tm_hour = 11;
-  tm.tm_min = 22;
-  tm.tm_sec = 33;
-  EXPECT_EQ(fmt::format("The date is {:%Y-%m-%d %H:%M:%S}.", tm),
-            "The date is 12345-04-25 11:22:33.");
-  EXPECT_EQ(fmt::format("{:%Y}", tm), "12345");
-  EXPECT_EQ(fmt::format("{:%C}", tm), "123");
-  EXPECT_EQ(fmt::format("{:%C%y}", tm), fmt::format("{:%Y}", tm));
-  EXPECT_EQ(fmt::format("{:%D}", tm), "04/25/45");
-  EXPECT_EQ(fmt::format("{:%F}", tm), "12345-04-25");
-  EXPECT_EQ(fmt::format("{:%T}", tm), "11:22:33");
-}
-
-TEST(chrono_test, format_tm_past) {
-  auto tm = std::tm();
-  tm.tm_year = -2001;
-  tm.tm_mon = 3;
-  tm.tm_mday = 25;
-  tm.tm_hour = 11;
-  tm.tm_min = 22;
-  tm.tm_sec = 33;
-  EXPECT_EQ(fmt::format("The date is {:%Y-%m-%d %H:%M:%S}.", tm),
-            "The date is -101-04-25 11:22:33.");
-  EXPECT_EQ(fmt::format("{:%Y}", tm), "-101");
-
-  // macOS  %C - "-1"
-  // Linux  %C - "-2"
-  // fmt    %C - "-1"
-  EXPECT_EQ(fmt::format("{:%C}", tm), "-1");
-  EXPECT_EQ(fmt::format("{:%C%y}", tm), fmt::format("{:%Y}", tm));
-
-  // macOS  %D - "04/25/01" (%y)
-  // Linux  %D - "04/25/99" (%y)
-  // fmt    %D - "04/25/01" (%y)
-  EXPECT_EQ(fmt::format("{:%D}", tm), "04/25/01");
-
-  EXPECT_EQ(fmt::format("{:%F}", tm), "-101-04-25");
-  EXPECT_EQ(fmt::format("{:%T}", tm), "11:22:33");
-
-  tm.tm_year = -1901;  // -1
-  EXPECT_EQ(fmt::format("{:%Y}", tm), "-001");
-  EXPECT_EQ(fmt::format("{:%C%y}", tm), fmt::format("{:%Y}", tm));
-
-  tm.tm_year = -1911;  // -11
-  EXPECT_EQ(fmt::format("{:%Y}", tm), "-011");
-  EXPECT_EQ(fmt::format("{:%C%y}", tm), fmt::format("{:%Y}", tm));
-}
-#endif
-
-TEST(chrono_test, grow_buffer) {
-  auto s = std::string("{:");
-  for (int i = 0; i < 30; ++i) s += "%c";
-  s += "}\n";
-  auto t = std::time(nullptr);
-  (void)fmt::format(fmt::runtime(s), *std::localtime(&t));
-}
-
-TEST(chrono_test, format_to_empty_container) {
-  auto time = std::tm();
-  time.tm_sec = 42;
-  auto s = std::string();
-  fmt::format_to(std::back_inserter(s), "{:%S}", time);
-  EXPECT_EQ(s, "42");
-}
-
-TEST(chrono_test, empty_result) { EXPECT_EQ(fmt::format("{}", std::tm()), ""); }
-
-auto equal(const std::tm& lhs, const std::tm& rhs) -> bool {
-  return lhs.tm_sec == rhs.tm_sec && lhs.tm_min == rhs.tm_min &&
-         lhs.tm_hour == rhs.tm_hour && lhs.tm_mday == rhs.tm_mday &&
-         lhs.tm_mon == rhs.tm_mon && lhs.tm_year == rhs.tm_year &&
-         lhs.tm_wday == rhs.tm_wday && lhs.tm_yday == rhs.tm_yday &&
-         lhs.tm_isdst == rhs.tm_isdst;
-}
-
-TEST(chrono_test, gmtime) {
-  auto t = std::time(nullptr);
-  auto tm = *std::gmtime(&t);
-  EXPECT_TRUE(equal(tm, fmt::gmtime(t)));
-}
-
-template <typename TimePoint>
-auto strftime_full_utc(TimePoint tp) -> std::string {
-  auto t = std::chrono::system_clock::to_time_t(tp);
-  auto tm = *std::gmtime(&t);
-  return system_strftime("%Y-%m-%d %H:%M:%S", &tm);
-}
-
-TEST(chrono_test, system_clock_time_point) {
-  auto t1 = std::chrono::time_point_cast<std::chrono::seconds>(
-      std::chrono::system_clock::now());
-  EXPECT_EQ(strftime_full_utc(t1), fmt::format("{:%Y-%m-%d %H:%M:%S}", t1));
-  EXPECT_EQ(strftime_full_utc(t1), fmt::format("{}", t1));
-  EXPECT_EQ(strftime_full_utc(t1), fmt::format("{:}", t1));
-
-  auto t2 = sys_time<std::chrono::seconds>(std::chrono::seconds(42));
-  EXPECT_EQ(strftime_full_utc(t2), fmt::format("{:%Y-%m-%d %H:%M:%S}", t2));
-
-  std::vector<std::string> spec_list = {
-      "%%",  "%n",  "%t",  "%Y",  "%EY", "%y",  "%Oy", "%Ey", "%C",
-      "%EC", "%G",  "%g",  "%b",  "%h",  "%B",  "%m",  "%Om", "%U",
-      "%OU", "%W",  "%OW", "%V",  "%OV", "%j",  "%d",  "%Od", "%e",
-      "%Oe", "%a",  "%A",  "%w",  "%Ow", "%u",  "%Ou", "%H",  "%OH",
-      "%I",  "%OI", "%M",  "%OM", "%S",  "%OS", "%x",  "%Ex", "%X",
-      "%EX", "%D",  "%F",  "%R",  "%T",  "%p"};
-#ifndef _WIN32
-  // Disabled on Windows because these formats are not consistent among
-  // platforms.
-  spec_list.insert(spec_list.end(), {"%c", "%Ec", "%r"});
-#elif !FMT_HAS_C99_STRFTIME
-  // Only C89 conversion specifiers when using MSVCRT instead of UCRT
-  spec_list = {"%%", "%Y", "%y", "%b", "%B", "%m", "%U", "%W", "%j", "%d",
-               "%a", "%A", "%w", "%H", "%I", "%M", "%S", "%x", "%X", "%p"};
-#endif
-  spec_list.push_back("%Y-%m-%d %H:%M:%S");
-
-  for (const auto& spec : spec_list) {
-    auto t = std::chrono::system_clock::to_time_t(t1);
-    auto tm = *std::gmtime(&t);
-
-    auto sys_output = system_strftime(spec, &tm);
-
-    auto fmt_spec = fmt::format("{{:{}}}", spec);
-    EXPECT_EQ(sys_output, fmt::format(fmt::runtime(fmt_spec), t1));
-    EXPECT_EQ(sys_output, fmt::format(fmt::runtime(fmt_spec), tm));
-  }
-
-  // Timezone formatters tests makes sense for localtime.
-#if FMT_HAS_C99_STRFTIME
-  spec_list = {"%z", "%Z"};
+TEST(module_test, compile_format_string) {
+  using namespace fmt::literals;
+#ifdef __clang__
+  fmt::println("\033[0;33m[=disabled=] {}\033[0;0m",
+               "Clang 16.0 fails to import user-defined literals");
 #else
-  spec_list = {"%Z"};
+  EXPECT_EQ("42", fmt::format("{0:x}"_cf, 0x42));
+  EXPECT_EQ(L"42", fmt::format(L"{:}"_cf, 42));
+  EXPECT_EQ("4.2", fmt::format("{arg:3.1f}"_cf, "arg"_a = 4.2));
+  EXPECT_EQ(L" 42", fmt::format(L"{arg:>3}"_cf, L"arg"_a = L"42"));
 #endif
-  for (const auto& spec : spec_list) {
-    auto t = std::chrono::system_clock::to_time_t(t1);
-    auto tm = *std::localtime(&t);
-
-    auto sys_output = system_strftime(spec, &tm);
-
-    auto fmt_spec = fmt::format("{{:{}}}", spec);
-    EXPECT_EQ(sys_output, fmt::format(fmt::runtime(fmt_spec), tm));
-
-    if (spec == "%z") {
-      sys_output.insert(sys_output.end() - 2, 1, ':');
-      EXPECT_EQ(sys_output, fmt::format("{:%Ez}", tm));
-      EXPECT_EQ(sys_output, fmt::format("{:%Oz}", tm));
-    }
-  }
-
-  // Separate tests for UTC, since std::time_put can use local time and ignoring
-  // the timezone in std::tm (if it presents on platform).
-  if (fmt::detail::has_member_data_tm_zone<std::tm>::value) {
-    auto t = std::chrono::system_clock::to_time_t(t1);
-    auto tm = *std::gmtime(&t);
-
-    std::vector<std::string> tz_names = {"GMT", "UTC"};
-    EXPECT_THAT(tz_names, Contains(fmt::format("{:%Z}", t1)));
-    EXPECT_THAT(tz_names, Contains(fmt::format("{:%Z}", tm)));
-  }
-
-  if (fmt::detail::has_member_data_tm_gmtoff<std::tm>::value) {
-    auto t = std::chrono::system_clock::to_time_t(t1);
-    auto tm = *std::gmtime(&t);
-
-    EXPECT_EQ(fmt::format("{:%z}", t1), "+0000");
-    EXPECT_EQ(fmt::format("{:%z}", tm), "+0000");
-
-    EXPECT_EQ(fmt::format("{:%Ez}", t1), "+00:00");
-    EXPECT_EQ(fmt::format("{:%Ez}", tm), "+00:00");
-
-    EXPECT_EQ(fmt::format("{:%Oz}", t1), "+00:00");
-    EXPECT_EQ(fmt::format("{:%Oz}", tm), "+00:00");
-  }
-}
-
-#if FMT_USE_LOCAL_TIME
-
-TEST(chrono_test, localtime) {
-  auto t = std::time(nullptr);
-  auto tm = *std::localtime(&t);
-  EXPECT_TRUE(equal(tm, fmt::localtime(t)));
-}
-
-template <typename Duration>
-auto strftime_full_local(std::chrono::local_time<Duration> tp) -> std::string {
-  auto t = std::chrono::system_clock::to_time_t(
-      std::chrono::current_zone()->to_sys(tp));
-  auto tm = *std::localtime(&t);
-  return system_strftime("%Y-%m-%d %H:%M:%S", &tm);
-}
-
-TEST(chrono_test, local_system_clock_time_point) {
-#  ifdef _WIN32
-  return;  // Not supported on Windows.
-#  endif
-  auto t1 = std::chrono::time_point_cast<std::chrono::seconds>(
-      std::chrono::current_zone()->to_local(std::chrono::system_clock::now()));
-  EXPECT_EQ(strftime_full_local(t1), fmt::format("{:%Y-%m-%d %H:%M:%S}", t1));
-  EXPECT_EQ(strftime_full_local(t1), fmt::format("{}", t1));
-  EXPECT_EQ(strftime_full_local(t1), fmt::format("{:}", t1));
-  using time_point = std::chrono::local_time<std::chrono::seconds>;
-  auto t2 = time_point(std::chrono::seconds(86400 + 42));
-  EXPECT_EQ(strftime_full_local(t2), fmt::format("{:%Y-%m-%d %H:%M:%S}", t2));
-
-  std::vector<std::string> spec_list = {
-      "%%",  "%n",  "%t",  "%Y",  "%EY", "%y",  "%Oy", "%Ey", "%C",
-      "%EC", "%G",  "%g",  "%b",  "%h",  "%B",  "%m",  "%Om", "%U",
-      "%OU", "%W",  "%OW", "%V",  "%OV", "%j",  "%d",  "%Od", "%e",
-      "%Oe", "%a",  "%A",  "%w",  "%Ow", "%u",  "%Ou", "%H",  "%OH",
-      "%I",  "%OI", "%M",  "%OM", "%S",  "%OS", "%x",  "%Ex", "%X",
-      "%EX", "%D",  "%F",  "%R",  "%T",  "%p",  "%z",  "%Z"};
-#  ifndef _WIN32
-  // Disabled on Windows because these formats are not consistent among
-  // platforms.
-  spec_list.insert(spec_list.end(), {"%c", "%Ec", "%r"});
-#  elif !FMT_HAS_C99_STRFTIME
-  // Only C89 conversion specifiers when using MSVCRT instead of UCRT
-  spec_list = {"%%", "%Y", "%y", "%b", "%B", "%m", "%U", "%W", "%j", "%d", "%a",
-               "%A", "%w", "%H", "%I", "%M", "%S", "%x", "%X", "%p", "%Z"};
-#  endif
-  spec_list.push_back("%Y-%m-%d %H:%M:%S");
-
-  for (const auto& spec : spec_list) {
-    auto t = std::chrono::system_clock::to_time_t(
-        std::chrono::current_zone()->to_sys(t1));
-    auto tm = *std::localtime(&t);
-
-    auto sys_output = system_strftime(spec, &tm);
-
-    auto fmt_spec = fmt::format("{{:{}}}", spec);
-    EXPECT_EQ(sys_output, fmt::format(fmt::runtime(fmt_spec), t1));
-    EXPECT_EQ(sys_output, fmt::format(fmt::runtime(fmt_spec), tm));
-  }
-
-  if (std::find(spec_list.cbegin(), spec_list.cend(), "%z") !=
-      spec_list.cend()) {
-    auto t = std::chrono::system_clock::to_time_t(
-        std::chrono::current_zone()->to_sys(t1));
-    auto tm = *std::localtime(&t);
-
-    auto sys_output = system_strftime("%z", &tm);
-    sys_output.insert(sys_output.end() - 2, 1, ':');
-
-    EXPECT_EQ(sys_output, fmt::format("{:%Ez}", t1));
-    EXPECT_EQ(sys_output, fmt::format("{:%Ez}", tm));
-
-    EXPECT_EQ(sys_output, fmt::format("{:%Oz}", t1));
-    EXPECT_EQ(sys_output, fmt::format("{:%Oz}", tm));
-  }
-}
-
-#endif  // FMT_USE_LOCAL_TIME
-
-#ifndef FMT_STATIC_THOUSANDS_SEPARATOR
-
-TEST(chrono_test, format_default) {
-  EXPECT_EQ(fmt::format("{}", std::chrono::seconds(42)), "42s");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::atto>(42)),
-            "42as");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::femto>(42)),
-            "42fs");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::pico>(42)),
-            "42ps");
-  EXPECT_EQ(fmt::format("{}", std::chrono::nanoseconds(42)), "42ns");
-  EXPECT_EQ(fmt::format("{}", std::chrono::microseconds(42)), "42µs");
-  EXPECT_EQ(fmt::format("{}", std::chrono::milliseconds(42)), "42ms");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::centi>(42)),
-            "42cs");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::deci>(42)),
-            "42ds");
-  EXPECT_EQ(fmt::format("{}", std::chrono::seconds(42)), "42s");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::deca>(42)),
-            "42das");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::hecto>(42)),
-            "42hs");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::kilo>(42)),
-            "42ks");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::mega>(42)),
-            "42Ms");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::giga>(42)),
-            "42Gs");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::tera>(42)),
-            "42Ts");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::peta>(42)),
-            "42Ps");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<int, std::exa>(42)),
-            "42Es");
-  EXPECT_EQ(fmt::format("{}", std::chrono::minutes(42)), "42min");
-  EXPECT_EQ(fmt::format("{}", std::chrono::hours(42)), "42h");
-  EXPECT_EQ(fmt::format("{}", days(42)), "42d");
-  EXPECT_EQ(
-      fmt::format("{}", std::chrono::duration<int, std::ratio<15, 1>>(42)),
-      "42[15]s");
-  EXPECT_EQ(
-      fmt::format("{}", std::chrono::duration<int, std::ratio<15, 4>>(42)),
-      "42[15/4]s");
-}
-
-TEST(chrono_test, duration_align) {
-  auto s = std::chrono::seconds(42);
-  EXPECT_EQ(fmt::format("{:5}", s), "42s  ");
-  EXPECT_EQ(fmt::format("{:{}}", s, 5), "42s  ");
-  EXPECT_EQ(fmt::format("{:>5}", s), "  42s");
-  EXPECT_EQ(fmt::format("{:*^7}", s), "**42s**");
-  EXPECT_EQ(fmt::format("{:12%H:%M:%S}", std::chrono::seconds(12345)),
-            "03:25:45    ");
-  EXPECT_EQ(fmt::format("{:>12%H:%M:%S}", std::chrono::seconds(12345)),
-            "    03:25:45");
-  EXPECT_EQ(fmt::format("{:~^12%H:%M:%S}", std::chrono::seconds(12345)),
-            "~~03:25:45~~");
-  EXPECT_EQ(fmt::format("{:{}%H:%M:%S}", std::chrono::seconds(12345), 12),
-            "03:25:45    ");
-}
-
-TEST(chrono_test, tm_align) {
-  auto t = make_tm(1975, 12, 29, 12, 14, 16);
-  EXPECT_EQ(fmt::format("{:%F %T}", t), "1975-12-29 12:14:16");
-  EXPECT_EQ(fmt::format("{:30%F %T}", t), "1975-12-29 12:14:16           ");
-  EXPECT_EQ(fmt::format("{:{}%F %T}", t, 30), "1975-12-29 12:14:16           ");
-  EXPECT_EQ(fmt::format("{:<30%F %T}", t), "1975-12-29 12:14:16           ");
-  EXPECT_EQ(fmt::format("{:^30%F %T}", t), "     1975-12-29 12:14:16      ");
-  EXPECT_EQ(fmt::format("{:>30%F %T}", t), "           1975-12-29 12:14:16");
-
-  EXPECT_EQ(fmt::format("{:*<30%F %T}", t), "1975-12-29 12:14:16***********");
-  EXPECT_EQ(fmt::format("{:*^30%F %T}", t), "*****1975-12-29 12:14:16******");
-  EXPECT_EQ(fmt::format("{:*>30%F %T}", t), "***********1975-12-29 12:14:16");
-}
-
-TEST(chrono_test, tp_align) {
-  auto tp = std::chrono::time_point_cast<std::chrono::microseconds>(
-      std::chrono::system_clock::from_time_t(0));
-  EXPECT_EQ(fmt::format("{:%M:%S}", tp), "00:00.000000");
-  EXPECT_EQ(fmt::format("{:15%M:%S}", tp), "00:00.000000   ");
-  EXPECT_EQ(fmt::format("{:{}%M:%S}", tp, 15), "00:00.000000   ");
-  EXPECT_EQ(fmt::format("{:<15%M:%S}", tp), "00:00.000000   ");
-  EXPECT_EQ(fmt::format("{:^15%M:%S}", tp), " 00:00.000000  ");
-  EXPECT_EQ(fmt::format("{:>15%M:%S}", tp), "   00:00.000000");
-
-  EXPECT_EQ(fmt::format("{:*<15%M:%S}", tp), "00:00.000000***");
-  EXPECT_EQ(fmt::format("{:*^15%M:%S}", tp), "*00:00.000000**");
-  EXPECT_EQ(fmt::format("{:*>15%M:%S}", tp), "***00:00.000000");
-}
-
-TEST(chrono_test, format_specs) {
-  EXPECT_EQ(fmt::format("{:%%}", std::chrono::seconds(0)), "%");
-  EXPECT_EQ(fmt::format("{:%n}", std::chrono::seconds(0)), "\n");
-  EXPECT_EQ(fmt::format("{:%t}", std::chrono::seconds(0)), "\t");
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::seconds(0)), "00");
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::seconds(60)), "00");
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::seconds(42)), "42");
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::milliseconds(1234)), "01.234");
-  EXPECT_EQ(fmt::format("{:%M}", std::chrono::minutes(0)), "00");
-  EXPECT_EQ(fmt::format("{:%M}", std::chrono::minutes(60)), "00");
-  EXPECT_EQ(fmt::format("{:%M}", std::chrono::minutes(42)), "42");
-  EXPECT_EQ(fmt::format("{:%M}", std::chrono::seconds(61)), "01");
-  EXPECT_EQ(fmt::format("{:%H}", std::chrono::hours(0)), "00");
-  EXPECT_EQ(fmt::format("{:%H}", std::chrono::hours(24)), "00");
-  EXPECT_EQ(fmt::format("{:%H}", std::chrono::hours(14)), "14");
-  EXPECT_EQ(fmt::format("{:%H}", std::chrono::minutes(61)), "01");
-  EXPECT_EQ(fmt::format("{:%I}", std::chrono::hours(0)), "12");
-  EXPECT_EQ(fmt::format("{:%I}", std::chrono::hours(12)), "12");
-  EXPECT_EQ(fmt::format("{:%I}", std::chrono::hours(24)), "12");
-  EXPECT_EQ(fmt::format("{:%I}", std::chrono::hours(4)), "04");
-  EXPECT_EQ(fmt::format("{:%I}", std::chrono::hours(14)), "02");
-  EXPECT_EQ(fmt::format("{:%j}", days(12345)), "12345");
-  EXPECT_EQ(fmt::format("{:%j}", std::chrono::hours(12345 * 24 + 12)), "12345");
-  EXPECT_EQ(fmt::format("{:%H:%M:%S}", std::chrono::seconds(12345)),
-            "03:25:45");
-  EXPECT_EQ(fmt::format("{:%R}", std::chrono::seconds(12345)), "03:25");
-  EXPECT_EQ(fmt::format("{:%T}", std::chrono::seconds(12345)), "03:25:45");
-  EXPECT_EQ(fmt::format("{:%Q}", std::chrono::seconds(12345)), "12345");
-  EXPECT_EQ(fmt::format("{:%q}", std::chrono::seconds(12345)), "s");
-}
-
-TEST(chrono_test, invalid_specs) {
-  auto sec = std::chrono::seconds(0);
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%a}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%A}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%c}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%x}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%Ex}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%X}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%EX}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%D}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%F}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%Ec}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%w}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%u}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%b}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%B}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%z}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%Z}"), sec), fmt::format_error,
-                   "no date");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%Eq}"), sec), fmt::format_error,
-                   "invalid format");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%Oq}"), sec), fmt::format_error,
-                   "invalid format");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:abc}"), sec), fmt::format_error,
-                   "invalid format");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:.2f}"), sec), fmt::format_error,
-                   "invalid format");
-}
-
-auto format_tm(const std::tm& time, fmt::string_view spec,
-               const std::locale& loc) -> std::string {
-  auto& facet = std::use_facet<std::time_put<char>>(loc);
-  std::ostringstream os;
-  os.imbue(loc);
-  facet.put(os, os, ' ', &time, spec.begin(), spec.end());
-  return os.str();
-}
-
-TEST(chrono_test, locale) {
-  auto loc = get_locale("ja_JP.utf8");
-  if (loc == std::locale::classic()) return;
-#  define EXPECT_TIME(spec, time, duration)                     \
-    {                                                           \
-      auto jp_loc = std::locale("ja_JP.utf8");                  \
-      EXPECT_EQ(format_tm(time, spec, jp_loc),                  \
-                fmt::format(jp_loc, "{:L" spec "}", duration)); \
-    }
-  EXPECT_TIME("%OH", make_hour(14), std::chrono::hours(14));
-  EXPECT_TIME("%OI", make_hour(14), std::chrono::hours(14));
-  EXPECT_TIME("%OM", make_minute(42), std::chrono::minutes(42));
-  EXPECT_TIME("%OS", make_second(42), std::chrono::seconds(42));
-  auto time = make_tm();
-  time.tm_hour = 3;
-  time.tm_min = 25;
-  time.tm_sec = 45;
-  auto sec = std::chrono::seconds(12345);
-  EXPECT_TIME("%r", time, sec);
-  EXPECT_TIME("%p", time, sec);
-}
-
-using dms = std::chrono::duration<double, std::milli>;
-
-TEST(chrono_test, format_default_fp) {
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<float>(1.234)), "1.234s");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<float, std::milli>(1.234)),
-            "1.234ms");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<double>(1.234)), "1.234s");
-  EXPECT_EQ(fmt::format("{}", dms(1.234)), "1.234ms");
-}
-
-TEST(chrono_test, format_precision) {
-  EXPECT_THROW_MSG(
-      (void)fmt::format(runtime("{:.2%Q}"), std::chrono::seconds(42)),
-      fmt::format_error, "precision not allowed for this argument type");
-  EXPECT_EQ(fmt::format("{:.0}", dms(1.234)), "1ms");
-  EXPECT_EQ(fmt::format("{:.1}", dms(1.234)), "1.2ms");
-  EXPECT_EQ(fmt::format("{:.{}}", dms(1.234), 2), "1.23ms");
-
-  EXPECT_EQ(fmt::format("{:.0}", dms(12.56)), "13ms");
-  EXPECT_EQ(fmt::format("{:.1}", dms(12.56)), "12.6ms");
-  EXPECT_EQ(fmt::format("{:.2}", dms(12.56)), "12.56ms");
-}
-
-TEST(chrono_test, format_full_specs) {
-  EXPECT_EQ(fmt::format("{:6.0}", dms(1.234)), "1ms   ");
-  EXPECT_EQ(fmt::format("{:6.1}", dms(1.234)), "1.2ms ");
-  EXPECT_EQ(fmt::format("{:>8.{}}", dms(1.234), 2), "  1.23ms");
-  EXPECT_EQ(fmt::format("{:^{}.{}}", dms(1.234), 7, 1), " 1.2ms ");
-  EXPECT_EQ(fmt::format("{0:^{2}.{1}}", dms(1.234), 2, 8), " 1.23ms ");
-  EXPECT_EQ(fmt::format("{:=^{}.{}}", dms(1.234), 9, 3), "=1.234ms=");
-  EXPECT_EQ(fmt::format("{:*^10.4}", dms(1.234)), "*1.2340ms*");
-
-  EXPECT_EQ(fmt::format("{:6.0}", dms(12.56)), "13ms  ");
-  EXPECT_EQ(fmt::format("{:>8.{}}", dms(12.56), 0), "    13ms");
-  EXPECT_EQ(fmt::format("{:^{}.{}}", dms(12.56), 6, 0), " 13ms ");
-  EXPECT_EQ(fmt::format("{0:^{2}.{1}}", dms(12.56), 0, 8), "  13ms  ");
-  EXPECT_EQ(fmt::format("{:=^{}.{}}", dms(12.56), 9, 0), "==13ms===");
-  EXPECT_EQ(fmt::format("{:*^10.0}", dms(12.56)), "***13ms***");
-}
-
-TEST(chrono_test, format_simple_q) {
-  EXPECT_EQ(fmt::format("{:%Q %q}", std::chrono::duration<float>(1.234)),
-            "1.234 s");
-  EXPECT_EQ(
-      fmt::format("{:%Q %q}", std::chrono::duration<float, std::milli>(1.234)),
-      "1.234 ms");
-  EXPECT_EQ(fmt::format("{:%Q %q}", std::chrono::duration<double>(1.234)),
-            "1.234 s");
-  EXPECT_EQ(fmt::format("{:%Q %q}", dms(1.234)), "1.234 ms");
-}
-
-TEST(chrono_test, format_precision_q) {
-  EXPECT_THROW_MSG(
-      (void)fmt::format(runtime("{:.2%Q %q}"), std::chrono::seconds(42)),
-      fmt::format_error, "precision not allowed for this argument type");
-  EXPECT_EQ(fmt::format("{:.1%Q %q}", dms(1.234)), "1.2 ms");
-  EXPECT_EQ(fmt::format("{:.{}%Q %q}", dms(1.234), 2), "1.23 ms");
-}
-
-TEST(chrono_test, format_full_specs_q) {
-  EXPECT_EQ(fmt::format("{:7.0%Q %q}", dms(1.234)), "1 ms   ");
-  EXPECT_EQ(fmt::format("{:7.1%Q %q}", dms(1.234)), "1.2 ms ");
-  EXPECT_EQ(fmt::format("{:>8.{}%Q %q}", dms(1.234), 2), " 1.23 ms");
-  EXPECT_EQ(fmt::format("{:^{}.{}%Q %q}", dms(1.234), 8, 1), " 1.2 ms ");
-  EXPECT_EQ(fmt::format("{0:^{2}.{1}%Q %q}", dms(1.234), 2, 9), " 1.23 ms ");
-  EXPECT_EQ(fmt::format("{:=^{}.{}%Q %q}", dms(1.234), 10, 3), "=1.234 ms=");
-  EXPECT_EQ(fmt::format("{:*^11.4%Q %q}", dms(1.234)), "*1.2340 ms*");
-
-  EXPECT_EQ(fmt::format("{:7.0%Q %q}", dms(12.56)), "13 ms  ");
-  EXPECT_EQ(fmt::format("{:>8.{}%Q %q}", dms(12.56), 0), "   13 ms");
-  EXPECT_EQ(fmt::format("{:^{}.{}%Q %q}", dms(12.56), 8, 0), " 13 ms  ");
-  EXPECT_EQ(fmt::format("{0:^{2}.{1}%Q %q}", dms(12.56), 0, 9), "  13 ms  ");
-  EXPECT_EQ(fmt::format("{:=^{}.{}%Q %q}", dms(12.56), 9, 0), "==13 ms==");
-  EXPECT_EQ(fmt::format("{:*^11.0%Q %q}", dms(12.56)), "***13 ms***");
-}
-
-TEST(chrono_test, invalid_width_id) {
-  EXPECT_THROW((void)fmt::format(runtime("{:{o}"), std::chrono::seconds(0)),
-               fmt::format_error);
-}
-
-TEST(chrono_test, invalid_colons) {
-  EXPECT_THROW((void)fmt::format(runtime("{0}=:{0::"), std::chrono::seconds(0)),
-               fmt::format_error);
-}
-
-TEST(chrono_test, negative_durations) {
-  EXPECT_EQ(fmt::format("{:%Q}", std::chrono::seconds(-12345)), "-12345");
-  EXPECT_EQ(fmt::format("{:%H:%M:%S}", std::chrono::seconds(-12345)),
-            "-03:25:45");
-  EXPECT_EQ(fmt::format("{:%M:%S}", std::chrono::duration<double>(-1)),
-            "-00:01");
-  EXPECT_EQ(fmt::format("{:%q}", std::chrono::seconds(-12345)), "s");
-  EXPECT_EQ(fmt::format("{:%S}",
-                        std::chrono::duration<signed char, std::milli>(-127)),
-            "-00.127");
-  auto min = std::numeric_limits<int>::min();
-  EXPECT_EQ(fmt::format("{}", min),
-            fmt::format("{:%Q}", std::chrono::duration<int>(min)));
-}
-
-TEST(chrono_test, special_durations) {
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::duration<double>(1e20)), "40");
-  auto nan = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_EQ(
-      fmt::format("{:%I %H %M %S %R %r}", std::chrono::duration<double>(nan)),
-      "nan nan nan nan nan:nan nan");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<float, std::exa>(1)),
-            "1Es");
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<float, std::atto>(1)),
-            "1as");
-  EXPECT_EQ(fmt::format("{:%R}", std::chrono::duration<char, std::mega>{2}),
-            "03:33");
-  EXPECT_EQ(fmt::format("{:%T}", std::chrono::duration<char, std::mega>{2}),
-            "03:33:20");
-  EXPECT_EQ(
-      fmt::format("{:.3%S}", std::chrono::duration<float, std::pico>(1.234e12)),
-      "01.234");
-}
-
-TEST(chrono_test, unsigned_duration) {
-  EXPECT_EQ(fmt::format("{}", std::chrono::duration<unsigned>(42)), "42s");
-}
-
-TEST(chrono_test, weekday) {
-  auto loc = get_locale("es_ES.UTF-8");
-  std::locale::global(loc);
-
-  auto sat = fmt::weekday(6);
-  
-  auto tm = std::tm();
-  tm.tm_wday = static_cast<int>(sat.c_encoding());
-
-  EXPECT_EQ(fmt::format("{}", sat), "Sat");
-  EXPECT_EQ(fmt::format("{:%a}", sat), "Sat");
-  EXPECT_EQ(fmt::format("{:%A}", sat), "Saturday");
-  EXPECT_EQ(fmt::format("{:%a}", tm), "Sat");
-
-  if (loc != std::locale::classic()) {
-    auto saturdays = std::vector<std::string>{"sáb", "sá."};
-    EXPECT_THAT(saturdays, Contains(fmt::format(loc, "{:L}", sat)));
-    EXPECT_THAT(saturdays, Contains(fmt::format(loc, "{:%a}", sat)));
-    EXPECT_THAT(saturdays, Contains(fmt::format(loc, "{:%a}", tm)));
-  }
-}
-
-TEST(chrono_test, cpp20_duration_subsecond_support) {
-  using attoseconds = std::chrono::duration<long long, std::atto>;
-  // Check that 18 digits of subsecond precision are supported.
-  EXPECT_EQ(fmt::format("{:%S}", attoseconds{999999999999999999}),
-            "00.999999999999999999");
-  EXPECT_EQ(fmt::format("{:%S}", attoseconds{673231113420148734}),
-            "00.673231113420148734");
-  EXPECT_EQ(fmt::format("{:%S}", attoseconds{-673231113420148734}),
-            "-00.673231113420148734");
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::nanoseconds{13420148734}),
-            "13.420148734");
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::nanoseconds{-13420148734}),
-            "-13.420148734");
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::milliseconds{1234}), "01.234");
-  // Check subsecond presision modifier.
-  EXPECT_EQ(fmt::format("{:.6%S}", std::chrono::nanoseconds{1234}),
-            "00.000001");
-  EXPECT_EQ(fmt::format("{:.18%S}", std::chrono::nanoseconds{1234}),
-            "00.000001234000000000");
-  EXPECT_EQ(fmt::format("{:.{}%S}", std::chrono::nanoseconds{1234}, 6),
-            "00.000001");
-  EXPECT_EQ(fmt::format("{:.6%S}", std::chrono::milliseconds{1234}),
-            "01.234000");
-  EXPECT_EQ(fmt::format("{:.6%S}", std::chrono::milliseconds{-1234}),
-            "-01.234000");
-  EXPECT_EQ(fmt::format("{:.2%S}", std::chrono::milliseconds{12345}),
-            "12.34");
-  EXPECT_EQ(fmt::format("{:.2%S}", std::chrono::milliseconds{12375}),
-            "12.37");
-  EXPECT_EQ(fmt::format("{:.2%S}", std::chrono::milliseconds{-12375}),
-            "-12.37");
-  EXPECT_EQ(fmt::format("{:.0%S}", std::chrono::milliseconds{12054}),
-            "12");
-  EXPECT_EQ(fmt::format("{:.2%S}", std::chrono::milliseconds{99999}),
-            "39.99");
-  EXPECT_EQ(fmt::format("{:.2%S}", std::chrono::milliseconds{1000}),
-            "01.00");
-  EXPECT_EQ(fmt::format("{:.3%S}", std::chrono::milliseconds{1}),
-            "00.001");
-  EXPECT_EQ(fmt::format("{:.3%S}", std::chrono::seconds{1234}), "34.000");
-  EXPECT_EQ(fmt::format("{:.3%S}", std::chrono::hours{1234}), "00.000");
-  EXPECT_EQ(fmt::format("{:.5%S}", dms(1.234)), "00.00123");
-  EXPECT_EQ(fmt::format("{:.8%S}", dms(1.234)), "00.00123400");
-  {
-    // Check that {:%H:%M:%S} is equivalent to {:%T}.
-    auto dur = std::chrono::milliseconds{3601234};
-    auto formatted_dur = fmt::format("{:%T}", dur);
-    EXPECT_EQ(formatted_dur, "01:00:01.234");
-    EXPECT_EQ(fmt::format("{:%H:%M:%S}", dur), formatted_dur);
-    EXPECT_EQ(fmt::format("{:.6%H:%M:%S}", dur), "01:00:01.234000");
-  }
-  using nanoseconds_dbl = std::chrono::duration<double, std::nano>;
-  EXPECT_EQ(fmt::format("{:%S}", nanoseconds_dbl{-123456789}), "-00.123456789");
-  EXPECT_EQ(fmt::format("{:%S}", nanoseconds_dbl{9123456789}), "09.123456789");
-  // Verify that only the seconds part is extracted and printed.
-  EXPECT_EQ(fmt::format("{:%S}", nanoseconds_dbl{99123456789}), "39.123456789");
-  EXPECT_EQ(fmt::format("{:%S}", nanoseconds_dbl{99123000000}), "39.123000000");
-  {
-    // Now the hour is printed, and we also test if negative doubles work.
-    auto dur = nanoseconds_dbl{-99123456789};
-    auto formatted_dur = fmt::format("{:%T}", dur);
-    EXPECT_EQ(formatted_dur, "-00:01:39.123456789");
-    EXPECT_EQ(fmt::format("{:%H:%M:%S}", dur), formatted_dur);
-    EXPECT_EQ(fmt::format("{:.3%H:%M:%S}", dur), "-00:01:39.123");
-  }
-  // Check that durations with precision greater than std::chrono::seconds have
-  // fixed precision, and print zeros even if there is no fractional part.
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::microseconds{7000000}),
-            "07.000000");
-  EXPECT_EQ(fmt::format("{:%S}",
-                        std::chrono::duration<long long, std::ratio<1, 3>>(1)),
-            "00.333333");
-  EXPECT_EQ(fmt::format("{:%S}",
-                        std::chrono::duration<long long, std::ratio<1, 7>>(1)),
-            "00.142857");
-
-  EXPECT_EQ(
-      fmt::format("{:%S}",
-                  std::chrono::duration<signed char, std::ratio<1, 100>>(0x80)),
-      "-01.28");
-
-  EXPECT_EQ(
-      fmt::format("{:%M:%S}",
-                  std::chrono::duration<short, std::ratio<1, 100>>(0x8000)),
-      "-05:27.68");
-
-  // Check that floating point seconds with ratio<1,1> are printed.
-  EXPECT_EQ(fmt::format("{:%S}", std::chrono::duration<double>{1.5}),
-            "01.500000");
-  EXPECT_EQ(fmt::format("{:%M:%S}", std::chrono::duration<double>{-61.25}),
-            "-01:01.250000");
-}
-
-#endif  // FMT_STATIC_THOUSANDS_SEPARATOR
-
-// Disable the utc_clock test for windows, as the icu.dll used for tzdb
-// (time zone database) is not shipped with many windows versions.
-#if FMT_USE_UTC_TIME && !defined(_WIN32)
-TEST(chrono_test, utc_clock) {
-  auto t1 = std::chrono::system_clock::now();
-  auto t1_utc = std::chrono::utc_clock::from_sys(t1);
-  EXPECT_EQ(fmt::format("{:%Y-%m-%d %H:%M:%S}", t1),
-            fmt::format("{:%Y-%m-%d %H:%M:%S}", t1_utc));
-}
-#endif
-
-TEST(chrono_test, timestamp_ratios) {
-  auto t1 =
-      sys_time<std::chrono::milliseconds>(std::chrono::milliseconds(67890));
-  EXPECT_EQ(fmt::format("{:%M:%S}", t1), "01:07.890");
-
-  auto t2 = sys_time<std::chrono::minutes>(std::chrono::minutes(7));
-  EXPECT_EQ(fmt::format("{:%M:%S}", t2), "07:00");
-
-  auto t3 = sys_time<std::chrono::duration<int, std::ratio<9>>>(
-      std::chrono::duration<int, std::ratio<9>>(7));
-  EXPECT_EQ(fmt::format("{:%M:%S}", t3), "01:03");
-
-  auto t4 = sys_time<std::chrono::duration<int, std::ratio<63>>>(
-      std::chrono::duration<int, std::ratio<63>>(1));
-  EXPECT_EQ(fmt::format("{:%M:%S}", t4), "01:03");
-
-  if (sizeof(time_t) > 4) {
-    auto tp =
-        sys_time<std::chrono::milliseconds>(std::chrono::seconds(32503680000));
-    EXPECT_EQ(fmt::format("{:%Y-%m-%d}", tp), "3000-01-01");
-  }
-
-  if (FMT_SAFE_DURATION_CAST) {
-    using years = std::chrono::duration<std::int64_t, std::ratio<31556952>>;
-    auto tp = sys_time<years>(years(std::numeric_limits<std::int64_t>::max()));
-    EXPECT_THROW_MSG((void)fmt::format("{:%Y-%m-%d}", tp), fmt::format_error,
-                     "cannot format duration");
-  }
-}
-
-TEST(chrono_test, timestamp_sub_seconds) {
-  auto t1 = sys_time<std::chrono::duration<long long, std::ratio<1, 3>>>(
-      std::chrono::duration<long long, std::ratio<1, 3>>(4));
-  EXPECT_EQ(fmt::format("{:%S}", t1), "01.333333");
-
-  auto t2 = sys_time<std::chrono::duration<double, std::ratio<1, 3>>>(
-      std::chrono::duration<double, std::ratio<1, 3>>(4));
-  EXPECT_EQ(fmt::format("{:%S}", t2), "01.333333");
-
-  auto t3 = sys_time<std::chrono::seconds>(std::chrono::seconds(2));
-  EXPECT_EQ(fmt::format("{:%S}", t3), "02");
-
-  auto t4 = sys_time<std::chrono::duration<double>>(
-      std::chrono::duration<double, std::ratio<1, 1>>(9.5));
-  EXPECT_EQ(fmt::format("{:%S}", t4), "09.500000");
-
-  auto t5 = sys_time<std::chrono::duration<double>>(
-      std::chrono::duration<double, std::ratio<1, 1>>(9));
-  EXPECT_EQ(fmt::format("{:%S}", t5), "09");
-
-  auto t6 = sys_time<std::chrono::milliseconds>(std::chrono::seconds(1) +
-                                                std::chrono::milliseconds(120));
-  EXPECT_EQ(fmt::format("{:%S}", t6), "01.120");
-
-  auto t7 =
-      sys_time<std::chrono::microseconds>(std::chrono::microseconds(1234567));
-  EXPECT_EQ(fmt::format("{:%S}", t7), "01.234567");
-
-  auto t8 =
-      sys_time<std::chrono::nanoseconds>(std::chrono::nanoseconds(123456789));
-  EXPECT_EQ(fmt::format("{:%S}", t8), "00.123456789");
-
-  auto t9 = std::chrono::time_point_cast<std::chrono::nanoseconds>(
-      std::chrono::system_clock::now());
-  auto t9_sec = std::chrono::time_point_cast<std::chrono::seconds>(t9);
-  auto t9_sub_sec_part = fmt::format("{0:09}", (t9 - t9_sec).count());
-  EXPECT_EQ(fmt::format("{}.{}", strftime_full_utc(t9_sec), t9_sub_sec_part),
-            fmt::format("{:%Y-%m-%d %H:%M:%S}", t9));
-  EXPECT_EQ(fmt::format("{}.{}", strftime_full_utc(t9_sec), t9_sub_sec_part),
-            fmt::format("{:%Y-%m-%d %T}", t9));
-
-  auto t10 =
-      sys_time<std::chrono::milliseconds>(std::chrono::milliseconds(2000));
-  EXPECT_EQ(fmt::format("{:%S}", t10), "02.000");
-
-  auto epoch = sys_time<std::chrono::milliseconds>();
-  auto d = std::chrono::milliseconds(250);
-  EXPECT_EQ(fmt::format("{:%S}", epoch - d), "59.750");
-  EXPECT_EQ(fmt::format("{:%S}", epoch), "00.000");
-  EXPECT_EQ(fmt::format("{:%S}", epoch + d), "00.250");
-}
-
-TEST(chrono_test, glibc_extensions) {
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%0}"), std::chrono::seconds()),
-                   fmt::format_error, "invalid format");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%_}"), std::chrono::seconds()),
-                   fmt::format_error, "invalid format");
-  EXPECT_THROW_MSG((void)fmt::format(runtime("{:%-}"), std::chrono::seconds()),
-                   fmt::format_error, "invalid format");
-
-  {
-    const auto d = std::chrono::hours(1) + std::chrono::minutes(2) +
-                   std::chrono::seconds(3);
-
-    EXPECT_EQ(fmt::format("{:%I,%H,%M,%S}", d), "01,01,02,03");
-    EXPECT_EQ(fmt::format("{:%_I,%_H,%_M,%_S}", d), " 1, 1, 2, 3");
-    EXPECT_EQ(fmt::format("{:%-I,%-H,%-M,%-S}", d), "1,1,2,3");
-    EXPECT_EQ(fmt::format("{:%-I,%H,%M,%S}", d), "1,01,02,03");
-
-    EXPECT_EQ(fmt::format("{:%OI,%OH,%OM,%OS}", d), "01,01,02,03");
-    EXPECT_EQ(fmt::format("{:%_OI,%_OH,%_OM,%_OS}", d), " 1, 1, 2, 3");
-    EXPECT_EQ(fmt::format("{:%-OI,%-OH,%-OM,%-OS}", d), "1,1,2,3");
-  }
-
-  {
-    const auto tm = make_tm(1970, 1, 1, 1, 2, 3);
-    EXPECT_EQ(fmt::format("{:%I,%H,%M,%S}", tm), "01,01,02,03");
-    EXPECT_EQ(fmt::format("{:%_I,%_H,%_M,%_S}", tm), " 1, 1, 2, 3");
-    EXPECT_EQ(fmt::format("{:%-I,%-H,%-M,%-S}", tm), "1,1,2,3");
-
-    EXPECT_EQ(fmt::format("{:%OI,%OH,%OM,%OS}", tm), "01,01,02,03");
-    EXPECT_EQ(fmt::format("{:%_OI,%_OH,%_OM,%_OS}", tm), " 1, 1, 2, 3");
-    EXPECT_EQ(fmt::format("{:%-OI,%-OH,%-OM,%-OS}", tm), "1,1,2,3");
-  }
-
-  {
-    const auto d = std::chrono::seconds(3) + std::chrono::milliseconds(140);
-    EXPECT_EQ(fmt::format("{:%S}", d), "03.140");
-    EXPECT_EQ(fmt::format("{:%_S}", d), " 3.140");
-    EXPECT_EQ(fmt::format("{:%-S}", d), "3.140");
-  }
-
-  {
-    auto d = std::chrono::duration<double>(3.14);
-    EXPECT_EQ(fmt::format("{:%S}", d), "03.140000");
-    EXPECT_EQ(fmt::format("{:%_S}", d), " 3.140000");
-    EXPECT_EQ(fmt::format("{:%-S}", d), "3.140000");
-  }
-
-  {
-    auto t = std::tm();
-    t.tm_yday = 7;
-    EXPECT_EQ(fmt::format("{:%U,%W,%V}", t), "02,01,01");
-    EXPECT_EQ(fmt::format("{:%_U,%_W,%_V}", t), " 2, 1, 1");
-    EXPECT_EQ(fmt::format("{:%-U,%-W,%-V}", t), "2,1,1");
-  }
-
-  {
-    auto t = std::tm();
-    t.tm_mday = 7;
-    EXPECT_EQ(fmt::format("{:%d}", t), "07");
-    EXPECT_EQ(fmt::format("{:%_d}", t), " 7");
-    EXPECT_EQ(fmt::format("{:%-d}", t), "7");
-
-    EXPECT_EQ(fmt::format("{:%e}", t), " 7");
-  }
-}
-
-TEST(chrono_test, out_of_range) {
-  auto d = std::chrono::duration<unsigned long, std::giga>(538976288);
-  EXPECT_THROW((void)fmt::format("{:%j}", d), fmt::format_error);
-}
-
-TEST(chrono_test, year_month_day) {
-  auto loc = get_locale("es_ES.UTF-8");
-  std::locale::global(loc);
-  
-  auto year = fmt::year(2024);
-  auto month = fmt::month(1);
-  auto day = fmt::day(1);
-  auto ymd = fmt::year_month_day(year, month, day);
-
-  EXPECT_EQ(fmt::format("{}", year), "2024");
-  EXPECT_EQ(fmt::format("{:%Y}", year), "2024");
-  EXPECT_EQ(fmt::format("{:%y}", year), "24");
-
-  EXPECT_EQ(fmt::format("{}", month), "Jan");
-  EXPECT_EQ(fmt::format("{:%m}", month), "01");
-  EXPECT_EQ(fmt::format("{:%b}", month), "Jan");
-  EXPECT_EQ(fmt::format("{:%B}", month), "January");
-
-  EXPECT_EQ(fmt::format("{}", day), "01");
-  EXPECT_EQ(fmt::format("{:%d}", day), "01");
-
-  EXPECT_EQ(fmt::format("{}", ymd), "2024-01-01");
-  EXPECT_EQ(fmt::format("{:%Y-%m-%d}", ymd), "2024-01-01");
-  EXPECT_EQ(fmt::format("{:%Y-%b-%d}", ymd), "2024-Jan-01");
-  EXPECT_EQ(fmt::format("{:%Y-%B-%d}", ymd), "2024-January-01");
-
-  if (loc != std::locale::classic()) {
-    auto months = std::vector<std::string>{"ene.", "ene"};
-    EXPECT_THAT(months, Contains(fmt::format(loc, "{:L}", month)));
-    EXPECT_THAT(months, Contains(fmt::format(loc, "{:%b}", month)));
-  }
 }

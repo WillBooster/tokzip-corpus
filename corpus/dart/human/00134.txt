@@ -1,45 +1,92 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:dio/dio.dart';
+import 'package:http/http.dart';
 
-class CacheInterceptor extends Interceptor {
-  CacheInterceptor();
+/// A conversion layer which translates Dio HTTP requests to
+/// [http](https://pub.dev/packages/http) compatible requests.
+/// This way there's no need to implement custom [HttpClientAdapter]
+/// for each platform. Therefore, the required effort to add tests is kept
+/// to a minimum. Since `CupertinoClient` and `CronetClient` depend anyway on
+/// `http` this also doesn't add any additional dependency.
+class ConversionLayerAdapter implements HttpClientAdapter {
+  ConversionLayerAdapter(this.client);
 
-  final _cache = <Uri, Response>{};
+  final Client client;
 
   @override
-  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
-    final response = _cache[options.uri];
-    if (options.extra['refresh'] == true) {
-      print('${options.uri}: force refresh, ignore cache! \n');
-      return handler.next(options);
-    } else if (response != null) {
-      print('cache hit: ${options.uri} \n');
-      return handler.resolve(response);
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<dynamic>? cancelFuture,
+  ) async {
+    final request = await _fromOptionsAndStream(options, requestStream);
+    final response = await client.send(request);
+    return response.toDioResponseBody(options);
+  }
+
+  @override
+  void close({bool force = false}) => client.close();
+
+  Future<BaseRequest> _fromOptionsAndStream(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+  ) async {
+    final request = Request(
+      options.method,
+      options.uri,
+    );
+
+    request.headers.addAll(
+      Map.fromEntries(
+        options.headers.entries.map(
+          (e) => MapEntry(
+            options.preserveHeaderCase ? e.key : e.key.toLowerCase(),
+            e.value.toString(),
+          ),
+        ),
+      ),
+    );
+
+    request.followRedirects = options.followRedirects;
+    request.maxRedirects = options.maxRedirects;
+
+    if (requestStream != null) {
+      final completer = Completer<Uint8List>();
+      final sink = ByteConversionSink.withCallback(
+        (bytes) => completer.complete(
+          bytes is Uint8List ? bytes : Uint8List.fromList(bytes),
+        ),
+      );
+      requestStream.listen(
+        sink.add,
+        onError: completer.completeError,
+        onDone: sink.close,
+        cancelOnError: true,
+      );
+      final bytes = await completer.future;
+      request.bodyBytes = bytes;
     }
-    super.onRequest(options, handler);
-  }
-
-  @override
-  void onResponse(Response response, ResponseInterceptorHandler handler) {
-    _cache[response.requestOptions.uri] = response;
-    super.onResponse(response, handler);
-  }
-
-  @override
-  void onError(DioException err, ErrorInterceptorHandler handler) {
-    print('onError: $err');
-    super.onError(err, handler);
+    return request;
   }
 }
 
-void main() async {
-  final dio = Dio();
-  dio.options.baseUrl = 'https://pub.dev';
-  dio.interceptors
-    ..add(CacheInterceptor())
-    ..add(LogInterceptor(requestHeader: false, responseHeader: false));
-
-  await dio.get('/'); // second request
-  await dio.get('/'); // Will hit cache
-  // Force refresh
-  await dio.get('/', options: Options(extra: {'refresh': true}));
+extension on StreamedResponse {
+  ResponseBody toDioResponseBody(RequestOptions options) {
+    final dioHeaders = headers.entries.map(
+      (e) => MapEntry(
+        options.preserveHeaderCase ? e.key : e.key.toLowerCase(),
+        [e.value],
+      ),
+    );
+    return ResponseBody(
+      stream.cast<Uint8List>(),
+      statusCode,
+      headers: Map.fromEntries(dioHeaders),
+      isRedirect: isRedirect,
+      statusMessage: reasonPhrase,
+    );
+  }
 }

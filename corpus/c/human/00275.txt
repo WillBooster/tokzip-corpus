@@ -21,169 +21,193 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+#define CURL_DISABLE_DEPRECATION  /* Using and testing the form api */
 #include "test.h"
 
-#ifdef HAVE_LOCALE_H
-#  include <locale.h> /* for setlocale() */
-#endif
+#include "memdebug.h"
 
-#ifdef HAVE_IO_H
-#  include <io.h> /* for setmode() */
-#endif
+static char data[] =
+  "this is what we post to the silly web server";
 
-#ifdef HAVE_FCNTL_H
-#  include <fcntl.h> /* for setmode() */
-#endif
+static const char name[] = "fieldname";
 
-#ifdef CURLDEBUG
-#  define MEMDEBUG_NODEFINES
-#  include "memdebug.h"
-#endif
 
-#include "timediff.h"
+/* This test attempts to use all form API features that are not
+ * used elsewhere.
+ */
 
-int select_wrapper(int nfds, fd_set *rd, fd_set *wr, fd_set *exc,
-                   struct timeval *tv)
+/* curl_formget callback to count characters. */
+static size_t count_chars(void *userp, const char *buf, size_t len)
 {
-  if(nfds < 0) {
-    SET_SOCKERRNO(EINVAL);
-    return -1;
+  size_t *pcounter = (size_t *) userp;
+
+  (void) buf;
+  *pcounter += len;
+  return len;
+}
+
+
+CURLcode test(char *URL)
+{
+  CURL *curl = NULL;
+  CURLcode res = TEST_ERR_MAJOR_BAD;
+  CURLFORMcode formrc;
+  struct curl_slist *headers, *headers2 = NULL;
+  struct curl_httppost *formpost = NULL;
+  struct curl_httppost *lastptr = NULL;
+  struct curl_forms formarray[3];
+  size_t formlength = 0;
+  char flbuf[32];
+  long contentlength = 0;
+
+  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+    fprintf(stderr, "curl_global_init() failed\n");
+    return TEST_ERR_MAJOR_BAD;
   }
-#ifdef USE_WINSOCK
-  /*
-   * Winsock select() requires that at least one of the three fd_set
-   * pointers is not NULL and points to a non-empty fdset. IOW Winsock
-   * select() can not be used to sleep without a single fd_set.
+
+  /* Check proper name and data copying, as well as headers. */
+  headers = curl_slist_append(NULL, "X-customheader-1: Header 1 data");
+  if(!headers) {
+    goto test_cleanup;
+  }
+  headers2 = curl_slist_append(headers, "X-customheader-2: Header 2 data");
+  if(!headers2) {
+    goto test_cleanup;
+  }
+  headers = headers2;
+  headers2 = curl_slist_append(headers, "Content-Type: text/plain");
+  if(!headers2) {
+    goto test_cleanup;
+  }
+  headers = headers2;
+  formrc = curl_formadd(&formpost, &lastptr,
+                        CURLFORM_COPYNAME, &name,
+                        CURLFORM_COPYCONTENTS, &data,
+                        CURLFORM_CONTENTHEADER, headers,
+                        CURLFORM_END);
+
+  if(formrc) {
+    printf("curl_formadd(1) = %d\n", (int) formrc);
+    goto test_cleanup;
+  }
+
+  contentlength = (long)(strlen(data) - 1);
+
+  /* Use a form array for the non-copy test. */
+  formarray[0].option = CURLFORM_PTRCONTENTS;
+  formarray[0].value = data;
+  formarray[1].option = CURLFORM_CONTENTSLENGTH;
+  formarray[1].value = (char *)(size_t)contentlength;
+  formarray[2].option = CURLFORM_END;
+  formarray[2].value = NULL;
+  formrc = curl_formadd(&formpost,
+                        &lastptr,
+                        CURLFORM_PTRNAME, name,
+                        CURLFORM_NAMELENGTH, strlen(name) - 1,
+                        CURLFORM_ARRAY, formarray,
+                        CURLFORM_FILENAME, "remotefile.txt",
+                        CURLFORM_END);
+
+  if(formrc) {
+    printf("curl_formadd(2) = %d\n", (int) formrc);
+    goto test_cleanup;
+  }
+
+  /* Now change in-memory data to affect CURLOPT_PTRCONTENTS value.
+     Copied values (first field) must not be affected.
+     CURLOPT_PTRNAME actually copies the name thus we do not test this here. */
+  data[0]++;
+
+  /* Check multi-files and content type propagation. */
+  formrc = curl_formadd(&formpost,
+                        &lastptr,
+                        CURLFORM_COPYNAME, "multifile",
+                        CURLFORM_FILE, libtest_arg2,    /* Set in first.c. */
+                        CURLFORM_FILE, libtest_arg2,
+                        CURLFORM_CONTENTTYPE, "text/whatever",
+                        CURLFORM_FILE, libtest_arg2,
+                        CURLFORM_END);
+
+  if(formrc) {
+    printf("curl_formadd(3) = %d\n", (int) formrc);
+    goto test_cleanup;
+  }
+
+  /* Check data from file content. */
+  formrc = curl_formadd(&formpost,
+                        &lastptr,
+                        CURLFORM_COPYNAME, "filecontents",
+                        CURLFORM_FILECONTENT, libtest_arg2,
+                        CURLFORM_END);
+
+  if(formrc) {
+    printf("curl_formadd(4) = %d\n", (int) formrc);
+    goto test_cleanup;
+  }
+
+  /* Measure the current form length.
+   * This is done before including stdin data because we want to reuse it
+   * and stdin cannot be rewound.
    */
-  if(!nfds) {
-    Sleep((DWORD)curlx_tvtoms(tv));
-    return 0;
-  }
-#endif
-  return select(nfds, rd, wr, exc, tv);
-}
+  curl_formget(formpost, (void *) &formlength, count_chars);
 
-void wait_ms(int ms)
-{
-  if(ms < 0)
-    return;
-#ifdef USE_WINSOCK
-  Sleep((DWORD)ms);
-#else
-  {
-    struct timeval t;
-    curlx_mstotv(&t, ms);
-    select_wrapper(0, NULL, NULL, NULL, &t);
-  }
-#endif
-}
-
-char *libtest_arg2 = NULL;
-char *libtest_arg3 = NULL;
-int test_argc;
-char **test_argv;
-
-struct timeval tv_test_start; /* for test timing */
-
-int unitfail; /* for unittests */
-
-#ifdef CURLDEBUG
-static void memory_tracking_init(void)
-{
-  char *env;
-  /* if CURL_MEMDEBUG is set, this starts memory tracking message logging */
-  env = curl_getenv("CURL_MEMDEBUG");
-  if(env) {
-    /* use the value as file name */
-    char fname[CURL_MT_LOGFNAME_BUFSIZE];
-    if(strlen(env) >= CURL_MT_LOGFNAME_BUFSIZE)
-      env[CURL_MT_LOGFNAME_BUFSIZE-1] = '\0';
-    strcpy(fname, env);
-    curl_free(env);
-    curl_dbg_memdebug(fname);
-    /* this weird stuff here is to make curl_free() get called before
-       curl_dbg_memdebug() as otherwise memory tracking will log a free()
-       without an alloc! */
-  }
-  /* if CURL_MEMLIMIT is set, this enables fail-on-alloc-number-N feature */
-  env = curl_getenv("CURL_MEMLIMIT");
-  if(env) {
-    char *endptr;
-    long num = strtol(env, &endptr, 10);
-    if((endptr != env) && (endptr == env + strlen(env)) && (num > 0))
-      curl_dbg_memlimit(num);
-    curl_free(env);
-  }
-}
-#else
-#  define memory_tracking_init() Curl_nop_stmt
-#endif
-
-/* returns a hexdump in a static memory area */
-char *hexdump(const unsigned char *buffer, size_t len)
-{
-  static char dump[200 * 3 + 1];
-  char *p = dump;
-  size_t i;
-  if(len > 200)
-    return NULL;
-  for(i = 0; i<len; i++, p += 3)
-    msnprintf(p, 4, "%02x ", buffer[i]);
-  return dump;
-}
-
-
-int main(int argc, char **argv)
-{
-  char *URL;
-  CURLcode result;
-
-#ifdef O_BINARY
-#  ifdef __HIGHC__
-  _setmode(stdout, O_BINARY);
-#  else
-  setmode(fileno(stdout), O_BINARY);
-#  endif
-#endif
-
-  memory_tracking_init();
-
-  /*
-   * Setup proper locale from environment. This is needed to enable locale-
-   * specific behavior by the C library in order to test for undesired side
-   * effects that could cause in libcurl.
-   */
-#ifdef HAVE_SETLOCALE
-  setlocale(LC_ALL, "");
-#endif
-
-  if(argc< 2) {
-    fprintf(stderr, "Pass URL as argument please\n");
-    return 1;
+  /* Include length in data for external check. */
+  curl_msnprintf(flbuf, sizeof(flbuf), "%lu", (unsigned long) formlength);
+  formrc = curl_formadd(&formpost,
+                        &lastptr,
+                        CURLFORM_COPYNAME, "formlength",
+                        CURLFORM_COPYCONTENTS, &flbuf,
+                        CURLFORM_END);
+  if(formrc) {
+    printf("curl_formadd(5) = %d\n", (int) formrc);
+    goto test_cleanup;
   }
 
-  test_argc = argc;
-  test_argv = argv;
+  /* Check stdin (may be problematic on some platforms). */
+  formrc = curl_formadd(&formpost,
+                        &lastptr,
+                        CURLFORM_COPYNAME, "standardinput",
+                        CURLFORM_FILE, "-",
+                        CURLFORM_END);
+  if(formrc) {
+    printf("curl_formadd(6) = %d\n", (int) formrc);
+    goto test_cleanup;
+  }
 
-  if(argc>2)
-    libtest_arg2 = argv[2];
+  curl = curl_easy_init();
+  if(!curl) {
+    fprintf(stderr, "curl_easy_init() failed\n");
+    goto test_cleanup;
+  }
 
-  if(argc>3)
-    libtest_arg3 = argv[3];
+  /* First set the URL that is about to receive our POST. */
+  test_setopt(curl, CURLOPT_URL, URL);
 
-  URL = argv[1]; /* provide this to the rest */
+  /* send a multi-part formpost */
+  test_setopt(curl, CURLOPT_HTTPPOST, formpost);
 
-  fprintf(stderr, "URL: %s\n", URL);
+  /* get verbose debug output please */
+  test_setopt(curl, CURLOPT_VERBOSE, 1L);
 
-  result = test(URL);
-  fprintf(stderr, "Test ended with result %d\n", result);
+  test_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  test_setopt(curl, CURLOPT_POSTREDIR, (long)CURL_REDIR_POST_301);
 
-#ifdef _WIN32
-  /* flush buffers of all streams regardless of mode */
-  _flushall();
-#endif
+  /* include headers in the output */
+  test_setopt(curl, CURLOPT_HEADER, 1L);
 
-  /* Regular program status codes are limited to 0..127 and 126 and 127 have
-   * special meanings by the shell, so limit a normal return code to 125 */
-  return (int)result <= 125 ? (int)result : 125;
+  /* Perform the request, res will get the return code */
+  res = curl_easy_perform(curl);
+
+test_cleanup:
+
+  /* always cleanup */
+  curl_easy_cleanup(curl);
+
+  /* now cleanup the formpost chain */
+  curl_formfree(formpost);
+  curl_slist_free_all(headers);
+
+  curl_global_cleanup();
+
+  return res;
 }

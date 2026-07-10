@@ -10,112 +10,96 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Util;
-
-use Composer\Config;
-use Composer\IO\IOInterface;
-use Composer\Pcre\Preg;
+namespace Composer\DependencyResolver;
 
 /**
- * @author Jonas Renaudot <jonas.renaudot@gmail.com>
+ * @author Nils Adermann <naderman@naderman.de>
+ * @implements \Iterator<RuleSet::TYPE_*, Rule>
  */
-class Hg
+class RuleSetIterator implements \Iterator
 {
-    /** @var string|false|null */
-    private static $version = false;
+    /** @var array<RuleSet::TYPE_*, Rule[]> */
+    protected $rules;
+    /** @var array<RuleSet::TYPE_*> */
+    protected $types;
+
+    /** @var int */
+    protected $currentOffset;
+    /** @var RuleSet::TYPE_*|-1 */
+    protected $currentType;
+    /** @var int */
+    protected $currentTypeOffset;
 
     /**
-     * @var \Composer\IO\IOInterface
+     * @param array<RuleSet::TYPE_*, Rule[]> $rules
      */
-    private $io;
-
-    /**
-     * @var \Composer\Config
-     */
-    private $config;
-
-    /**
-     * @var \Composer\Util\ProcessExecutor
-     */
-    private $process;
-
-    public function __construct(IOInterface $io, Config $config, ProcessExecutor $process)
+    public function __construct(array $rules)
     {
-        $this->io = $io;
-        $this->config = $config;
-        $this->process = $process;
+        $this->rules = $rules;
+        $this->types = array_keys($rules);
+        sort($this->types);
+
+        $this->rewind();
     }
 
-    public function runCommand(callable $commandCallable, string $url, ?string $cwd): void
+    public function current(): Rule
     {
-        $this->config->prohibitUrlByConfig($url, $this->io);
+        return $this->rules[$this->currentType][$this->currentOffset];
+    }
 
-        // Try as is
-        $command = $commandCallable($url);
+    /**
+     * @return RuleSet::TYPE_*|-1
+     */
+    public function key(): int
+    {
+        return $this->currentType;
+    }
 
-        if (0 === $this->process->execute($command, $ignoredOutput, $cwd)) {
+    public function next(): void
+    {
+        $this->currentOffset++;
+
+        if (!isset($this->rules[$this->currentType])) {
             return;
         }
 
-        // Try with the authentication information available
-        if (
-            Preg::isMatch('{^(?P<proto>ssh|https?)://(?:(?P<user>[^:@]+)(?::(?P<pass>[^:@]+))?@)?(?P<host>[^/]+)(?P<path>/.*)?}mi', $url, $matches)
-            && $this->io->hasAuthentication((string) $matches['host'])
-        ) {
-            if ($matches['proto'] === 'ssh') {
-                $user = '';
-                if ($matches['user'] !== '' && $matches['user'] !== null) {
-                    $user = rawurlencode($matches['user']) . '@';
+        if ($this->currentOffset >= \count($this->rules[$this->currentType])) {
+            $this->currentOffset = 0;
+
+            do {
+                $this->currentTypeOffset++;
+
+                if (!isset($this->types[$this->currentTypeOffset])) {
+                    $this->currentType = -1;
+                    break;
                 }
-                $authenticatedUrl = $matches['proto'] . '://' . $user . $matches['host'] . $matches['path'];
-            } else {
-                $auth = $this->io->getAuthentication((string) $matches['host']);
-                $authenticatedUrl = $matches['proto'] . '://' . rawurlencode($auth['username']) . ':' . rawurlencode($auth['password']) . '@' . $matches['host'] . $matches['path'];
-            }
-            $command = $commandCallable($authenticatedUrl);
 
-            if (0 === $this->process->execute($command, $ignoredOutput, $cwd)) {
-                return;
-            }
-
-            $error = $this->process->getErrorOutput();
-        } else {
-            $error = 'The given URL (' .$url. ') does not match the required format (ssh|http(s)://(username:password@)example.com/path-to-repository)';
+                $this->currentType = $this->types[$this->currentTypeOffset];
+            } while (0 === \count($this->rules[$this->currentType]));
         }
-
-        $this->throwException("Failed to clone $url, \n\n" . $error, $url);
     }
 
-    /**
-     * @param non-empty-string $message
-     *
-     * @return never
-     */
-    private function throwException($message, string $url): void
+    public function rewind(): void
     {
-        if (null === self::getVersion($this->process)) {
-            throw new \RuntimeException(Url::sanitize(
-                'Failed to clone ' . $url . ', hg was not found, check that it is installed and in your PATH env.' . "\n\n" . $this->process->getErrorOutput()
-            ));
-        }
+        $this->currentOffset = 0;
 
-        throw new \RuntimeException(Url::sanitize($message));
+        $this->currentTypeOffset = -1;
+        $this->currentType = -1;
+
+        do {
+            $this->currentTypeOffset++;
+
+            if (!isset($this->types[$this->currentTypeOffset])) {
+                $this->currentType = -1;
+                break;
+            }
+
+            $this->currentType = $this->types[$this->currentTypeOffset];
+        } while (0 === \count($this->rules[$this->currentType]));
     }
 
-    /**
-     * Retrieves the current hg version.
-     *
-     * @return string|null The hg version number, if present.
-     */
-    public static function getVersion(ProcessExecutor $process): ?string
+    public function valid(): bool
     {
-        if (false === self::$version) {
-            self::$version = null;
-            if (0 === $process->execute('hg --version', $output) && Preg::isMatch('/^.+? (\d+(?:\.\d+)+)(?:\+.*?)?\)?\r?\n/', $output, $matches)) {
-                self::$version = $matches[1];
-            }
-        }
-
-        return self::$version;
+        return isset($this->rules[$this->currentType], $this->rules[$this->currentType][$this->currentOffset]);
     }
 }

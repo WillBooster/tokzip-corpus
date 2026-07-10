@@ -1,83 +1,138 @@
-use crate::builder::StyledStr;
-use crate::util::color::ColorChoice;
+#![allow(elided_lifetimes_in_paths)] // needed for divan
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Stream {
-    Stdout,
-    Stderr,
+use clap::{arg, ArgMatches, Command};
+
+macro_rules! create_app {
+    () => {{
+        Command::new("claptests")
+            .version("0.1")
+            .about("tests clap library")
+            .author("Kevin K. <kbknapp@gmail.com>")
+            .arg(arg!(-o --option <opt> ... "tests options"))
+            .arg(arg!([positional] "tests positionals"))
+            .arg(arg!(-f --flag ... "tests flags").global(true))
+            .args([
+                arg!(flag2: -F "tests flags with exclusions")
+                    .conflicts_with("flag")
+                    .requires("option2"),
+                arg!(option2: --"long-option-2" <option2> "tests long options with exclusions")
+                    .conflicts_with("option")
+                    .requires("positional2"),
+                arg!([positional2] "tests positionals with exclusions"),
+                arg!(-O --Option <option3> "tests options with specific value sets")
+                    .value_parser(["fast", "slow"]),
+                arg!([positional3] ... "tests positionals with specific values")
+                    .value_parser(["vi", "emacs"]),
+                arg!(--multvals <s> "Tests multiple values not mult occs").value_names(["one", "two"]),
+                arg!(
+                    --multvalsmo <s> "Tests multiple values, not mult occs"
+                ).required(false).value_names(["one", "two"]),
+                arg!(--minvals2 <minvals> ... "Tests 2 min vals").num_args(2..),
+                arg!(--maxvals3 <maxvals> ... "Tests 3 max vals").num_args(1..=3),
+            ])
+            .subcommand(
+                Command::new("subcmd")
+                    .about("tests subcommands")
+                    .version("0.1")
+                    .author("Kevin K. <kbknapp@gmail.com>")
+                    .arg(arg!(-o --option <scoption> ... "tests options"))
+                    .arg(arg!([scpositional] "tests positionals"))
+            )
+    }};
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct Colorizer {
-    stream: Stream,
-    #[allow(unused)]
-    color_when: ColorChoice,
-    content: StyledStr,
+#[divan::bench]
+fn build() -> Command {
+    create_app!()
 }
 
-impl Colorizer {
-    pub(crate) fn new(stream: Stream, color_when: ColorChoice) -> Self {
-        Colorizer {
-            stream,
-            color_when,
-            content: Default::default(),
-        }
+#[divan::bench(args=COMPLEX_ARGS)]
+fn startup(args: &Args) -> ArgMatches {
+    create_app!().get_matches_from(args.args())
+}
+
+#[divan::bench]
+fn render_help(bencher: divan::Bencher) {
+    let mut cmd = create_app!();
+    bencher.bench_local(|| build_help(&mut cmd));
+}
+
+fn build_help(cmd: &mut Command) -> String {
+    let help = cmd.render_help();
+    help.to_string()
+}
+
+const COMPLEX_ARGS: &[Args] = &[
+    Args("empty", &[""]),
+    Args("flag", &["myprog", "-f"]),
+    Args("opt", &["myprog", "-o", "option1"]),
+    Args("pos", &["myprog", "arg1"]),
+    Args("sc", &["myprog", "subcmd"]),
+    Args("sc_flag", &["myprog", "subcmd", "-f"]),
+    Args("sc_opt", &["myprog", "subcmd", "-o", "option1"]),
+    Args("sc_pos", &["myprog", "subcmd", "arg1"]),
+    Args(
+        "sc_nested",
+        &["myprog", "subcmd", "-f", "-o", "option1", "arg1"],
+    ),
+    Args(
+        "mixed1",
+        &[
+            "myprog",
+            "-ff",
+            "-o",
+            "option1",
+            "arg1",
+            "-O",
+            "fast",
+            "arg2",
+            "--multvals",
+            "one",
+            "two",
+            "emacs",
+        ],
+    ),
+    Args(
+        "mixed2",
+        &[
+            "myprog",
+            "arg1",
+            "-f",
+            "arg2",
+            "--long-option-2",
+            "some",
+            "-O",
+            "slow",
+            "--multvalsmo",
+            "one",
+            "two",
+            "--minvals2",
+            "3",
+            "2",
+            "1",
+        ],
+    ),
+];
+
+#[derive(Debug)]
+pub struct Args(&'static str, &'static [&'static str]);
+
+impl Args {
+    pub const fn name(&self) -> &'static str {
+        self.0
     }
 
-    pub(crate) fn with_content(mut self, content: StyledStr) -> Self {
-        self.content = content;
-        self
+    pub const fn args(&self) -> &[&str] {
+        self.1
     }
 }
 
-/// Printing methods.
-impl Colorizer {
-    #[cfg(feature = "color")]
-    pub(crate) fn print(&self) -> std::io::Result<()> {
-        let color_when = match self.color_when {
-            ColorChoice::Always => anstream::ColorChoice::Always,
-            ColorChoice::Auto => anstream::ColorChoice::Auto,
-            ColorChoice::Never => anstream::ColorChoice::Never,
-        };
-
-        let mut stdout;
-        let mut stderr;
-        let writer: &mut dyn std::io::Write = match self.stream {
-            Stream::Stderr => {
-                stderr = anstream::AutoStream::new(std::io::stderr().lock(), color_when);
-                &mut stderr
-            }
-            Stream::Stdout => {
-                stdout = anstream::AutoStream::new(std::io::stdout().lock(), color_when);
-                &mut stdout
-            }
-        };
-
-        self.content.write_to(writer)
-    }
-
-    #[cfg(not(feature = "color"))]
-    pub(crate) fn print(&self) -> std::io::Result<()> {
-        // [e]println can't be used here because it panics
-        // if something went wrong. We don't want that.
-        match self.stream {
-            Stream::Stdout => {
-                let stdout = std::io::stdout();
-                let mut stdout = stdout.lock();
-                self.content.write_to(&mut stdout)
-            }
-            Stream::Stderr => {
-                let stderr = std::io::stderr();
-                let mut stderr = stderr.lock();
-                self.content.write_to(&mut stderr)
-            }
-        }
-    }
-}
-
-/// Color-unaware printing. Never uses coloring.
-impl std::fmt::Display for Colorizer {
+impl std::fmt::Display for Args {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.content.fmt(f)
+        self.name().fmt(f)
     }
+}
+
+fn main() {
+    divan::main();
 }

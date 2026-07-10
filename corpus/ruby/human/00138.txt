@@ -1,144 +1,86 @@
 require_relative 'test_helper'
 
-class CompileTest < Minitest::Test
-  def self.parses pattern, example, expected_params, mtype = :sinatra, mopts = {}
-    it "parses #{example} with #{pattern} into params #{expected_params}" do
-      compiled = mock_app { set :mustermann_opts, :type => mtype }.send(:compile, pattern, mopts)
-      params = compiled.params(example)
-      fail %Q{"#{example}" does not parse on pattern "#{pattern}".} unless params
+begin
+require 'yajl'
 
-      assert_equal expected_params, params, "Pattern #{pattern} does not match path #{example}."
+class YajlTest < Minitest::Test
+  def yajl_app(&block)
+    mock_app do
+      set :views, __dir__ + '/views'
+      get('/', &block)
     end
+    get '/'
   end
 
-  def self.fails pattern, example, mtype = :sinatra, mopts = {}
-    it "does not parse #{example} with #{pattern}" do
-      compiled = mock_app { set :mustermann_opts, :type => mtype }.send(:compile, pattern, mopts)
-      match = compiled.match(example)
-      fail %Q{"#{pattern}" does parse "#{example}" but it should fail} if match
-    end
+  it 'renders inline Yajl strings' do
+    yajl_app { yajl('json = { :foo => "bar" }') }
+    assert ok?
+    assert_body '{"foo":"bar"}'
   end
 
-  def self.raises pattern, mtype = :sinatra, mopts = {}
-    it "does not compile #{pattern}" do
-      assert_raises(Mustermann::CompileError, %Q{Pattern "#{pattern}" compiles but it should not}) do
-        mock_app { set :mustermann_opts, :type => mtype }.send(:compile, pattern, mopts)
-      end
-    end
+  it 'renders .yajl files in views path' do
+    yajl_app { yajl(:hello) }
+    assert ok?
+    assert_body '{"yajl":"hello"}'
   end
 
-  parses "/", "/", {}
+  it 'raises error if template not found' do
+    mock_app { get('/') { yajl(:no_such_template) } }
+    assert_raises(Errno::ENOENT) { get('/') }
+  end
 
-  parses "/foo", "/foo", {}
+  it 'accepts a :locals option' do
+    yajl_app do
+      locals = { :object => { :foo => 'bar' } }
+      yajl 'json = object', :locals => locals
+    end
+    assert ok?
+    assert_body '{"foo":"bar"}'
+  end
 
-  parses "/:foo", "/foo",       "foo" => "foo"
-  parses "/:foo", "/foo.bar",   "foo" => "foo.bar"
-  parses "/:foo", "/foo%2Fbar", "foo" => "foo/bar"
-  parses "/:foo", "/%0Afoo",    "foo" => "\nfoo"
-  fails  "/:foo", "/foo?"
-  fails  "/:foo", "/foo/bar"
-  fails  "/:foo", "/"
-  fails  "/:foo", "/foo/"
+  it 'accepts a :scope option' do
+    yajl_app do
+      scope = { :object => { :foo => 'bar' } }
+      yajl 'json = self[:object]', :scope => scope
+    end
+    assert ok?
+    assert_body '{"foo":"bar"}'
+  end
 
-  parses "/föö", "/f%C3%B6%C3%B6", {}
+  it 'decorates the json with a callback' do
+    yajl_app do
+      yajl(
+        'json = { :foo => "bar" }',
+        { :callback => 'baz' }
+      )
+    end
+    assert ok?
+    assert_body 'baz({"foo":"bar"});'
+  end
 
-  parses "/:foo/:bar", "/foo/bar", "foo" => "foo", "bar" => "bar"
+  it 'decorates the json with a variable' do
+    yajl_app do
+      yajl(
+        'json = { :foo => "bar" }',
+        { :variable => 'qux' }
+      )
+    end
+    assert ok?
+    assert_body 'var qux = {"foo":"bar"};'
+  end
 
-  parses "/hello/:person", "/hello/Frank", "person" => "Frank"
+  it 'decorates the json with a callback and a variable' do
+    yajl_app do
+      yajl(
+        'json = { :foo => "bar" }',
+        { :callback => 'baz', :variable => 'qux' }
+      )
+    end
+    assert ok?
+    assert_body 'var qux = {"foo":"bar"}; baz(qux);'
+  end
+end
 
-  parses "/?:foo?/?:bar?", "/hello/world", "foo" => "hello", "bar" => "world"
-  parses "/?:foo?/?:bar?", "/hello",       "foo" => "hello", "bar" => nil
-  parses "/?:foo?/?:bar?", "/",            "foo" => nil, "bar" => nil
-  parses "/?:foo?/?:bar?", "",             "foo" => nil, "bar" => nil
-
-  parses "/*", "/",       "splat" => [""]
-  parses "/*", "/foo",    "splat" => ["foo"]
-  parses "/*", "/foo/bar", "splat" => ["foo/bar"]
-
-  parses "/:foo/*", "/foo/bar/baz", "foo" => "foo", "splat" => ["bar/baz"]
-
-  parses "/:foo/:bar", "/user@example.com/name", "foo" => "user@example.com", "bar" => "name"
-
-  parses "/test$/", "/test$/", {}
-
-  parses "/te+st/", "/te+st/", {}
-  fails  "/te+st/", "/test/"
-  fails  "/te+st/", "/teeest/"
-
-  parses "/test(bar)/", "/testbar/", {}
-
-  parses "/path with spaces", "/path%20with%20spaces", {}
-  parses "/path with spaces", "/path%2Bwith%2Bspaces", {}
-  parses "/path with spaces", "/path+with+spaces",     {}
-
-  parses "/foo&bar", "/foo&bar", {}
-
-  parses "/:foo/*", "/hello%20world/how%20are%20you", "foo" => "hello world", "splat" => ["how are you"]
-
-  parses "/*/foo/*/*", "/bar/foo/bling/baz/boom", "splat" => ["bar", "bling", "baz/boom"]
-  parses "/*/foo/*/*rest", "/bar/foo/bling/baz/boom", "splat" => ["bar", "bling"], "rest" => "baz/boom"
-  fails  "/*/foo/*/*", "/bar/foo/baz"
-
-  parses "/test.bar", "/test.bar", {}
-  fails  "/test.bar", "/test0bar"
-
-  parses "/:file.:ext", "/pony.jpg",   "file" => "pony", "ext" => "jpg"
-  parses "/:file.:ext", "/pony%2Ejpg", "file" => "pony", "ext" => "jpg"
-  fails  "/:file.:ext", "/.jpg"
-
-  parses "/:name.?:format?", "/foo",       "name" => "foo", "format" => nil
-  parses "/:name.?:format?", "/foo.bar",   "name" => "foo", "format" => "bar"
-  parses "/:name.?:format?", "/foo%2Ebar", "name" => "foo", "format" => "bar"
-
-  parses "/:user@?:host?", "/foo@bar",     "user" => "foo", "host" => "bar"
-  parses "/:user@?:host?", "/foo.foo@bar", "user" => "foo.foo", "host" => "bar"
-  parses "/:user@?:host?", "/foo@bar.bar", "user" => "foo", "host" => "bar.bar"
-
-  # From https://gist.github.com/2154980#gistcomment-169469.
-  #
-  parses "/:name(.:format)?", "/foo", "name" => "foo", "format" => nil
-  parses "/:name(.:format)?", "/foo.bar", "name" => "foo", "format" => "bar"
-  parses "/:name(.:format)?", "/foo.", "name" => "foo.", "format" => nil
-
-  parses "/:id/test.bar", "/3/test.bar", {"id" => "3"}
-  parses "/:id/test.bar", "/2/test.bar", {"id" => "2"}
-  parses "/:id/test.bar", "/2E/test.bar", {"id" => "2E"}
-  parses "/:id/test.bar", "/2e/test.bar", {"id" => "2e"}
-  parses "/:id/test.bar", "/%2E/test.bar", {"id" => "."}
-  parses "/{id}/test.bar", "/%2E/test.bar", {"id" => "."}
-
-  parses '/10/:id', '/10/test', "id" => "test"
-  parses '/10/:id', '/10/te.st', "id" => "te.st"
-
-  parses '/10.1/:id', '/10.1/test', "id" => "test"
-  parses '/10.1/:id', '/10.1/te.st', "id" => "te.st"
-  parses '/:foo/:id', '/10.1/te.st', "foo" => "10.1", "id" => "te.st"
-  parses '/:foo/:id', '/10.1.2/te.st', "foo" => "10.1.2", "id" => "te.st"
-  parses '/:foo.:bar/:id', '/10.1/te.st', "foo" => "10", "bar" => "1", "id" => "te.st"
-
-  parses '/:a/:b.?:c?', '/a/b',       "a" => "a",   "b" => "b", "c" => nil
-  parses '/:a/:b.?:c?', '/a/b.c',     "a" => "a",   "b" => "b", "c" => "c"
-  parses '/:a/:b.?:c?', '/a.b/c',     "a" => "a.b", "b" => "c", "c" => nil
-  parses '/:a/:b.?:c?', '/a.b/c.d',   "a" => "a.b", "b" => "c", "c" => "d"
-  fails  '/:a/:b.?:c?', '/a.b/c.d/e'
-
-  parses "/:file.:ext", "/pony%2ejpg", "file" => "pony", "ext" => "jpg"
-  parses "/:file.:ext", "/pony%E6%AD%A3%2Ejpg", "file" => "pony正", "ext" => "jpg"
-  parses "/:file.:ext", "/pony%e6%ad%a3%2ejpg", "file" => "pony正", "ext" => "jpg"
-  parses "/:file.:ext", "/pony正%2Ejpg", "file" => "pony正", "ext" => "jpg"
-  parses "/:file.:ext", "/pony正%2ejpg", "file" => "pony正", "ext" => "jpg"
-  parses "/:file.:ext", "/pony正..jpg", "file" => "pony正.", "ext" => "jpg"
-
-  parses "/:name.:format", "/file.tar.gz", "name" => "file.tar", "format" => "gz"
-  parses "/:name.:format1.:format2", "/file.tar.gz", "name" => "file", "format1" => "tar", "format2" => "gz"
-  parses "/:name.:format1.:format2", "/file.temp.tar.gz", "name" => "file.temp", "format1" => "tar", "format2" => "gz"
-
-  # From issue #688.
-  #
-  parses "/articles/10.1103/:doi", "/articles/10.1103/PhysRevLett.110.026401", "doi" => "PhysRevLett.110.026401"
-
-  # Mustermann anchoring
-  fails "/bar", "/foo/bar", :regexp
-  raises "^/foo/bar$", :regexp
-  parses "^/foo/bar$", "/foo/bar", {}, :regexp, :check_anchors => false
+rescue LoadError
+  warn "#{$!}: skipping yajl tests"
 end

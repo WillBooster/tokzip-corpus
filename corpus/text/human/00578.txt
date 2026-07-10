@@ -1,101 +1,96 @@
----
-c: Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
-SPDX-License-Identifier: curl
-Title: CURLOPT_INTERLEAVEFUNCTION
-Section: 3
-Source: libcurl
-See-also:
-  - CURLOPT_INTERLEAVEDATA (3)
-  - CURLOPT_RTSP_REQUEST (3)
-Protocol:
-  - RTSP
-Added-in: 7.20.0
----
+# 5.0 Upgrade Guide
 
-# NAME
+## Initialization
 
-CURLOPT_INTERLEAVEFUNCTION - callback for RTSP interleaved data
+You now must use `MapperConfiguration` to initialize AutoMapper.
 
-# SYNOPSIS
+If you have a lot of `Mapper.CreateMap` calls everywhere, move those to a Profile.
 
-~~~c
-#include <curl/curl.h>
+For examples see [here](Setup.html).
 
-size_t interleave_callback(void *ptr, size_t size, size_t nmemb,
-                           void *userdata);
+## Profiles
 
-CURLcode curl_easy_setopt(CURL *handle, CURLOPT_INTERLEAVEFUNCTION,
-                          interleave_callback);
-~~~
+Instead of overriding a Configure method, you configure directly via the constructor:
 
-# DESCRIPTION
-
-Pass a pointer to your callback function, which should match the prototype
-shown above.
-
-This callback function gets called by libcurl as soon as it has received
-interleaved RTP data. This function gets called for each $ block and therefore
-contains exactly one upper-layer protocol unit (e.g. one RTP packet). Curl
-writes the interleaved header as well as the included data for each call. The
-first byte is always an ASCII dollar sign. The dollar sign is followed by a
-one byte channel identifier and then a 2 byte integer length in network byte
-order. See RFC 2326 Section 10.12 for more information on how RTP interleaving
-behaves. If unset or set to NULL, curl uses the default write function.
-
-Interleaved RTP poses some challenges for the client application. Since the
-stream data is sharing the RTSP control connection, it is critical to service
-the RTP in a timely fashion. If the RTP data is not handled quickly,
-subsequent response processing may become unreasonably delayed and the
-connection may close. The application may use *CURL_RTSPREQ_RECEIVE* to
-service RTP data when no requests are desired. If the application makes a
-request, (e.g. *CURL_RTSPREQ_PAUSE*) then the response handler processes
-any pending RTP data before marking the request as finished.
-
-The CURLOPT_INTERLEAVEDATA(3) is passed in the *userdata* argument in
-the callback.
-
-Your callback should return the number of bytes actually taken care of. If
-that amount differs from the amount passed to your callback function, it
-signals an error condition to the library. This causes the transfer to abort
-and the libcurl function used returns *CURLE_WRITE_ERROR*.
-
-You can also abort the transfer by returning CURL_WRITEFUNC_ERROR. (7.87.0)
-
-# DEFAULT
-
-NULL, the interleave data is then passed to the regular write function:
-CURLOPT_WRITEFUNCTION(3).
-
-# %PROTOCOLS%
-
-# EXAMPLE
-
-~~~c
-struct local {
-  void *custom;
-};
-
-static size_t rtp_write(void *ptr, size_t size, size_t nmemb, void *userp)
-{
-  struct local *l = userp;
-  printf("our ptr: %p\n", l->custom);
-  /* take care of the packet in 'ptr', then return... */
-  return size * nmemb;
+```c#
+public class MappingProfile : Profile {
+    public MappingProfile() {
+        CreateMap<Foo, Bar>();
+        RecognizePrefix("m_");
+    }
 }
+```
 
-int main(void)
+## IgnoreAllNonExisting extension
+
+A popular Stack Overflow post introduced the idea of ignoring all non-existing members on the destination type. It used things that don't exist anymore in the configuration API. This functionality is really only intended for configuration validation.
+
+In 5.0, you can use ReverseMap or CreateMap passing in the MemberList enum to validate against the source members (or no members). Any place you have this IgnoreAllNonExisting extension, use the CreateMap overload that validates against the source or no members:
+
+```c#
+cfg.CreateMap<ProductDto, Product>(MemberList.None);
+```
+
+## Resolution Context things
+
+ResolutionContext used to capture a lot of information, source and destination values, along with a hierarchical parent model. For source/destination values, all of the interfaces (value resolvers and type converters) along with config options now include the source/destination values, and if applicable, source/destination members.
+
+If you're trying to access some parent object in your model, you will need to add those relationships to your models and access them through those relationships, and not through AutoMapper's hierarchy. The ResolutionContext was pared down for both performance and sanity reasons.
+
+## Value resolvers
+
+The signature of a value resolver has changed to allow access to the source/destination models. Additionally, the base class is gone in favor of interfaces. For value resolvers that do not have a member redirection, the interface is now:
+
+```c#
+public interface IValueResolver<in TSource, in TDestination, TDestMember>
 {
-  struct local rtp_data;
-  CURL *curl = curl_easy_init();
-  if(curl) {
-    curl_easy_setopt(curl, CURLOPT_INTERLEAVEFUNCTION, rtp_write);
-    curl_easy_setopt(curl, CURLOPT_INTERLEAVEDATA, &rtp_data);
-  }
+    TDestMember Resolve(TSource source, TDestination destination, TDestMember destMember, ResolutionContext context);
 }
-~~~
+```
 
-# %AVAILABILITY%
+You have access now to the source model, destination model, and destination member this resolver is configured against.
 
-# RETURN VALUE
+If you are using a ResolveUsing and passing in the `FromMember` configuration, this is now a new resolver interface:
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+```c#
+public interface IMemberValueResolver<in TSource, in TDestination, in TSourceMember, TDestMember>
+{
+    TDestMember Resolve(TSource source, TDestination destination, TSourceMember sourceMember, TDestMember destMember, ResolutionContext context);
+}
+```
+
+This is now configured directly as `ForMember(dest => dest.Foo, opt => opt.ResolveUsing<MyCustomResolver, string>(src => src.Bar)`
+
+## Type converters
+
+The base class for a type converter is now gone in favor of a single interface that accepts the source and destination objects and returns the destination object:
+
+```c#
+public interface ITypeConverter<in TSource, TDestination>
+{
+    TDestination Convert(TSource source, TDestination destination, ResolutionContext context);
+}
+```
+
+## Circular references
+
+Previously, AutoMapper could handle circular references by keeping track of what was mapped, and on every mapping, check a local hashtable of source/destination objects to see if the item was already mapped. It turns out this tracking is very expensive, and you need to opt-in using PreserveReferences for circular maps to work. Alternatively, you can configure MaxDepth:
+
+```c#
+// Self-referential mapping
+cfg.CreateMap<Category, CategoryDto>().MaxDepth(3);
+
+// Circular references between users and groups
+cfg.CreateMap<User, UserDto>().PreserveReferences();
+```
+
+Starting from 6.1.0 PreserveReferences is set automatically at config time whenever the recursion can be detected statically. If you're still getting `StackOverflowException`, open an issue with a full repro and we'll look into it.
+
+## UseDestinationValue
+
+UseDestinationValue tells AutoMapper not to create a new object for some member, but to use the existing property of the destination object. It used to be true by default. Consider whether this applies to your case. Check [recent issues](https://github.com/AutoMapper/AutoMapper/search?o=desc&q=UseDestinationValue&s=created&type=Issues&utf8=%E2%9C%93).
+
+```c#
+cfg.CreateMap<Source, Destination>()
+   .ForMember(d => d.Child, opt => opt.UseDestinationValue());
+```

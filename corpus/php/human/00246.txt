@@ -10,519 +10,195 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Repository;
+namespace Composer\Test\Mock;
 
-use Composer\Downloader\TransportException;
-use Composer\Pcre\Preg;
-use Composer\Repository\Vcs\VcsDriverInterface;
-use Composer\Package\Version\VersionParser;
-use Composer\Package\Loader\ArrayLoader;
-use Composer\Package\Loader\ValidatingArrayLoader;
-use Composer\Package\Loader\InvalidPackageException;
-use Composer\Package\Loader\LoaderInterface;
-use Composer\EventDispatcher\EventDispatcher;
-use Composer\Util\Platform;
+use PHPUnit\Framework\MockObject\MockBuilder;
+use React\Promise\PromiseInterface;
 use Composer\Util\ProcessExecutor;
-use Composer\Util\HttpDownloader;
-use Composer\Util\Url;
-use Composer\Semver\Constraint\Constraint;
-use Composer\IO\IOInterface;
-use Composer\Config;
+use Composer\Util\Platform;
+use PHPUnit\Framework\Assert;
+use PHPUnit\Framework\AssertionFailedError;
+use Symfony\Component\Process\Process;
+use React\Promise\Promise;
 
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
  */
-class VcsRepository extends ArrayRepository implements ConfigurableRepositoryInterface
+class ProcessExecutorMock extends ProcessExecutor
 {
-    /** @var string */
-    protected $url;
-    /** @var ?string */
-    protected $packageName;
-    /** @var bool */
-    protected $isVerbose;
-    /** @var bool */
-    protected $isVeryVerbose;
-    /** @var IOInterface */
-    protected $io;
-    /** @var Config */
-    protected $config;
-    /** @var VersionParser */
-    protected $versionParser;
-    /** @var string */
-    protected $type;
-    /** @var ?LoaderInterface */
-    protected $loader;
-    /** @var array<string, mixed> */
-    protected $repoConfig;
-    /** @var HttpDownloader */
-    protected $httpDownloader;
-    /** @var ProcessExecutor */
-    protected $processExecutor;
-    /** @var bool */
-    protected $branchErrorOccurred = false;
-    /** @var array<string, class-string<VcsDriverInterface>> */
-    private $drivers;
-    /** @var ?VcsDriverInterface */
-    private $driver;
-    /** @var ?VersionCacheInterface */
-    private $versionCache;
-    /** @var string[] */
-    private $emptyReferences = [];
-    /** @var array<'tags'|'branches', array<string, TransportException>> */
-    private $versionTransportExceptions = [];
+    /**
+     * @var array<array{cmd: string|list<string>, return: int, stdout: string, stderr: string, callback: callable|null}>|null
+     */
+    private $expectations = null;
+    /**
+     * @var bool
+     */
+    private $strict = false;
+    /**
+     * @var array{return: int, stdout: string, stderr: string}
+     */
+    private $defaultHandler = ['return' => 0, 'stdout' => '', 'stderr' => ''];
+    /**
+     * @var string[]
+     */
+    private $log = [];
+    /**
+     * @var MockBuilder<Process>
+     */
+    private $processMockBuilder;
 
     /**
-     * @param array{url: string, type?: string}&array<string, mixed> $repoConfig
-     * @param array<string, class-string<VcsDriverInterface>>|null $drivers
+     * @param MockBuilder<Process> $processMockBuilder
      */
-    public function __construct(array $repoConfig, IOInterface $io, Config $config, HttpDownloader $httpDownloader, ?EventDispatcher $dispatcher = null, ?ProcessExecutor $process = null, ?array $drivers = null, ?VersionCacheInterface $versionCache = null)
+    public function __construct(MockBuilder $processMockBuilder)
     {
         parent::__construct();
-        $this->drivers = $drivers ?: [
-            'github' => 'Composer\Repository\Vcs\GitHubDriver',
-            'gitlab' => 'Composer\Repository\Vcs\GitLabDriver',
-            'bitbucket' => 'Composer\Repository\Vcs\GitBitbucketDriver',
-            'git-bitbucket' => 'Composer\Repository\Vcs\GitBitbucketDriver',
-            'git' => 'Composer\Repository\Vcs\GitDriver',
-            'hg' => 'Composer\Repository\Vcs\HgDriver',
-            'perforce' => 'Composer\Repository\Vcs\PerforceDriver',
-            'fossil' => 'Composer\Repository\Vcs\FossilDriver',
-            // svn must be last because identifying a subversion server for sure is practically impossible
-            'svn' => 'Composer\Repository\Vcs\SvnDriver',
-        ];
-
-        $this->url = $repoConfig['url'] = Platform::expandPath($repoConfig['url']);
-        $this->io = $io;
-        $this->type = $repoConfig['type'] ?? 'vcs';
-        $this->isVerbose = $io->isVerbose();
-        $this->isVeryVerbose = $io->isVeryVerbose();
-        $this->config = $config;
-        $this->repoConfig = $repoConfig;
-        $this->versionCache = $versionCache;
-        $this->httpDownloader = $httpDownloader;
-        $this->processExecutor = $process ?? new ProcessExecutor($io);
-    }
-
-    public function getRepoName()
-    {
-        $driverClass = get_class($this->getDriver());
-        $driverType = array_search($driverClass, $this->drivers);
-        if (!$driverType) {
-            $driverType = $driverClass;
-        }
-
-        return 'vcs repo ('.$driverType.' '.Url::sanitize($this->url).')';
-    }
-
-    public function getRepoConfig()
-    {
-        return $this->repoConfig;
-    }
-
-    public function setLoader(LoaderInterface $loader): void
-    {
-        $this->loader = $loader;
-    }
-
-    public function getDriver(): ?VcsDriverInterface
-    {
-        if ($this->driver) {
-            return $this->driver;
-        }
-
-        if (isset($this->drivers[$this->type])) {
-            $class = $this->drivers[$this->type];
-            $this->driver = new $class($this->repoConfig, $this->io, $this->config, $this->httpDownloader, $this->processExecutor);
-            $this->driver->initialize();
-
-            return $this->driver;
-        }
-
-        foreach ($this->drivers as $driver) {
-            if ($driver::supports($this->io, $this->config, $this->url)) {
-                $this->driver = new $driver($this->repoConfig, $this->io, $this->config, $this->httpDownloader, $this->processExecutor);
-                $this->driver->initialize();
-
-                return $this->driver;
-            }
-        }
-
-        foreach ($this->drivers as $driver) {
-            if ($driver::supports($this->io, $this->config, $this->url, true)) {
-                $this->driver = new $driver($this->repoConfig, $this->io, $this->config, $this->httpDownloader, $this->processExecutor);
-                $this->driver->initialize();
-
-                return $this->driver;
-            }
-        }
-
-        return null;
-    }
-
-    public function hadInvalidBranches(): bool
-    {
-        return $this->branchErrorOccurred;
+        $this->processMockBuilder = $processMockBuilder->disableOriginalConstructor();
     }
 
     /**
-     * @return string[]
+     * @param array<string|array{cmd: string|list<string>, return?: int, stdout?: string, stderr?: string, callback?: callable}> $expectations
+     * @param bool                                                                                                               $strict         set to true if you want to provide *all* expected commands, and not just a subset you are interested in testing
+     * @param array{return: int, stdout?: string, stderr?: string}                                                               $defaultHandler default command handler for undefined commands if not in strict mode
      */
-    public function getEmptyReferences(): array
+    public function expects(array $expectations, bool $strict = false, array $defaultHandler = ['return' => 0, 'stdout' => '', 'stderr' => '']): void
     {
-        return $this->emptyReferences;
+        /** @var array{cmd: string|list<string>, return: int, stdout: string, stderr: string, callback: callable|null} $default */
+        $default = ['cmd' => '', 'return' => 0, 'stdout' => '', 'stderr' => '', 'callback' => null];
+        $this->expectations = array_map(static function ($expect) use ($default): array {
+            if (is_string($expect)) {
+                $command = $expect;
+                $expect = $default;
+                $expect['cmd'] = $command;
+            } elseif (count($diff = array_diff_key(array_merge($default, $expect), $default)) > 0) {
+                throw new \UnexpectedValueException('Unexpected keys in process execution step: '.implode(', ', array_keys($diff)));
+            }
+
+            return array_merge($default, $expect);
+        }, $expectations);
+        $this->strict = $strict;
+
+        $this->defaultHandler = array_merge($this->defaultHandler, $defaultHandler);
+    }
+
+    public function assertComplete(): void
+    {
+        // this was not configured to expect anything, so no need to react here
+        if (!is_array($this->expectations)) {
+            return;
+        }
+
+        if (count($this->expectations) > 0) {
+            $expectations = array_map(static function ($expect): string {
+                return is_array($expect['cmd']) ? implode(' ', $expect['cmd']) : $expect['cmd'];
+            }, $this->expectations);
+            throw new AssertionFailedError(
+                'There are still '.count($this->expectations).' expected process calls which have not been consumed:'.PHP_EOL.
+                implode(PHP_EOL, $expectations).PHP_EOL.PHP_EOL.
+                'Received calls:'.PHP_EOL.implode(PHP_EOL, $this->log)
+            );
+        }
+
+        // dummy assertion to ensure the test is not marked as having no assertions
+        Assert::assertTrue(true); // @phpstan-ignore staticMethod.alreadyNarrowedType
+    }
+
+    public function execute($command, &$output = null, ?string $cwd = null): int
+    {
+        $cwd = $cwd ?? Platform::getCwd();
+        if (func_num_args() > 1) {
+            return $this->doExecute($command, $cwd, false, $output);
+        }
+
+        return $this->doExecute($command, $cwd, false);
+    }
+
+    public function executeTty($command, ?string $cwd = null): int
+    {
+        $cwd = $cwd ?? Platform::getCwd();
+        if (Platform::isTty()) {
+            return $this->doExecute($command, $cwd, true);
+        }
+
+        return $this->doExecute($command, $cwd, false);
     }
 
     /**
-     * @return array<'tags'|'branches', array<string, TransportException>>
+     * @param string|list<string> $command
+     * @param callable|string|null $output
+     * @return mixed
      */
-    public function getVersionTransportExceptions(): array
+    private function doExecute($command, string $cwd, bool $tty, &$output = null)
     {
-        return $this->versionTransportExceptions;
+        $this->captureOutput = func_num_args() > 3;
+        $this->errorOutput = '';
+
+        $callback = is_callable($output) ? $output : function (string $type, string $buffer): void {
+            $this->outputHandler($type, $buffer);
+        };
+
+        $commandString = is_array($command) ? implode(' ', $command) : $command;
+        $this->log[] = $commandString;
+
+        if (is_array($this->expectations) && count($this->expectations) > 0 && $command === $this->expectations[0]['cmd']) {
+            $expect = array_shift($this->expectations);
+            $stdout = $expect['stdout'];
+            $stderr = $expect['stderr'];
+            $return = $expect['return'];
+            if (isset($expect['callback'])) {
+                $expect['callback']();
+            }
+        } elseif (!$this->strict) {
+            $stdout = $this->defaultHandler['stdout'];
+            $stderr = $this->defaultHandler['stderr'];
+            $return = $this->defaultHandler['return'];
+        } else {
+            throw new AssertionFailedError(
+                'Received unexpected command '.var_export($command, true).' in "'.$cwd.'"'.PHP_EOL.
+                (is_array($this->expectations) && count($this->expectations) > 0 ? 'Expected '.var_export($this->expectations[0]['cmd'], true).' at this point.' : 'Expected no more calls at this point.').PHP_EOL.
+                'Received calls:'.PHP_EOL.implode(PHP_EOL, array_slice($this->log, 0, -1))
+            );
+        }
+
+        if ($stdout) {
+            $callback(Process::OUT, $stdout);
+        }
+        if ($stderr) {
+            $callback(Process::ERR, $stderr);
+        }
+
+        if ($this->captureOutput && !is_callable($output)) {
+            $output = $stdout;
+        }
+
+        $this->errorOutput = $stderr;
+
+        return $return;
     }
 
-    protected function initialize()
+    public function executeAsync($command, ?string $cwd = null): PromiseInterface
     {
-        parent::initialize();
+        $cwd = $cwd ?? Platform::getCwd();
 
-        $isVerbose = $this->isVerbose;
-        $isVeryVerbose = $this->isVeryVerbose;
+        $resolver = function ($resolve, $reject) use ($command, $cwd): void {
+            $result = $this->doExecute($command, $cwd, false, $output);
+            $procMock = $this->processMockBuilder->getMock();
+            $procMock->method('getOutput')->willReturn($output);
+            $procMock->method('isSuccessful')->willReturn($result === 0);
+            $procMock->method('getExitCode')->willReturn($result);
 
-        $driver = $this->getDriver();
-        if (!$driver) {
-            throw new \InvalidArgumentException('No driver found to handle VCS repository '.$this->url);
-        }
+            $resolve($procMock);
+        };
 
-        $this->versionParser = new VersionParser;
-        if (!$this->loader) {
-            $this->loader = new ArrayLoader($this->versionParser);
-        }
+        $canceler = static function (): void {
+            throw new \RuntimeException('Aborted process');
+        };
 
-        $hasRootIdentifierComposerJson = false;
-        try {
-            $hasRootIdentifierComposerJson = $driver->hasComposerFile($driver->getRootIdentifier());
-            if ($hasRootIdentifierComposerJson) {
-                $data = $driver->getComposerInformation($driver->getRootIdentifier());
-                $this->packageName = !empty($data['name']) ? $data['name'] : null;
-            }
-        } catch (\Exception $e) {
-            if ($e instanceof TransportException && $this->shouldRethrowTransportException($e)) {
-                throw $e;
-            }
-
-            if ($isVeryVerbose) {
-                $this->io->writeError('<error>Skipped parsing '.$driver->getRootIdentifier().', '.$e->getMessage().'</error>');
-            }
-        }
-
-        foreach ($driver->getTags() as $tag => $identifier) {
-            $tag = (string) $tag;
-            $msg = 'Reading composer.json of <info>' . ($this->packageName ?: $this->url) . '</info> (<comment>' . $tag . '</comment>)';
-            if ($isVeryVerbose) {
-                $this->io->writeError($msg);
-            } elseif ($isVerbose) {
-                $this->io->overwriteError($msg, false);
-            }
-
-            // strip the release- prefix from tags if present
-            $tag = str_replace('release-', '', $tag);
-
-            $cachedPackage = $this->getCachedPackageVersion($tag, $identifier, $isVerbose, $isVeryVerbose);
-            if ($cachedPackage) {
-                $this->addPackage($cachedPackage);
-
-                continue;
-            }
-            if ($cachedPackage === false) {
-                $this->emptyReferences[] = $identifier;
-
-                continue;
-            }
-
-            if (!$parsedTag = $this->validateTag($tag)) {
-                if ($isVeryVerbose) {
-                    $this->io->writeError('<warning>Skipped tag '.$tag.', invalid tag name</warning>');
-                }
-                continue;
-            }
-
-            try {
-                $data = $driver->getComposerInformation($identifier);
-                if (null === $data) {
-                    if ($isVeryVerbose) {
-                        $this->io->writeError('<warning>Skipped tag '.$tag.', no composer file</warning>');
-                    }
-                    $this->emptyReferences[] = $identifier;
-                    continue;
-                }
-
-                // manually versioned package
-                if (isset($data['version'])) {
-                    $data['version_normalized'] = $this->versionParser->normalize($data['version']);
-                } else {
-                    // auto-versioned package, read value from tag
-                    $data['version'] = $tag;
-                    $data['version_normalized'] = $parsedTag;
-                }
-
-                // make sure tag packages have no -dev flag
-                $data['version'] = Preg::replace('{[.-]?dev$}i', '', $data['version']);
-                $data['version_normalized'] = Preg::replace('{(^dev-|[.-]?dev$)}i', '', $data['version_normalized']);
-
-                // make sure tag do not contain the default-branch marker
-                unset($data['default-branch']);
-
-                // broken package, version doesn't match tag
-                if ($data['version_normalized'] !== $parsedTag) {
-                    if ($isVeryVerbose) {
-                        if (Preg::isMatch('{(^dev-|[.-]?dev$)}i', $parsedTag)) {
-                            $this->io->writeError('<warning>Skipped tag '.$tag.', invalid tag name, tags can not use dev prefixes or suffixes</warning>');
-                        } else {
-                            $this->io->writeError('<warning>Skipped tag '.$tag.', tag ('.$parsedTag.') does not match version ('.$data['version_normalized'].') in composer.json</warning>');
-                        }
-                    }
-                    continue;
-                }
-
-                $tagPackageName = $this->packageName ?: ($data['name'] ?? '');
-                if ($existingPackage = $this->findPackage($tagPackageName, $data['version_normalized'])) {
-                    if ($isVeryVerbose) {
-                        $this->io->writeError('<warning>Skipped tag '.$tag.', it conflicts with an another tag ('.$existingPackage->getPrettyVersion().') as both resolve to '.$data['version_normalized'].' internally</warning>');
-                    }
-                    continue;
-                }
-
-                if ($isVeryVerbose) {
-                    $this->io->writeError('Importing tag '.$tag.' ('.$data['version_normalized'].')');
-                }
-
-                $this->addPackage($this->loader->load($this->preProcess($driver, $data, $identifier)));
-            } catch (\Exception $e) {
-                if ($e instanceof TransportException) {
-                    $this->versionTransportExceptions['tags'][$tag] = $e;
-                    if ($e->getCode() === 404) {
-                        $this->emptyReferences[] = $identifier;
-                    }
-                    if ($this->shouldRethrowTransportException($e)) {
-                        throw $e;
-                    }
-                }
-                if ($isVeryVerbose) {
-                    $this->io->writeError('<warning>Skipped tag '.$tag.', '.($e instanceof TransportException ? 'no composer file was found (' . $e->getCode() . ' HTTP status code)' : $e->getMessage()).'</warning>');
-                }
-                continue;
-            }
-        }
-
-        if (!$isVeryVerbose) {
-            $this->io->overwriteError('', false);
-        }
-
-        $branches = $driver->getBranches();
-        // make sure the root identifier branch gets loaded first
-        if ($hasRootIdentifierComposerJson && isset($branches[$driver->getRootIdentifier()])) {
-            $branches = [$driver->getRootIdentifier() => $branches[$driver->getRootIdentifier()]] + $branches;
-        }
-
-        foreach ($branches as $branch => $identifier) {
-            $branch = (string) $branch;
-            $msg = 'Reading composer.json of <info>' . ($this->packageName ?: $this->url) . '</info> (<comment>' . $branch . '</comment>)';
-            if ($isVeryVerbose) {
-                $this->io->writeError($msg);
-            } elseif ($isVerbose) {
-                $this->io->overwriteError($msg, false);
-            }
-
-            if (!$parsedBranch = $this->validateBranch($branch)) {
-                if ($isVeryVerbose) {
-                    $this->io->writeError('<warning>Skipped branch '.$branch.', invalid name</warning>');
-                }
-                continue;
-            }
-
-            // make sure branch packages have a dev flag
-            if (strpos($parsedBranch, 'dev-') === 0 || VersionParser::DEFAULT_BRANCH_ALIAS === $parsedBranch) {
-                $version = 'dev-' . $branch;
-            } else {
-                $prefix = strpos($branch, 'v') === 0 ? 'v' : '';
-                $version = $prefix . Preg::replace('{(\.9{7})+}', '.x', $parsedBranch);
-            }
-
-            $cachedPackage = $this->getCachedPackageVersion($version, $identifier, $isVerbose, $isVeryVerbose, $driver->getRootIdentifier() === $branch);
-            if ($cachedPackage) {
-                $this->addPackage($cachedPackage);
-
-                continue;
-            }
-            if ($cachedPackage === false) {
-                $this->emptyReferences[] = $identifier;
-
-                continue;
-            }
-
-            try {
-                $data = $driver->getComposerInformation($identifier);
-                if (null === $data) {
-                    if ($isVeryVerbose) {
-                        $this->io->writeError('<warning>Skipped branch '.$branch.', no composer file</warning>');
-                    }
-                    $this->emptyReferences[] = $identifier;
-                    continue;
-                }
-
-                // branches are always auto-versioned, read value from branch name
-                $data['version'] = $version;
-                $data['version_normalized'] = $parsedBranch;
-
-                unset($data['default-branch']);
-                if ($driver->getRootIdentifier() === $branch) {
-                    $data['default-branch'] = true;
-                }
-
-                if ($isVeryVerbose) {
-                    $this->io->writeError('Importing branch '.$branch.' ('.$data['version'].')');
-                }
-
-                $packageData = $this->preProcess($driver, $data, $identifier);
-                $package = $this->loader->load($packageData);
-                if ($this->loader instanceof ValidatingArrayLoader && \count($this->loader->getWarnings()) > 0) {
-                    throw new InvalidPackageException($this->loader->getErrors(), $this->loader->getWarnings(), $packageData);
-                }
-                $this->addPackage($package);
-            } catch (TransportException $e) {
-                $this->versionTransportExceptions['branches'][$branch] = $e;
-                if ($e->getCode() === 404) {
-                    $this->emptyReferences[] = $identifier;
-                }
-                if ($this->shouldRethrowTransportException($e)) {
-                    throw $e;
-                }
-                if ($isVeryVerbose) {
-                    $this->io->writeError('<warning>Skipped branch '.$branch.', no composer file was found (' . $e->getCode() . ' HTTP status code)</warning>');
-                }
-                continue;
-            } catch (\Exception $e) {
-                if (!$isVeryVerbose) {
-                    $this->io->writeError('');
-                }
-                $this->branchErrorOccurred = true;
-                $this->io->writeError('<error>Skipped branch '.$branch.', '.$e->getMessage().'</error>');
-                $this->io->writeError('');
-                continue;
-            }
-        }
-        $driver->cleanup();
-
-        if (!$isVeryVerbose) {
-            $this->io->overwriteError('', false);
-        }
-
-        if (!$this->getPackages()) {
-            throw new InvalidRepositoryException('No valid composer.json was found in any branch or tag of '.$this->url.', could not load a package from it.');
-        }
+        return new Promise($resolver, $canceler);
     }
 
-    /**
-     * @param array{name?: string, dist?: array{type: string, url: string, reference: string, shasum: string}, source?: array{type: string, url: string, reference: string}} $data
-     *
-     * @return array{name: string|null, dist: array{type: string, url: string, reference: string, shasum: string}|null, source: array{type: string, url: string, reference: string}}
-     */
-    protected function preProcess(VcsDriverInterface $driver, array $data, string $identifier): array
+    public function getErrorOutput(): string
     {
-        // keep the name of the main identifier for all packages
-        // this ensures that a package can be renamed in one place and that all old tags
-        // will still be installable using that new name without requiring re-tagging
-        $dataPackageName = $data['name'] ?? null;
-        $data['name'] = $this->packageName ?: $dataPackageName;
-
-        if (!isset($data['dist'])) {
-            $data['dist'] = $driver->getDist($identifier);
-        }
-        if (!isset($data['source'])) {
-            $data['source'] = $driver->getSource($identifier);
-        }
-
-        return $data;
-    }
-
-    /**
-     * @return string|false
-     */
-    private function validateBranch(string $branch)
-    {
-        try {
-            $normalizedBranch = $this->versionParser->normalizeBranch($branch);
-
-            // validate that the branch name has no weird characters conflicting with constraints
-            $this->versionParser->parseConstraints($normalizedBranch);
-
-            return $normalizedBranch;
-        } catch (\Exception $e) {
-        }
-
-        return false;
-    }
-
-    /**
-     * @return string|false
-     */
-    private function validateTag(string $version)
-    {
-        try {
-            return $this->versionParser->normalize($version);
-        } catch (\Exception $e) {
-        }
-
-        return false;
-    }
-
-    /**
-     * @return \Composer\Package\CompletePackage|\Composer\Package\CompleteAliasPackage|null|false null if no cache present, false if the absence of a version was cached
-     */
-    private function getCachedPackageVersion(string $version, string $identifier, bool $isVerbose, bool $isVeryVerbose, bool $isDefaultBranch = false)
-    {
-        if (!$this->versionCache) {
-            return null;
-        }
-
-        $cachedPackage = $this->versionCache->getVersionPackage($version, $identifier);
-        if ($cachedPackage === false) {
-            if ($isVeryVerbose) {
-                $this->io->writeError('<warning>Skipped '.$version.', no composer file (cached from ref '.$identifier.')</warning>');
-            }
-
-            return false;
-        }
-
-        if ($cachedPackage) {
-            $msg = 'Found cached composer.json of <info>' . ($this->packageName ?: $this->url) . '</info> (<comment>' . $version . '</comment>)';
-            if ($isVeryVerbose) {
-                $this->io->writeError($msg);
-            } elseif ($isVerbose) {
-                $this->io->overwriteError($msg, false);
-            }
-
-            unset($cachedPackage['default-branch']);
-            if ($isDefaultBranch) {
-                $cachedPackage['default-branch'] = true;
-            }
-
-            if ($existingPackage = $this->findPackage($cachedPackage['name'], new Constraint('=', $cachedPackage['version_normalized']))) {
-                if ($isVeryVerbose) {
-                    $this->io->writeError('<warning>Skipped cached version '.$version.', it conflicts with an another tag ('.$existingPackage->getPrettyVersion().') as both resolve to '.$cachedPackage['version_normalized'].' internally</warning>');
-                }
-                $cachedPackage = null;
-            }
-        }
-
-        if ($cachedPackage) {
-            return $this->loader->load($cachedPackage);
-        }
-
-        return null;
-    }
-
-    private function shouldRethrowTransportException(TransportException $e): bool
-    {
-        return in_array($e->getCode(), [401, 403, 429], true) || $e->getCode() >= 500;
+        return $this->errorOutput;
     }
 }

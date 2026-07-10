@@ -21,188 +21,98 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-#define CURL_DISABLE_DEPRECATION  /* Using and testing the form api */
-#include "test.h"
+/* <DESC>
+ * Preload domains to HSTS
+ * </DESC>
+ */
+#include <stdio.h>
+#include <string.h>
+#include <curl/curl.h>
 
-#include "memdebug.h"
-
-static char data[]=
-  "this is what we post to the silly web server\n";
-
-struct WriteThis {
-  char *readptr;
-  size_t sizeleft;
+struct entry {
+  const char *name;
+  const char *exp;
 };
 
-static size_t read_callback(char *ptr, size_t size, size_t nmemb, void *userp)
+static const struct entry preload_hosts[] = {
+  { "example.com", "20370320 01:02:03" },
+  { "curl.se",     "20370320 03:02:01" },
+  { NULL, NULL } /* end of list marker */
+};
+
+struct state {
+  int index;
+};
+
+/* "read" is from the point of the library, it wants data from us. One domain
+   entry per invoke. */
+static CURLSTScode hstsread(CURL *easy, struct curl_hstsentry *e,
+                            void *userp)
 {
-#ifdef LIB587
-  (void)ptr;
-  (void)size;
-  (void)nmemb;
-  (void)userp;
-  return CURL_READFUNC_ABORT;
-#else
+  const char *host;
+  const char *expire;
+  struct state *s = (struct state *)userp;
+  (void)easy;
+  host = preload_hosts[s->index].name;
+  expire = preload_hosts[s->index++].exp;
 
-  struct WriteThis *pooh = (struct WriteThis *)userp;
-
-  if(size*nmemb < 1)
-    return 0;
-
-  if(pooh->sizeleft) {
-    *ptr = pooh->readptr[0]; /* copy one single byte */
-    pooh->readptr++;                 /* advance pointer */
-    pooh->sizeleft--;                /* less data left */
-    return 1;                        /* we return 1 byte at a time! */
+  if(host && (strlen(host) < e->namelen)) {
+    strcpy(e->name, host);
+    e->includeSubDomains = 0;
+    strcpy(e->expire, expire);
+    fprintf(stderr, "HSTS preload '%s' until '%s'\n", host, expire);
   }
-
-  return 0;                         /* no more data left to deliver */
-#endif
+  else
+    return CURLSTS_DONE;
+  return CURLSTS_OK;
 }
 
-static CURLcode once(char *URL, bool oldstyle)
+static CURLSTScode hstswrite(CURL *easy, struct curl_hstsentry *e,
+                             struct curl_index *i, void *userp)
+{
+  (void)easy;
+  (void)userp; /* we have no custom input */
+  printf("[%u/%u] %s %s\n", (unsigned int)i->index, (unsigned int)i->total,
+         e->name, e->expire);
+  return CURLSTS_OK;
+}
+
+int main(void)
 {
   CURL *curl;
-  CURLcode res = CURLE_OK;
-  CURLFORMcode formrc;
-
-  struct curl_httppost *formpost = NULL;
-  struct curl_httppost *lastptr = NULL;
-  struct WriteThis pooh;
-  struct WriteThis pooh2;
-
-  pooh.readptr = data;
-  pooh.sizeleft = strlen(data);
-
-  /* Fill in the file upload field */
-  if(oldstyle) {
-    formrc = curl_formadd(&formpost,
-                          &lastptr,
-                          CURLFORM_COPYNAME, "sendfile",
-                          CURLFORM_STREAM, &pooh,
-                          CURLFORM_CONTENTSLENGTH, (long)pooh.sizeleft,
-                          CURLFORM_FILENAME, "postit2.c",
-                          CURLFORM_END);
-  }
-  else {
-    /* new style */
-    formrc = curl_formadd(&formpost,
-                          &lastptr,
-                          CURLFORM_COPYNAME, "sendfile alternative",
-                          CURLFORM_STREAM, &pooh,
-                          CURLFORM_CONTENTLEN, (curl_off_t)pooh.sizeleft,
-                          CURLFORM_FILENAME, "file name 2",
-                          CURLFORM_END);
-  }
-
-  if(formrc)
-    printf("curl_formadd(1) = %d\n", (int)formrc);
-
-  /* Now add the same data with another name and make it not look like
-     a file upload but still using the callback */
-
-  pooh2.readptr = data;
-  pooh2.sizeleft = strlen(data);
-
-  /* Fill in the file upload field */
-  formrc = curl_formadd(&formpost,
-                        &lastptr,
-                        CURLFORM_COPYNAME, "callbackdata",
-                        CURLFORM_STREAM, &pooh2,
-                        CURLFORM_CONTENTSLENGTH, (long)pooh2.sizeleft,
-                        CURLFORM_END);
-
-  if(formrc)
-    printf("curl_formadd(2) = %d\n", (int)formrc);
-
-  /* Fill in the filename field */
-  formrc = curl_formadd(&formpost,
-                        &lastptr,
-                        CURLFORM_COPYNAME, "filename",
-                        CURLFORM_COPYCONTENTS, "postit2.c",
-                        CURLFORM_END);
-
-  if(formrc)
-    printf("curl_formadd(3) = %d\n", (int)formrc);
-
-  /* Fill in a submit field too */
-  formrc = curl_formadd(&formpost,
-                        &lastptr,
-                        CURLFORM_COPYNAME, "submit",
-                        CURLFORM_COPYCONTENTS, "send",
-                        CURLFORM_CONTENTTYPE, "text/plain",
-                        CURLFORM_END);
-
-  if(formrc)
-    printf("curl_formadd(4) = %d\n", (int)formrc);
-
-  formrc = curl_formadd(&formpost, &lastptr,
-                        CURLFORM_COPYNAME, "somename",
-                        CURLFORM_BUFFER, "somefile.txt",
-                        CURLFORM_BUFFERPTR, "blah blah",
-                        CURLFORM_BUFFERLENGTH, (long)9,
-                        CURLFORM_END);
-
-  if(formrc)
-    printf("curl_formadd(5) = %d\n", (int)formrc);
-
-  curl = curl_easy_init();
-  if(!curl) {
-    fprintf(stderr, "curl_easy_init() failed\n");
-    curl_formfree(formpost);
-    curl_global_cleanup();
-    return TEST_ERR_MAJOR_BAD;
-  }
-
-  /* First set the URL that is about to receive our POST. */
-  test_setopt(curl, CURLOPT_URL, URL);
-
-  /* Now specify we want to POST data */
-  test_setopt(curl, CURLOPT_POST, 1L);
-
-  /* Set the expected POST size */
-  test_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)pooh.sizeleft);
-
-  /* we want to use our own read function */
-  test_setopt(curl, CURLOPT_READFUNCTION, read_callback);
-
-  /* send a multi-part formpost */
-  test_setopt(curl, CURLOPT_HTTPPOST, formpost);
-
-  /* get verbose debug output please */
-  test_setopt(curl, CURLOPT_VERBOSE, 1L);
-
-  /* include headers in the output */
-  test_setopt(curl, CURLOPT_HEADER, 1L);
-
-  /* Perform the request, res will get the return code */
-  res = curl_easy_perform(curl);
-
-test_cleanup:
-
-  /* always cleanup */
-  curl_easy_cleanup(curl);
-
-  /* now cleanup the formpost chain */
-  curl_formfree(formpost);
-
-  return res;
-}
-
-CURLcode test(char *URL)
-{
   CURLcode res;
 
-  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
-    fprintf(stderr, "curl_global_init() failed\n");
-    return TEST_ERR_MAJOR_BAD;
+  curl = curl_easy_init();
+  if(curl) {
+    struct state st = {0};
+
+    /* enable HSTS for this handle */
+    curl_easy_setopt(curl, CURLOPT_HSTS_CTRL, (long)CURLHSTS_ENABLE);
+
+    /* function to call at first to populate the cache before the transfer */
+    curl_easy_setopt(curl, CURLOPT_HSTSREADFUNCTION, hstsread);
+    curl_easy_setopt(curl, CURLOPT_HSTSREADDATA, &st);
+
+    /* function to call after transfer to store the new state of the HSTS
+       cache */
+    curl_easy_setopt(curl, CURLOPT_HSTSWRITEFUNCTION, hstswrite);
+    curl_easy_setopt(curl, CURLOPT_HSTSWRITEDATA, NULL);
+
+    /* use the domain with HTTP but due to the preload, it should do the
+       transfer using HTTPS */
+    curl_easy_setopt(curl, CURLOPT_URL, "http://curl.se");
+
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+
+    /* Perform the request, res gets the return code */
+    res = curl_easy_perform(curl);
+    /* Check for errors */
+    if(res != CURLE_OK)
+      fprintf(stderr, "curl_easy_perform() failed: %s\n",
+              curl_easy_strerror(res));
+
+    /* always cleanup */
+    curl_easy_cleanup(curl);
   }
-
-  res = once(URL, TRUE); /* old */
-  if(!res)
-    res = once(URL, FALSE); /* new */
-
-  curl_global_cleanup();
-
-  return res;
+  return 0;
 }

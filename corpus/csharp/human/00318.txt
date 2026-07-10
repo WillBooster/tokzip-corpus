@@ -1,196 +1,114 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
-using System;
 using System.Collections.Generic;
-using System.Reflection;
-using NUnit.Framework.Internal;
+using System.Threading;
+using NUnit.Framework.Interfaces;
+using NUnit.Framework.Internal.Abstractions;
+using NUnit.Framework.Internal.Extensions;
 
-namespace NUnit.Framework.Tests.Internal
+namespace NUnit.Framework.Internal.Execution
 {
-    public class GenericMethodHelperTests
+    /// <summary>
+    /// WorkItemBuilder class knows how to build a tree of work items from a tree of tests
+    /// </summary>
+    public static class WorkItemBuilder
     {
-        private static readonly TestCaseData[] TypeArgData = new[]
-        {
-            new TestCaseData("MethodWithOneTypeAndOneParameter",
-                ArgList(42),
-                TypeArgs<int>()),
-            new TestCaseData(nameof(MethodWithOneTypeAndTwoParameters),
-                ArgList(42, 99),
-                TypeArgs<int>()),
-            new TestCaseData(nameof(MethodWithOneTypeAndTwoParameters),
-                ArgList(42.0, 99.0),
-                TypeArgs<double>()),
-            new TestCaseData(nameof(MethodWithOneTypeAndTwoParameters),
-                ArgList(42, 99.0),
-                TypeArgs<double>()),
-            new TestCaseData(nameof(MethodWithOneTypeAndTwoParameters),
-                ArgList(42.0, 99),
-                TypeArgs<double>()),
-            new TestCaseData(nameof(MethodWithOneTypeAndThreeParameters),
-                ArgList(42, -1, 7),
-                TypeArgs<int>()),
-            new TestCaseData(nameof(MethodWithTwoTypesAndTwoParameters),
-                ArgList(42, "Answer"),
-                TypeArgs<int, string>()),
-            new TestCaseData(nameof(MethodWithTwoTypesAndTwoParameters_Reversed),
-                ArgList("Answer", 42),
-                TypeArgs<int, string>()),
-            new TestCaseData(nameof(MethodWithTwoTypesAndThreeParameters),
-                ArgList(42, "Answer", 42),
-                TypeArgs<int, string>()),
-            new TestCaseData(nameof(MethodWithTwoTypesAndFourParameters),
-                ArgList("Question", 1, "Answer", 42),
-                TypeArgs<int, string>()),
-            new TestCaseData(nameof(MethodWithThreeTypes_Order123),
-                ArgList(42, 42.0, "forty-two"),
-                TypeArgs<int, double, string>()),
-            new TestCaseData(nameof(MethodWithThreeTypes_Order132),
-                ArgList(42, "forty-two", 42.0),
-                TypeArgs<int, double, string>()),
-            new TestCaseData(nameof(MethodWithThreeTypes_Order321),
-                ArgList("forty-two", 42.0, 42),
-                TypeArgs<int, double, string>()),
-            new TestCaseData(nameof(MethodWithThreeTypes_Order213),
-                ArgList(42.0, 42, "forty-two"),
-                TypeArgs<int, double, string>()),
-            new TestCaseData(nameof(MethodWithOneTypeAndOneParameter),
-                ArgList(new[] { 1, 2, 3 }),
-                TypeArgs<int[]>()),
-            new TestCaseData(nameof(MethodWithGenericListOfType),
-                ArgList(new List<int>()),
-                TypeArgs<int>()),
-            new TestCaseData(nameof(MethodWithGenericListOfType),
-                ArgList(new LinkedList<int>()),
-                null),
-            new TestCaseData(nameof(MethodWithGenericListOfLists),
-                ArgList(new List<List<int>>()),
-                TypeArgs<int>()),
-            new TestCaseData(nameof(MethodWithGenericEnumerableOfType),
-                ArgList(new List<int>(new[] { 1, 2, 3 })),
-                TypeArgs<int>()),
-            new TestCaseData(nameof(MethodWithGenericEnumerableOfType),
-                ArgList(new[] { 1, 2, 3 }),
-                TypeArgs<int>()),
-            new TestCaseData(nameof(MethodWithGenericEnumerableOfTypeAsSecondArg),
-                ArgList("X", new int[] { }),
-                TypeArgs<string, int>()),
-            new TestCaseData(nameof(MethodTakingDictionary),
-                ArgList(new Dictionary<string, object>()),
-                TypeArgs<string, object>()),
-            new TestCaseData(nameof(MethodWithNestedTypes),
-                ArgList(new List<Dictionary<string, int>>(), new Dictionary<int, List<string[]>>()),
-                TypeArgs<string, int, string[]>()),
-            new TestCaseData(nameof(MethodWithOneTypeUsedDirectlyAndAsAnArray),
-                ArgList(10, new int[40]),
-                TypeArgs<int>()),
-            new TestCaseData(nameof(MethodWithOneTypeUsedAsAnArrayAndDirectly),
-                ArgList(new int[40], 10),
-                TypeArgs<int>())
-        };
+        #region Static Factory Method
 
-        [TestCaseSource(nameof(TypeArgData))]
-        public void GetTypeArgumentsForMethodTests(string methodName, object[] args, Type[] typeArgs)
+        /// <summary>
+        /// Creates a work item.
+        /// </summary>
+        /// <param name="test">The test for which this WorkItem is being created.</param>
+        /// <param name="filter">The filter to be used in selecting any child Tests.</param>
+        /// <param name="recursive">True if child work items should be created and added.</param>
+        /// <returns></returns>
+        public static WorkItem? CreateWorkItem(ITest test, ITestFilter filter, bool recursive = false)
         {
-            MethodInfo? method = GetType().GetMethod(methodName, BindingFlags.Instance | BindingFlags.NonPublic);
-            Assert.That(method, Is.Not.Null);
-            Assert.That(new GenericMethodHelper(method).TryGetTypeArguments(args, out var typeArguments) ? typeArguments : null, Is.EqualTo(typeArgs));
+            return CreateWorkItem(test, filter, new DebuggerProxy(), recursive);
         }
 
-        private static object[] ArgList(params object[] args)
+        /// <summary>
+        /// Creates a work item.
+        /// </summary>
+        /// <param name="test">The test for which this WorkItem is being created.</param>
+        /// <param name="filter">The filter to be used in selecting any child Tests.</param>
+        /// <param name="debugger">An <see cref="IDebugger" /> instance.</param>
+        /// <param name="recursive">True if child work items should be created and added.</param>
+        /// <param name="root"><see langword="true"/> if work item needs to be created unconditionally, if <see langword="false"/> <see langword="null"/> will be returned for tests that don't match the filter.</param>
+        /// <returns></returns>
+        internal static WorkItem? CreateWorkItem(ITest test, ITestFilter filter, IDebugger debugger, bool recursive = false, bool root = true)
         {
-            return args;
+            // Run filter on leaf nodes only
+            // use the presence of leaf nodes as an indicator that parent need to be created
+            // Always create a workitem for the root node
+            if (test is not TestSuite suite)
+            {
+                if (root || filter.Pass(test))
+                {
+                    return new SimpleWorkItem((TestMethod)test, filter, debugger);
+                }
+                return null;
+            }
+
+            CompositeWorkItem? work = root ? new CompositeWorkItem(suite, filter) : null;
+
+            if (recursive)
+            {
+                int countOrderedItems = 0;
+
+                foreach (var childTest in suite.Tests)
+                {
+                    var childItem = CreateWorkItem(childTest, filter, debugger, recursive, root: false);
+                    if (childItem is null)
+                        continue;
+
+                    work ??= new CompositeWorkItem(suite, filter);
+
+                    if (childItem.TargetApartment == ApartmentState.Unknown && work.TargetApartment != ApartmentState.Unknown)
+                        childItem.TargetApartment = work.TargetApartment;
+
+                    if (childTest.Properties.ContainsKey(PropertyNames.Order))
+                    {
+                        work.Children.Insert(0, childItem);
+                        countOrderedItems++;
+                    }
+                    else
+                    {
+                        work.Children.Add(childItem);
+                    }
+                }
+
+                if (countOrderedItems > 0)
+                    work!.Children.Sort(0, countOrderedItems, new WorkItemOrderComparer());
+            }
+            return work;
         }
 
-        private static Type[] TypeArgs<T>()
-        {
-            return new[] { typeof(T) };
-        }
-        private static Type[] TypeArgs<T1, T2>()
-        {
-            return new[] { typeof(T1), typeof(T2) };
-        }
-        private static Type[] TypeArgs<T1, T2, T3>()
-        {
-            return new[] { typeof(T1), typeof(T2), typeof(T3) };
-        }
+        #endregion
 
-        private void MethodWithOneTypeAndOneParameter<T>(T x)
+        private class WorkItemOrderComparer : IComparer<WorkItem>
         {
-        }
+            /// <summary>
+            /// Compares two objects and returns a value indicating whether one is less than, equal to, or greater than the other.
+            /// </summary>
+            /// <returns>
+            /// A signed integer that indicates the relative values of <paramref name="x"/> and <paramref name="y"/>, as shown in the following table.Value Meaning Less than zero<paramref name="x"/> is less than <paramref name="y"/>.Zero<paramref name="x"/> equals <paramref name="y"/>.Greater than zero<paramref name="x"/> is greater than <paramref name="y"/>.
+            /// </returns>
+            /// <param name="x">The first object to compare.</param><param name="y">The second object to compare.</param>
+            public int Compare(WorkItem? x, WorkItem? y)
+            {
+                if (x is null && y is null)
+                    return 0;
+                if (x is null)
+                    return -1;
+                if (y is null)
+                    return 1;
 
-        private void MethodWithOneTypeAndTwoParameters<T>(T x, T y)
-        {
-        }
+                var xKey = x.Test.Properties.TryGet(PropertyNames.Order, int.MaxValue);
+                var yKey = y.Test.Properties.TryGet(PropertyNames.Order, int.MaxValue);
 
-        private void MethodWithOneTypeAndThreeParameters<T>(T x, T y, T z)
-        {
-        }
-
-        private void MethodWithTwoTypesAndTwoParameters<T1, T2>(T1 x, T2 y)
-        {
-        }
-
-        private void MethodWithTwoTypesAndTwoParameters_Reversed<T1, T2>(T2 x, T1 y)
-        {
-        }
-
-        private void MethodWithTwoTypesAndThreeParameters<T1, T2>(T1 x, T2 y, T1 z)
-        {
-        }
-
-        private void MethodWithTwoTypesAndFourParameters<T1, T2>(T2 q, T1 x, T2 y, T1 z)
-        {
-        }
-
-        private void MethodWithThreeTypes_Order123<T1, T2, T3>(T1 x, T2 y, T3 z)
-        {
-        }
-
-        private void MethodWithThreeTypes_Order132<T1, T2, T3>(T1 x, T3 y, T2 z)
-        {
-        }
-
-        private void MethodWithThreeTypes_Order321<T1, T2, T3>(T3 x, T2 y, T1 z)
-        {
-        }
-
-        private void MethodWithThreeTypes_Order213<T1, T2, T3>(T2 x, T1 y, T3 z)
-        {
-        }
-
-        private void MethodWithGenericListOfType<T>(List<T> c)
-        {
-        }
-
-        private void MethodWithGenericListOfLists<T>(List<List<T>> c)
-        {
-        }
-
-        private void MethodWithGenericEnumerableOfType<T>(IEnumerable<T> c)
-        {
-        }
-
-        private void MethodWithGenericEnumerableOfTypeAsSecondArg<T1, T2>(T1 x, IEnumerable<T2> c)
-        {
-        }
-
-        private void MethodTakingDictionary<T1, T2>(Dictionary<T1, T2> d)
-            where T1 : notnull
-        {
-        }
-
-        private void MethodWithNestedTypes<T1, T2, T3>(List<Dictionary<T1, T2>> x, Dictionary<T2, List<T3>> z)
-            where T1 : notnull
-            where T2 : notnull
-        {
-        }
-
-        private void MethodWithOneTypeUsedDirectlyAndAsAnArray<T>(T value, T[] array)
-        {
-        }
-
-        private void MethodWithOneTypeUsedAsAnArrayAndDirectly<T>(T[] array, T value)
-        {
+                return xKey.CompareTo(yKey);
+            }
         }
     }
 }

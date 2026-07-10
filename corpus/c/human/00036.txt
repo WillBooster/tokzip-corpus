@@ -20,104 +20,118 @@
  *
  * SPDX-License-Identifier: curl
  *
+ * RFC4616 PLAIN authentication
+ * Draft   LOGIN SASL Mechanism <draft-murchison-sasl-login-00.txt>
+ *
  ***************************************************************************/
-#include "test.h"
 
+#include "curl_setup.h"
+
+#if !defined(CURL_DISABLE_IMAP) || !defined(CURL_DISABLE_SMTP) ||       \
+  !defined(CURL_DISABLE_POP3) || \
+  (!defined(CURL_DISABLE_LDAP) && defined(USE_OPENLDAP))
+
+#include <curl/curl.h>
+#include "urldata.h"
+
+#include "vauth/vauth.h"
+#include "warnless.h"
+#include "strtok.h"
+#include "sendf.h"
+#include "curl_printf.h"
+
+/* The last #include files should be: */
+#include "curl_memory.h"
 #include "memdebug.h"
 
-static char data[]="this is what we post to the silly web server\n";
-
-struct WriteThis {
-  char *readptr;
-  size_t sizeleft;
-};
-
-static size_t read_callback(char *ptr, size_t size, size_t nmemb, void *userp)
+/*
+ * Curl_auth_create_plain_message()
+ *
+ * This is used to generate an already encoded PLAIN message ready
+ * for sending to the recipient.
+ *
+ * Parameters:
+ *
+ * authzid [in]     - The authorization identity.
+ * authcid [in]     - The authentication identity.
+ * passwd  [in]     - The password.
+ * out     [out]    - The result storage.
+ *
+ * Returns CURLE_OK on success.
+ */
+CURLcode Curl_auth_create_plain_message(const char *authzid,
+                                        const char *authcid,
+                                        const char *passwd,
+                                        struct bufref *out)
 {
-  struct WriteThis *pooh = (struct WriteThis *)userp;
-  size_t tocopy = size * nmemb;
+  char *plainauth;
+  size_t plainlen;
+  size_t zlen;
+  size_t clen;
+  size_t plen;
 
-  /* Wait one second before return POST data          *
-   * so libcurl will wait before sending request body */
-  wait_ms(1000);
+  zlen = (authzid == NULL ? 0 : strlen(authzid));
+  clen = strlen(authcid);
+  plen = strlen(passwd);
 
-  if(tocopy < 1 || !pooh->sizeleft)
-    return 0;
+  /* Compute binary message length. Check for overflows. */
+  if((zlen > SIZE_T_MAX/4) || (clen > SIZE_T_MAX/4) ||
+     (plen > (SIZE_T_MAX/2 - 2)))
+    return CURLE_OUT_OF_MEMORY;
+  plainlen = zlen + clen + plen + 2;
 
-  if(pooh->sizeleft < tocopy)
-    tocopy = pooh->sizeleft;
+  plainauth = malloc(plainlen + 1);
+  if(!plainauth)
+    return CURLE_OUT_OF_MEMORY;
 
-  memcpy(ptr, pooh->readptr, tocopy);/* copy requested data */
-  pooh->readptr += tocopy;           /* advance pointer */
-  pooh->sizeleft -= tocopy;          /* less data left */
-  return tocopy;
+  /* Calculate the reply */
+  if(zlen)
+    memcpy(plainauth, authzid, zlen);
+  plainauth[zlen] = '\0';
+  memcpy(plainauth + zlen + 1, authcid, clen);
+  plainauth[zlen + clen + 1] = '\0';
+  memcpy(plainauth + zlen + clen + 2, passwd, plen);
+  plainauth[plainlen] = '\0';
+  Curl_bufref_set(out, plainauth, plainlen, curl_free);
+  return CURLE_OK;
 }
 
-CURLcode test(char *URL)
+/*
+ * Curl_auth_create_login_message()
+ *
+ * This is used to generate an already encoded LOGIN message containing the
+ * username or password ready for sending to the recipient.
+ *
+ * Parameters:
+ *
+ * valuep  [in]     - The username or user's password.
+ * out     [out]    - The result storage.
+ *
+ * Returns void.
+ */
+void Curl_auth_create_login_message(const char *valuep, struct bufref *out)
 {
-  CURL *curl;
-  CURLcode res = CURLE_OK;
-
-  struct WriteThis pooh;
-
-  if(!strcmp(URL, "check")) {
-#if (defined(_WIN32) || defined(__CYGWIN__))
-    printf("Windows TCP does not deliver response data but reports "
-           "CONNABORTED\n");
-    return (CURLcode)1; /* skip since it fails on Windows without workaround */
-#else
-    return CURLE_OK; /* sure, run this! */
-#endif
-  }
-
-  pooh.readptr = data;
-  pooh.sizeleft = strlen(data);
-
-  if(curl_global_init(CURL_GLOBAL_ALL)) {
-    fprintf(stderr, "curl_global_init() failed\n");
-    return TEST_ERR_MAJOR_BAD;
-  }
-
-  curl = curl_easy_init();
-  if(!curl) {
-    fprintf(stderr, "curl_easy_init() failed\n");
-    curl_global_cleanup();
-    return TEST_ERR_MAJOR_BAD;
-  }
-
-  /* First set the URL that is about to receive our POST. */
-  test_setopt(curl, CURLOPT_URL, URL);
-
-  /* Now specify we want to POST data */
-  test_setopt(curl, CURLOPT_POST, 1L);
-
-  /* Set the expected POST size */
-  test_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)pooh.sizeleft);
-
-  /* we want to use our own read function */
-  test_setopt(curl, CURLOPT_READFUNCTION, read_callback);
-
-  /* pointer to pass to our read function */
-  test_setopt(curl, CURLOPT_READDATA, &pooh);
-
-  /* get verbose debug output please */
-  test_setopt(curl, CURLOPT_VERBOSE, 1L);
-
-  /* include headers in the output */
-  test_setopt(curl, CURLOPT_HEADER, 1L);
-
-  /* detect HTTP error codes >= 400 */
-  /* test_setopt(curl, CURLOPT_FAILONERROR, 1L); */
-
-
-  /* Perform the request, res will get the return code */
-  res = curl_easy_perform(curl);
-
-test_cleanup:
-
-  /* always cleanup */
-  curl_easy_cleanup(curl);
-  curl_global_cleanup();
-
-  return res;
+  Curl_bufref_set(out, valuep, strlen(valuep), NULL);
 }
+
+/*
+ * Curl_auth_create_external_message()
+ *
+ * This is used to generate an already encoded EXTERNAL message containing
+ * the username ready for sending to the recipient.
+ *
+ * Parameters:
+ *
+ * user    [in]     - The username.
+ * out     [out]    - The result storage.
+ *
+ * Returns void.
+ */
+void Curl_auth_create_external_message(const char *user,
+                                           struct bufref *out)
+{
+  /* This is the same formatting as the login message */
+  Curl_auth_create_login_message(user, out);
+}
+
+#endif /* if no users */

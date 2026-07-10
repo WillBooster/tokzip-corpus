@@ -10,226 +10,233 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Util;
+namespace Composer\IO;
 
-use Composer\Package\Loader\ArrayLoader;
-use Composer\Package\Loader\ValidatingArrayLoader;
-use Composer\Package\Loader\InvalidPackageException;
-use Composer\Json\JsonValidationException;
-use Composer\IO\IOInterface;
-use Composer\Json\JsonFile;
+use Composer\Config;
 use Composer\Pcre\Preg;
-use Composer\Spdx\SpdxLicenses;
-use Seld\JsonLint\DuplicateKeyException;
-use Seld\JsonLint\JsonParser;
+use Composer\Util\ProcessExecutor;
+use Composer\Util\Silencer;
+use Psr\Log\LogLevel;
 
-/**
- * Validates a composer configuration.
- *
- * @author Robert Schönthal <seroscho@googlemail.com>
- * @author Jordi Boggiano <j.boggiano@seld.be>
- */
-class ConfigValidator
+abstract class BaseIO implements IOInterface
 {
-    public const CHECK_VERSION = 1;
+    /** @var array<string, array{username: string|null, password: string|null}> */
+    protected $authentications = [];
 
-    /** @var IOInterface */
-    private $io;
-
-    public function __construct(IOInterface $io)
+    /**
+     * @inheritDoc
+     */
+    public function getAuthentications()
     {
-        $this->io = $io;
+        return $this->authentications;
     }
 
     /**
-     * Validates the config, and returns the result.
-     *
-     * @param string $file                       The path to the file
-     * @param int    $arrayLoaderValidationFlags Flags for ArrayLoader validation
-     * @param int    $flags                      Flags for validation
-     *
-     * @return array{list<string>, list<string>, list<string>} a triple containing the errors, publishable errors, and warnings
+     * @return void
      */
-    public function validate(string $file, int $arrayLoaderValidationFlags = ValidatingArrayLoader::CHECK_ALL, int $flags = self::CHECK_VERSION): array
+    public function resetAuthentications()
     {
-        $errors = [];
-        $publishErrors = [];
-        $warnings = [];
+        $this->authentications = [];
+    }
 
-        // validate json schema
-        $laxValid = false;
-        $manifest = null;
-        try {
-            $json = new JsonFile($file, null, $this->io);
-            $manifest = $json->read();
+    /**
+     * @inheritDoc
+     */
+    public function hasAuthentication($repositoryName)
+    {
+        return isset($this->authentications[$repositoryName]);
+    }
 
-            $json->validateSchema(JsonFile::LAX_SCHEMA);
-            $laxValid = true;
-            $json->validateSchema();
-        } catch (JsonValidationException $e) {
-            foreach ($e->getErrors() as $message) {
-                if ($laxValid) {
-                    $publishErrors[] = $message;
-                } else {
-                    $errors[] = $message;
-                }
-            }
-        } catch (\Exception $e) {
-            $errors[] = $e->getMessage();
-
-            return [$errors, $publishErrors, $warnings];
+    /**
+     * @inheritDoc
+     */
+    public function getAuthentication($repositoryName)
+    {
+        if (isset($this->authentications[$repositoryName])) {
+            return $this->authentications[$repositoryName];
         }
 
-        if (is_array($manifest)) {
-            $jsonParser = new JsonParser();
-            try {
-                $jsonParser->parse((string) file_get_contents($file), JsonParser::DETECT_KEY_CONFLICTS);
-            } catch (DuplicateKeyException $e) {
-                $details = $e->getDetails();
-                $warnings[] = 'Key '.$details['key'].' is a duplicate in '.$file.' at line '.$details['line'];
+        return ['username' => null, 'password' => null];
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function setAuthentication($repositoryName, $username, $password = null)
+    {
+        $this->authentications[$repositoryName] = ['username' => $username, 'password' => $password];
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function writeRaw($messages, bool $newline = true, int $verbosity = self::NORMAL)
+    {
+        $this->write($messages, $newline, $verbosity);
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function writeErrorRaw($messages, bool $newline = true, int $verbosity = self::NORMAL)
+    {
+        $this->writeError($messages, $newline, $verbosity);
+    }
+
+    /**
+     * Check for overwrite and set the authentication information for the repository.
+     *
+     * @param string $repositoryName The unique name of repository
+     * @param string $username       The username
+     * @param string $password       The password
+     *
+     * @return void
+     */
+    protected function checkAndSetAuthentication(string $repositoryName, string $username, ?string $password = null)
+    {
+        if ($this->hasAuthentication($repositoryName)) {
+            $auth = $this->getAuthentication($repositoryName);
+            if ($auth['username'] === $username && $auth['password'] === $password) {
+                return;
             }
-        }
 
-        // validate actual data
-        if (empty($manifest['license'])) {
-            $warnings[] = 'No license specified, it is recommended to do so. For closed-source software you may use "proprietary" as license.';
-        } else {
-            $licenses = (array) $manifest['license'];
-
-            // strip proprietary since it's not a valid SPDX identifier, but is accepted by composer
-            foreach ($licenses as $key => $license) {
-                if ('proprietary' === $license) {
-                    unset($licenses[$key]);
-                }
-            }
-
-            $licenseValidator = new SpdxLicenses();
-            foreach ($licenses as $license) {
-                $spdxLicense = $licenseValidator->getLicenseByIdentifier($license);
-                if ($spdxLicense && $spdxLicense[3]) {
-                    if (Preg::isMatch('{^[AL]?GPL-[123](\.[01])?\+$}i', $license)) {
-                        $warnings[] = sprintf(
-                            'License "%s" is a deprecated SPDX license identifier, use "'.str_replace('+', '', $license).'-or-later" instead',
-                            $license
-                        );
-                    } elseif (Preg::isMatch('{^[AL]?GPL-[123](\.[01])?$}i', $license)) {
-                        $warnings[] = sprintf(
-                            'License "%s" is a deprecated SPDX license identifier, use "'.$license.'-only" or "'.$license.'-or-later" instead',
-                            $license
-                        );
-                    } else {
-                        $warnings[] = sprintf(
-                            'License "%s" is a deprecated SPDX license identifier, see https://spdx.org/licenses/',
-                            $license
-                        );
-                    }
-                }
-            }
-        }
-
-        if (($flags & self::CHECK_VERSION) && isset($manifest['version'])) {
-            $warnings[] = 'The version field is present, it is recommended to leave it out if the package is published on Packagist.';
-        }
-
-        if (!empty($manifest['name']) && Preg::isMatch('{[A-Z]}', $manifest['name'])) {
-            $suggestName = Preg::replace('{(?:([a-z])([A-Z])|([A-Z])([A-Z][a-z]))}', '\\1\\3-\\2\\4', $manifest['name']);
-            $suggestName = strtolower($suggestName);
-
-            $publishErrors[] = sprintf(
-                'Name "%s" does not match the best practice (e.g. lower-cased/with-dashes). We suggest using "%s" instead. As such you will not be able to submit it to Packagist.',
-                $manifest['name'],
-                $suggestName
+            $this->writeError(
+                sprintf(
+                    "<warning>Warning: You should avoid overwriting already defined auth settings for %s.</warning>",
+                    $repositoryName
+                )
             );
         }
+        $this->setAuthentication($repositoryName, $username, $password);
+    }
 
-        if (!empty($manifest['type']) && $manifest['type'] === 'composer-installer') {
-            $warnings[] = "The package type 'composer-installer' is deprecated. Please distribute your custom installers as plugins from now on. See https://getcomposer.org/doc/articles/plugins.md for plugin documentation.";
+    /**
+     * @inheritDoc
+     */
+    public function loadConfiguration(Config $config)
+    {
+        $bitbucketOauth = $config->get('bitbucket-oauth');
+        $githubOauth = $config->get('github-oauth');
+        $gitlabOauth = $config->get('gitlab-oauth');
+        $gitlabToken = $config->get('gitlab-token');
+        $httpBasic = $config->get('http-basic');
+        $bearerToken = $config->get('bearer');
+
+        // reload oauth tokens from config if available
+
+        foreach ($bitbucketOauth as $domain => $cred) {
+            $this->checkAndSetAuthentication($domain, $cred['consumer-key'], $cred['consumer-secret']);
         }
 
-        // check for require-dev overrides
-        if (isset($manifest['require'], $manifest['require-dev'])) {
-            $requireOverrides = array_intersect_key($manifest['require'], $manifest['require-dev']);
+        foreach ($githubOauth as $domain => $token) {
+            if ($domain !== 'github.com' && !in_array($domain, $config->get('github-domains'), true)) {
+                $this->debug($domain.' is not in the configured github-domains, adding it implicitly as authentication is configured for this domain');
+                $config->merge(['config' => ['github-domains' => array_merge($config->get('github-domains'), [$domain])]], 'implicit-due-to-auth');
+            }
 
-            if (!empty($requireOverrides)) {
-                $plural = (count($requireOverrides) > 1) ? 'are' : 'is';
-                $warnings[] = implode(', ', array_keys($requireOverrides)). " {$plural} required both in require and require-dev, this can lead to unexpected behavior";
+            // allowed chars for GH tokens are from https://github.blog/changelog/2021-03-04-authentication-token-format-updates/
+            // plus dots which were at some point used for GH app integration tokens
+            if (!Preg::isMatch('{^[.A-Za-z0-9_]+$}', $token)) {
+                throw new \UnexpectedValueException('Your github oauth token for '.$domain.' contains invalid characters: "'.$token.'"');
+            }
+            $this->checkAndSetAuthentication($domain, $token, 'x-oauth-basic');
+        }
+
+        foreach ($gitlabOauth as $domain => $token) {
+            if ($domain !== 'gitlab.com' && !in_array($domain, $config->get('gitlab-domains'), true)) {
+                $this->debug($domain.' is not in the configured gitlab-domains, adding it implicitly as authentication is configured for this domain');
+                $config->merge(['config' => ['gitlab-domains' => array_merge($config->get('gitlab-domains'), [$domain])]], 'implicit-due-to-auth');
+            }
+
+            $token = is_array($token) ? $token["token"] : $token;
+            $this->checkAndSetAuthentication($domain, $token, 'oauth2');
+        }
+
+        foreach ($gitlabToken as $domain => $token) {
+            if ($domain !== 'gitlab.com' && !in_array($domain, $config->get('gitlab-domains'), true)) {
+                $this->debug($domain.' is not in the configured gitlab-domains, adding it implicitly as authentication is configured for this domain');
+                $config->merge(['config' => ['gitlab-domains' => array_merge($config->get('gitlab-domains'), [$domain])]], 'implicit-due-to-auth');
+            }
+
+            $username = is_array($token) ? $token["username"] : $token;
+            $password = is_array($token) ? $token["token"] : 'private-token';
+            $this->checkAndSetAuthentication($domain, $username, $password);
+        }
+
+        // reload http basic credentials from config if available
+        foreach ($httpBasic as $domain => $cred) {
+            $this->checkAndSetAuthentication($domain, $cred['username'], $cred['password']);
+        }
+
+        foreach ($bearerToken as $domain => $token) {
+            $this->checkAndSetAuthentication($domain, $token, 'bearer');
+        }
+
+        // setup process timeout
+        ProcessExecutor::setTimeout($config->get('process-timeout'));
+    }
+
+    public function emergency($message, array $context = []): void
+    {
+        $this->log(LogLevel::EMERGENCY, $message, $context);
+    }
+
+    public function alert($message, array $context = []): void
+    {
+        $this->log(LogLevel::ALERT, $message, $context);
+    }
+
+    public function critical($message, array $context = []): void
+    {
+        $this->log(LogLevel::CRITICAL, $message, $context);
+    }
+
+    public function error($message, array $context = []): void
+    {
+        $this->log(LogLevel::ERROR, $message, $context);
+    }
+
+    public function warning($message, array $context = []): void
+    {
+        $this->log(LogLevel::WARNING, $message, $context);
+    }
+
+    public function notice($message, array $context = []): void
+    {
+        $this->log(LogLevel::NOTICE, $message, $context);
+    }
+
+    public function info($message, array $context = []): void
+    {
+        $this->log(LogLevel::INFO, $message, $context);
+    }
+
+    public function debug($message, array $context = []): void
+    {
+        $this->log(LogLevel::DEBUG, $message, $context);
+    }
+
+    public function log($level, $message, array $context = []): void
+    {
+        $message = (string) $message;
+
+        if ($context !== []) {
+            $json = Silencer::call('json_encode', $context, JSON_INVALID_UTF8_IGNORE|JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE);
+            if ($json !== false) {
+                $message .= ' ' . $json;
             }
         }
 
-        // check for meaningless provide/replace satisfying requirements
-        foreach (['provide', 'replace'] as $linkType) {
-            if (isset($manifest[$linkType])) {
-                foreach (['require', 'require-dev'] as $requireType) {
-                    if (isset($manifest[$requireType])) {
-                        foreach ($manifest[$linkType] as $provide => $constraint) {
-                            if (isset($manifest[$requireType][$provide])) {
-                                $warnings[] = 'The package ' . $provide . ' in '.$requireType.' is also listed in '.$linkType.' which satisfies the requirement. Remove it from '.$linkType.' if you wish to install it.';
-                            }
-                        }
-                    }
-                }
-            }
+        if (in_array($level, [LogLevel::EMERGENCY, LogLevel::ALERT, LogLevel::CRITICAL, LogLevel::ERROR])) {
+            $this->writeError('<error>'.$message.'</error>');
+        } elseif ($level === LogLevel::WARNING) {
+            $this->writeError('<warning>'.$message.'</warning>');
+        } elseif ($level === LogLevel::NOTICE) {
+            $this->writeError('<info>'.$message.'</info>', true, self::VERBOSE);
+        } elseif ($level === LogLevel::INFO) {
+            $this->writeError('<info>'.$message.'</info>', true, self::VERY_VERBOSE);
+        } else {
+            $this->writeError($message, true, self::DEBUG);
         }
-
-        // check for commit references
-        $require = $manifest['require'] ?? [];
-        $requireDev = $manifest['require-dev'] ?? [];
-        $packages = array_merge($require, $requireDev);
-        foreach ($packages as $package => $version) {
-            if (Preg::isMatch('/#/', $version)) {
-                $warnings[] = sprintf(
-                    'The package "%s" is pointing to a commit-ref, this is bad practice and can cause unforeseen issues.',
-                    $package
-                );
-            }
-        }
-
-        // report scripts-descriptions for non-existent scripts
-        $scriptsDescriptions = $manifest['scripts-descriptions'] ?? [];
-        $scripts = $manifest['scripts'] ?? [];
-        foreach ($scriptsDescriptions as $scriptName => $scriptDescription) {
-            if (!array_key_exists($scriptName, $scripts)) {
-                $warnings[] = sprintf(
-                    'Description for non-existent script "%s" found in "scripts-descriptions"',
-                    $scriptName
-                );
-            }
-        }
-
-        // report scripts-aliases for non-existent scripts
-        $scriptAliases = $manifest['scripts-aliases'] ?? [];
-        foreach ($scriptAliases as $scriptName => $scriptAlias) {
-            if (!array_key_exists($scriptName, $scripts)) {
-                $warnings[] = sprintf(
-                    'Aliases for non-existent script "%s" found in "scripts-aliases"',
-                    $scriptName
-                );
-            }
-        }
-
-        // check for empty psr-0/psr-4 namespace prefixes
-        if (isset($manifest['autoload']['psr-0'][''])) {
-            $warnings[] = "Defining autoload.psr-0 with an empty namespace prefix is a bad idea for performance";
-        }
-        if (isset($manifest['autoload']['psr-4'][''])) {
-            $warnings[] = "Defining autoload.psr-4 with an empty namespace prefix is a bad idea for performance";
-        }
-
-        $loader = new ValidatingArrayLoader(new ArrayLoader(), true, null, $arrayLoaderValidationFlags);
-        try {
-            if (!isset($manifest['version'])) {
-                $manifest['version'] = '1.0.0';
-            }
-            if (!isset($manifest['name'])) {
-                $manifest['name'] = 'dummy/dummy';
-            }
-            $loader->load($manifest);
-        } catch (InvalidPackageException $e) {
-            $errors = array_merge($errors, $e->getErrors());
-        }
-
-        $warnings = array_merge($warnings, $loader->getWarnings());
-
-        return [$errors, $publishErrors, $warnings];
     }
 }

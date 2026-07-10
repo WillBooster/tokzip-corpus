@@ -10,289 +10,310 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Downloader;
+namespace Composer\Util;
 
-use Composer\Package\PackageInterface;
+use Composer\IO\IOInterface;
+use Composer\Config;
+use Composer\Factory;
+use Composer\Downloader\TransportException;
 use Composer\Pcre\Preg;
-use Composer\Util\IniHelper;
-use Composer\Util\Platform;
-use Composer\Util\ProcessExecutor;
-use Symfony\Component\Process\ExecutableFinder;
-use Symfony\Component\Process\Process;
-use React\Promise\PromiseInterface;
-use ZipArchive;
 
 /**
- * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @author Roshan Gautam <roshan.gautam@hotmail.com>
  */
-class ZipDownloader extends ArchiveDownloader
+class GitLab
 {
-    /** @var array<int, array{0: string, 1: string}> */
-    private static $unzipCommands;
-    /** @var bool */
-    private static $hasZipArchive;
-    /** @var bool */
-    private static $isWindows;
-
-    /** @var ZipArchive|null */
-    private $zipArchiveObject; // @phpstan-ignore property.onlyRead (helper property that is set via reflection for testing purposes)
+    /** @var IOInterface */
+    protected $io;
+    /** @var Config */
+    protected $config;
+    /** @var ProcessExecutor */
+    protected $process;
+    /** @var HttpDownloader */
+    protected $httpDownloader;
 
     /**
-     * @inheritDoc
+     * Constructor.
+     *
+     * @param IOInterface     $io             The IO instance
+     * @param Config          $config         The composer configuration
+     * @param ProcessExecutor $process        Process instance, injectable for mocking
+     * @param HttpDownloader  $httpDownloader Remote Filesystem, injectable for mocking
      */
-    public function download(PackageInterface $package, string $path, ?PackageInterface $prevPackage = null, bool $output = true): PromiseInterface
+    public function __construct(IOInterface $io, Config $config, ?ProcessExecutor $process = null, ?HttpDownloader $httpDownloader = null)
     {
-        if (null === self::$unzipCommands) {
-            self::$unzipCommands = [];
-            $finder = new ExecutableFinder;
-            if (Platform::isWindows() && ($cmd = $finder->find('7z', null, ['C:\Program Files\7-Zip']))) {
-                self::$unzipCommands[] = ['7z', ProcessExecutor::escape($cmd).' x -bb0 -y %s -o%s'];
-            }
-            if ($cmd = $finder->find('unzip')) {
-                self::$unzipCommands[] = ['unzip', ProcessExecutor::escape($cmd).' -qq %s -d %s'];
-            }
-            if (!Platform::isWindows() && ($cmd = $finder->find('7z'))) { // 7z linux/macOS support is only used if unzip is not present
-                self::$unzipCommands[] = ['7z', ProcessExecutor::escape($cmd).' x -bb0 -y %s -o%s'];
-            }
-            if (!Platform::isWindows() && ($cmd = $finder->find('7zz'))) { // 7zz linux/macOS support is only used if unzip is not present
-                self::$unzipCommands[] = ['7zz', ProcessExecutor::escape($cmd).' x -bb0 -y %s -o%s'];
-            }
-        }
-
-        $procOpenMissing = false;
-        if (!function_exists('proc_open')) {
-            self::$unzipCommands = [];
-            $procOpenMissing = true;
-        }
-
-        if (null === self::$hasZipArchive) {
-            self::$hasZipArchive = class_exists('ZipArchive');
-        }
-
-        if (!self::$hasZipArchive && !self::$unzipCommands) {
-            // php.ini path is added to the error message to help users find the correct file
-            $iniMessage = IniHelper::getMessage();
-            if ($procOpenMissing) {
-                $error = "The zip extension is missing and unzip/7z commands cannot be called as proc_open is disabled, skipping.\n" . $iniMessage;
-            } else {
-                $error = "The zip extension and unzip/7z commands are both missing, skipping.\n" . $iniMessage;
-            }
-
-            throw new \RuntimeException($error);
-        }
-
-        if (null === self::$isWindows) {
-            self::$isWindows = Platform::isWindows();
-
-            if (!self::$isWindows && !self::$unzipCommands) {
-                if ($procOpenMissing) {
-                    $this->io->writeError("<warning>proc_open is disabled so 'unzip' and '7z' commands cannot be used, zip files are being unpacked using the PHP zip extension.</warning>");
-                    $this->io->writeError("<warning>This may cause invalid reports of corrupted archives. Besides, any UNIX permissions (e.g. executable) defined in the archives will be lost.</warning>");
-                    $this->io->writeError("<warning>Enabling proc_open and installing 'unzip' or '7z' (21.01+) may remediate them.</warning>");
-                } else {
-                    $this->io->writeError("<warning>As there is no 'unzip' nor '7z' command installed zip files are being unpacked using the PHP zip extension.</warning>");
-                    $this->io->writeError("<warning>This may cause invalid reports of corrupted archives. Besides, any UNIX permissions (e.g. executable) defined in the archives will be lost.</warning>");
-                    $this->io->writeError("<warning>Installing 'unzip' or '7z' (21.01+) may remediate them.</warning>");
-                }
-            }
-        }
-
-        return parent::download($package, $path, $prevPackage, $output);
+        $this->io = $io;
+        $this->config = $config;
+        $this->process = $process ?: new ProcessExecutor($io);
+        $this->httpDownloader = $httpDownloader ?: Factory::createHttpDownloader($this->io, $config);
     }
 
     /**
-     * extract $file to $path with "unzip" command
+     * Attempts to authorize a GitLab domain via OAuth.
      *
-     * @param  string           $file File to extract
-     * @param  string           $path Path where to extract file
-     * @phpstan-return PromiseInterface<void|null>
+     * @param string $originUrl The host this GitLab instance is located at
+     *
+     * @return bool true on success
      */
-    private function extractWithSystemUnzip(PackageInterface $package, string $file, string $path): PromiseInterface
+    public function authorizeOAuth(string $originUrl): bool
     {
-        static $warned7ZipLinux = false;
+        // before composer 1.9, origin URLs had no port number in them
+        $bcOriginUrl = Preg::replace('{:\d+}', '', $originUrl);
 
-        // Force Exception throwing if the other alternative extraction method is not available
-        $isLastChance = !self::$hasZipArchive;
-
-        if (!self::$unzipCommands) {
-            // This was call as the favorite extract way, but is not available
-            // We switch to the alternative
-            return $this->extractWithZipArchive($package, $file, $path);
+        if (!in_array($originUrl, $this->config->get('gitlab-domains'), true) && !in_array($bcOriginUrl, $this->config->get('gitlab-domains'), true)) {
+            return false;
         }
 
-        $commandSpec = reset(self::$unzipCommands);
-        $command = sprintf($commandSpec[1], ProcessExecutor::escape($file), ProcessExecutor::escape($path));
-        // normalize separators to backslashes to avoid problems with 7-zip on windows
-        // see https://github.com/composer/composer/issues/10058
-        if (Platform::isWindows()) {
-            $command = sprintf($commandSpec[1], ProcessExecutor::escape(strtr($file, '/', '\\')), ProcessExecutor::escape(strtr($path, '/', '\\')));
+        // if available use token from git config
+        if (0 === $this->process->execute('git config gitlab.accesstoken', $output)) {
+            $this->io->setAuthentication($originUrl, trim($output), 'oauth2');
+
+            return true;
         }
 
-        $executable = $commandSpec[0];
-        if (!$warned7ZipLinux && !Platform::isWindows() && in_array($executable, ['7z', '7zz'], true)) {
-            $warned7ZipLinux = true;
-            if (0 === $this->process->execute($executable, $output)) {
-                if (Preg::isMatchStrictGroups('{^\s*7-Zip(?: \[64\])? ([0-9.]+)}', $output, $match) && version_compare($match[1], '21.01', '<')) {
-                    $this->io->writeError('    <warning>Unzipping using '.$executable.' '.$match[1].' may result in incorrect file permissions. Install '.$executable.' 21.01+ or unzip to ensure you get correct permissions.</warning>');
-                }
-            }
+        // if available use deploy token from git config
+        if (0 === $this->process->execute('git config gitlab.deploytoken.user', $tokenUser) && 0 === $this->process->execute('git config gitlab.deploytoken.token', $tokenPassword)) {
+            $this->io->setAuthentication($originUrl, trim($tokenUser), trim($tokenPassword));
+
+            return true;
         }
 
-        $io = $this->io;
-        $tryFallback = function (\Throwable $processError) use ($isLastChance, $io, $file, $path, $package, $executable): \React\Promise\PromiseInterface {
-            if ($isLastChance) {
-                throw $processError;
-            }
+        // if available use token from composer config
+        $authTokens = $this->config->get('gitlab-token');
 
-            if (str_contains($processError->getMessage(), 'zip bomb')) {
-                throw $processError;
-            }
+        if (isset($authTokens[$originUrl])) {
+            $token = $authTokens[$originUrl];
+        }
 
-            if (!is_file($file)) {
-                $io->writeError('    <warning>'.$processError->getMessage().'</warning>');
-                $io->writeError('    <warning>This most likely is due to a custom installer plugin not handling the returned Promise from the downloader</warning>');
-                $io->writeError('    <warning>See https://github.com/composer/installers/commit/5006d0c28730ade233a8f42ec31ac68fb1c5c9bb for an example fix</warning>');
+        if (isset($authTokens[$bcOriginUrl])) {
+            $token = $authTokens[$bcOriginUrl];
+        }
+
+        if (isset($token)) {
+            $username = is_array($token) ? $token["username"] : $token;
+            $password = is_array($token) ? $token["token"] : 'private-token';
+
+            // Composer expects the GitLab token to be stored as username and 'private-token' or 'gitlab-ci-token' to be stored as password
+            // Detect cases where this is reversed and resolve automatically resolve it
+            if (in_array($username, ['private-token', 'gitlab-ci-token',  'oauth2'], true)) {
+                $this->io->setAuthentication($originUrl, $password, $username);
             } else {
-                $io->writeError('    <warning>'.$processError->getMessage().'</warning>');
-                $io->writeError('    The archive may contain identical file names with different capitalization (which fails on case insensitive filesystems)');
-                $io->writeError('    Unzip with '.$executable.' command failed, falling back to ZipArchive class');
-
-                // additional debug data to try to figure out GH actions issues https://github.com/composer/composer/issues/11148
-                if (Platform::getEnv('GITHUB_ACTIONS') !== false && Platform::getEnv('COMPOSER_TESTS_ARE_RUNNING') === false) {
-                    $io->writeError('    <warning>Additional debug info, please report to https://github.com/composer/composer/issues/11148 if you see this:</warning>');
-                    $io->writeError('File size: '.@filesize($file));
-                    $io->writeError('File SHA1: '.hash_file('sha1', $file));
-                    $io->writeError('First 100 bytes (hex): '.bin2hex(substr((string) file_get_contents($file), 0, 100)));
-                    $io->writeError('Last 100 bytes (hex): '.bin2hex(substr((string) file_get_contents($file), -100)));
-                    if (strlen((string) $package->getDistUrl()) > 0) {
-                        $io->writeError('Origin URL: '.$this->processUrl($package, (string) $package->getDistUrl()));
-                        $io->writeError('Response Headers: '.json_encode(FileDownloader::$responseHeaders[$package->getName()] ?? []));
-                    }
-                }
+                $this->io->setAuthentication($originUrl, $username, $password);
             }
 
-            return $this->extractWithZipArchive($package, $file, $path);
-        };
-
-        try {
-            $promise = $this->process->executeAsync($command);
-
-            return $promise->then(function (Process $process) use ($tryFallback, $command, $package, $file) {
-                if (!$process->isSuccessful()) {
-                    if (isset($this->cleanupExecuted[$package->getName()])) {
-                        throw new \RuntimeException('Failed to extract '.$package->getName().' as the installation was aborted by another package operation.');
-                    }
-
-                    $output = $process->getErrorOutput();
-                    $output = str_replace(', '.$file.'.zip or '.$file.'.ZIP', '', $output);
-
-                    return $tryFallback(new \RuntimeException('Failed to extract '.$package->getName().': ('.$process->getExitCode().') '.$command."\n\n".$output));
-                }
-            });
-        } catch (\Throwable $e) {
-            return $tryFallback($e);
+            return true;
         }
+
+        return false;
     }
 
     /**
-     * extract $file to $path with ZipArchive
+     * Authorizes a GitLab domain interactively via OAuth.
      *
-     * @param  string           $file File to extract
-     * @param  string           $path Path where to extract file
-     * @phpstan-return PromiseInterface<void|null>
+     * @param string $scheme    Scheme used in the origin URL
+     * @param string $originUrl The host this GitLab instance is located at
+     * @param string $message   The reason this authorization is required
+     *
+     * @throws \RuntimeException
+     * @throws TransportException|\Exception
+     *
+     * @return bool true on success
      */
-    private function extractWithZipArchive(PackageInterface $package, string $file, string $path): PromiseInterface
+    public function authorizeOAuthInteractively(string $scheme, string $originUrl, ?string $message = null): bool
     {
-        $processError = null;
-        $zipArchive = $this->zipArchiveObject ?: new ZipArchive();
+        if ($message) {
+            $this->io->writeError($message);
+        }
 
-        try {
-            if (!file_exists($file) || ($filesize = filesize($file)) === false || $filesize === 0) {
-                $retval = -1;
-            } else {
-                $retval = $zipArchive->open($file);
-            }
+        $localAuthConfig = $this->config->getLocalAuthConfigSource();
+        $personalAccessTokenLink = $scheme.'://'.$originUrl.'/-/profile/personal_access_tokens';
+        $revokeLink = $scheme.'://'.$originUrl.'/-/profile/applications';
+        $this->io->writeError(sprintf('A token will be created and stored in "%s", your password will never be stored', ($localAuthConfig !== null ? $localAuthConfig->getName() . ' OR ' : '') . $this->config->getAuthConfigSource()->getName()));
+        $this->io->writeError('To revoke access to this token you can visit:');
+        $this->io->writeError($revokeLink);
+        $this->io->writeError('Alternatively you can setup an personal access token on:');
+        $this->io->writeError($personalAccessTokenLink);
+        $this->io->writeError('and store it under "gitlab-token" see https://getcomposer.org/doc/articles/authentication-for-private-packages.md#gitlab-token for more details.');
+        $this->io->writeError('https://getcomposer.org/doc/articles/authentication-for-private-packages.md#gitlab-token');
+        $this->io->writeError('for more details.');
 
-            if (true === $retval) {
-                $totalSize = 0;
-                $archiveSize = filesize($file);
-                $totalFiles = $zipArchive->count();
-                if ($totalFiles > 0) {
-                    for ($i = 0; $i < min($totalFiles, 5); $i++) {
-                        $stat = $zipArchive->statIndex(random_int(0, $totalFiles - 1));
-                        if ($stat === false) {
-                            continue;
+        $storeInLocalAuthConfig = false;
+        if ($localAuthConfig !== null) {
+            $storeInLocalAuthConfig = $this->io->askConfirmation('A local auth config source was found, do you want to store the token there?', true);
+        }
+
+        $attemptCounter = 0;
+
+        while ($attemptCounter++ < 5) {
+            try {
+                $response = $this->createToken($scheme, $originUrl);
+            } catch (TransportException $e) {
+                // 401 is bad credentials,
+                // 403 is max login attempts exceeded
+                if (in_array($e->getCode(), [403, 401])) {
+                    if (401 === $e->getCode()) {
+                        $response = json_decode($e->getResponse(), true);
+                        if (isset($response['error']) && $response['error'] === 'invalid_grant') {
+                            $this->io->writeError('Bad credentials. If you have two factor authentication enabled you will have to manually create a personal access token');
+                        } else {
+                            $this->io->writeError('Bad credentials.');
                         }
-                        $totalSize += $stat['size'];
-                        if ($stat['size'] > $stat['comp_size'] * 200) {
-                            throw new \RuntimeException('Invalid zip file with compression ratio >99% (possible zip bomb)');
-                        }
+                    } else {
+                        $this->io->writeError('Maximum number of login attempts exceeded. Please try again later.');
                     }
-                    if ($archiveSize !== false && $totalSize > $archiveSize * 100 && $totalSize > 50*1024*1024) {
-                        throw new \RuntimeException('Invalid zip file with compression ratio >99% (possible zip bomb)');
-                    }
+
+                    $this->io->writeError('You can also manually create a personal access token enabling the "read_api" scope at:');
+                    $this->io->writeError($scheme.'://'.$originUrl.'/profile/personal_access_tokens');
+                    $this->io->writeError('Add it using "composer config --global --auth gitlab-token.'.$originUrl.' <token>"');
+
+                    continue;
                 }
 
-                $extractResult = $zipArchive->extractTo($path);
-
-                if (true === $extractResult) {
-                    $zipArchive->close();
-
-                    return \React\Promise\resolve(null);
-                }
-
-                $processError = new \RuntimeException(rtrim("There was an error extracting the ZIP file, it is either corrupted or using an invalid format.\n"));
-            } else {
-                $processError = new \UnexpectedValueException(rtrim($this->getErrorMessage($retval, $file)."\n"), $retval);
+                throw $e;
             }
-        } catch (\ErrorException $e) {
-            $processError = new \RuntimeException('The archive may contain identical file names with different capitalization (which fails on case insensitive filesystems): '.$e->getMessage(), 0, $e);
-        } catch (\Throwable $e) {
-            $processError = $e;
+
+            $this->io->setAuthentication($originUrl, $response['access_token'], 'oauth2');
+
+            $authConfigSource = $storeInLocalAuthConfig && $localAuthConfig !== null ? $localAuthConfig : $this->config->getAuthConfigSource();
+            // store value in user config in auth file
+            if (isset($response['expires_in'])) {
+                $authConfigSource->addConfigSetting(
+                    'gitlab-oauth.'.$originUrl,
+                    [
+                        'expires-at' => intval($response['created_at']) + intval($response['expires_in']),
+                        'refresh-token' => $response['refresh_token'],
+                        'token' => $response['access_token'],
+                    ]
+                );
+            } else {
+                $authConfigSource->addConfigSetting('gitlab-oauth.'.$originUrl, $response['access_token']);
+            }
+
+            return true;
         }
 
-        throw $processError;
+        throw new \RuntimeException('Invalid GitLab credentials 5 times in a row, aborting.');
     }
 
     /**
-     * extract $file to $path
+     * Authorizes a GitLab domain interactively via OAuth.
      *
-     * @param  string                $file File to extract
-     * @param  string                $path Path where to extract file
+     * @param string $scheme    Scheme used in the origin URL
+     * @param string $originUrl The host this GitLab instance is located at
+     *
+     * @throws \RuntimeException
+     * @throws TransportException|\Exception
+     *
+     * @return bool true on success
      */
-    protected function extract(PackageInterface $package, string $file, string $path): PromiseInterface
+    public function authorizeOAuthRefresh(string $scheme, string $originUrl): bool
     {
-        return $this->extractWithSystemUnzip($package, $file, $path);
+        try {
+            $response = $this->refreshToken($scheme, $originUrl);
+        } catch (TransportException $e) {
+            $this->io->writeError("Couldn't refresh access token: ".$e->getMessage());
+
+            return false;
+        }
+
+        $this->io->setAuthentication($originUrl, $response['access_token'], 'oauth2');
+
+        // store value in user config in auth file
+        $this->config->getAuthConfigSource()->addConfigSetting(
+            'gitlab-oauth.'.$originUrl,
+            [
+                'expires-at' => intval($response['created_at']) + intval($response['expires_in']),
+                'refresh-token' => $response['refresh_token'],
+                'token' => $response['access_token'],
+            ]
+        );
+
+        return true;
     }
 
     /**
-     * Give a meaningful error message to the user.
+     * @return array{access_token: non-empty-string, refresh_token: non-empty-string, token_type: non-empty-string, expires_in?: positive-int, created_at: positive-int}
+     *
+     * @see https://docs.gitlab.com/ee/api/oauth2.html#resource-owner-password-credentials-flow
      */
-    protected function getErrorMessage(int $retval, string $file): string
+    private function createToken(string $scheme, string $originUrl): array
     {
-        switch ($retval) {
-            case ZipArchive::ER_EXISTS:
-                return sprintf("File '%s' already exists.", $file);
-            case ZipArchive::ER_INCONS:
-                return sprintf("Zip archive '%s' is inconsistent.", $file);
-            case ZipArchive::ER_INVAL:
-                return sprintf("Invalid argument (%s)", $file);
-            case ZipArchive::ER_MEMORY:
-                return sprintf("Malloc failure (%s)", $file);
-            case ZipArchive::ER_NOENT:
-                return sprintf("No such zip file: '%s'", $file);
-            case ZipArchive::ER_NOZIP:
-                return sprintf("'%s' is not a zip archive.", $file);
-            case ZipArchive::ER_OPEN:
-                return sprintf("Can't open zip file: %s", $file);
-            case ZipArchive::ER_READ:
-                return sprintf("Zip read error (%s)", $file);
-            case ZipArchive::ER_SEEK:
-                return sprintf("Zip seek error (%s)", $file);
-            case -1:
-                return sprintf("'%s' is a corrupted zip archive (0 bytes), try again.", $file);
-            default:
-                return sprintf("'%s' is not a valid zip archive, got error code: %s", $file, $retval);
+        $username = $this->io->ask('Username: ');
+        $password = $this->io->askAndHideAnswer('Password: ');
+
+        $headers = ['Content-Type: application/x-www-form-urlencoded'];
+
+        $apiUrl = $originUrl;
+        $data = http_build_query([
+            'username' => $username,
+            'password' => $password,
+            'grant_type' => 'password',
+        ], '', '&');
+        $options = [
+            'retry-auth-failure' => false,
+            'http' => [
+                'method' => 'POST',
+                'header' => $headers,
+                'content' => $data,
+            ],
+        ];
+
+        $token = $this->httpDownloader->get($scheme.'://'.$apiUrl.'/oauth/token', $options)->decodeJson();
+
+        $this->io->writeError('Token successfully created');
+
+        return $token;
+    }
+
+    /**
+     * Is the OAuth access token expired?
+     *
+     * @return bool true on expired token, false if token is fresh or expiration date is not set
+     */
+    public function isOAuthExpired(string $originUrl): bool
+    {
+        $authTokens = $this->config->get('gitlab-oauth');
+        if (isset($authTokens[$originUrl]['expires-at'])) {
+            if ($authTokens[$originUrl]['expires-at'] < time()) {
+                return true;
+            }
         }
+
+        return false;
+    }
+
+    /**
+     * @return array{access_token: non-empty-string, refresh_token: non-empty-string, token_type: non-empty-string, expires_in: positive-int, created_at: positive-int}
+     *
+     * @see https://docs.gitlab.com/ee/api/oauth2.html#resource-owner-password-credentials-flow
+     */
+    private function refreshToken(string $scheme, string $originUrl): array
+    {
+        $authTokens = $this->config->get('gitlab-oauth');
+        if (!isset($authTokens[$originUrl]['refresh-token'])) {
+            throw new \RuntimeException('No GitLab refresh token present for '.$originUrl.'.');
+        }
+
+        $refreshToken = $authTokens[$originUrl]['refresh-token'];
+        $headers = ['Content-Type: application/x-www-form-urlencoded'];
+
+        $data = http_build_query([
+            'refresh_token' => $refreshToken,
+            'grant_type' => 'refresh_token',
+        ], '', '&');
+        $options = [
+            'retry-auth-failure' => false,
+            'http' => [
+                'method' => 'POST',
+                'header' => $headers,
+                'content' => $data,
+            ],
+        ];
+
+        $token = $this->httpDownloader->get($scheme.'://'.$originUrl.'/oauth/token', $options)->decodeJson();
+        $this->io->writeError('GitLab token successfully refreshed', true, IOInterface::VERY_VERBOSE);
+        $this->io->writeError('To revoke access to this token you can visit '.$scheme.'://'.$originUrl.'/-/profile/applications', true, IOInterface::VERY_VERBOSE);
+
+        return $token;
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011 Google Inc.
+ * Copyright (C) 2022 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,174 +19,208 @@ package com.google.gson.functional;
 import static com.google.common.truth.Truth.assertThat;
 
 import com.google.gson.Gson;
-import com.google.gson.JsonObject;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import org.junit.Before;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonDeserializationContext;
+import com.google.gson.JsonDeserializer;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.JsonSerializationContext;
+import com.google.gson.JsonSerializer;
+import com.google.gson.TypeAdapter;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonWriter;
+import java.io.IOException;
+import java.lang.reflect.Type;
 import org.junit.Test;
 
-/**
- * Tests for Gson serialization of a sub-class object while encountering a base-class type
- *
- * @author Inderjeet Singh
- */
-@SuppressWarnings("unused")
-public class MoreSpecificTypeSerializationTest {
-  private Gson gson;
+public class TypeAdapterRuntimeTypeWrapperTest {
+  private static class Base {}
 
-  @Before
-  public void setUp() throws Exception {
-    gson = new Gson();
+  private static class Subclass extends Base {
+    @SuppressWarnings("unused")
+    String f = "test";
   }
 
-  @Test
-  public void testSubclassFields() {
-    ClassWithBaseFields target = new ClassWithBaseFields(new Sub(1, 2));
-    String json = gson.toJson(target);
-    assertThat(json).contains("\"b\":1");
-    assertThat(json).contains("\"s\":2");
+  private static class Container {
+    @SuppressWarnings("unused")
+    Base b = new Subclass();
   }
 
-  @Test
-  public void testListOfSubclassFields() {
-    List<Base> list = new ArrayList<>();
-    list.add(new Base(1));
-    list.add(new Sub(2, 3));
-    ClassWithContainersOfBaseFields target = new ClassWithContainersOfBaseFields(list, null);
-    String json = gson.toJson(target);
-    assertThat(json).contains("{\"b\":1}");
-    assertThat(json).contains("{\"s\":3,\"b\":2}");
-  }
-
-  @Test
-  public void testMapOfSubclassFields() {
-    Map<String, Base> map = new HashMap<>();
-    map.put("base", new Base(1));
-    map.put("sub", new Sub(2, 3));
-    ClassWithContainersOfBaseFields target = new ClassWithContainersOfBaseFields(null, map);
-    JsonObject json = gson.toJsonTree(target).getAsJsonObject().get("map").getAsJsonObject();
-    assertThat(json.get("base").getAsJsonObject().get("b").getAsInt()).isEqualTo(1);
-    JsonObject sub = json.get("sub").getAsJsonObject();
-    assertThat(sub.get("b").getAsInt()).isEqualTo(2);
-    assertThat(sub.get("s").getAsInt()).isEqualTo(3);
-  }
-
-  /** For parameterized type, Gson ignores the more-specific type and sticks to the declared type */
-  @Test
-  public void testParameterizedSubclassFields() {
-    ClassWithParameterizedBaseFields target =
-        new ClassWithParameterizedBaseFields(new ParameterizedSub<>("one", "two"));
-    String json = gson.toJson(target);
-    assertThat(json).contains("\"t\":\"one\"");
-    assertThat(json).doesNotContain("\"s\"");
+  private static class Deserializer implements JsonDeserializer<Base> {
+    @Override
+    public Base deserialize(JsonElement json, Type typeOfT, JsonDeserializationContext context) {
+      throw new AssertionError("not needed for this test");
+    }
   }
 
   /**
-   * For parameterized type in a List, Gson ignores the more-specific type and sticks to the
-   * declared type
+   * When custom {@link JsonSerializer} is registered for Base should prefer that over reflective
+   * adapter for Subclass for serialization.
    */
   @Test
-  public void testListOfParameterizedSubclassFields() {
-    List<ParameterizedBase<String>> list = new ArrayList<>();
-    list.add(new ParameterizedBase<>("one"));
-    list.add(new ParameterizedSub<>("two", "three"));
-    ClassWithContainersOfParameterizedBaseFields target =
-        new ClassWithContainersOfParameterizedBaseFields(list, null);
-    String json = gson.toJson(target);
-    assertThat(json).contains("{\"t\":\"one\"}");
-    assertThat(json).doesNotContain("\"s\":");
+  public void testJsonSerializer() {
+    Gson gson =
+        new GsonBuilder()
+            .registerTypeAdapter(
+                Base.class,
+                new JsonSerializer<Base>() {
+                  @Override
+                  public JsonElement serialize(
+                      Base src, Type typeOfSrc, JsonSerializationContext context) {
+                    return new JsonPrimitive("serializer");
+                  }
+                })
+            .create();
+
+    String json = gson.toJson(new Container());
+    assertThat(json).isEqualTo("{\"b\":\"serializer\"}");
   }
 
   /**
-   * For parameterized type in a map, Gson ignores the more-specific type and sticks to the declared
-   * type
+   * When only {@link JsonDeserializer} is registered for Base, then on serialization should prefer
+   * reflective adapter for Subclass since Base would use reflective adapter as delegate.
    */
   @Test
-  public void testMapOfParameterizedSubclassFields() {
-    Map<String, ParameterizedBase<String>> map = new HashMap<>();
-    map.put("base", new ParameterizedBase<>("one"));
-    map.put("sub", new ParameterizedSub<>("two", "three"));
-    ClassWithContainersOfParameterizedBaseFields target =
-        new ClassWithContainersOfParameterizedBaseFields(null, map);
-    JsonObject json = gson.toJsonTree(target).getAsJsonObject().get("map").getAsJsonObject();
-    assertThat(json.get("base").getAsJsonObject().get("t").getAsString()).isEqualTo("one");
-    JsonObject sub = json.get("sub").getAsJsonObject();
-    assertThat(sub.get("t").getAsString()).isEqualTo("two");
-    assertThat(sub.get("s")).isNull();
+  public void testJsonDeserializer_ReflectiveSerializerDelegate() {
+    Gson gson = new GsonBuilder().registerTypeAdapter(Base.class, new Deserializer()).create();
+
+    String json = gson.toJson(new Container());
+    assertThat(json).isEqualTo("{\"b\":{\"f\":\"test\"}}");
   }
 
-  private static class Base {
-    int b;
+  /**
+   * When {@link JsonDeserializer} with custom adapter as delegate is registered for Base, then on
+   * serialization should prefer custom adapter delegate for Base over reflective adapter for
+   * Subclass.
+   */
+  @Test
+  public void testJsonDeserializer_CustomSerializerDelegate() {
+    Gson gson =
+        new GsonBuilder()
+            // Register custom delegate
+            .registerTypeAdapter(
+                Base.class,
+                new TypeAdapter<Base>() {
+                  @Override
+                  public Base read(JsonReader in) throws IOException {
+                    throw new UnsupportedOperationException();
+                  }
 
-    Base(int b) {
-      this.b = b;
+                  @Override
+                  public void write(JsonWriter out, Base value) throws IOException {
+                    out.value("custom delegate");
+                  }
+                })
+            .registerTypeAdapter(Base.class, new Deserializer())
+            .create();
+
+    String json = gson.toJson(new Container());
+    assertThat(json).isEqualTo("{\"b\":\"custom delegate\"}");
+  }
+
+  /**
+   * When two (or more) {@link JsonDeserializer}s are registered for Base which eventually fall back
+   * to reflective adapter as delegate, then on serialization should prefer reflective adapter for
+   * Subclass.
+   */
+  @Test
+  public void testJsonDeserializer_ReflectiveTreeSerializerDelegate() {
+    Gson gson =
+        new GsonBuilder()
+            // Register delegate which itself falls back to reflective serialization
+            .registerTypeAdapter(Base.class, new Deserializer())
+            .registerTypeAdapter(Base.class, new Deserializer())
+            .create();
+
+    String json = gson.toJson(new Container());
+    assertThat(json).isEqualTo("{\"b\":{\"f\":\"test\"}}");
+  }
+
+  /**
+   * When {@link JsonDeserializer} with {@link JsonSerializer} as delegate is registered for Base,
+   * then on serialization should prefer {@code JsonSerializer} over reflective adapter for
+   * Subclass.
+   */
+  @Test
+  public void testJsonDeserializer_JsonSerializerDelegate() {
+    Gson gson =
+        new GsonBuilder()
+            // Register JsonSerializer as delegate
+            .registerTypeAdapter(
+                Base.class,
+                new JsonSerializer<Base>() {
+                  @Override
+                  public JsonElement serialize(
+                      Base src, Type typeOfSrc, JsonSerializationContext context) {
+                    return new JsonPrimitive("custom delegate");
+                  }
+                })
+            .registerTypeAdapter(Base.class, new Deserializer())
+            .create();
+
+    String json = gson.toJson(new Container());
+    assertThat(json).isEqualTo("{\"b\":\"custom delegate\"}");
+  }
+
+  /**
+   * When a {@link JsonDeserializer} is registered for Subclass, and a custom {@link JsonSerializer}
+   * is registered for Base, then Gson should prefer the reflective adapter for Subclass for
+   * backward compatibility (see https://github.com/google/gson/pull/1787#issuecomment-1222175189)
+   * even though normally TypeAdapterRuntimeTypeWrapper should prefer the custom serializer for
+   * Base.
+   */
+  @Test
+  public void testJsonDeserializer_SubclassBackwardCompatibility() {
+    Gson gson =
+        new GsonBuilder()
+            .registerTypeAdapter(
+                Subclass.class,
+                new JsonDeserializer<Subclass>() {
+                  @Override
+                  public Subclass deserialize(
+                      JsonElement json, Type typeOfT, JsonDeserializationContext context) {
+                    throw new AssertionError("not needed for this test");
+                  }
+                })
+            .registerTypeAdapter(
+                Base.class,
+                new JsonSerializer<Base>() {
+                  @Override
+                  public JsonElement serialize(
+                      Base src, Type typeOfSrc, JsonSerializationContext context) {
+                    return new JsonPrimitive("base");
+                  }
+                })
+            .create();
+
+    String json = gson.toJson(new Container());
+    assertThat(json).isEqualTo("{\"b\":{\"f\":\"test\"}}");
+  }
+
+  private static class CyclicBase {
+    @SuppressWarnings("unused")
+    CyclicBase f;
+  }
+
+  private static class CyclicSub extends CyclicBase {
+    @SuppressWarnings("unused")
+    int i;
+
+    public CyclicSub(int i) {
+      this.i = i;
     }
   }
 
-  private static class Sub extends Base {
-    int s;
-
-    Sub(int b, int s) {
-      super(b);
-      this.s = s;
-    }
-  }
-
-  private static class ClassWithBaseFields {
-    Base b;
-
-    ClassWithBaseFields(Base b) {
-      this.b = b;
-    }
-  }
-
-  private static class ClassWithContainersOfBaseFields {
-    Collection<Base> collection;
-    Map<String, Base> map;
-
-    ClassWithContainersOfBaseFields(Collection<Base> collection, Map<String, Base> map) {
-      this.collection = collection;
-      this.map = map;
-    }
-  }
-
-  private static class ParameterizedBase<T> {
-    T t;
-
-    ParameterizedBase(T t) {
-      this.t = t;
-    }
-  }
-
-  private static class ParameterizedSub<T> extends ParameterizedBase<T> {
-    T s;
-
-    ParameterizedSub(T t, T s) {
-      super(t);
-      this.s = s;
-    }
-  }
-
-  private static class ClassWithParameterizedBaseFields {
-    ParameterizedBase<String> b;
-
-    ClassWithParameterizedBaseFields(ParameterizedBase<String> b) {
-      this.b = b;
-    }
-  }
-
-  private static class ClassWithContainersOfParameterizedBaseFields {
-    Collection<ParameterizedBase<String>> collection;
-    Map<String, ParameterizedBase<String>> map;
-
-    ClassWithContainersOfParameterizedBaseFields(
-        Collection<ParameterizedBase<String>> collection,
-        Map<String, ParameterizedBase<String>> map) {
-      this.collection = collection;
-      this.map = map;
-    }
+  /**
+   * Tests behavior when the type of a field refers to a type whose adapter is currently in the
+   * process of being created. For these cases {@link Gson} uses a future adapter for the type. That
+   * adapter later uses the actual adapter as delegate.
+   */
+  @Test
+  public void testGsonFutureAdapter() {
+    CyclicBase b = new CyclicBase();
+    b.f = new CyclicSub(2);
+    String json = new Gson().toJson(b);
+    assertThat(json).isEqualTo("{\"f\":{\"i\":2}}");
   }
 }

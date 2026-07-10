@@ -21,240 +21,170 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+#include "tool_setup.h"
 
-#include "curl_setup.h"
-
-#ifdef HAVE_NETINET_IN_H
-#  include <netinet/in.h>
-#endif
-#ifdef HAVE_ARPA_INET_H
-#  include <arpa/inet.h>
-#endif
-#ifdef HAVE_NET_IF_H
-#  include <net/if.h>
-#endif
-#ifdef HAVE_SYS_IOCTL_H
-#  include <sys/ioctl.h>
-#endif
-#ifdef HAVE_NETDB_H
-#  include <netdb.h>
-#endif
-#ifdef HAVE_SYS_SOCKIO_H
-#  include <sys/sockio.h>
-#endif
-#ifdef HAVE_IFADDRS_H
-#  include <ifaddrs.h>
-#endif
-#ifdef HAVE_STROPTS_H
-#  include <stropts.h>
-#endif
-#ifdef __VMS
-#  include <inet.h>
+#if defined(HAVE_STRCASECMP) && defined(HAVE_STRINGS_H)
+#include <strings.h>
 #endif
 
-#include "inet_ntop.h"
-#include "strcase.h"
-#include "if2ip.h"
-/* The last 3 #include files should be in this order */
-#include "curl_printf.h"
-#include "curl_memory.h"
-#include "memdebug.h"
+#include "tool_util.h"
 
-/* ------------------------------------------------------------------ */
+#include "memdebug.h" /* keep this as LAST include */
 
-#ifdef USE_IPV6
-/* Return the scope of the given address. */
-unsigned int Curl_ipv6_scope(const struct sockaddr *sa)
+#if defined(_WIN32)
+
+/* In case of bug fix this function has a counterpart in timeval.c */
+struct timeval tvnow(void)
 {
-  if(sa->sa_family == AF_INET6) {
-    const struct sockaddr_in6 * sa6 = (const struct sockaddr_in6 *)(void *) sa;
-    const unsigned char *b = sa6->sin6_addr.s6_addr;
-    unsigned short w = (unsigned short) ((b[0] << 8) | b[1]);
-
-    if((b[0] & 0xFE) == 0xFC) /* Handle ULAs */
-      return IPV6_SCOPE_UNIQUELOCAL;
-    switch(w & 0xFFC0) {
-    case 0xFE80:
-      return IPV6_SCOPE_LINKLOCAL;
-    case 0xFEC0:
-      return IPV6_SCOPE_SITELOCAL;
-    case 0x0000:
-      w = b[1] | b[2] | b[3] | b[4] | b[5] | b[6] | b[7] | b[8] | b[9] |
-          b[10] | b[11] | b[12] | b[13] | b[14];
-      if(w || b[15] != 0x01)
-        break;
-      return IPV6_SCOPE_NODELOCAL;
-    default:
-      break;
-    }
+  struct timeval now;
+  if(tool_isVistaOrGreater) { /* QPC timer might have issues pre-Vista */
+    LARGE_INTEGER count;
+    QueryPerformanceCounter(&count);
+    now.tv_sec = (long)(count.QuadPart / tool_freq.QuadPart);
+    now.tv_usec = (long)((count.QuadPart % tool_freq.QuadPart) * 1000000 /
+                         tool_freq.QuadPart);
   }
-  return IPV6_SCOPE_GLOBAL;
-}
+  else {
+    /* Disable /analyze warning that GetTickCount64 is preferred  */
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable:28159)
+#endif
+    DWORD milliseconds = GetTickCount();
+#if defined(_MSC_VER)
+#pragma warning(pop)
 #endif
 
-#ifndef CURL_DISABLE_BINDLOCAL
-
-#if defined(HAVE_GETIFADDRS)
-
-if2ip_result_t Curl_if2ip(int af,
-#ifdef USE_IPV6
-                          unsigned int remote_scope,
-                          unsigned int local_scope_id,
-#endif
-                          const char *interf,
-                          char *buf, size_t buf_size)
-{
-  struct ifaddrs *iface, *head;
-  if2ip_result_t res = IF2IP_NOT_FOUND;
-
-#if defined(USE_IPV6) && \
-    !defined(HAVE_SOCKADDR_IN6_SIN6_SCOPE_ID)
-  (void) local_scope_id;
-#endif
-
-  if(getifaddrs(&head) >= 0) {
-    for(iface = head; iface != NULL; iface = iface->ifa_next) {
-      if(iface->ifa_addr) {
-        if(iface->ifa_addr->sa_family == af) {
-          if(strcasecompare(iface->ifa_name, interf)) {
-            void *addr;
-            const char *ip;
-            char scope[12] = "";
-            char ipstr[64];
-#ifdef USE_IPV6
-            if(af == AF_INET6) {
-#ifdef HAVE_SOCKADDR_IN6_SIN6_SCOPE_ID
-              unsigned int scopeid = 0;
-#endif
-              unsigned int ifscope = Curl_ipv6_scope(iface->ifa_addr);
-
-              if(ifscope != remote_scope) {
-                /* We are interested only in interface addresses whose scope
-                   matches the remote address we want to connect to: global
-                   for global, link-local for link-local, etc... */
-                if(res == IF2IP_NOT_FOUND)
-                  res = IF2IP_AF_NOT_SUPPORTED;
-                continue;
-              }
-
-              addr =
-                &((struct sockaddr_in6 *)(void *)iface->ifa_addr)->sin6_addr;
-#ifdef HAVE_SOCKADDR_IN6_SIN6_SCOPE_ID
-              /* Include the scope of this interface as part of the address */
-              scopeid = ((struct sockaddr_in6 *)(void *)iface->ifa_addr)
-                            ->sin6_scope_id;
-
-              /* If given, scope id should match. */
-              if(local_scope_id && scopeid != local_scope_id) {
-                if(res == IF2IP_NOT_FOUND)
-                  res = IF2IP_AF_NOT_SUPPORTED;
-
-                continue;
-              }
-
-              if(scopeid)
-                msnprintf(scope, sizeof(scope), "%%%u", scopeid);
-#endif
-            }
-            else
-#endif
-              addr =
-                &((struct sockaddr_in *)(void *)iface->ifa_addr)->sin_addr;
-            res = IF2IP_FOUND;
-            ip = Curl_inet_ntop(af, addr, ipstr, sizeof(ipstr));
-            msnprintf(buf, buf_size, "%s%s", ip, scope);
-            break;
-          }
-        }
-        else if((res == IF2IP_NOT_FOUND) &&
-                strcasecompare(iface->ifa_name, interf)) {
-          res = IF2IP_AF_NOT_SUPPORTED;
-        }
-      }
-    }
-
-    freeifaddrs(head);
+    now.tv_sec = (long)(milliseconds / 1000);
+    now.tv_usec = (long)((milliseconds % 1000) * 1000);
   }
-
-  return res;
+  return now;
 }
 
-#elif defined(HAVE_IOCTL_SIOCGIFADDR)
+#elif defined(HAVE_CLOCK_GETTIME_MONOTONIC)
 
-if2ip_result_t Curl_if2ip(int af,
-#ifdef USE_IPV6
-                          unsigned int remote_scope,
-                          unsigned int local_scope_id,
-#endif
-                          const char *interf,
-                          char *buf, size_t buf_size)
+struct timeval tvnow(void)
 {
-  struct ifreq req;
-  struct in_addr in;
-  struct sockaddr_in *s;
-  curl_socket_t dummy;
-  size_t len;
-  const char *r;
-
-#ifdef USE_IPV6
-  (void)remote_scope;
-  (void)local_scope_id;
-#endif
-
-  if(!interf || (af != AF_INET))
-    return IF2IP_NOT_FOUND;
-
-  len = strlen(interf);
-  if(len >= sizeof(req.ifr_name))
-    return IF2IP_NOT_FOUND;
-
-  dummy = socket(AF_INET, SOCK_STREAM, 0);
-  if(CURL_SOCKET_BAD == dummy)
-    return IF2IP_NOT_FOUND;
-
-  memset(&req, 0, sizeof(req));
-  memcpy(req.ifr_name, interf, len + 1);
-  req.ifr_addr.sa_family = AF_INET;
-
-  if(ioctl(dummy, SIOCGIFADDR, &req) < 0) {
-    sclose(dummy);
-    /* With SIOCGIFADDR, we cannot tell the difference between an interface
-       that does not exist and an interface that has no address of the
-       correct family. Assume the interface does not exist */
-    return IF2IP_NOT_FOUND;
+  /*
+  ** clock_gettime() is granted to be increased monotonically when the
+  ** monotonic clock is queried. Time starting point is unspecified, it
+  ** could be the system start-up time, the Epoch, or something else,
+  ** in any case the time starting point does not change once that the
+  ** system has started up.
+  */
+  struct timeval now;
+  struct timespec tsnow;
+  if(0 == clock_gettime(CLOCK_MONOTONIC, &tsnow)) {
+    now.tv_sec = tsnow.tv_sec;
+    now.tv_usec = (int)(tsnow.tv_nsec / 1000);
   }
+  /*
+  ** Even when the configure process has truly detected monotonic clock
+  ** availability, it might happen that it is not actually available at
+  ** runtime. When this occurs simply fallback to other time source.
+  */
+#ifdef HAVE_GETTIMEOFDAY
+  else
+    (void)gettimeofday(&now, NULL);
+#else
+  else {
+    now.tv_sec = time(NULL);
+    now.tv_usec = 0;
+  }
+#endif
+  return now;
+}
 
-  s = (struct sockaddr_in *)(void *)&req.ifr_addr;
-  memcpy(&in, &s->sin_addr, sizeof(in));
-  r = Curl_inet_ntop(s->sin_family, &in, buf, buf_size);
+#elif defined(HAVE_GETTIMEOFDAY)
 
-  sclose(dummy);
-  if(!r)
-    return IF2IP_NOT_FOUND;
-  return IF2IP_FOUND;
+struct timeval tvnow(void)
+{
+  /*
+  ** gettimeofday() is not granted to be increased monotonically, due to
+  ** clock drifting and external source time synchronization it can jump
+  ** forward or backward in time.
+  */
+  struct timeval now;
+  (void)gettimeofday(&now, NULL);
+  return now;
 }
 
 #else
 
-if2ip_result_t Curl_if2ip(int af,
-#ifdef USE_IPV6
-                          unsigned int remote_scope,
-                          unsigned int local_scope_id,
-#endif
-                          const char *interf,
-                          char *buf, size_t buf_size)
+struct timeval tvnow(void)
 {
-    (void) af;
-#ifdef USE_IPV6
-    (void) remote_scope;
-    (void) local_scope_id;
-#endif
-    (void) interf;
-    (void) buf;
-    (void) buf_size;
-    return IF2IP_NOT_FOUND;
+  /*
+  ** time() returns the value of time in seconds since the Epoch.
+  */
+  struct timeval now;
+  now.tv_sec = time(NULL);
+  now.tv_usec = 0;
+  return now;
 }
 
 #endif
 
-#endif /* CURL_DISABLE_BINDLOCAL */
+/*
+ * Make sure that the first argument is the more recent time, as otherwise
+ * we will get a weird negative time-diff back...
+ *
+ * Returns: the time difference in number of milliseconds.
+ */
+long tvdiff(struct timeval newer, struct timeval older)
+{
+  return (long)(newer.tv_sec-older.tv_sec)*1000+
+    (long)(newer.tv_usec-older.tv_usec)/1000;
+}
+
+/* Case insensitive compare. Accept NULL pointers. */
+int struplocompare(const char *p1, const char *p2)
+{
+  if(!p1)
+    return p2? -1: 0;
+  if(!p2)
+    return 1;
+#ifdef HAVE_STRCASECMP
+  return strcasecmp(p1, p2);
+#elif defined(HAVE_STRCMPI)
+  return strcmpi(p1, p2);
+#elif defined(HAVE_STRICMP)
+  return stricmp(p1, p2);
+#else
+  return strcmp(p1, p2);
+#endif
+}
+
+/* Indirect version to use as qsort callback. */
+int struplocompare4sort(const void *p1, const void *p2)
+{
+  return struplocompare(* (char * const *) p1, * (char * const *) p2);
+}
+
+#ifdef USE_TOOL_FTRUNCATE
+
+#ifdef _WIN32_WCE
+/* 64-bit lseek-like function unavailable */
+#  undef _lseeki64
+#  define _lseeki64(hnd,ofs,whence) lseek(hnd,ofs,whence)
+#  undef _get_osfhandle
+#  define _get_osfhandle(fd) (fd)
+#endif
+
+/*
+ * Truncate a file handle at a 64-bit position 'where'.
+ */
+
+int tool_ftruncate64(int fd, curl_off_t where)
+{
+  intptr_t handle = _get_osfhandle(fd);
+
+  if(_lseeki64(fd, where, SEEK_SET) < 0)
+    return -1;
+
+  if(!SetEndOfFile((HANDLE)handle))
+    return -1;
+
+  return 0;
+}
+
+#endif /* USE_TOOL_FTRUNCATE */

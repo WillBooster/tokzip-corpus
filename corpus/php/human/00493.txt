@@ -10,393 +10,304 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Package;
+namespace Composer\Downloader;
 
-use Composer\Repository\RepositoryInterface;
+use React\Promise\PromiseInterface;
+use Composer\Package\Archiver\ArchivableFilesFinder;
+use Composer\Package\Dumper\ArrayDumper;
+use Composer\Package\PackageInterface;
+use Composer\Package\Version\VersionGuesser;
+use Composer\Package\Version\VersionParser;
+use Composer\Util\Platform;
+use Composer\Util\Filesystem;
+use Symfony\Component\Filesystem\Exception\IOException;
+use Symfony\Component\Filesystem\Filesystem as SymfonyFilesystem;
+use Composer\DependencyResolver\Operation\InstallOperation;
+use Composer\DependencyResolver\Operation\UninstallOperation;
 
 /**
- * Defines the essential information a package has that is used during solving/installation
+ * Download a package from a local path.
  *
- * PackageInterface & derivatives are considered internal, you may use them in type hints but extending/implementing them is not recommended and not supported. Things may change without notice.
- *
- * @author Jordi Boggiano <j.boggiano@seld.be>
- *
- * @phpstan-type AutoloadRules    array{psr-0?: array<string, string|string[]>, psr-4?: array<string, string|string[]>, classmap?: list<string>, files?: list<string>, exclude-from-classmap?: list<string>}
- * @phpstan-type DevAutoloadRules array{psr-0?: array<string, string|string[]>, psr-4?: array<string, string|string[]>, classmap?: list<string>, files?: list<string>}
+ * @author Samuel Roze <samuel.roze@gmail.com>
+ * @author Johann Reinke <johann.reinke@gmail.com>
  */
-interface PackageInterface
+class PathDownloader extends FileDownloader implements VcsCapableDownloaderInterface
 {
-    public const DISPLAY_SOURCE_REF_IF_DEV = 0;
-    public const DISPLAY_SOURCE_REF = 1;
-    public const DISPLAY_DIST_REF = 2;
+    private const STRATEGY_SYMLINK = 10;
+    private const STRATEGY_MIRROR = 20;
 
     /**
-     * Returns the package's name without version info, thus not a unique identifier
-     *
-     * @return string package name
+     * @inheritDoc
      */
-    public function getName(): string;
+    public function download(PackageInterface $package, string $path, ?PackageInterface $prevPackage = null, bool $output = true): PromiseInterface
+    {
+        $path = Filesystem::trimTrailingSlash($path);
+        $url = $package->getDistUrl();
+        $realUrl = realpath($url);
+        if (false === $realUrl || !file_exists($realUrl) || !is_dir($realUrl)) {
+            throw new \RuntimeException(sprintf(
+                'Source path "%s" is not found for package %s',
+                $url,
+                $package->getName()
+            ));
+        }
+
+        if (realpath($path) === $realUrl) {
+            return \React\Promise\resolve(null);
+        }
+
+        if (strpos(realpath($path) . DIRECTORY_SEPARATOR, $realUrl . DIRECTORY_SEPARATOR) === 0) {
+            // IMPORTANT NOTICE: If you wish to change this, don't. You are wasting your time and ours.
+            //
+            // Please see https://github.com/composer/composer/pull/5974 and https://github.com/composer/composer/pull/6174
+            // for previous attempts that were shut down because they did not work well enough or introduced too many risks.
+            throw new \RuntimeException(sprintf(
+                'Package %s cannot install to "%s" inside its source at "%s"',
+                $package->getName(),
+                realpath($path),
+                $realUrl
+            ));
+        }
+
+        return \React\Promise\resolve(null);
+    }
 
     /**
-     * Returns the package's pretty (i.e. with proper case) name
-     *
-     * @return string package name
+     * @inheritDoc
      */
-    public function getPrettyName(): string;
+    public function install(PackageInterface $package, string $path, bool $output = true): PromiseInterface
+    {
+        $path = Filesystem::trimTrailingSlash($path);
+        $url = $package->getDistUrl();
+        $realUrl = realpath($url);
+
+        if (realpath($path) === $realUrl) {
+            if ($output) {
+                $this->io->writeError("  - " . InstallOperation::format($package) . $this->getInstallOperationAppendix($package, $path));
+            }
+
+            return \React\Promise\resolve(null);
+        }
+
+        // Get the transport options with default values
+        $transportOptions = $package->getTransportOptions() + ['relative' => true];
+
+        [$currentStrategy, $allowedStrategies] = $this->computeAllowedStrategies($transportOptions);
+
+        $symfonyFilesystem = new SymfonyFilesystem();
+        $this->filesystem->removeDirectory($path);
+
+        if ($output) {
+            $this->io->writeError("  - " . InstallOperation::format($package).': ', false);
+        }
+
+        $isFallback = false;
+        if (self::STRATEGY_SYMLINK === $currentStrategy) {
+            try {
+                if (Platform::isWindows()) {
+                    // Implement symlinks as NTFS junctions on Windows
+                    if ($output) {
+                        $this->io->writeError(sprintf('Junctioning from %s', $url), false);
+                    }
+                    $this->filesystem->junction($realUrl, $path);
+                } else {
+                    $absolutePath = $path;
+                    if (!$this->filesystem->isAbsolutePath($absolutePath)) {
+                        $absolutePath = Platform::getCwd() . DIRECTORY_SEPARATOR . $path;
+                    }
+                    $shortestPath = $this->filesystem->findShortestPath($absolutePath, $realUrl);
+                    $path = rtrim($path, "/");
+                    if ($output) {
+                        $this->io->writeError(sprintf('Symlinking from %s', $url), false);
+                    }
+                    if ($transportOptions['relative']) {
+                        $symfonyFilesystem->symlink($shortestPath.'/', $path);
+                    } else {
+                        $symfonyFilesystem->symlink($realUrl.'/', $path);
+                    }
+                }
+            } catch (IOException $e) {
+                if (in_array(self::STRATEGY_MIRROR, $allowedStrategies, true)) {
+                    if ($output) {
+                        $this->io->writeError('');
+                        $this->io->writeError('    <error>Symlink failed, fallback to use mirroring!</error>');
+                    }
+                    $currentStrategy = self::STRATEGY_MIRROR;
+                    $isFallback = true;
+                } else {
+                    throw new \RuntimeException(sprintf('Symlink from "%s" to "%s" failed!', $realUrl, $path));
+                }
+            }
+        }
+
+        // Fallback if symlink failed or if symlink is not allowed for the package
+        if (self::STRATEGY_MIRROR === $currentStrategy) {
+            $realUrl = $this->filesystem->normalizePath($realUrl);
+
+            if ($output) {
+                $this->io->writeError(sprintf('%sMirroring from %s', $isFallback ? '    ' : '', $url), false);
+            }
+            $iterator = new ArchivableFilesFinder($realUrl, []);
+            $symfonyFilesystem->mirror($realUrl, $path, $iterator);
+        }
+
+        if ($output) {
+            $this->io->writeError('');
+        }
+
+        return \React\Promise\resolve(null);
+    }
 
     /**
-     * Returns a set of names that could refer to this package
-     *
-     * No version or release type information should be included in any of the
-     * names. Provided or replaced package names need to be returned as well.
-     *
-     * @param bool $provides Whether provided names should be included
-     *
-     * @return string[] An array of strings referring to this package
+     * @inheritDoc
      */
-    public function getNames(bool $provides = true): array;
+    public function remove(PackageInterface $package, string $path, bool $output = true): PromiseInterface
+    {
+        $path = Filesystem::trimTrailingSlash($path);
+        /**
+         * realpath() may resolve Windows junctions to the source path, so we'll check for a junction first
+         * to prevent a false positive when checking if the dist and install paths are the same.
+         * See https://bugs.php.net/bug.php?id=77639
+         *
+         * For junctions don't blindly rely on Filesystem::removeDirectory as it may be overzealous. If a process
+         * inadvertently locks the file the removal will fail, but it would fall back to recursive delete which
+         * is disastrous within a junction. So in that case we have no other real choice but to fail hard.
+         */
+        if (Platform::isWindows() && $this->filesystem->isJunction($path)) {
+            if ($output) {
+                $this->io->writeError("  - " . UninstallOperation::format($package).", source is still present in $path");
+            }
+            if (!$this->filesystem->removeJunction($path)) {
+                $this->io->writeError("    <warning>Could not remove junction at " . $path . " - is another process locking it?</warning>");
+                throw new \RuntimeException('Could not reliably remove junction for package ' . $package->getName());
+            }
+
+            return \React\Promise\resolve(null);
+        }
+
+        // ensure that the source path (dist url) is not the same as the install path, which
+        // can happen when using custom installers, see https://github.com/composer/composer/pull/9116
+        // not using realpath here as we do not want to resolve the symlink to the original dist url
+        // it points to
+        $fs = new Filesystem;
+        $absPath = $fs->isAbsolutePath($path) ? $path : Platform::getCwd() . '/' . $path;
+        $absDistUrl = $fs->isAbsolutePath($package->getDistUrl()) ? $package->getDistUrl() : Platform::getCwd() . '/' . $package->getDistUrl();
+        if ($fs->normalizePath($absPath) === $fs->normalizePath($absDistUrl)) {
+            if ($output) {
+                $this->io->writeError("  - " . UninstallOperation::format($package).", source is still present in $path");
+            }
+
+            return \React\Promise\resolve(null);
+        }
+
+        return parent::remove($package, $path, $output);
+    }
 
     /**
-     * Allows the solver to set an id for this package to refer to it.
+     * @inheritDoc
      */
-    public function setId(int $id): void;
+    public function getVcsReference(PackageInterface $package, string $path): ?string
+    {
+        $path = Filesystem::trimTrailingSlash($path);
+        $parser = new VersionParser;
+        $guesser = new VersionGuesser($this->config, $this->process, $parser);
+        $dumper = new ArrayDumper;
+
+        $packageConfig = $dumper->dump($package);
+        if ($packageVersion = $guesser->guessVersion($packageConfig, $path)) {
+            return $packageVersion['commit'];
+        }
+
+        return null;
+    }
 
     /**
-     * Retrieves the package's id set through setId
+     * @inheritDoc
+     */
+    protected function getInstallOperationAppendix(PackageInterface $package, string $path): string
+    {
+        $realUrl = realpath($package->getDistUrl());
+
+        if (realpath($path) === $realUrl) {
+            return ': Source already present';
+        }
+
+        [$currentStrategy] = $this->computeAllowedStrategies($package->getTransportOptions());
+
+        if ($currentStrategy === self::STRATEGY_SYMLINK) {
+            if (Platform::isWindows()) {
+                return ': Junctioning from '.$package->getDistUrl();
+            }
+
+            return ': Symlinking from '.$package->getDistUrl();
+        }
+
+        return ': Mirroring from '.$package->getDistUrl();
+    }
+
+    /**
+     * @param mixed[] $transportOptions
      *
-     * @return int The previously set package id
+     * @phpstan-return array{self::STRATEGY_*, non-empty-list<self::STRATEGY_*>}
      */
-    public function getId(): int;
+    private function computeAllowedStrategies(array $transportOptions): array
+    {
+        // When symlink transport option is null, both symlink and mirror are allowed
+        $currentStrategy = self::STRATEGY_SYMLINK;
+        $allowedStrategies = [self::STRATEGY_SYMLINK, self::STRATEGY_MIRROR];
+
+        $mirrorPathRepos = Platform::getEnv('COMPOSER_MIRROR_PATH_REPOS');
+        if ($mirrorPathRepos) {
+            $currentStrategy = self::STRATEGY_MIRROR;
+        }
+
+        $symlinkOption = $transportOptions['symlink'] ?? null;
+
+        if (true === $symlinkOption) {
+            $currentStrategy = self::STRATEGY_SYMLINK;
+            $allowedStrategies = [self::STRATEGY_SYMLINK];
+        } elseif (false === $symlinkOption) {
+            $currentStrategy = self::STRATEGY_MIRROR;
+            $allowedStrategies = [self::STRATEGY_MIRROR];
+        }
+
+        // Check we can use junctions safely if we are on Windows
+        if (Platform::isWindows() && self::STRATEGY_SYMLINK === $currentStrategy && !$this->safeJunctions()) {
+            if (!in_array(self::STRATEGY_MIRROR, $allowedStrategies, true)) {
+                throw new \RuntimeException('You are on an old Windows / old PHP combo which does not allow Composer to use junctions/symlinks and this path repository has symlink:true in its options so copying is not allowed');
+            }
+            $currentStrategy = self::STRATEGY_MIRROR;
+            $allowedStrategies = [self::STRATEGY_MIRROR];
+        }
+
+        // Check we can use symlink() otherwise
+        if (!Platform::isWindows() && self::STRATEGY_SYMLINK === $currentStrategy && !function_exists('symlink')) {
+            if (!in_array(self::STRATEGY_MIRROR, $allowedStrategies, true)) {
+                throw new \RuntimeException('Your PHP has the symlink() function disabled which does not allow Composer to use symlinks and this path repository has symlink:true in its options so copying is not allowed');
+            }
+            $currentStrategy = self::STRATEGY_MIRROR;
+            $allowedStrategies = [self::STRATEGY_MIRROR];
+        }
+
+        return [$currentStrategy, $allowedStrategies];
+    }
 
     /**
-     * Returns whether the package is a development virtual package or a concrete one
-     */
-    public function isDev(): bool;
-
-    /**
-     * Returns the package type, e.g. library
+     * Returns true if junctions can be created and safely used on Windows
      *
-     * @return string The package type
-     */
-    public function getType(): string;
-
-    /**
-     * Returns the package targetDir property
+     * A PHP bug makes junction detection fragile, leading to possible data loss
+     * when removing a package. See https://bugs.php.net/bug.php?id=77552
      *
-     * @return ?string The package targetDir
-     */
-    public function getTargetDir(): ?string;
-
-    /**
-     * Returns the package extra data
+     * For safety we require a minimum version of Windows 7, so we can call the
+     * system rmdir which will preserve target content if given a junction.
      *
-     * @return mixed[] The package extra data
+     * The PHP bug was fixed in 7.2.16 and 7.3.3 (requires at least Windows 7).
      */
-    public function getExtra(): array;
-
-    /**
-     * Sets source from which this package was installed (source/dist).
-     *
-     * @param ?string $type source/dist
-     * @phpstan-param 'source'|'dist'|null $type
-     */
-    public function setInstallationSource(?string $type): void;
-
-    /**
-     * Returns source from which this package was installed (source/dist).
-     *
-     * @return ?string source/dist
-     * @phpstan-return 'source'|'dist'|null
-     */
-    public function getInstallationSource(): ?string;
-
-    /**
-     * Returns the repository type of this package, e.g. git, svn
-     *
-     * @return ?string The repository type
-     */
-    public function getSourceType(): ?string;
-
-    /**
-     * Returns the repository url of this package, e.g. git://github.com/naderman/composer.git
-     *
-     * @return ?string The repository url
-     */
-    public function getSourceUrl(): ?string;
-
-    /**
-     * Returns the repository urls of this package including mirrors, e.g. git://github.com/naderman/composer.git
-     *
-     * @return list<string>
-     */
-    public function getSourceUrls(): array;
-
-    /**
-     * Returns the repository reference of this package, e.g. master, 1.0.0 or a commit hash for git
-     *
-     * @return ?string The repository reference
-     */
-    public function getSourceReference(): ?string;
-
-    /**
-     * Returns the source mirrors of this package
-     *
-     * @return ?list<array{url: non-empty-string, preferred: bool}>
-     */
-    public function getSourceMirrors(): ?array;
-
-    /**
-     * @param  null|list<array{url: non-empty-string, preferred: bool}> $mirrors
-     */
-    public function setSourceMirrors(?array $mirrors): void;
-
-    /**
-     * Returns the type of the distribution archive of this version, e.g. zip, tarball
-     *
-     * @return ?string The repository type
-     */
-    public function getDistType(): ?string;
-
-    /**
-     * Returns the url of the distribution archive of this version
-     *
-     * @return ?non-empty-string
-     */
-    public function getDistUrl(): ?string;
-
-    /**
-     * Returns the urls of the distribution archive of this version, including mirrors
-     *
-     * @return non-empty-string[]
-     */
-    public function getDistUrls(): array;
-
-    /**
-     * Returns the reference of the distribution archive of this version, e.g. master, 1.0.0 or a commit hash for git
-     *
-     * @return ?string
-     */
-    public function getDistReference(): ?string;
-
-    /**
-     * Returns the sha1 checksum for the distribution archive of this version
-     *
-     * Can be an empty string which should be treated as null
-     *
-     * @return ?string
-     */
-    public function getDistSha1Checksum(): ?string;
-
-    /**
-     * Returns the dist mirrors of this package
-     *
-     * @return ?list<array{url: non-empty-string, preferred: bool}>
-     */
-    public function getDistMirrors(): ?array;
-
-    /**
-     * @param  null|list<array{url: non-empty-string, preferred: bool}> $mirrors
-     */
-    public function setDistMirrors(?array $mirrors): void;
-
-    /**
-     * Returns the version of this package
-     *
-     * @return string version
-     */
-    public function getVersion(): string;
-
-    /**
-     * Returns the pretty (i.e. non-normalized) version string of this package
-     *
-     * @return string version
-     */
-    public function getPrettyVersion(): string;
-
-    /**
-     * Returns the pretty version string plus a git or hg commit hash of this package
-     *
-     * @see getPrettyVersion
-     *
-     * @param  bool   $truncate    If the source reference is a sha1 hash, truncate it
-     * @param  int    $displayMode One of the DISPLAY_ constants on this interface determining display of references
-     * @return string version
-     *
-     * @phpstan-param self::DISPLAY_SOURCE_REF_IF_DEV|self::DISPLAY_SOURCE_REF|self::DISPLAY_DIST_REF $displayMode
-     */
-    public function getFullPrettyVersion(bool $truncate = true, int $displayMode = self::DISPLAY_SOURCE_REF_IF_DEV): string;
-
-    /**
-     * Returns the release date of the package
-     *
-     * @return ?\DateTimeInterface
-     */
-    public function getReleaseDate(): ?\DateTimeInterface;
-
-    /**
-     * Returns the stability of this package: one of (dev, alpha, beta, RC, stable)
-     *
-     * @phpstan-return 'stable'|'RC'|'beta'|'alpha'|'dev'
-     */
-    public function getStability(): string;
-
-    /**
-     * Returns a set of links to packages which need to be installed before
-     * this package can be installed
-     *
-     * @return array<string, Link> A map of package links defining required packages, indexed by the require package's name
-     */
-    public function getRequires(): array;
-
-    /**
-     * Returns a set of links to packages which must not be installed at the
-     * same time as this package
-     *
-     * @return Link[] An array of package links defining conflicting packages
-     */
-    public function getConflicts(): array;
-
-    /**
-     * Returns a set of links to virtual packages that are provided through
-     * this package
-     *
-     * @return Link[] An array of package links defining provided packages
-     */
-    public function getProvides(): array;
-
-    /**
-     * Returns a set of links to packages which can alternatively be
-     * satisfied by installing this package
-     *
-     * @return Link[] An array of package links defining replaced packages
-     */
-    public function getReplaces(): array;
-
-    /**
-     * Returns a set of links to packages which are required to develop
-     * this package. These are installed if in dev mode.
-     *
-     * @return array<string, Link> A map of package links defining packages required for development, indexed by the require package's name
-     */
-    public function getDevRequires(): array;
-
-    /**
-     * Returns a set of package names and reasons why they are useful in
-     * combination with this package.
-     *
-     * @return array An array of package suggestions with descriptions
-     * @phpstan-return array<string, string>
-     */
-    public function getSuggests(): array;
-
-    /**
-     * Returns an associative array of autoloading rules
-     *
-     * {"<type>": {"<namespace": "<directory>"}}
-     *
-     * Type is either "psr-4", "psr-0", "classmap" or "files". Namespaces are mapped to
-     * directories for autoloading using the type specified.
-     *
-     * @return array Mapping of autoloading rules
-     * @phpstan-return AutoloadRules
-     */
-    public function getAutoload(): array;
-
-    /**
-     * Returns an associative array of dev autoloading rules
-     *
-     * {"<type>": {"<namespace": "<directory>"}}
-     *
-     * Type is either "psr-4", "psr-0", "classmap" or "files". Namespaces are mapped to
-     * directories for autoloading using the type specified.
-     *
-     * @return array Mapping of dev autoloading rules
-     * @phpstan-return DevAutoloadRules
-     */
-    public function getDevAutoload(): array;
-
-    /**
-     * Returns a list of directories which should get added to PHP's
-     * include path.
-     *
-     * @return string[]
-     */
-    public function getIncludePaths(): array;
-
-    /**
-     * Returns the settings for php extension packages
-     *
-     * @return array{extension-name?: string, priority?: int, support-zts?: bool, configure-options?: list<array{name: string, description?: string}>}|null
-     */
-    public function getPhpExt(): ?array;
-
-    /**
-     * Stores a reference to the repository that owns the package
-     */
-    public function setRepository(RepositoryInterface $repository): void;
-
-    /**
-     * Returns a reference to the repository that owns the package
-     *
-     * @return ?RepositoryInterface
-     */
-    public function getRepository(): ?RepositoryInterface;
-
-    /**
-     * Returns the package binaries
-     *
-     * @return string[]
-     */
-    public function getBinaries(): array;
-
-    /**
-     * Returns package unique name, constructed from name and version.
-     */
-    public function getUniqueName(): string;
-
-    /**
-     * Returns the package notification url
-     *
-     * @return ?string
-     */
-    public function getNotificationUrl(): ?string;
-
-    /**
-     * Converts the package into a readable and unique string
-     */
-    public function __toString(): string;
-
-    /**
-     * Converts the package into a pretty readable string
-     */
-    public function getPrettyString(): string;
-
-    public function isDefaultBranch(): bool;
-
-    /**
-     * Returns a list of options to download package dist files
-     *
-     * @return mixed[]
-     */
-    public function getTransportOptions(): array;
-
-    /**
-     * Configures the list of options to download package dist files
-     *
-     * @param mixed[] $options
-     */
-    public function setTransportOptions(array $options): void;
-
-    public function setSourceReference(?string $reference): void;
-
-    public function setDistUrl(?string $url): void;
-
-    public function setDistType(?string $type): void;
-
-    public function setDistReference(?string $reference): void;
-
-    /**
-     * Set dist and source references and update dist URL for ones that contain a reference
-     */
-    public function setSourceDistReferences(string $reference): void;
+    private function safeJunctions(): bool
+    {
+        // We need to call mklink, and rmdir on Windows 7 (version 6.1)
+        return function_exists('proc_open') &&
+            (PHP_WINDOWS_VERSION_MAJOR > 6 ||
+            (PHP_WINDOWS_VERSION_MAJOR === 6 && PHP_WINDOWS_VERSION_MINOR >= 1));
+    }
 }

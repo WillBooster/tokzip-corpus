@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008 Google Inc.
+ * Copyright (C) 2021 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,217 +13,140 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.google.gson.functional;
+
+package com.google.gson;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
 
-import com.google.errorprone.annotations.CanIgnoreReturnValue;
-import com.google.gson.Gson;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParseException;
-import com.google.gson.JsonPrimitive;
-import com.google.gson.TypeAdapter;
-import com.google.gson.TypeAdapterFactory;
-import com.google.gson.annotations.JsonAdapter;
-import com.google.gson.internal.Streams;
-import com.google.gson.reflect.TypeToken;
-import com.google.gson.stream.JsonReader;
-import com.google.gson.stream.JsonWriter;
-import java.io.IOException;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import com.google.gson.functional.FieldNamingTest;
+import java.lang.reflect.Field;
+import java.util.Locale;
 import org.junit.Test;
 
-/** Functional tests for the RuntimeTypeAdapterFactory feature in extras. */
-public final class RuntimeTypeAdapterFactoryFunctionalTest {
-
-  private final Gson gson = new Gson();
-
-  /**
-   * This test also ensures that {@link TypeAdapterFactory} registered through {@link JsonAdapter}
-   * work correctly for {@link Gson#getDelegateAdapter(TypeAdapterFactory, TypeToken)}.
-   */
+/**
+ * Performs tests directly against {@link FieldNamingPolicy}; for integration tests see {@link
+ * FieldNamingTest}.
+ */
+public class FieldNamingPolicyTest {
   @Test
-  public void testSubclassesAutomaticallySerialized() {
-    Shape shape = new Circle(25);
-    String json = gson.toJson(shape);
-    shape = gson.fromJson(json, Shape.class);
-    assertThat(((Circle) shape).radius).isEqualTo(25);
+  public void testSeparateCamelCase() {
+    // Map from original -> expected
+    String[][] argumentPairs = {
+      {"a", "a"},
+      {"ab", "ab"},
+      {"Ab", "Ab"},
+      {"aB", "a_B"},
+      {"AB", "A_B"},
+      {"A_B", "A__B"},
+      {"firstSecondThird", "first_Second_Third"},
+      {"__", "__"},
+      {"_123", "_123"}
+    };
 
-    shape = new Square(15);
-    json = gson.toJson(shape);
-    shape = gson.fromJson(json, Shape.class);
-    assertThat(((Square) shape).side).isEqualTo(15);
-    assertThat(shape.type).isEqualTo(ShapeType.SQUARE);
-  }
-
-  @JsonAdapter(Shape.JsonAdapterFactory.class)
-  static class Shape {
-    final ShapeType type;
-
-    Shape(ShapeType type) {
-      this.type = type;
-    }
-
-    private static final class JsonAdapterFactory extends RuntimeTypeAdapterFactory<Shape> {
-      public JsonAdapterFactory() {
-        super(Shape.class, "type");
-        registerSubtype(Circle.class, ShapeType.CIRCLE.toString());
-        registerSubtype(Square.class, ShapeType.SQUARE.toString());
-      }
+    for (String[] pair : argumentPairs) {
+      assertThat(FieldNamingPolicy.separateCamelCase(pair[0], '_')).isEqualTo(pair[1]);
     }
   }
 
-  public enum ShapeType {
-    SQUARE,
-    CIRCLE
-  }
+  @Test
+  public void testUpperCaseFirstLetter() {
+    // Map from original -> expected
+    String[][] argumentPairs = {
+      {"a", "A"},
+      {"ab", "Ab"},
+      {"AB", "AB"},
+      {"_a", "_A"},
+      {"_ab", "_Ab"},
+      {"__", "__"},
+      {"_1", "_1"},
+      // Not a letter, but has uppercase variant (should not be uppercased)
+      // See https://github.com/google/gson/issues/1965
+      {"\u2170", "\u2170"},
+      {"_\u2170", "_\u2170"},
+      {"\u2170a", "\u2170A"},
+    };
 
-  private static final class Circle extends Shape {
-    final int radius;
-
-    Circle(int radius) {
-      super(ShapeType.CIRCLE);
-      this.radius = radius;
+    for (String[] pair : argumentPairs) {
+      assertThat(FieldNamingPolicy.upperCaseFirstLetter(pair[0])).isEqualTo(pair[1]);
     }
   }
 
-  private static final class Square extends Shape {
-    final int side;
+  /** Upper-casing policies should be unaffected by default Locale. */
+  @Test
+  public void testUpperCasingLocaleIndependent() throws Exception {
+    class Dummy {
+      @SuppressWarnings("unused")
+      int i;
+    }
 
-    Square(int side) {
-      super(ShapeType.SQUARE);
-      this.side = side;
+    FieldNamingPolicy[] policies = {
+      FieldNamingPolicy.UPPER_CAMEL_CASE,
+      FieldNamingPolicy.UPPER_CAMEL_CASE_WITH_SPACES,
+      FieldNamingPolicy.UPPER_CASE_WITH_UNDERSCORES,
+    };
+
+    Field field = Dummy.class.getDeclaredField("i");
+    String name = field.getName();
+    String expected = name.toUpperCase(Locale.ROOT);
+
+    Locale oldLocale = Locale.getDefault();
+    // Set Turkish as Locale which has special case conversion rules
+    Locale.setDefault(new Locale("tr"));
+
+    try {
+      // Verify that default Locale has different case conversion rules
+      assertWithMessage("Test setup is broken")
+          .that(name.toUpperCase(Locale.getDefault()))
+          .doesNotMatch(expected);
+
+      for (FieldNamingPolicy policy : policies) {
+        // Should ignore default Locale
+        assertWithMessage("Unexpected conversion for %s", policy)
+            .that(policy.translateName(field))
+            .matches(expected);
+      }
+    } finally {
+      Locale.setDefault(oldLocale);
     }
   }
 
-  // Copied from the extras package
-  static class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
-    private final Class<?> baseType;
-    private final String typeFieldName;
-    private final Map<String, Class<?>> labelToSubtype = new LinkedHashMap<>();
-    private final Map<Class<?>, String> subtypeToLabel = new LinkedHashMap<>();
-
-    protected RuntimeTypeAdapterFactory(Class<?> baseType, String typeFieldName) {
-      if (typeFieldName == null || baseType == null) {
-        throw new NullPointerException();
-      }
-      this.baseType = baseType;
-      this.typeFieldName = typeFieldName;
+  /** Lower casing policies should be unaffected by default Locale. */
+  @Test
+  public void testLowerCasingLocaleIndependent() throws Exception {
+    class Dummy {
+      @SuppressWarnings({"unused", "ConstantField"})
+      int I;
     }
 
-    /**
-     * Creates a new runtime type adapter for {@code baseType} using {@code typeFieldName} as the
-     * type field name. Type field names are case sensitive.
-     */
-    public static <T> RuntimeTypeAdapterFactory<T> of(Class<T> baseType, String typeFieldName) {
-      return new RuntimeTypeAdapterFactory<>(baseType, typeFieldName);
-    }
+    FieldNamingPolicy[] policies = {
+      FieldNamingPolicy.LOWER_CASE_WITH_DASHES,
+      FieldNamingPolicy.LOWER_CASE_WITH_DOTS,
+      FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES,
+    };
 
-    /**
-     * Creates a new runtime type adapter for {@code baseType} using {@code "type"} as the type
-     * field name.
-     */
-    public static <T> RuntimeTypeAdapterFactory<T> of(Class<T> baseType) {
-      return new RuntimeTypeAdapterFactory<>(baseType, "type");
-    }
+    Field field = Dummy.class.getDeclaredField("I");
+    String name = field.getName();
+    String expected = name.toLowerCase(Locale.ROOT);
 
-    /**
-     * Registers {@code type} identified by {@code label}. Labels are case sensitive.
-     *
-     * @throws IllegalArgumentException if either {@code type} or {@code label} have already been
-     *     registered on this type adapter.
-     */
-    @CanIgnoreReturnValue
-    public RuntimeTypeAdapterFactory<T> registerSubtype(Class<? extends T> type, String label) {
-      if (type == null || label == null) {
-        throw new NullPointerException();
+    Locale oldLocale = Locale.getDefault();
+    // Set Turkish as Locale which has special case conversion rules
+    Locale.setDefault(new Locale("tr"));
+
+    try {
+      // Verify that default Locale has different case conversion rules
+      assertWithMessage("Test setup is broken")
+          .that(name.toLowerCase(Locale.getDefault()))
+          .doesNotMatch(expected);
+
+      for (FieldNamingPolicy policy : policies) {
+        // Should ignore default Locale
+        assertWithMessage("Unexpected conversion for %s", policy)
+            .that(policy.translateName(field))
+            .matches(expected);
       }
-      if (subtypeToLabel.containsKey(type) || labelToSubtype.containsKey(label)) {
-        throw new IllegalArgumentException("types and labels must be unique");
-      }
-      labelToSubtype.put(label, type);
-      subtypeToLabel.put(type, label);
-      return this;
-    }
-
-    /**
-     * Registers {@code type} identified by its {@link Class#getSimpleName simple name}. Labels are
-     * case sensitive.
-     *
-     * @throws IllegalArgumentException if either {@code type} or its simple name have already been
-     *     registered on this type adapter.
-     */
-    @CanIgnoreReturnValue
-    public RuntimeTypeAdapterFactory<T> registerSubtype(Class<? extends T> type) {
-      return registerSubtype(type, type.getSimpleName());
-    }
-
-    @Override
-    public <R> TypeAdapter<R> create(Gson gson, TypeToken<R> type) {
-      if (type.getRawType() != baseType) {
-        return null;
-      }
-
-      final Map<String, TypeAdapter<?>> labelToDelegate = new LinkedHashMap<>();
-      final Map<Class<?>, TypeAdapter<?>> subtypeToDelegate = new LinkedHashMap<>();
-      for (Map.Entry<String, Class<?>> entry : labelToSubtype.entrySet()) {
-        TypeAdapter<?> delegate = gson.getDelegateAdapter(this, TypeToken.get(entry.getValue()));
-        labelToDelegate.put(entry.getKey(), delegate);
-        subtypeToDelegate.put(entry.getValue(), delegate);
-      }
-
-      return new TypeAdapter<R>() {
-        @Override
-        public R read(JsonReader in) {
-          JsonElement jsonElement = Streams.parse(in);
-          JsonElement labelJsonElement = jsonElement.getAsJsonObject().get(typeFieldName);
-          if (labelJsonElement == null) {
-            throw new JsonParseException(
-                "cannot deserialize "
-                    + baseType
-                    + " because it does not define a field named "
-                    + typeFieldName);
-          }
-          String label = labelJsonElement.getAsString();
-          @SuppressWarnings("unchecked") // registration requires that subtype extends T
-          TypeAdapter<R> delegate = (TypeAdapter<R>) labelToDelegate.get(label);
-          if (delegate == null) {
-            throw new JsonParseException(
-                "cannot deserialize "
-                    + baseType
-                    + " subtype named "
-                    + label
-                    + "; did you forget to register a subtype?");
-          }
-          return delegate.fromJsonTree(jsonElement);
-        }
-
-        @Override
-        public void write(JsonWriter out, R value) throws IOException {
-          Class<?> srcType = value.getClass();
-          String label = subtypeToLabel.get(srcType);
-          @SuppressWarnings("unchecked") // registration requires that subtype extends T
-          TypeAdapter<R> delegate = (TypeAdapter<R>) subtypeToDelegate.get(srcType);
-          if (delegate == null) {
-            throw new JsonParseException(
-                "cannot serialize "
-                    + srcType.getName()
-                    + "; did you forget to register a subtype?");
-          }
-          JsonObject jsonObject = delegate.toJsonTree(value).getAsJsonObject();
-          if (!jsonObject.has(typeFieldName)) {
-            JsonObject clone = new JsonObject();
-            clone.add(typeFieldName, new JsonPrimitive(label));
-            for (Map.Entry<String, JsonElement> e : jsonObject.entrySet()) {
-              clone.add(e.getKey(), e.getValue());
-            }
-            jsonObject = clone;
-          }
-          Streams.write(jsonObject, out);
-        }
-      };
+    } finally {
+      Locale.setDefault(oldLocale);
     }
   }
 }

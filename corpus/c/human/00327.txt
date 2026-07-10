@@ -1,5 +1,3 @@
-#ifndef HEADER_CURL_SSPI_H
-#define HEADER_CURL_SSPI_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -24,100 +22,185 @@
  *
  ***************************************************************************/
 
-#include "curl_setup.h"
-
-#ifdef USE_WINDOWS_SSPI
-
-#include <curl/curl.h>
-
 /*
- * When including the following three headers, it is mandatory to define either
- * SECURITY_WIN32 or SECURITY_KERNEL, indicating who is compiling the code.
+ * This test sends data with CURLOPT_KEEP_SENDING_ON_ERROR.
+ * The server responds with an early error response.
+ * The test is successful if the connection can be reused for the next request,
+ * because this implies that the data has been sent completely to the server.
  */
 
-#undef SECURITY_WIN32
-#undef SECURITY_KERNEL
-#define SECURITY_WIN32 1
-#include <security.h>
-#include <sspi.h>
-#include <rpc.h>
+#include "test.h"
 
-CURLcode Curl_sspi_global_init(void);
-void Curl_sspi_global_cleanup(void);
+#include "memdebug.h"
 
-/* This is used to populate the domain in a SSPI identity structure */
-CURLcode Curl_override_sspi_http_realm(const char *chlg,
-                                       SEC_WINNT_AUTH_IDENTITY *identity);
+struct cb_data {
+  CURL *easy_handle;
+  int response_received;
+  int paused;
+  size_t remaining_bytes;
+};
 
-/* This is used to generate an SSPI identity structure */
-CURLcode Curl_create_sspi_identity(const char *userp, const char *passwdp,
-                                   SEC_WINNT_AUTH_IDENTITY *identity);
 
-/* This is used to free an SSPI identity structure */
-void Curl_sspi_free_identity(SEC_WINNT_AUTH_IDENTITY *identity);
+static void reset_data(struct cb_data *data, CURL *curl)
+{
+  data->easy_handle = curl;
+  data->response_received = 0;
+  data->paused = 0;
+  data->remaining_bytes = 3;
+}
 
-/* Forward-declaration of global variables defined in curl_sspi.c */
-extern HMODULE s_hSecDll;
-extern PSecurityFunctionTable s_pSecFn;
 
-/* Provide some definitions missing in old headers */
-#define SP_NAME_DIGEST              "WDigest"
-#define SP_NAME_NTLM                "NTLM"
-#define SP_NAME_NEGOTIATE           "Negotiate"
-#define SP_NAME_KERBEROS            "Kerberos"
+static size_t read_callback(char *ptr, size_t size, size_t nitems,
+                            void *userdata)
+{
+  struct cb_data *data = (struct cb_data *)userdata;
 
-#ifndef ISC_REQ_USE_HTTP_STYLE
-#define ISC_REQ_USE_HTTP_STYLE                0x01000000
-#endif
+  /* wait until the server has sent all response headers */
+  if(data->response_received) {
+    size_t totalsize = nitems * size;
 
-#ifndef SEC_E_INVALID_PARAMETER
-# define SEC_E_INVALID_PARAMETER              ((HRESULT)0x8009035DL)
-#endif
-#ifndef SEC_E_DELEGATION_POLICY
-# define SEC_E_DELEGATION_POLICY              ((HRESULT)0x8009035EL)
-#endif
-#ifndef SEC_E_POLICY_NLTM_ONLY
-# define SEC_E_POLICY_NLTM_ONLY               ((HRESULT)0x8009035FL)
-#endif
+    size_t bytes_to_send = data->remaining_bytes;
+    if(bytes_to_send > totalsize) {
+      bytes_to_send = totalsize;
+    }
 
-#ifndef SEC_I_SIGNATURE_NEEDED
-# define SEC_I_SIGNATURE_NEEDED               ((HRESULT)0x0009035CL)
-#endif
+    memset(ptr, 'a', bytes_to_send);
+    data->remaining_bytes -= bytes_to_send;
 
-#ifndef CRYPT_E_REVOKED
-# define CRYPT_E_REVOKED                      ((HRESULT)0x80092010L)
-#endif
+    return bytes_to_send;
+  }
+  else {
+    data->paused = 1;
+    return CURL_READFUNC_PAUSE;
+  }
+}
 
-#ifndef CRYPT_E_NO_REVOCATION_DLL
-# define CRYPT_E_NO_REVOCATION_DLL            ((HRESULT)0x80092011L)
-#endif
 
-#ifndef CRYPT_E_NO_REVOCATION_CHECK
-# define CRYPT_E_NO_REVOCATION_CHECK          ((HRESULT)0x80092012L)
-#endif
+static size_t write_callback(char *ptr, size_t size, size_t nmemb,
+                             void *userdata)
+{
+  struct cb_data *data = (struct cb_data *)userdata;
+  size_t totalsize = nmemb * size;
 
-#ifndef CRYPT_E_REVOCATION_OFFLINE
-# define CRYPT_E_REVOCATION_OFFLINE           ((HRESULT)0x80092013L)
-#endif
+  /* unused parameter */
+  (void)ptr;
 
-#ifndef CRYPT_E_NOT_IN_REVOCATION_DATABASE
-# define CRYPT_E_NOT_IN_REVOCATION_DATABASE   ((HRESULT)0x80092014L)
-#endif
+  /* all response headers have been received */
+  data->response_received = 1;
 
-#ifdef UNICODE
-#  define SECFLAG_WINNT_AUTH_IDENTITY \
-     (unsigned long)SEC_WINNT_AUTH_IDENTITY_UNICODE
-#else
-#  define SECFLAG_WINNT_AUTH_IDENTITY \
-     (unsigned long)SEC_WINNT_AUTH_IDENTITY_ANSI
-#endif
+  if(data->paused) {
+    /* continue to send request body data */
+    data->paused = 0;
+    curl_easy_pause(data->easy_handle, CURLPAUSE_CONT);
+  }
 
-/*
- * Definitions required from ntsecapi.h are directly provided below this point
- * to avoid including ntsecapi.h due to a conflict with OpenSSL's safestack.h
- */
-#define KERB_WRAP_NO_ENCRYPT 0x80000001
+  return totalsize;
+}
 
-#endif /* USE_WINDOWS_SSPI */
 
-#endif /* HEADER_CURL_SSPI_H */
+static int perform_and_check_connections(CURL *curl, const char *description,
+                                         long expected_connections)
+{
+  CURLcode res;
+  long connections = 0;
+
+  res = curl_easy_perform(curl);
+  if(res != CURLE_OK) {
+    fprintf(stderr, "curl_easy_perform() failed with %d\n", res);
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  res = curl_easy_getinfo(curl, CURLINFO_NUM_CONNECTS, &connections);
+  if(res != CURLE_OK) {
+    fprintf(stderr, "curl_easy_getinfo() failed\n");
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  fprintf(stderr, "%s: expected: %ld connections; actual: %ld connections\n",
+          description, expected_connections, connections);
+
+  if(connections != expected_connections) {
+    return TEST_ERR_FAILURE;
+  }
+
+  return TEST_ERR_SUCCESS;
+}
+
+
+CURLcode test(char *URL)
+{
+  struct cb_data data;
+  CURL *curl = NULL;
+  CURLcode res = TEST_ERR_FAILURE;
+  int result;
+
+  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+    fprintf(stderr, "curl_global_init() failed\n");
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  curl = curl_easy_init();
+  if(!curl) {
+    fprintf(stderr, "curl_easy_init() failed\n");
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  reset_data(&data, curl);
+
+  test_setopt(curl, CURLOPT_URL, URL);
+  test_setopt(curl, CURLOPT_POST, 1L);
+  test_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+              (curl_off_t)data.remaining_bytes);
+  test_setopt(curl, CURLOPT_VERBOSE, 1L);
+  test_setopt(curl, CURLOPT_READFUNCTION, read_callback);
+  test_setopt(curl, CURLOPT_READDATA, &data);
+  test_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+  test_setopt(curl, CURLOPT_WRITEDATA, &data);
+
+  result = perform_and_check_connections(curl,
+    "First request without CURLOPT_KEEP_SENDING_ON_ERROR", 1);
+  if(result != TEST_ERR_SUCCESS) {
+    res = (CURLcode) result;
+    goto test_cleanup;
+  }
+
+  reset_data(&data, curl);
+
+  result = perform_and_check_connections(curl,
+    "Second request without CURLOPT_KEEP_SENDING_ON_ERROR", 1);
+  if(result != TEST_ERR_SUCCESS) {
+    res = (CURLcode) result;
+    goto test_cleanup;
+  }
+
+  test_setopt(curl, CURLOPT_KEEP_SENDING_ON_ERROR, 1L);
+
+  reset_data(&data, curl);
+
+  result = perform_and_check_connections(curl,
+    "First request with CURLOPT_KEEP_SENDING_ON_ERROR", 1);
+  if(result != TEST_ERR_SUCCESS) {
+    res = (CURLcode) result;
+    goto test_cleanup;
+  }
+
+  reset_data(&data, curl);
+
+  result = perform_and_check_connections(curl,
+    "Second request with CURLOPT_KEEP_SENDING_ON_ERROR", 0);
+  if(result != TEST_ERR_SUCCESS) {
+    res = (CURLcode) result;
+    goto test_cleanup;
+  }
+
+  res = TEST_ERR_SUCCESS;
+
+test_cleanup:
+
+  curl_easy_cleanup(curl);
+
+  curl_global_cleanup();
+
+  return res;
+}

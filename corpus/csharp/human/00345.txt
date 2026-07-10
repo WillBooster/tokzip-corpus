@@ -1,203 +1,317 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
-using System.Collections.Generic;
+using System.Threading;
 using NUnit.Framework.Interfaces;
 using NUnit.Framework.Internal;
+using NUnit.Framework.Internal.Execution;
 
 namespace NUnit.Framework.Tests.Internal
 {
+    /// <summary>
+    /// Summary description for EventQueueTests.
+    /// </summary>
     [TestFixture]
-    public class TestXmlTests
+    public class EventQueueTests
     {
-        private TestSuite _testSuite;
-        private TestFixture _testFixture;
-        private TestMethod _testMethod;
-
-        [SetUp]
-        public void SetUp()
+        private static readonly Event[] Events =
         {
-            _testMethod = new TestMethod(new MethodWrapper(typeof(DummyFixture), "DummyMethod"));
-            _testMethod.Properties.Set(PropertyNames.Description, "Test description");
-            _testMethod.Properties.Add(PropertyNames.Category, "Dubious");
-            _testMethod.Properties.Set("Priority", "low");
+            // These are all in violation of contract
+            // However the code here doesn't use the argument.
+#pragma warning disable CS8625 // Cannot convert null literal to non-nullable reference type.
+            new TestStartedEvent(null),
+            new TestOutputEvent(null),
+            new TestStartedEvent(null),
+            new TestFinishedEvent(null),
+            new TestStartedEvent(null),
+            new TestOutputEvent(null),
+            new TestMessageEvent(null),
+            new TestFinishedEvent(null),
+            new TestFinishedEvent(null),
+#pragma warning restore CS8625 // Cannot convert null literal to non-nullable reference type.
+        };
 
-            _testFixture = new TestFixture(new TypeWrapper(typeof(DummyFixture)));
-            _testFixture.Properties.Set(PropertyNames.Description, "Fixture description");
-            _testFixture.Properties.Add(PropertyNames.Category, "Fast");
-            _testFixture.Properties.Add("Value", 3);
-
-            _testFixture.Tests.Add(_testMethod);
-
-            _testSuite = new TestSuite(typeof(DummyFixture));
-            _testSuite.Properties.Set(PropertyNames.Description, "Suite description");
+        private static void EnqueueEvents(EventQueue q)
+        {
+            foreach (Event e in Events)
+                q.Enqueue(e);
         }
 
-        [Test]
-        public void TestTypeTests()
+        private static void SendEvents(ITestListener listener)
         {
-            Assert.Multiple(() =>
+            foreach (Event e in Events)
+                e.Send(listener);
+        }
+
+        private static void VerifyQueue(EventQueue q)
+        {
+            for (int index = 0; index < Events.Length; index++)
             {
-                Assert.That(_testMethod.TestType, Is.EqualTo("TestMethod"));
-                Assert.That(_testFixture.TestType, Is.EqualTo("TestFixture"));
-                Assert.That(_testSuite.TestType, Is.EqualTo("TestSuite"));
-                Assert.That(new TestAssembly("junk").TestType, Is.EqualTo("Assembly"));
-                Assert.That(new ParameterizedMethodSuite(new MethodWrapper(typeof(DummyFixture), "GenericMethod")).TestType, Is.EqualTo("GenericMethod"));
-                Assert.That(new ParameterizedMethodSuite(new MethodWrapper(typeof(DummyFixture), "ParameterizedMethod")).TestType, Is.EqualTo("ParameterizedMethod"));
-                Assert.That(new ParameterizedFixtureSuite(new TypeWrapper(typeof(DummyFixture))).TestType, Is.EqualTo("ParameterizedFixture"));
-            });
-            Type genericType = typeof(DummyGenericFixture<int>).GetGenericTypeDefinition();
-            Assert.That(new ParameterizedFixtureSuite(new TypeWrapper(genericType)).TestType, Is.EqualTo("GenericFixture"));
-        }
-
-        [Test]
-        public void TestMethodToXml()
-        {
-            CheckXmlForTest(_testMethod, false);
-        }
-
-        [Test]
-        public void TestFixtureToXml()
-        {
-            CheckXmlForTest(_testFixture, false);
-        }
-
-        [Test]
-        public void TestFixtureToXml_Recursive()
-        {
-            CheckXmlForTest(_testFixture, true);
-        }
-
-        [Test]
-        public void TestSuiteToXml()
-        {
-            CheckXmlForTest(_testSuite, false);
-        }
-
-        [Test]
-        public void TestSuiteToXml_Recursive()
-        {
-            CheckXmlForTest(_testSuite, true);
-        }
-
-        [Test]
-        public void TestNameWithInvalidCharacter()
-        {
-            _testMethod.Name = "\u0001HappyFace";
-            // This throws if the name is not properly escaped
-            Assert.That(_testMethod.ToXml(false).OuterXml, Contains.Substring("name=\"\\u0001HappyFace\""));
-        }
-
-        [Test]
-        public void TestNameWithInvalidCharacter_NonFirstPosition()
-        {
-            _testMethod.Name = "Happy\u0001Face";
-            // This throws if the name is not properly escaped
-            Assert.That(_testMethod.ToXml(false).OuterXml, Contains.Substring("name=\"Happy\\u0001Face\""));
-        }
-
-        #region Helper Methods For Checking XML
-
-        private void CheckXmlForTest(Test test, bool recursive)
-        {
-            TNode topNode = test.ToXml(true);
-            CheckXmlForTest(test, topNode, recursive);
-        }
-
-        private void CheckXmlForTest(Test test, TNode topNode, bool recursive)
-        {
-            Assert.That(topNode, Is.Not.Null);
-
-            //if (test is TestSuite)
-            //{
-            //    Assert.That(xmlNode.Name, Is.EqualTo("test-suite"));
-            //    Assert.That(xmlNode.Attributes["type"].Value, Is.EqualTo(test.XmlElementName));
-            //}
-            //else
-            //{
-            //    Assert.That(xmlNode.Name, Is.EqualTo("test-case"));
-            //}
-
-            Assert.That(topNode.Name, Is.EqualTo(test.XmlElementName));
-            Assert.That(topNode.Attributes["id"], Is.EqualTo(test.Id));
-            Assert.That(topNode.Attributes["name"], Is.EqualTo(test.Name));
-            Assert.That(topNode.Attributes["fullname"], Is.EqualTo(test.FullName));
-            if (test.TypeInfo is not null)
-            {
-                Assert.That(test.ClassName, Is.Not.Null);
-                Assert.That(topNode.Attributes["classname"], Is.EqualTo(test.ClassName));
+                Event? e = q.Dequeue(false);
+                Assert.That(e, Is.Not.Null);
+                Assert.That(e.GetType(), Is.EqualTo(Events[index].GetType()), $"Event {index}");
             }
-            if (test is TestMethod)
+        }
+
+        private static void StartPump(EventPump pump, int waitTime)
+        {
+            pump.Start();
+            WaitForPumpToStart(pump, waitTime);
+        }
+
+        private static void StopPump(EventPump pump, int waitTime)
+        {
+            pump.Stop();
+            WaitForPumpToStop(pump, waitTime);
+        }
+
+        private static void WaitForPumpToStart(EventPump pump, int waitTime)
+        {
+            while (waitTime > 0 && pump.PumpState != EventPumpState.Pumping)
             {
-                Assert.That(test.MethodName, Is.Not.Null);
-                Assert.That(topNode.Attributes["methodname"], Is.EqualTo(test.MethodName));
+                Thread.Sleep(100);
+                waitTime -= 100;
             }
-            Assert.That(topNode.Attributes["runstate"], Is.EqualTo(test.RunState.ToString()));
+        }
 
-            if (test.Properties.Keys.Count > 0)
+        private static void WaitForPumpToStop(EventPump pump, int waitTime)
+        {
+            while (waitTime > 0 && pump.PumpState != EventPumpState.Stopped)
             {
-                var expectedProps = new List<string>();
-                foreach (string key in test.Properties.Keys)
-                {
-                    foreach (object? value in test.Properties[key])
-                    {
-                        if (value is not null)
-                            expectedProps.Add(key + "=" + value);
-                    }
-                }
+                Thread.Sleep(100);
+                waitTime -= 100;
+            }
+        }
 
-                TNode? propsNode = topNode.SelectSingleNode("properties");
-                Assert.That(propsNode, Is.Not.Null);
+        #region EventQueue Tests
 
-                var actualProps = new List<string>();
-                foreach (TNode node in propsNode.ChildNodes)
-                {
-                    string? name = node.Attributes["name"];
-                    string? value = node.Attributes["value"];
-                    Assert.Multiple(() =>
-                    {
-                        Assert.That(name, Is.Not.Null);
-                        Assert.That(value, Is.Not.Null);
-                    });
-                    actualProps.Add(name + "=" + value);
-                }
+        [Test]
+        public void QueueEvents()
+        {
+            EventQueue q = new EventQueue();
+            EnqueueEvents(q);
+            VerifyQueue(q);
+        }
 
-                Assert.That(actualProps, Is.EquivalentTo(expectedProps));
+        [Test]
+        public void DequeueEmpty()
+        {
+            EventQueue q = new EventQueue();
+            Assert.That(q.Dequeue(false), Is.Null);
+        }
+
+        [TestFixture]
+        public class DequeueBlocking_StopTest : ProducerConsumerTest
+        {
+            private volatile int _receivedEvents;
+
+            [Test]
+#if THREAD_ABORT
+            [Timeout(1000)]
+#endif
+            public void DequeueBlocking_Stop()
+            {
+                var q = new EventQueue();
+                _receivedEvents = 0;
+                RunProducerConsumer(q);
+                Assert.That(_receivedEvents, Is.EqualTo(Events.Length + 1));
             }
 
-            if (recursive)
+            protected override void Producer(object? parameter)
             {
-                if (test is TestSuite suite)
-                {
-                    foreach (Test child in suite.Tests)
-                    {
-                        string xpathQuery = $"{child.XmlElementName}[@id={child.Id}]";
-                        TNode? childNode = topNode.SelectSingleNode(xpathQuery);
-                        Assert.That(childNode, Is.Not.Null, $"Expected node for test with ID={child.Id}, Name={child.Name}");
+                if (parameter is not EventQueue q)
+                    throw new ArgumentException("Expected an EventQueue", nameof(parameter));
+                EnqueueEvents(q);
+                while (_receivedEvents < Events.Length)
+                    Thread.Sleep(30);
 
-                        CheckXmlForTest(child, childNode, recursive);
-                    }
+                q.Stop();
+            }
+
+            protected override void Consumer(object? parameter)
+            {
+                if (parameter is not EventQueue q)
+                    throw new ArgumentException("Expected an EventQueue", nameof(parameter));
+                Event? e;
+                do
+                {
+                    e = q.Dequeue(true);
+                    _receivedEvents++;
+                    Thread.MemoryBarrier();
                 }
+                while (e is not null);
             }
         }
 
         #endregion
 
-        public class DummyFixture
+        #region QueuingEventListener Tests
+
+        [Test]
+        public void SendEvents()
         {
-            public void DummyMethod()
+            QueuingEventListener el = new QueuingEventListener();
+            SendEvents(el);
+            VerifyQueue(el.Events);
+        }
+
+        #endregion
+
+        #region EventPump Tests
+
+        [Test]
+        public void StartAndStopPumpOnEmptyQueue()
+        {
+            using (EventPump pump = new EventPump(TestListener.NULL, new EventQueue()))
             {
-            }
-            public void ParameterizedMethod(int x)
-            {
-            }
-            public void GenericMethod<T>(T x)
-            {
+                pump.Name = "StartAndStopPumpOnEmptyQueue";
+                StartPump(pump, 1000);
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Pumping));
+                StopPump(pump, 1000);
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Stopped));
             }
         }
 
-        public class DummyGenericFixture<T>
+        [Test]
+#if THREAD_ABORT
+        [Timeout(3000)]
+#endif
+        public void PumpEvents()
         {
+            EventQueue q = new EventQueue();
+            QueuingEventListener el = new QueuingEventListener();
+            using (EventPump pump = new EventPump(el, q))
+            {
+                pump.Name = "PumpEvents";
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Stopped));
+                StartPump(pump, 1000);
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Pumping));
+                EnqueueEvents(q);
+                StopPump(pump, 1000);
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Stopped));
+            }
+            VerifyQueue(el.Events);
+        }
+
+        [Test]
+#if THREAD_ABORT
+        [Timeout(3000)]
+#endif
+        public void PumpSynchronousAndAsynchronousEvents()
+        {
+            EventQueue q = new EventQueue();
+            using (EventPump pump = new EventPump(TestListener.NULL, q))
+            {
+                pump.Name = "PumpSynchronousAndAsynchronousEvents";
+                pump.Start();
+
+                int numberOfAsynchronousEvents = 0;
+                int sumOfAsynchronousQueueLength = 0;
+                const int repetitions = 2;
+                for (int i = 0; i < repetitions; i++)
+                {
+                    foreach (Event e in Events)
+                    {
+                        q.Enqueue(e);
+
+                        sumOfAsynchronousQueueLength += q.Count;
+                        numberOfAsynchronousEvents++;
+                    }
+                }
+
+                Console.WriteLine("Average queue length: {0}", (float)sumOfAsynchronousQueueLength / numberOfAsynchronousEvents);
+            }
+        }
+
+        #endregion
+
+        public abstract class ProducerConsumerTest
+        {
+            private volatile Exception? _myConsumerException;
+
+            protected void RunProducerConsumer(object? parameter)
+            {
+                _myConsumerException = null;
+                Thread consumerThread = new Thread(ConsumerThreadWrapper);
+                try
+                {
+                    consumerThread.Start(parameter);
+                    Producer(parameter);
+                    bool consumerStopped = consumerThread.Join(1000);
+                    Assert.That(consumerStopped, Is.True);
+                }
+                finally
+                {
+#if THREAD_ABORT
+                    ThreadUtility.Kill(consumerThread);
+#endif
+                }
+
+                Assert.That(_myConsumerException, Is.Null);
+            }
+
+            protected abstract void Producer(object? parameter);
+
+            protected abstract void Consumer(object? parameter);
+
+            private void ConsumerThreadWrapper(object? parameter)
+            {
+                try
+                {
+                    Consumer(parameter);
+                }
+#if THREAD_ABORT
+                catch (System.Threading.ThreadAbortException)
+                {
+                    Thread.ResetAbort();
+                }
+#endif
+                catch (Exception ex)
+                {
+                    _myConsumerException = ex;
+                }
+            }
+        }
+
+        private class EventProducer
+        {
+            public readonly Thread ProducerThread;
+            public int SentEventsCount;
+            public int MaxQueueLength;
+            public Exception? Exception;
+            private readonly EventQueue _queue;
+            private readonly bool _delay;
+
+            public EventProducer(EventQueue q, int id, bool delay)
+            {
+                _queue = q;
+                ProducerThread = new Thread(new ThreadStart(Produce));
+                ProducerThread.Name = GetType().FullName + id;
+                _delay = delay;
+            }
+
+            private void Produce()
+            {
+                try
+                {
+                    Event e = new TestStartedEvent(new TestSuite("Dummy"));
+                    DateTime start = DateTime.Now;
+                    while (DateTime.Now - start <= TimeSpan.FromSeconds(3))
+                    {
+                        _queue.Enqueue(e);
+                        SentEventsCount++;
+                        MaxQueueLength = Math.Max(_queue.Count, MaxQueueLength);
+
+                        // without Sleep or with just a Sleep(0), the EventPump thread does not keep up and the queue gets very long
+                        if (_delay)
+                            Thread.Sleep(1);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Exception = ex;
+                }
+            }
         }
     }
 }

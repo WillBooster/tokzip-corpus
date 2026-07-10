@@ -1,81 +1,97 @@
-import 'dart:io';
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
+import 'package:http/http.dart' as http;
 
-void main() async {
-  final dio = Dio();
-  dio.options
-    ..baseUrl = 'https://httpbin.org/'
-    ..connectTimeout = const Duration(seconds: 5)
-    ..receiveTimeout = const Duration(seconds: 5)
-    ..validateStatus = (int? status) {
-      return status != null && status > 0;
-    }
-    ..headers = {
-      HttpHeaders.userAgentHeader: 'dio',
-      'common-header': 'xx',
-    };
+const _kIsWeb = bool.hasEnvironment('dart.library.js_util')
+    ? bool.fromEnvironment('dart.library.js_util')
+    : identical(0, 0.0);
 
-  // Or you can create dio instance and config it as follow:
-  //  final dio = Dio(BaseOptions(
-  //    baseUrl: "http://www.dtworkroom.com/doris/1/2.0.0/",
-  //    connectTimeout: const Duration(seconds: 5),
-  //    receiveTimeout: const Duration(seconds: 5),
-  //    headers: {
-  //      HttpHeaders.userAgentHeader: 'dio',
-  //      'common-header': 'xx',
-  //    },
-  //  ));
-  dio.interceptors
-    ..add(
-      InterceptorsWrapper(
-        onRequest: (options, handler) {
-          // return handler.resolve( Response(data:"xxx"));
-          // return handler.reject( DioException(message: "eh"));
-          return handler.next(options);
-        },
+/// A conversion layer which translates [Dio] requests to
+/// [`http`](https://pub.dev/packages/http) compatible requests.
+/// This enables you to use
+/// [`cronet_http`](https://pub.dev/packages/cronet_http),
+/// [`cupertino_http`](https://pub.dev/packages/cupertino_http),
+/// and other `http` compatible packages with [Dio].
+class ConversionLayerAdapter implements HttpClientAdapter {
+  ConversionLayerAdapter(this.client);
+
+  /// The client instance from the `http` package.
+  final http.Client client;
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<dynamic>? cancelFuture,
+  ) async {
+    final request = await _fromOptionsAndStream(options, requestStream);
+    final response = await client.send(request);
+    return ResponseBody(
+      response.stream.cast<Uint8List>(),
+      response.statusCode,
+      statusMessage: response.reasonPhrase,
+      isRedirect: response.isRedirect,
+      headers: Map.fromEntries(
+        response.headers.entries.map((e) => MapEntry(e.key, [e.value])),
       ),
-    )
-    ..add(LogInterceptor(responseBody: false)); //Open log;
+    );
+  }
 
-  Response response = await dio.get('https://pub.dev/');
+  @override
+  void close({bool force = false}) => client.close();
 
-  // Download a file
-  response = await dio.download(
-    'https://pub.dev/',
-    './example/xx.html',
-    queryParameters: {'a': 1},
-    onReceiveProgress: (received, total) {
-      print('received: $received, total: $total');
-    },
-  );
-
-  // Create a FormData
-  final formData = FormData.fromMap({
-    'age': 25,
-    'file': await MultipartFile.fromFile(
-      './example/upload.txt',
-      filename: 'upload.txt',
-    ),
-  });
-
-  // Send FormData
-  response = await dio.post('/test', data: formData);
-  print(response);
-
-  // post data with "application/x-www-form-urlencoded" format
-  response = await dio.post(
-    '/test',
-    data: {
-      'id': 8,
-      'info': {
-        'name': 'wendux',
-        'age': 25,
-      },
-    },
-    options: Options(
-      contentType: Headers.formUrlEncodedContentType,
-    ),
-  );
-  print(response.data);
+  Future<http.BaseRequest> _fromOptionsAndStream(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+  ) async {
+    final http.BaseRequest request;
+    if (_kIsWeb && requestStream != null) {
+      final normalRequest = request = http.Request(
+        options.method,
+        options.uri,
+      );
+      final completer = Completer<Uint8List>();
+      final sink = ByteConversionSink.withCallback(
+        (bytes) => completer.complete(
+          bytes is Uint8List ? bytes : Uint8List.fromList(bytes),
+        ),
+      );
+      requestStream.listen(
+        sink.add,
+        onError: completer.completeError,
+        onDone: sink.close,
+        cancelOnError: true,
+      );
+      final bytes = await completer.future;
+      normalRequest.bodyBytes = bytes;
+    } else if (requestStream != null) {
+      final streamedRequest = request = http.StreamedRequest(
+        options.method,
+        options.uri,
+      );
+      requestStream.listen(
+        streamedRequest.sink.add,
+        onError: streamedRequest.sink.addError,
+        onDone: streamedRequest.sink.close,
+        cancelOnError: true,
+      );
+    } else {
+      request = http.Request(options.method, options.uri);
+    }
+    request.headers.addAll(
+      Map.fromEntries(
+        options.headers.entries.map(
+          (e) => MapEntry(e.key, e.value.toString().trim()),
+        ),
+      ),
+    );
+    request
+      ..followRedirects = options.followRedirects
+      ..maxRedirects = options.maxRedirects
+      ..persistentConnection = options.persistentConnection;
+    return request;
+  }
 }

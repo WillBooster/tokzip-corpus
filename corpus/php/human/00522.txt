@@ -1,389 +1,546 @@
-<?php declare(strict_types=1);
+<?php
 
-/*
- * This file is part of Composer.
- *
- * (c) Nils Adermann <naderman@naderman.de>
- *     Jordi Boggiano <j.boggiano@seld.be>
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
- */
+namespace GuzzleHttp\Tests;
 
-namespace Composer;
-
-use Composer\IO\IOInterface;
-use Composer\Pcre\Preg;
-use Composer\Util\Filesystem;
-use Composer\Util\Platform;
-use Composer\Util\Silencer;
-use Symfony\Component\Finder\Finder;
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\BadResponseException;
+use GuzzleHttp\Exception\TooManyRedirectsException;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Middleware;
+use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Response;
+use GuzzleHttp\RedirectMiddleware;
+use PHPUnit\Framework\TestCase;
+use Psr\Http\Message\RequestInterface;
 
 /**
- * Reads/writes to a filesystem cache
- *
- * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @covers \GuzzleHttp\RedirectMiddleware
  */
-class Cache
+class RedirectMiddlewareTest extends TestCase
 {
-    /** @var bool|null */
-    private static $cacheCollected = null;
-    /** @var IOInterface */
-    private $io;
-    /** @var string */
-    private $root;
-    /** @var ?bool */
-    private $enabled = null;
-    /** @var string */
-    private $allowlist;
-    /** @var Filesystem */
-    private $filesystem;
-    /** @var bool */
-    private $readOnly;
-
-    /**
-     * @param string      $cacheDir   location of the cache
-     * @param string      $allowlist  List of characters that are allowed in path names (used in a regex character class)
-     * @param Filesystem  $filesystem optional filesystem instance
-     * @param bool        $readOnly   whether the cache is in readOnly mode
-     */
-    public function __construct(IOInterface $io, string $cacheDir, string $allowlist = 'a-z0-9._', ?Filesystem $filesystem = null, bool $readOnly = false)
+    public function testIgnoresNonRedirects()
     {
-        $this->io = $io;
-        $this->root = rtrim($cacheDir, '/\\') . '/';
-        $this->allowlist = $allowlist;
-        $this->filesystem = $filesystem ?: new Filesystem();
-        $this->readOnly = (bool) $readOnly;
+        $response = new Response(200);
+        $stack = new HandlerStack(new MockHandler([$response]));
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com');
+        $promise = $handler($request, []);
+        $response = $promise->wait();
+        self::assertSame(200, $response->getStatusCode());
+    }
 
-        if (!self::isUsable($cacheDir)) {
-            $this->enabled = false;
+    public function testIgnoresWhenNoLocation()
+    {
+        $response = new Response(304);
+        $stack = new HandlerStack(new MockHandler([$response]));
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com');
+        $promise = $handler($request, []);
+        $response = $promise->wait();
+        self::assertSame(304, $response->getStatusCode());
+    }
+
+    public function testRedirectsWithAbsoluteUri()
+    {
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://test.com']),
+            new Response(200),
+        ]);
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com?a=b');
+        $promise = $handler($request, [
+            'allow_redirects' => ['max' => 2],
+        ]);
+        $response = $promise->wait();
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame('http://test.com', (string) $mock->getLastRequest()->getUri());
+    }
+
+    public function testRedirectsWithRelativeUri()
+    {
+        $mock = new MockHandler([
+            new Response(302, ['Location' => '/foo']),
+            new Response(200),
+        ]);
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com?a=b');
+        $promise = $handler($request, [
+            'allow_redirects' => ['max' => 2],
+        ]);
+        $response = $promise->wait();
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame('http://example.com/foo', (string) $mock->getLastRequest()->getUri());
+    }
+
+    public function testLimitsToMaxRedirects()
+    {
+        $mock = new MockHandler([
+            new Response(301, ['Location' => 'http://test.com']),
+            new Response(302, ['Location' => 'http://test.com']),
+            new Response(303, ['Location' => 'http://test.com']),
+            new Response(304, ['Location' => 'http://test.com']),
+        ]);
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com');
+        $promise = $handler($request, ['allow_redirects' => ['max' => 3]]);
+
+        $this->expectException(TooManyRedirectsException::class);
+        $this->expectExceptionMessage('Will not follow more than 3 redirects');
+        $promise->wait();
+    }
+
+    public function testTooManyRedirectsExceptionHasResponse()
+    {
+        $mock = new MockHandler([
+            new Response(301, ['Location' => 'http://test.com']),
+            new Response(302, ['Location' => 'http://test.com']),
+        ]);
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com');
+        $promise = $handler($request, ['allow_redirects' => ['max' => 1]]);
+
+        try {
+            $promise->wait();
+            self::fail();
+        } catch (TooManyRedirectsException $e) {
+            self::assertSame(302, $e->getResponse()->getStatusCode());
         }
     }
 
-    /**
-     * @return void
-     */
-    public function setReadOnly(bool $readOnly)
+    public function testEnsuresProtocolIsValid()
     {
-        $this->readOnly = (bool) $readOnly;
+        $mock = new MockHandler([
+            new Response(301, ['Location' => 'ftp://test.com']),
+        ]);
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com');
+
+        $this->expectException(BadResponseException::class);
+        $this->expectExceptionMessage('Redirect URI,');
+        $handler($request, ['allow_redirects' => ['max' => 3]])->wait();
+    }
+
+    public function testAddsRefererHeader()
+    {
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://test.com']),
+            new Response(200),
+        ]);
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com?a=b');
+        $promise = $handler($request, [
+            'allow_redirects' => ['max' => 2, 'referer' => true],
+        ]);
+        $promise->wait();
+        self::assertSame(
+            'http://example.com?a=b',
+            $mock->getLastRequest()->getHeaderLine('Referer')
+        );
+    }
+
+    public function testAddsRefererHeaderButClearsUserInfo()
+    {
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://test.com']),
+            new Response(200),
+        ]);
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://foo:bar@example.com?a=b');
+        $promise = $handler($request, [
+            'allow_redirects' => ['max' => 2, 'referer' => true],
+        ]);
+        $promise->wait();
+        self::assertSame(
+            'http://example.com?a=b',
+            $mock->getLastRequest()->getHeaderLine('Referer')
+        );
+    }
+
+    public function testAddsGuzzleRedirectHeader()
+    {
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://example.com']),
+            new Response(302, ['Location' => 'http://example.com/foo']),
+            new Response(302, ['Location' => 'http://example.com/bar']),
+            new Response(200),
+        ]);
+
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com?a=b');
+        $promise = $handler($request, [
+            'allow_redirects' => ['track_redirects' => true],
+        ]);
+        $response = $promise->wait(true);
+        self::assertSame(
+            [
+                'http://example.com',
+                'http://example.com/foo',
+                'http://example.com/bar',
+            ],
+            $response->getHeader(RedirectMiddleware::HISTORY_HEADER)
+        );
+    }
+
+    public function testAddsGuzzleRedirectStatusHeader()
+    {
+        $mock = new MockHandler([
+            new Response(301, ['Location' => 'http://example.com']),
+            new Response(302, ['Location' => 'http://example.com/foo']),
+            new Response(301, ['Location' => 'http://example.com/bar']),
+            new Response(302, ['Location' => 'http://example.com/baz']),
+            new Response(200),
+        ]);
+
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com?a=b');
+        $promise = $handler($request, [
+            'allow_redirects' => ['track_redirects' => true],
+        ]);
+        $response = $promise->wait(true);
+        self::assertSame(
+            [
+                '301',
+                '302',
+                '301',
+                '302',
+            ],
+            $response->getHeader(RedirectMiddleware::STATUS_HISTORY_HEADER)
+        );
+    }
+
+    public function testDoesNotAddRefererWhenGoingFromHttpsToHttp()
+    {
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://test.com']),
+            new Response(200),
+        ]);
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'https://example.com?a=b');
+        $promise = $handler($request, [
+            'allow_redirects' => ['max' => 2, 'referer' => true],
+        ]);
+        $promise->wait();
+        self::assertFalse($mock->getLastRequest()->hasHeader('Referer'));
+    }
+
+    public function testInvokesOnRedirectForRedirects()
+    {
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://test.com']),
+            new Response(200),
+        ]);
+        $stack = new HandlerStack($mock);
+        $stack->push(Middleware::redirect());
+        $handler = $stack->resolve();
+        $request = new Request('GET', 'http://example.com?a=b');
+        $call = false;
+        $promise = $handler($request, [
+            'allow_redirects' => [
+                'max' => 2,
+                'on_redirect' => static function ($request, $response, $uri) use (&$call) {
+                    self::assertSame(302, $response->getStatusCode());
+                    self::assertSame('GET', $request->getMethod());
+                    self::assertSame('http://test.com', (string) $uri);
+                    $call = true;
+                },
+            ],
+        ]);
+        $promise->wait();
+        self::assertTrue($call);
     }
 
     /**
-     * @return bool
+     * @testWith ["digest"]
+     *           ["ntlm"]
      */
-    public function isReadOnly()
+    public function testRemoveCurlAuthorizationOptionsOnRedirectCrossHost($auth)
     {
-        return $this->readOnly;
-    }
-
-    /**
-     * @return bool
-     */
-    public static function isUsable(string $path)
-    {
-        return !Preg::isMatch('{(^|[\\\\/])(\$null|nul|NUL|/dev/null)([\\\\/]|$)}', $path);
-    }
-
-    /**
-     * @return bool
-     */
-    public function isEnabled()
-    {
-        if ($this->enabled === null) {
-            $this->enabled = true;
-
-            if (
-                !$this->readOnly
-                && (
-                    (!is_dir($this->root) && !Silencer::call('mkdir', $this->root, 0777, true))
-                    || !is_writable($this->root)
-                )
-            ) {
-                $this->io->writeError('<warning>Cannot create cache directory ' . $this->root . ', or directory is not writable. Proceeding without cache. See also cache-read-only config if your filesystem is read-only.</warning>');
-                $this->enabled = false;
-            }
+        if (!defined('\CURLOPT_HTTPAUTH')) {
+            self::markTestSkipped('ext-curl is required for this test');
         }
 
-        return $this->enabled;
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://test.com']),
+            static function (RequestInterface $request, $options) {
+                self::assertFalse(
+                    isset($options['curl'][\CURLOPT_HTTPAUTH]),
+                    'curl options still contain CURLOPT_HTTPAUTH entry'
+                );
+                self::assertFalse(
+                    isset($options['curl'][\CURLOPT_USERPWD]),
+                    'curl options still contain CURLOPT_USERPWD entry'
+                );
+
+                return new Response(200);
+            },
+        ]);
+        $handler = HandlerStack::create($mock);
+        $client = new Client(['handler' => $handler]);
+        $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
     }
 
     /**
-     * @return string
+     * @testWith ["digest"]
+     *           ["ntlm"]
      */
-    public function getRoot()
+    public function testRemoveCurlAuthorizationOptionsOnRedirectCrossPort($auth)
     {
-        return $this->root;
-    }
-
-    /**
-     * @return string|false
-     */
-    public function read(string $file)
-    {
-        if ($this->isEnabled()) {
-            $file = Preg::replace('{[^'.$this->allowlist.']}i', '-', $file);
-            if (file_exists($this->root . $file)) {
-                $this->io->writeError('Reading '.$this->root . $file.' from cache', true, IOInterface::DEBUG);
-
-                return file_get_contents($this->root . $file);
-            }
+        if (!defined('\CURLOPT_HTTPAUTH')) {
+            self::markTestSkipped('ext-curl is required for this test');
         }
 
-        return false;
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://example.com:81/']),
+            static function (RequestInterface $request, $options) {
+                self::assertFalse(
+                    isset($options['curl'][\CURLOPT_HTTPAUTH]),
+                    'curl options still contain CURLOPT_HTTPAUTH entry'
+                );
+                self::assertFalse(
+                    isset($options['curl'][\CURLOPT_USERPWD]),
+                    'curl options still contain CURLOPT_USERPWD entry'
+                );
+
+                return new Response(200);
+            },
+        ]);
+        $handler = HandlerStack::create($mock);
+        $client = new Client(['handler' => $handler]);
+        $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
     }
 
     /**
-     * @return bool
+     * @testWith ["digest"]
+     *           ["ntlm"]
      */
-    public function write(string $file, string $contents)
+    public function testRemoveCurlAuthorizationOptionsOnRedirectCrossScheme($auth)
     {
-        $wasEnabled = $this->enabled === true;
-
-        if ($this->isEnabled() && !$this->readOnly) {
-            $file = Preg::replace('{[^'.$this->allowlist.']}i', '-', $file);
-
-            $this->io->writeError('Writing '.$this->root . $file.' into cache', true, IOInterface::DEBUG);
-
-            $tempFileName = $this->root . $file . uniqid('.', true) . '.tmp';
-            try {
-                return file_put_contents($tempFileName, $contents) !== false && rename($tempFileName, $this->root . $file);
-            } catch (\ErrorException $e) {
-                // If the write failed despite isEnabled checks passing earlier, rerun the isEnabled checks to
-                // see if they are still current and recreate the cache dir if needed. Refs https://github.com/composer/composer/issues/11076
-                if ($wasEnabled) {
-                    clearstatcache();
-                    $this->enabled = null;
-                    return $this->write($file, $contents);
-                }
-
-                $this->io->writeError('<warning>Failed to write into cache: '.$e->getMessage().'</warning>', true, IOInterface::DEBUG);
-                if (Preg::isMatch('{^file_put_contents\(\): Only ([0-9]+) of ([0-9]+) bytes written}', $e->getMessage(), $m)) {
-                    // Remove partial file.
-                    unlink($tempFileName);
-
-                    $message = sprintf(
-                        '<warning>Writing %1$s into cache failed after %2$u of %3$u bytes written, only %4$s bytes of free space available</warning>',
-                        $tempFileName,
-                        $m[1],
-                        $m[2],
-                        function_exists('disk_free_space') ? @disk_free_space(dirname($tempFileName)) : 'unknown'
-                    );
-
-                    $this->io->writeError($message);
-
-                    return false;
-                }
-
-                throw $e;
-            }
+        if (!defined('\CURLOPT_HTTPAUTH')) {
+            self::markTestSkipped('ext-curl is required for this test');
         }
 
-        return false;
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://example.com?a=b']),
+            static function (RequestInterface $request, $options) {
+                self::assertFalse(
+                    isset($options['curl'][\CURLOPT_HTTPAUTH]),
+                    'curl options still contain CURLOPT_HTTPAUTH entry'
+                );
+                self::assertFalse(
+                    isset($options['curl'][\CURLOPT_USERPWD]),
+                    'curl options still contain CURLOPT_USERPWD entry'
+                );
+
+                return new Response(200);
+            },
+        ]);
+        $handler = HandlerStack::create($mock);
+        $client = new Client(['handler' => $handler]);
+        $client->get('https://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
     }
 
     /**
-     * Copy a file into the cache
+     * @testWith ["digest"]
+     *           ["ntlm"]
+     */
+    public function testRemoveCurlAuthorizationOptionsOnRedirectCrossSchemeSamePort($auth)
+    {
+        if (!defined('\CURLOPT_HTTPAUTH')) {
+            self::markTestSkipped('ext-curl is required for this test');
+        }
+
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://example.com:80?a=b']),
+            static function (RequestInterface $request, $options) {
+                self::assertFalse(
+                    isset($options['curl'][\CURLOPT_HTTPAUTH]),
+                    'curl options still contain CURLOPT_HTTPAUTH entry'
+                );
+                self::assertFalse(
+                    isset($options['curl'][\CURLOPT_USERPWD]),
+                    'curl options still contain CURLOPT_USERPWD entry'
+                );
+
+                return new Response(200);
+            },
+        ]);
+        $handler = HandlerStack::create($mock);
+        $client = new Client(['handler' => $handler]);
+        $client->get('https://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
+    }
+
+    /**
+     * @testWith ["digest"]
+     *           ["ntlm"]
+     */
+    public function testNotRemoveCurlAuthorizationOptionsOnRedirect($auth)
+    {
+        if (!defined('\CURLOPT_HTTPAUTH') || !defined('\CURLOPT_USERPWD')) {
+            self::markTestSkipped('ext-curl is required for this test');
+        }
+
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://example.com/2']),
+            static function (RequestInterface $request, $options) {
+                self::assertTrue(
+                    isset($options['curl'][\CURLOPT_HTTPAUTH]),
+                    'curl options does not contain expected CURLOPT_HTTPAUTH entry'
+                );
+                self::assertTrue(
+                    isset($options['curl'][\CURLOPT_USERPWD]),
+                    'curl options does not contain expected CURLOPT_USERPWD entry'
+                );
+
+                return new Response(200);
+            },
+        ]);
+        $handler = HandlerStack::create($mock);
+        $client = new Client(['handler' => $handler]);
+        $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
+    }
+
+    public function crossOriginRedirectProvider()
+    {
+        return [
+            ['http://example.com/123', 'http://example.com/', false],
+            ['http://example.com/123', 'http://example.com:80/', false],
+            ['http://example.com:80/123', 'http://example.com/', false],
+            ['http://example.com:80/123', 'http://example.com:80/', false],
+            ['http://example.com/123', 'https://example.com/', true],
+            ['http://example.com/123', 'http://www.example.com/', true],
+            ['http://example.com/123', 'http://example.com:81/', true],
+            ['http://example.com:80/123', 'http://example.com:81/', true],
+            ['https://example.com/123', 'https://example.com/', false],
+            ['https://example.com/123', 'https://example.com:443/', false],
+            ['https://example.com:443/123', 'https://example.com/', false],
+            ['https://example.com:443/123', 'https://example.com:443/', false],
+            ['https://example.com/123', 'http://example.com/', true],
+            ['https://example.com/123', 'https://www.example.com/', true],
+            ['https://example.com/123', 'https://example.com:444/', true],
+            ['https://example.com:443/123', 'https://example.com:444/', true],
+        ];
+    }
+
+    /**
+     * @dataProvider crossOriginRedirectProvider
+     */
+    public function testHeadersTreatmentOnRedirect($originalUri, $targetUri, $isCrossOrigin)
+    {
+        $mock = new MockHandler([
+            new Response(302, ['Location' => $targetUri]),
+            static function (RequestInterface $request) use ($isCrossOrigin) {
+                self::assertSame(!$isCrossOrigin, $request->hasHeader('Authorization'));
+                self::assertSame(!$isCrossOrigin, $request->hasHeader('Cookie'));
+
+                return new Response(200);
+            },
+        ]);
+        $handler = HandlerStack::create($mock);
+        $client = new Client(['handler' => $handler]);
+        $client->get($originalUri, ['auth' => ['testuser', 'testpass'], 'headers' => ['Cookie' => 'foo=bar']]);
+    }
+
+    public function testNotRemoveAuthorizationHeaderOnRedirect()
+    {
+        $mock = new MockHandler([
+            new Response(302, ['Location' => 'http://example.com/2']),
+            static function (RequestInterface $request) {
+                self::assertTrue($request->hasHeader('Authorization'));
+
+                return new Response(200);
+            },
+        ]);
+        $handler = HandlerStack::create($mock);
+        $client = new Client(['handler' => $handler]);
+        $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass']]);
+    }
+
+    /**
+     * Verifies how RedirectMiddleware::modifyRequest() modifies the method and body of a request issued when
+     * encountering a redirect response.
      *
-     * @return bool
-     */
-    public function copyFrom(string $file, string $source)
-    {
-        if ($this->isEnabled() && !$this->readOnly) {
-            $file = Preg::replace('{[^'.$this->allowlist.']}i', '-', $file);
-            $this->filesystem->ensureDirectoryExists(dirname($this->root . $file));
-
-            if (!file_exists($source)) {
-                $this->io->writeError('<error>'.$source.' does not exist, can not write into cache</error>');
-            } elseif ($this->io->isDebug()) {
-                $this->io->writeError('Writing '.$this->root . $file.' into cache from '.$source);
-            }
-
-            return copy($source, $this->root . $file);
-        }
-
-        return false;
-    }
-
-    /**
-     * Copy a file out of the cache
+     * @dataProvider modifyRequestFollowRequyestMethodAndBodyProvider
      *
-     * @return bool
+     * @param string $expectedFollowRequestMethod
      */
-    public function copyTo(string $file, string $target)
-    {
-        if ($this->isEnabled()) {
-            $file = Preg::replace('{[^'.$this->allowlist.']}i', '-', $file);
-            if (file_exists($this->root . $file)) {
-                try {
-                    touch($this->root . $file, (int) filemtime($this->root . $file), time());
-                } catch (\ErrorException $e) {
-                    // fallback in case the above failed due to incorrect ownership
-                    // see https://github.com/composer/composer/issues/4070
-                    Silencer::call('touch', $this->root . $file);
-                }
+    public function testModifyRequestFollowRequestMethodAndBody(
+        RequestInterface $request,
+        $expectedFollowRequestMethod
+    ) {
+        $redirectMiddleware = new RedirectMiddleware(static function () {
+        });
 
-                $this->io->writeError('Reading '.$this->root . $file.' from cache', true, IOInterface::DEBUG);
+        $options = [
+            'allow_redirects' => [
+                'protocols' => ['http', 'https'],
+                'strict' => false,
+                'referer' => null,
+            ],
+        ];
 
-                return copy($this->root . $file, $target);
-            }
-        }
+        $modifiedRequest = $redirectMiddleware->modifyRequest($request, $options, new Response());
 
-        return false;
+        self::assertEquals($expectedFollowRequestMethod, $modifiedRequest->getMethod());
+        self::assertEquals(0, $modifiedRequest->getBody()->getSize());
     }
 
     /**
-     * @return bool
+     * @return array
      */
-    public function gcIsNecessary()
+    public function modifyRequestFollowRequyestMethodAndBodyProvider()
     {
-        if (self::$cacheCollected) {
-            return false;
-        }
-
-        self::$cacheCollected = true;
-        if (Platform::getEnv('COMPOSER_TEST_SUITE')) {
-            return false;
-        }
-
-        if (Platform::isInputCompletionProcess()) {
-            return false;
-        }
-
-        return !random_int(0, 50);
-    }
-
-    /**
-     * @return bool
-     */
-    public function remove(string $file)
-    {
-        if ($this->isEnabled() && !$this->readOnly) {
-            $file = Preg::replace('{[^'.$this->allowlist.']}i', '-', $file);
-            if (file_exists($this->root . $file)) {
-                return $this->filesystem->unlink($this->root . $file);
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * @return bool
-     */
-    public function clear()
-    {
-        if ($this->isEnabled() && !$this->readOnly) {
-            $this->filesystem->emptyDirectory($this->root);
-
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * @return int|false
-     * @phpstan-return int<0, max>|false
-     */
-    public function getAge(string $file)
-    {
-        if ($this->isEnabled()) {
-            $file = Preg::replace('{[^'.$this->allowlist.']}i', '-', $file);
-            if (file_exists($this->root . $file) && ($mtime = filemtime($this->root . $file)) !== false) {
-                return abs(time() - $mtime);
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * @return bool
-     */
-    public function gc(int $ttl, int $maxSize)
-    {
-        if ($this->isEnabled() && !$this->readOnly) {
-            $expire = new \DateTime();
-            $expire->modify('-'.$ttl.' seconds');
-
-            $finder = $this->getFinder()->date('until '.$expire->format('Y-m-d H:i:s'));
-            foreach ($finder as $file) {
-                $this->filesystem->unlink($file->getPathname());
-            }
-
-            $totalSize = $this->filesystem->size($this->root);
-            if ($totalSize > $maxSize) {
-                $iterator = $this->getFinder()->sortByAccessedTime()->getIterator();
-                while ($totalSize > $maxSize && $iterator->valid()) {
-                    $filepath = $iterator->current()->getPathname();
-                    $totalSize -= $this->filesystem->size($filepath);
-                    $this->filesystem->unlink($filepath);
-                    $iterator->next();
-                }
-            }
-
-            self::$cacheCollected = true;
-
-            return true;
-        }
-
-        return false;
-    }
-
-    public function gcVcsCache(int $ttl): bool
-    {
-        if ($this->isEnabled()) {
-            $expire = new \DateTime();
-            $expire->modify('-'.$ttl.' seconds');
-
-            $finder = Finder::create()->in($this->root)->directories()->depth(0)->date('until '.$expire->format('Y-m-d H:i:s'));
-            foreach ($finder as $file) {
-                $this->filesystem->removeDirectory($file->getPathname());
-            }
-
-            self::$cacheCollected = true;
-
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * @return string|false
-     */
-    public function sha1(string $file)
-    {
-        if ($this->isEnabled()) {
-            $file = Preg::replace('{[^'.$this->allowlist.']}i', '-', $file);
-            if (file_exists($this->root . $file)) {
-                return sha1_file($this->root . $file);
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * @return string|false
-     */
-    public function sha256(string $file)
-    {
-        if ($this->isEnabled()) {
-            $file = Preg::replace('{[^'.$this->allowlist.']}i', '-', $file);
-            if (file_exists($this->root . $file)) {
-                return hash_file('sha256', $this->root . $file);
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * @return Finder
-     */
-    protected function getFinder()
-    {
-        return Finder::create()->in($this->root)->files();
+        return [
+            'DELETE' => [
+                'request' => new Request('DELETE', 'http://example.com/'),
+                'expectedFollowRequestMethod' => 'GET',
+            ],
+            'GET' => [
+                'request' => new Request('GET', 'http://example.com/'),
+                'expectedFollowRequestMethod' => 'GET',
+            ],
+            'HEAD' => [
+                'request' => new Request('HEAD', 'http://example.com/'),
+                'expectedFollowRequestMethod' => 'HEAD',
+            ],
+            'OPTIONS' => [
+                'request' => new Request('OPTIONS', 'http://example.com/'),
+                'expectedFollowRequestMethod' => 'OPTIONS',
+            ],
+            'PATCH' => [
+                'request' => new Request('PATCH', 'http://example.com/'),
+                'expectedFollowRequestMethod' => 'GET',
+            ],
+            'POST' => [
+                'request' => new Request('POST', 'http://example.com/'),
+                'expectedFollowRequestMethod' => 'GET',
+            ],
+            'PUT' => [
+                'request' => new Request('PUT', 'http://example.com/'),
+                'expectedFollowRequestMethod' => 'GET',
+            ],
+        ];
     }
 }

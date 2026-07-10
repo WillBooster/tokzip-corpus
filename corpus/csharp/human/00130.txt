@@ -1,92 +1,125 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
-using System.Collections.Generic;
-using NUnit.Framework.Interfaces;
+using System;
+using System.Collections;
+using System.ComponentModel;
+using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 
-namespace NUnit.Framework.Tests.Internal.Results
+namespace NUnit.Framework.Internal
 {
-    public class AssertionResultTests : TestResultTests
+    /// <summary>
+    /// <para>
+    /// Examines an attribute argument and tries to simulate what that value would have been if the literal syntax
+    /// which might have defined the value in C# had instead been used as an argument to a given method parameter in a direct call.
+    /// </para>
+    /// <para>
+    /// For example, since you can’t apply attributes using <see cref="decimal"/> arguments, we allow the C# syntax
+    /// <c>10</c> (<see cref="int"/> value) or <c>0.1</c> (<see cref="double"/> value) to be specified.
+    /// NUnit then converts it to match the method’s <see cref="decimal"/> parameters, just as if you were actually
+    /// using the syntax <c>TestMethod(10)</c> or <c>TestMethod(0.1)</c>.
+    /// </para>
+    /// <para>
+    /// For another example, you might have written the syntax <c>10</c> and picked up the <see cref="int"/> attribute
+    /// constructor overload; however, the test method for which this value is intended only has a <see cref="byte"/>
+    /// signature. Again, NUnit simulates what would have happened if the inferred C# syntax was transplanted
+    /// and you were actually using the syntax <c>TestMethod(10)</c>.
+    /// </para>
+    /// </summary>
+    internal static class ParamAttributeTypeConversions
     {
-        [SetUp]
-        public void SimulateTestRun()
+        /// <summary>
+        /// Converts an array of objects to the <paramref name="targetType"/>, if it is supported.
+        /// </summary>
+        public static IEnumerable ConvertData(object?[] data, Type targetType)
         {
-            TestResult.SetResult(ResultState.Success, "Test passed!");
-
-            RecordExpectedAssertions(
-                new AssertionResult(AssertionStatus.Passed, "Message 1", "Stack 1"),
-                new AssertionResult(AssertionStatus.Failed, "Message 2", "Stack 2"));
-
-            SuiteResult.AddResult(TestResult);
+            Guard.ArgumentNotNull(data, nameof(data));
+            Guard.ArgumentNotNull(targetType, nameof(targetType));
+            return GetData(data, targetType);
         }
 
-        private readonly List<AssertionResult> _expectedAssertions = new List<AssertionResult>();
-
-        protected void RecordExpectedAssertions(params AssertionResult[] expectedAssertions)
+        private static IEnumerable GetData(object?[] data, Type targetType)
         {
-            _expectedAssertions.AddRange(expectedAssertions);
-
-            foreach (var assertion in _expectedAssertions)
-                TestResult.RecordAssertion(assertion);
-        }
-
-        [Test]
-        public void TestResult_AssertionResults()
-        {
-            Assert.That(TestResult.AssertionResults, Is.EqualTo(_expectedAssertions));
-        }
-
-        [Test]
-        public void SuiteResult_AssertionResults()
-        {
-            Assert.That(SuiteResult.AssertionResults, Is.Empty);
-        }
-
-        [Test]
-        public void TestResultXml_AssertionResults()
-        {
-            TNode? assertionResults = TestResult.ToXml(true).SelectSingleNode("assertions");
-
-            if (_expectedAssertions.Count == 0)
+            for (int i = 0; i < data.Length; i++)
             {
-                Assert.That(assertionResults, Is.Null, "No <assertions> element expected");
-                return;
+                if (TryConvert(data[i], targetType, out var convertedValue))
+                    data[i] = convertedValue;
             }
 
-            Assert.That(assertionResults, Is.Not.Null, "Expected <assertions> element");
-
-            var assertionNodes = assertionResults.SelectNodes("assertion");
-            Assert.That(assertionNodes, Is.Not.Null, "Empty <assertions> element");
-
-            Assert.That(assertionNodes, Has.Count.EqualTo(_expectedAssertions.Count), "Wrong number of <assertion> elements");
-
-            for (int index = 0; index < _expectedAssertions.Count; index++)
-            {
-                AssertionResult expectedAssertion = _expectedAssertions[index];
-                TNode assertionNode = assertionNodes[index];
-
-                Assert.That(assertionNode.Attributes["result"], Is.EqualTo(expectedAssertion.Status.ToString()));
-
-                if (expectedAssertion.Message is not null)
-                {
-                    TNode? messageNode = assertionNode.SelectSingleNode("message");
-                    Assert.That(messageNode, Is.Not.Null);
-                    Assert.That(messageNode.Value, Is.EqualTo(expectedAssertion.Message));
-                }
-
-                if (expectedAssertion.StackTrace is not null)
-                {
-                    TNode? stackNode = assertionNode.SelectSingleNode("stack-trace");
-                    Assert.That(stackNode, Is.Not.Null);
-                    Assert.That(stackNode.Value, Is.EqualTo(expectedAssertion.StackTrace));
-                }
-            }
+            return data;
         }
 
-        [Test]
-        public void SuiteResultXml_AssertionResults()
+        /// <summary>
+        /// Converts a single value to the <paramref name="targetType"/>, if it is supported.
+        /// </summary>
+        public static object Convert(object? value, Type targetType)
         {
-            TNode suiteNode = SuiteResult.ToXml(true);
-            Assert.That(suiteNode.SelectSingleNode("assertions"), Is.Null);
+            if (TryConvert(value, targetType, out var convertedValue))
+                return convertedValue;
+
+            throw new InvalidOperationException(
+                (value is null ? "Null" : $"A value of type {value.GetType()} ({value})")
+                + $" cannot be passed to a parameter of type {targetType}.");
+        }
+
+        /// <summary>
+        /// Performs several special conversions allowed by NUnit in order to
+        /// permit arguments with types that cannot be used in the constructor
+        /// of an Attribute such as TestCaseAttribute or to simplify their use.
+        /// </summary>
+        /// <param name="value">The value to be converted</param>
+        /// <param name="targetType">The target <see cref="Type"/> in which the <paramref name="value"/> should be converted</param>
+        /// <param name="convertedValue">If conversion was successfully applied, the <paramref name="value"/> converted into <paramref name="targetType"/></param>
+        /// <returns>
+        /// <see langword="true"/> if <paramref name="value"/> was converted and <paramref name="convertedValue"/> should be used;
+        /// <see langword="false"/> is no conversion was applied and <paramref name="convertedValue"/> should be ignored
+        /// </returns>
+        public static bool TryConvert(object? value, Type targetType, [NotNullWhen(true)] out object? convertedValue)
+        {
+            if (targetType.IsInstanceOfType(value))
+            {
+                convertedValue = value;
+                return true;
+            }
+
+            if (value is null || value.GetType().FullName == "System.DBNull")
+            {
+                convertedValue = null;
+                return Reflect.IsAssignableFromNull(targetType);
+            }
+
+            bool convert = false;
+            var underlyingTargetType = Nullable.GetUnderlyingType(targetType) ?? targetType;
+
+            if (underlyingTargetType == typeof(short) || underlyingTargetType == typeof(byte) || underlyingTargetType == typeof(sbyte)
+                || underlyingTargetType == typeof(long) || underlyingTargetType == typeof(double))
+            {
+                convert = value is int;
+            }
+            else if (underlyingTargetType == typeof(decimal))
+            {
+                convert = value is double || value is string || value is int;
+            }
+            else if (underlyingTargetType == typeof(DateTime))
+            {
+                convert = value is string;
+            }
+
+            if (convert)
+            {
+                convertedValue = System.Convert.ChangeType(value, underlyingTargetType, CultureInfo.InvariantCulture);
+                return true;
+            }
+
+            var converter = TypeDescriptor.GetConverter(underlyingTargetType);
+            if (converter.CanConvertFrom(value.GetType()))
+            {
+                convertedValue = converter.ConvertFrom(null, CultureInfo.InvariantCulture, value);
+                return convertedValue is not null;
+            }
+
+            convertedValue = null;
+            return false;
         }
     }
 }

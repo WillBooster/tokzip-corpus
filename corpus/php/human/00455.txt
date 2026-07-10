@@ -10,140 +10,424 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Command;
+namespace Composer\Test\Repository;
 
-use Composer\Installer;
-use Composer\Plugin\CommandEvent;
-use Composer\Plugin\PluginEvents;
-use Composer\Advisory\Auditor;
-use Composer\Util\HttpDownloader;
-use Symfony\Component\Console\Input\InputInterface;
-use Composer\Console\Input\InputOption;
-use Composer\Console\Input\InputArgument;
-use Symfony\Component\Console\Output\OutputInterface;
+use Composer\IO\NullIO;
+use Composer\Json\JsonFile;
+use Composer\Repository\ComposerRepository;
+use Composer\Repository\RepositoryInterface;
+use Composer\Semver\Constraint\Constraint;
+use Composer\Test\Mock\FactoryMock;
+use Composer\Test\TestCase;
+use Composer\Package\Loader\ArrayLoader;
 
-/**
- * @author Jordi Boggiano <j.boggiano@seld.be>
- * @author Ryan Weaver <ryan@knplabs.com>
- * @author Konstantin Kudryashov <ever.zet@gmail.com>
- * @author Nils Adermann <naderman@naderman.de>
- */
-class InstallCommand extends BaseCommand
+class ComposerRepositoryTest extends TestCase
 {
-    use CompletionTrait;
-
     /**
-     * @return void
+     * @dataProvider loadDataProvider
+     *
+     * @param mixed[]              $expected
+     * @param array<string, mixed> $repoPackages
      */
-    protected function configure()
+    public function testLoadData(array $expected, array $repoPackages): void
     {
-        $this
-            ->setName('install')
-            ->setAliases(['i'])
-            ->setDescription('Installs the project dependencies from the composer.lock file if present, or falls back on the composer.json')
-            ->setDefinition([
-                new InputOption('prefer-source', null, InputOption::VALUE_NONE, 'Forces installation from package sources when possible, including VCS information.'),
-                new InputOption('prefer-dist', null, InputOption::VALUE_NONE, 'Forces installation from package dist (default behavior).'),
-                new InputOption('prefer-install', null, InputOption::VALUE_REQUIRED, 'Forces installation from package dist|source|auto (auto chooses source for dev versions, dist for the rest).', null, $this->suggestPreferInstall()),
-                new InputOption('dry-run', null, InputOption::VALUE_NONE, 'Outputs the operations but will not execute anything (implicitly enables --verbose).'),
-                new InputOption('download-only', null, InputOption::VALUE_NONE, 'Download only, do not install packages.'),
-                new InputOption('dev', null, InputOption::VALUE_NONE, 'DEPRECATED: Enables installation of require-dev packages (enabled by default, only present for BC).'),
-                new InputOption('no-suggest', null, InputOption::VALUE_NONE, 'DEPRECATED: This flag does not exist anymore.'),
-                new InputOption('no-dev', null, InputOption::VALUE_NONE, 'Disables installation of require-dev packages.'),
-                new InputOption('no-autoloader', null, InputOption::VALUE_NONE, 'Skips autoloader generation'),
-                new InputOption('no-progress', null, InputOption::VALUE_NONE, 'Do not output download progress.'),
-                new InputOption('no-install', null, InputOption::VALUE_NONE, 'Do not use, only defined here to catch misuse of the install command.'),
-                new InputOption('audit', null, InputOption::VALUE_NONE, 'Run an audit after installation is complete.'),
-                new InputOption('audit-format', null, InputOption::VALUE_REQUIRED, 'Audit output format. Must be "table", "plain", "json", or "summary".', Auditor::FORMAT_SUMMARY, Auditor::FORMATS),
-                new InputOption('verbose', 'v|vv|vvv', InputOption::VALUE_NONE, 'Shows more details including new commits pulled in when updating packages.'),
-                new InputOption('optimize-autoloader', 'o', InputOption::VALUE_NONE, 'Optimize autoloader during autoloader dump'),
-                new InputOption('classmap-authoritative', 'a', InputOption::VALUE_NONE, 'Autoload classes from the classmap only. Implicitly enables `--optimize-autoloader`.'),
-                new InputOption('apcu-autoloader', null, InputOption::VALUE_NONE, 'Use APCu to cache found/not-found classes.'),
-                new InputOption('apcu-autoloader-prefix', null, InputOption::VALUE_REQUIRED, 'Use a custom prefix for the APCu autoloader cache. Implicitly enables --apcu-autoloader'),
-                new InputOption('ignore-platform-req', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Ignore a specific platform requirement (php & ext- packages).'),
-                new InputOption('ignore-platform-reqs', null, InputOption::VALUE_NONE, 'Ignore all platform requirements (php & ext- packages).'),
-                new InputArgument('packages', InputArgument::IS_ARRAY | InputArgument::OPTIONAL, 'Should not be provided, use composer require instead to add a given package to composer.json.'),
+        $repoConfig = [
+            'url' => 'http://example.org',
+        ];
+
+        $repository = $this->getMockBuilder('Composer\Repository\ComposerRepository')
+            ->onlyMethods(['loadRootServerFile'])
+            ->setConstructorArgs([
+                $repoConfig,
+                new NullIO,
+                FactoryMock::createConfig(),
+                $this->getMockBuilder('Composer\Util\HttpDownloader')->disableOriginalConstructor()->getMock(),
+                $this->getMockBuilder('Composer\EventDispatcher\EventDispatcher')->disableOriginalConstructor()->getMock(),
             ])
-            ->setHelp(
-                <<<EOT
-The <info>install</info> command reads the composer.lock file from
-the current directory, processes it, and downloads and installs all the
-libraries and dependencies outlined in that file. If the file does not
-exist it will look for composer.json and do the same.
+            ->getMock();
 
-<info>php composer.phar install</info>
+        $repository
+            ->expects($this->exactly(2))
+            ->method('loadRootServerFile')
+            ->will($this->returnValue($repoPackages));
 
-Read more at https://getcomposer.org/doc/03-cli.md#install-i
-EOT
-            )
-        ;
+        // Triggers initialization
+        $packages = $repository->getPackages();
+
+        // Final sanity check, ensure the correct number of packages were added.
+        self::assertCount(count($expected), $packages);
+
+        foreach ($expected as $index => $pkg) {
+            self::assertSame($pkg['name'].' '.$pkg['version'], $packages[$index]->getName().' '.$packages[$index]->getPrettyVersion());
+        }
     }
 
-    protected function execute(InputInterface $input, OutputInterface $output): int
+    public static function loadDataProvider(): array
     {
-        $io = $this->getIO();
-        if ($input->getOption('dev')) {
-            $io->writeError('<warning>You are using the deprecated option "--dev". It has no effect and will break in Composer 3.</warning>');
+        return [
+            // Old repository format
+            [
+                [
+                    ['name' => 'foo/bar', 'version' => '1.0.0'],
+                ],
+                ['foo/bar' => [
+                    'name' => 'foo/bar',
+                    'versions' => [
+                        '1.0.0' => ['name' => 'foo/bar', 'version' => '1.0.0'],
+                    ],
+                ]],
+            ],
+            // New repository format
+            [
+                [
+                    ['name' => 'bar/foo', 'version' => '3.14'],
+                    ['name' => 'bar/foo', 'version' => '3.145'],
+                ],
+                ['packages' => [
+                    'bar/foo' => [
+                        '3.14' => ['name' => 'bar/foo', 'version' => '3.14'],
+                        '3.145' => ['name' => 'bar/foo', 'version' => '3.145'],
+                    ],
+                ]],
+            ],
+            // New repository format but without versions as keys should also be supported
+            [
+                [
+                    ['name' => 'bar/foo', 'version' => '3.14'],
+                    ['name' => 'bar/foo', 'version' => '3.145'],
+                ],
+                ['packages' => [
+                    'bar/foo' => [
+                        ['name' => 'bar/foo', 'version' => '3.14'],
+                        ['name' => 'bar/foo', 'version' => '3.145'],
+                    ],
+                ]],
+            ],
+        ];
+    }
+
+    public function testWhatProvides(): void
+    {
+        $repo = $this->getMockBuilder('Composer\Repository\ComposerRepository')
+            ->setConstructorArgs([
+                ['url' => 'https://dummy.test.link'],
+                new NullIO,
+                FactoryMock::createConfig(),
+                $this->getMockBuilder('Composer\Util\HttpDownloader')->disableOriginalConstructor()->getMock(),
+                $this->getMockBuilder('Composer\EventDispatcher\EventDispatcher')->disableOriginalConstructor()->getMock(),
+            ])
+            ->onlyMethods(['fetchFile'])
+            ->getMock();
+
+        $cache = $this->getMockBuilder('Composer\Cache')->disableOriginalConstructor()->getMock();
+        $cache->expects($this->any())
+            ->method('sha256')
+            ->will($this->returnValue(false));
+
+        $properties = [
+            'cache' => $cache,
+            'loader' => new ArrayLoader(),
+            'providerListing' => ['a' => ['sha256' => 'xxx']],
+            'providersUrl' => 'https://dummy.test.link/to/%package%/file',
+        ];
+
+        foreach ($properties as $property => $value) {
+            $ref = new \ReflectionProperty($repo, $property);
+            $ref->setAccessible(true);
+            $ref->setValue($repo, $value);
         }
-        if ($input->getOption('no-suggest')) {
-            $io->writeError('<warning>You are using the deprecated option "--no-suggest". It has no effect and will break in Composer 3.</warning>');
-        }
 
-        $args = $input->getArgument('packages');
-        if (count($args) > 0) {
-            $io->writeError('<error>Invalid argument '.implode(' ', $args).'. Use "composer require '.implode(' ', $args).'" instead to add packages to your composer.json.</error>');
+        $repo->expects($this->any())
+            ->method('fetchFile')
+            ->will($this->returnValue([
+                'packages' => [
+                    [[
+                        'uid' => 1,
+                        'name' => 'a',
+                        'version' => 'dev-master',
+                        'extra' => ['branch-alias' => ['dev-master' => '1.0.x-dev']],
+                    ]],
+                    [[
+                        'uid' => 2,
+                        'name' => 'a',
+                        'version' => 'dev-develop',
+                        'extra' => ['branch-alias' => ['dev-develop' => '1.1.x-dev']],
+                    ]],
+                    [[
+                        'uid' => 3,
+                        'name' => 'a',
+                        'version' => '0.6',
+                    ]],
+                ],
+            ]));
 
-            return 1;
-        }
+        $reflMethod = new \ReflectionMethod(ComposerRepository::class, 'whatProvides');
+        $reflMethod->setAccessible(true);
+        $packages = $reflMethod->invoke($repo, 'a');
 
-        if ($input->getOption('no-install')) {
-            $io->writeError('<error>Invalid option "--no-install". Use "composer update --no-install" instead if you are trying to update the composer.lock file.</error>');
+        self::assertCount(5, $packages);
+        self::assertEquals(['1', '1-alias', '2', '2-alias', '3'], array_keys($packages));
+        self::assertSame($packages['2'], $packages['2-alias']->getAliasOf());
+    }
 
-            return 1;
-        }
+    public function testSearchWithType(): void
+    {
+        $repoConfig = [
+            'url' => 'http://example.org',
+        ];
 
-        $composer = $this->requireComposer();
+        $result = [
+            'results' => [
+                [
+                    'name' => 'foo',
+                    'description' => null,
+                ],
+            ],
+        ];
 
-        if (!$composer->getLocker()->isLocked() && !HttpDownloader::isCurlEnabled()) {
-            $io->writeError('<warning>Composer is operating significantly slower than normal because you do not have the PHP curl extension enabled.</warning>');
-        }
+        $httpDownloader = $this->getHttpDownloaderMock();
+        $httpDownloader->expects(
+            [
+                ['url' => 'http://example.org/packages.json', 'body' => JsonFile::encode(['search' => '/search.json?q=%query%&type=%type%'])],
+                ['url' => 'http://example.org/search.json?q=foo&type=composer-plugin', 'body' => JsonFile::encode($result)],
+                ['url' => 'http://example.org/search.json?q=foo&type=library', 'body' => JsonFile::encode([])],
+            ],
+            true
+        );
+        $eventDispatcher = $this->getMockBuilder('Composer\EventDispatcher\EventDispatcher')
+            ->disableOriginalConstructor()
+            ->getMock();
 
-        $commandEvent = new CommandEvent(PluginEvents::COMMAND, 'install', $input, $output);
-        $composer->getEventDispatcher()->dispatch($commandEvent->getName(), $commandEvent);
+        $config = FactoryMock::createConfig();
+        $config->merge(['config' => ['cache-read-only' => true]]);
+        $repository = new ComposerRepository($repoConfig, new NullIO, $config, $httpDownloader, $eventDispatcher);
 
-        $install = Installer::create($io, $composer);
+        self::assertSame(
+            [['name' => 'foo', 'description' => null]],
+            $repository->search('foo', RepositoryInterface::SEARCH_FULLTEXT, 'composer-plugin')
+        );
 
-        $config = $composer->getConfig();
-        [$preferSource, $preferDist] = $this->getPreferredInstallOptions($config, $input);
+        self::assertEmpty(
+            $repository->search('foo', RepositoryInterface::SEARCH_FULLTEXT, 'library')
+        );
+    }
 
-        $optimize = $input->getOption('optimize-autoloader') || $config->get('optimize-autoloader');
-        $authoritative = $input->getOption('classmap-authoritative') || $config->get('classmap-authoritative');
-        $apcuPrefix = $input->getOption('apcu-autoloader-prefix');
-        $apcu = $apcuPrefix !== null || $input->getOption('apcu-autoloader') || $config->get('apcu-autoloader');
+    public function testSearchWithSpecialChars(): void
+    {
+        $repoConfig = [
+            'url' => 'http://example.org',
+        ];
 
-        $composer->getInstallationManager()->setOutputProgress(!$input->getOption('no-progress'));
+        $httpDownloader = $this->getHttpDownloaderMock();
+        $httpDownloader->expects(
+            [
+                ['url' => 'http://example.org/packages.json', 'body' => JsonFile::encode(['search' => '/search.json?q=%query%&type=%type%'])],
+                ['url' => 'http://example.org/search.json?q=foo+bar&type=', 'body' => JsonFile::encode([])],
+            ],
+            true
+        );
+        $eventDispatcher = $this->getMockBuilder('Composer\EventDispatcher\EventDispatcher')
+            ->disableOriginalConstructor()
+            ->getMock();
 
-        $install
-            ->setDryRun($input->getOption('dry-run'))
-            ->setDownloadOnly($input->getOption('download-only'))
-            ->setVerbose($input->getOption('verbose'))
-            ->setPreferSource($preferSource)
-            ->setPreferDist($preferDist)
-            ->setDevMode(!$input->getOption('no-dev'))
-            ->setDumpAutoloader(!$input->getOption('no-autoloader'))
-            ->setOptimizeAutoloader($optimize)
-            ->setClassMapAuthoritative($authoritative)
-            ->setApcuAutoloader($apcu, $apcuPrefix)
-            ->setPlatformRequirementFilter($this->getPlatformRequirementFilter($input))
-            ->setAudit($input->getOption('audit'))
-            ->setErrorOnAudit($input->getOption('audit'))
-            ->setAuditFormat($this->getAuditFormat($input))
-        ;
+        $config = FactoryMock::createConfig();
+        $config->merge(['config' => ['cache-read-only' => true]]);
+        $repository = new ComposerRepository($repoConfig, new NullIO, $config, $httpDownloader, $eventDispatcher);
 
-        if ($input->getOption('no-plugins')) {
-            $install->disablePlugins();
-        }
+        self::assertEmpty(
+            $repository->search('foo bar', RepositoryInterface::SEARCH_FULLTEXT)
+        );
+    }
 
-        return $install->run();
+    public function testSearchWithAbandonedPackages(): void
+    {
+        $repoConfig = [
+            'url' => 'http://example.org',
+        ];
+
+        $result = [
+            'results' => [
+                [
+                    'name' => 'foo1',
+                    'description' => null,
+                    'abandoned' => true,
+                ],
+                [
+                    'name' => 'foo2',
+                    'description' => null,
+                    'abandoned' => 'bar',
+                ],
+            ],
+        ];
+
+        $httpDownloader = $this->getHttpDownloaderMock();
+        $httpDownloader->expects(
+            [
+                ['url' => 'http://example.org/packages.json', 'body' => JsonFile::encode(['search' => '/search.json?q=%query%'])],
+                ['url' => 'http://example.org/search.json?q=foo', 'body' => JsonFile::encode($result)],
+            ],
+            true
+        );
+
+        $eventDispatcher = $this->getMockBuilder('Composer\EventDispatcher\EventDispatcher')
+            ->disableOriginalConstructor()
+            ->getMock();
+
+        $config = FactoryMock::createConfig();
+        $config->merge(['config' => ['cache-read-only' => true]]);
+        $repository = new ComposerRepository($repoConfig, new NullIO, $config, $httpDownloader, $eventDispatcher);
+
+        self::assertSame(
+            [
+                ['name' => 'foo1', 'description' => null, 'abandoned' => true],
+                ['name' => 'foo2', 'description' => null, 'abandoned' => 'bar'],
+            ],
+            $repository->search('foo')
+        );
+    }
+
+    /**
+     * @dataProvider provideCanonicalizeUrlTestCases
+     * @param non-empty-string $url
+     * @param non-empty-string $repositoryUrl
+     */
+    public function testCanonicalizeUrl(string $expected, string $url, string $repositoryUrl): void
+    {
+        $repository = new ComposerRepository(
+            ['url' => $repositoryUrl],
+            new NullIO(),
+            FactoryMock::createConfig(),
+            $this->getMockBuilder('Composer\Util\HttpDownloader')->disableOriginalConstructor()->getMock(),
+            $this->getMockBuilder('Composer\EventDispatcher\EventDispatcher')->disableOriginalConstructor()->getMock()
+        );
+
+        $object = new \ReflectionObject($repository);
+
+        $method = $object->getMethod('canonicalizeUrl');
+        $method->setAccessible(true);
+
+        // ComposerRepository::__construct ensures that the repository URL has a
+        // protocol, so reset it here in order to test all cases.
+        $property = $object->getProperty('url');
+        $property->setAccessible(true);
+        $property->setValue($repository, $repositoryUrl);
+
+        self::assertSame($expected, $method->invoke($repository, $url));
+    }
+
+    public static function provideCanonicalizeUrlTestCases(): array
+    {
+        return [
+            [
+                'https://example.org/path/to/file',
+                '/path/to/file',
+                'https://example.org',
+            ],
+            [
+                'https://example.org/canonic_url',
+                'https://example.org/canonic_url',
+                'https://should-not-see-me.test',
+            ],
+            [
+                'file:///path/to/repository/file',
+                '/path/to/repository/file',
+                'file:///path/to/repository',
+            ],
+            [
+                // Assert that the repository URL is returned unchanged if it is
+                // not a URL.
+                // (Backward compatibility test)
+                'invalid_repo_url',
+                '/path/to/file',
+                'invalid_repo_url',
+            ],
+            [
+                // Assert that URLs can contain sequences resembling pattern
+                // references as understood by preg_replace() without messing up
+                // the result.
+                // (Regression test)
+                'https://example.org/path/to/unusual_$0_filename',
+                '/path/to/unusual_$0_filename',
+                'https://example.org',
+            ],
+        ];
+    }
+
+    public function testGetProviderNamesWillReturnPartialPackageNames(): void
+    {
+        $httpDownloader = $this->getHttpDownloaderMock();
+        $httpDownloader->expects(
+            [
+                [
+                    'url' => 'http://example.org/packages.json',
+                    'body' => JsonFile::encode([
+                        'providers-lazy-url' => '/foo/p/%package%.json',
+                        'packages' => ['foo/bar' => [
+                            'dev-branch' => ['name' => 'foo/bar'],
+                            'v1.0.0' => ['name' => 'foo/bar'],
+                        ]],
+                    ]),
+                ],
+            ],
+            true
+        );
+
+        $repository = new ComposerRepository(
+            ['url' => 'http://example.org/packages.json'],
+            new NullIO(),
+            FactoryMock::createConfig(),
+            $httpDownloader
+        );
+
+        self::assertEquals(['foo/bar'], $repository->getPackageNames());
+    }
+
+    public function testGetSecurityAdvisoriesAssertRepositoryHttpOptionsAreUsed(): void
+    {
+        $httpDownloader = $this->getHttpDownloaderMock();
+        $httpDownloader->expects(
+            [
+                [
+                    'url' => 'https://example.org/packages.json',
+                    'body' => JsonFile::encode([
+                        'packages' => ['foo/bar' => [
+                            'dev-branch' => ['name' => 'foo/bar'],
+                            'v1.0.0' => ['name' => 'foo/bar'],
+                        ]],
+                        'metadata-url' => 'https://example.org/p2/%package%.json',
+                        'security-advisories' => [
+                            'api-url' => 'https://example.org/security-advisories',
+                        ],
+                    ]),
+                    'options' => ['http' => ['verify_peer' => false]],
+                ],
+                [
+                    'url' => 'https://example.org/security-advisories',
+                    'body' => JsonFile::encode(['advisories' => []]),
+                    'options' => ['http' => [
+                        'verify_peer' => false,
+                        'method' => 'POST',
+                        'header' => [
+                            'Content-type: application/x-www-form-urlencoded',
+                        ],
+                        'timeout' => 10,
+                        'content' => http_build_query(['packages' => ['foo/bar']]),
+                    ]],
+                ]
+            ],
+            true
+        );
+
+        $repository = new ComposerRepository(
+            ['url' => 'https://example.org/packages.json', 'options' => ['http' => ['verify_peer' => false]]],
+            new NullIO(),
+            FactoryMock::createConfig(),
+            $httpDownloader
+        );
+
+        self::assertSame([
+            'namesFound' => [],
+            'advisories' => [],
+        ], $repository->getSecurityAdvisories(['foo/bar' => new Constraint('=', '1.0.0.0')]));
     }
 }

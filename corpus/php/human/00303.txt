@@ -10,179 +10,158 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Package;
+namespace Composer\DependencyResolver;
 
 /**
- * Defines package metadata that is not necessarily needed for solving and installing packages
+ * The RuleWatchGraph efficiently propagates decisions to other rules
  *
- * PackageInterface & derivatives are considered internal, you may use them in type hints but extending/implementing them is not recommended and not supported. Things may change without notice.
+ * All rules generated for solving a SAT problem should be inserted into the
+ * graph. When a decision on a literal is made, the graph can be used to
+ * propagate the decision to all other rules involving the literal, leading to
+ * other trivial decisions resulting from unit clauses.
  *
  * @author Nils Adermann <naderman@naderman.de>
  */
-interface CompletePackageInterface extends PackageInterface
+class RuleWatchGraph
 {
+    /** @var array<int, RuleWatchChain> */
+    protected $watchChains = [];
+
     /**
-     * Returns the scripts of this package
+     * Inserts a rule node into the appropriate chains within the graph
      *
-     * @return array<string, string[]> Map of script name to array of handlers
-     */
-    public function getScripts(): array;
-
-    /**
-     * @param  array<string, string[]> $scripts
-     */
-    public function setScripts(array $scripts): void;
-
-    /**
-     * Returns an array of repositories
+     * The node is prepended to the watch chains for each of the two literals it
+     * watches.
      *
-     * @return mixed[] Repositories
-     */
-    public function getRepositories(): array;
-
-    /**
-     * Set the repositories
+     * Assertions are skipped because they only depend on a single package and
+     * have no alternative literal that could be true, so there is no need to
+     * watch changes in any literals.
      *
-     * @param  mixed[] $repositories
+     * @param RuleWatchNode $node The rule node to be inserted into the graph
      */
-    public function setRepositories(array $repositories): void;
+    public function insert(RuleWatchNode $node): void
+    {
+        if ($node->getRule()->isAssertion()) {
+            return;
+        }
+
+        if (!$node->getRule() instanceof MultiConflictRule) {
+            foreach ([$node->watch1, $node->watch2] as $literal) {
+                if (!isset($this->watchChains[$literal])) {
+                    $this->watchChains[$literal] = new RuleWatchChain;
+                }
+
+                $this->watchChains[$literal]->unshift($node);
+            }
+        } else {
+            foreach ($node->getRule()->getLiterals() as $literal) {
+                if (!isset($this->watchChains[$literal])) {
+                    $this->watchChains[$literal] = new RuleWatchChain;
+                }
+
+                $this->watchChains[$literal]->unshift($node);
+            }
+        }
+    }
 
     /**
-     * Returns the package license, e.g. MIT, BSD, GPL
+     * Propagates a decision on a literal to all rules watching the literal
      *
-     * @return string[] The package licenses
-     */
-    public function getLicense(): array;
-
-    /**
-     * Set the license
+     * If a decision, e.g. +A has been made, then all rules containing -A, e.g.
+     * (-A|+B|+C) now need to satisfy at least one of the other literals, so
+     * that the rule as a whole becomes true, since with +A applied the rule
+     * is now (false|+B|+C) so essentially (+B|+C).
      *
-     * @param  string[] $license
-     */
-    public function setLicense(array $license): void;
-
-    /**
-     * Returns an array of keywords relating to the package
+     * This means that all rules watching the literal -A need to be updated to
+     * watch 2 other literals which can still be satisfied instead. So literals
+     * that conflict with previously made decisions are not an option.
      *
-     * @return string[]
-     */
-    public function getKeywords(): array;
-
-    /**
-     * Set the keywords
+     * Alternatively it can occur that a unit clause results: e.g. if in the
+     * above example the rule was (-A|+B), then A turning true means that
+     * B must now be decided true as well.
      *
-     * @param  string[] $keywords
+     * @param  int       $decidedLiteral The literal which was decided (A in our example)
+     * @param  int       $level          The level at which the decision took place and at which
+     *                                   all resulting decisions should be made.
+     * @param  Decisions $decisions      Used to check previous decisions and to
+     *                                   register decisions resulting from propagation
+     * @return Rule|null If a conflict is found the conflicting rule is returned
      */
-    public function setKeywords(array $keywords): void;
+    public function propagateLiteral(int $decidedLiteral, int $level, Decisions $decisions): ?Rule
+    {
+        // we invert the decided literal here, example:
+        // A was decided => (-A|B) now requires B to be true, so we look for
+        // rules which are fulfilled by -A, rather than A.
+        $literal = -$decidedLiteral;
+
+        if (!isset($this->watchChains[$literal])) {
+            return null;
+        }
+
+        $chain = $this->watchChains[$literal];
+
+        $chain->rewind();
+        while ($chain->valid()) {
+            $node = $chain->current();
+            if (!$node->getRule() instanceof MultiConflictRule) {
+                $otherWatch = $node->getOtherWatch($literal);
+
+                if (!$node->getRule()->isDisabled() && !$decisions->satisfy($otherWatch)) {
+                    $ruleLiterals = $node->getRule()->getLiterals();
+
+                    $alternativeLiterals = array_filter($ruleLiterals, static function ($ruleLiteral) use ($literal, $otherWatch, $decisions): bool {
+                        return $literal !== $ruleLiteral &&
+                            $otherWatch !== $ruleLiteral &&
+                            !$decisions->conflict($ruleLiteral);
+                    });
+
+                    if (\count($alternativeLiterals) > 0) {
+                        reset($alternativeLiterals);
+                        $this->moveWatch($literal, current($alternativeLiterals), $node);
+                        continue;
+                    }
+
+                    if ($decisions->conflict($otherWatch)) {
+                        return $node->getRule();
+                    }
+
+                    $decisions->decide($otherWatch, $level, $node->getRule());
+                }
+            } else {
+                foreach ($node->getRule()->getLiterals() as $otherLiteral) {
+                    if ($literal !== $otherLiteral && !$decisions->satisfy($otherLiteral)) {
+                        if ($decisions->conflict($otherLiteral)) {
+                            return $node->getRule();
+                        }
+
+                        $decisions->decide($otherLiteral, $level, $node->getRule());
+                    }
+                }
+            }
+
+            $chain->next();
+        }
+
+        return null;
+    }
 
     /**
-     * Returns the package description
+     * Moves a rule node from one watch chain to another
      *
-     * @return ?string
-     */
-    public function getDescription(): ?string;
-
-    /**
-     * Set the description
-     */
-    public function setDescription(string $description): void;
-
-    /**
-     * Returns the package homepage
+     * The rule node's watched literals are updated accordingly.
      *
-     * @return ?string
+     * @param int           $fromLiteral A literal the node used to watch
+     * @param int           $toLiteral   A literal the node should watch now
+     * @param RuleWatchNode $node        The rule node to be moved
      */
-    public function getHomepage(): ?string;
+    protected function moveWatch(int $fromLiteral, int $toLiteral, RuleWatchNode $node): void
+    {
+        if (!isset($this->watchChains[$toLiteral])) {
+            $this->watchChains[$toLiteral] = new RuleWatchChain;
+        }
 
-    /**
-     * Set the homepage
-     */
-    public function setHomepage(string $homepage): void;
-
-    /**
-     * Returns an array of authors of the package
-     *
-     * Each item can contain name/homepage/email keys
-     *
-     * @return array<array{name?: string, homepage?: string, email?: string, role?: string}>
-     */
-    public function getAuthors(): array;
-
-    /**
-     * Set the authors
-     *
-     * @param  array<array{name?: string, homepage?: string, email?: string, role?: string}> $authors
-     */
-    public function setAuthors(array $authors): void;
-
-    /**
-     * Returns the support information
-     *
-     * @return array{issues?: string, forum?: string, wiki?: string, source?: string, email?: string, irc?: string, docs?: string, rss?: string, chat?: string, security?: string}
-     */
-    public function getSupport(): array;
-
-    /**
-     * Set the support information
-     *
-     * @param  array{issues?: string, forum?: string, wiki?: string, source?: string, email?: string, irc?: string, docs?: string, rss?: string, chat?: string, security?: string} $support
-     */
-    public function setSupport(array $support): void;
-
-    /**
-     * Returns an array of funding options for the package
-     *
-     * Each item will contain type and url keys
-     *
-     * @return array<array{type?: string, url?: string}>
-     */
-    public function getFunding(): array;
-
-    /**
-     * Set the funding
-     *
-     * @param  array<array{type?: string, url?: string}> $funding
-     */
-    public function setFunding(array $funding): void;
-
-    /**
-     * Returns if the package is abandoned or not
-     */
-    public function isAbandoned(): bool;
-
-    /**
-     * If the package is abandoned and has a suggested replacement, this method returns it
-     */
-    public function getReplacementPackage(): ?string;
-
-    /**
-     * @param  bool|string $abandoned
-     */
-    public function setAbandoned($abandoned): void;
-
-    /**
-     * Returns default base filename for archive
-     *
-     * @return ?string
-     */
-    public function getArchiveName(): ?string;
-
-    /**
-     * Sets default base filename for archive
-     */
-    public function setArchiveName(string $name): void;
-
-    /**
-     * Returns a list of patterns to exclude from package archives
-     *
-     * @return string[]
-     */
-    public function getArchiveExcludes(): array;
-
-    /**
-     * Sets a list of patterns to be excluded from archives
-     *
-     * @param  string[] $excludes
-     */
-    public function setArchiveExcludes(array $excludes): void;
+        $node->moveWatch($fromLiteral, $toLiteral);
+        $this->watchChains[$fromLiteral]->remove();
+        $this->watchChains[$toLiteral]->unshift($node);
+    }
 }

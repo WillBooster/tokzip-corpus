@@ -1,158 +1,115 @@
-## How Reactivity Works in Vue {#how-reactivity-works-in-vue}
+Result:
 
-We can't really track the reading and writing of local variables like in the example. There's just no mechanism for doing that in vanilla JavaScript. What we **can** do though, is intercept the reading and writing of **object properties**.
-
-There are two ways of intercepting property access in JavaScript: [getter](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Functions/get#description) / [setters](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Functions/set#description) and [Proxies](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Proxy). Vue 2 used getter / setters exclusively due to browser support limitations. In Vue 3, Proxies are used for reactive objects and getter / setters are used for refs. Here's some pseudo-code that illustrates how they work:
-
-```js{4,9,17,22}
-function reactive(obj) {
-  return new Proxy(obj, {
-    get(target, key) {
-      track(target, key)
-      return target[key]
-    },
-    set(target, key, value) {
-      target[key] = value
-      trigger(target, key)
-    }
-  })
-}
-
-function ref(value) {
-  const refObject = {
-    get value() {
-      track(refObject, 'value')
-      return value
-    },
-    set value(newValue) {
-      value = newValue
-      trigger(refObject, 'value')
-    }
-  }
-  return refObject
-}
-```
-
-:::tip
-Code snippets here and below are meant to explain the core concepts in the simplest form possible, so many details are omitted, and edge cases ignored.
-:::
-
-This explains a few [limitations of reactive objects](/guide/essentials/reactivity-fundamentals#limitations-of-reactive) that we have discussed in the fundamentals section:
-
-- When you assign or destructure a reactive object's property to a local variable, accessing or assigning to that variable is non-reactive because it no longer triggers the get / set proxy traps on the source object. Note this "disconnect" only affects the variable binding - if the variable points to a non-primitive value such as an object, mutating the object would still be reactive.
-
-- The returned proxy from `reactive()`, although behaving just like the original, has a different identity if we compare it to the original using the `===` operator.
-
-Inside `track()`, we check whether there is a currently running effect. If there is one, we lookup the subscriber effects (stored in a Set) for the property being tracked, and add the effect to the Set:
-
-```js
-// This will be set right before an effect is about
-// to be run. We'll deal with this later.
-let activeEffect
-
-function track(target, key) {
-  if (activeEffect) {
-    const effects = getSubscribersForProperty(target, key)
-    effects.add(activeEffect)
-  }
-}
-```
-
-Effect subscriptions are stored in a global `WeakMap<target, Map<key, Set<effect>>>` data structure. If no subscribing effects Set was found for a property (tracked for the first time), it will be created. This is what the `getSubscribersForProperty()` function does, in short. For simplicity, we will skip its details.
-
-Inside `trigger()`, we again lookup the subscriber effects for the property. But this time we invoke them instead:
-
-```js
-function trigger(target, key) {
-  const effects = getSubscribersForProperty(target, key)
-  effects.forEach((effect) => effect())
-}
-```
-
-Now let's circle back to the `whenDepsChange()` function:
-
-```js
-function whenDepsChange(update) {
-  const effect = () => {
-    activeEffect = effect
-    update()
-    activeEffect = null
-  }
-  effect()
-}
-```
-
-It wraps the raw `update` function in an effect that sets itself as the current active effect before running the actual update. This enables `track()` calls during the update to locate the current active effect.
-
-At this point, we have created an effect that automatically tracks its dependencies, and re-runs whenever a dependency changes. We call this a **Reactive Effect**.
-
-Vue provides an API that allows you to create reactive effects: [`watchEffect()`](/api/reactivity-core#watcheffect). In fact, you may have noticed that it works pretty similarly to the magical `whenDepsChange()` in the example. We can now rework the original example using actual Vue APIs:
-
-```js
-import { ref, watchEffect } from 'vue'
-
-const A0 = ref(0)
-const A1 = ref(1)
-const A2 = ref()
-
-watchEffect(() => {
-  // tracks A0 and A1
-  A2.value = A0.value + A1.value
-})
-
-// triggers the effect
-A0.value = 2
-```
-
-Using a reactive effect to mutate a ref isn't the most interesting use case - in fact, using a computed property makes it more declarative:
-
-```js
-import { ref, computed } from 'vue'
-
-const A0 = ref(0)
-const A1 = ref(1)
-const A2 = computed(() => A0.value + A1.value)
-
-A0.value = 2
-```
-
-Internally, `computed` manages its invalidation and re-computation using a reactive effect.
-
-So what's an example of a common and useful reactive effect? Well, updating the DOM! We can implement simple "reactive rendering" like this:
-
-```js
-import { ref, watchEffect } from 'vue'
-
-const count = ref(0)
-
-watchEffect(() => {
-  document.body.innerHTML = `Count is: ${count.value}`
-})
-
-// updates the DOM
-count.value++
-```
-
-In fact, this is pretty close to how a Vue component keeps the state and the DOM in sync - each component instance creates a reactive effect to render and update the DOM. Of course, Vue components use much more efficient ways to update the DOM than `innerHTML`. This is discussed in [Rendering Mechanism](./rendering-mechanism).
-
-<div class="options-api">
-
-The `ref()`, `computed()` and `watchEffect()` APIs are all part of the Composition API. If you have only been using Options API with Vue so far, you'll notice that Composition API is closer to how Vue's reactivity system works under the hood. In fact, in Vue 3 the Options API is implemented on top of the Composition API. All property access on the component instance (`this`) triggers getter / setters for reactivity tracking, and options like `watch` and `computed` invoke their Composition API equivalents internally.
-
+{% raw %}
+<div id="example-1" class="demo">
+  <button v-on:click="counter += 1">Add 1</button>
+  <p>The button above has been clicked {{ counter }} times.</p>
 </div>
+<script>
+var example1 = new Vue({
+  el: '#example-1',
+  data: {
+    counter: 0
+  }
+})
+</script>
+{% endraw %}
 
-## Runtime vs. Compile-time Reactivity {#runtime-vs-compile-time-reactivity}
+## Method Event Handlers
 
-Vue's reactivity system is primarily runtime-based: the tracking and triggering are all performed while the code is running directly in the browser. The pros of runtime reactivity are that it can work without a build step, and there are fewer edge cases. On the other hand, this makes it constrained by the syntax limitations of JavaScript, leading to the need of value containers like Vue refs.
+The logic for many event handlers will be more complex though, so keeping your JavaScript in the value of the `v-on` attribute isn't feasible. That's why `v-on` can also accept the name of a method you'd like to call.
 
-Some frameworks, such as [Svelte](https://svelte.dev/), choose to overcome such limitations by implementing reactivity during compilation. It analyzes and transforms the code in order to simulate reactivity. The compilation step allows the framework to alter the semantics of JavaScript itself - for example, implicitly injecting code that performs dependency analysis and effect triggering around access to locally defined variables. The downside is that such transforms require a build step, and altering JavaScript semantics is essentially creating a language that looks like JavaScript but compiles into something else.
+For example:
 
-The Vue team did explore this direction via an experimental feature called [Reactivity Transform](/guide/extras/reactivity-transform), but in the end we have decided that it would not be a good fit for the project due to [the reasoning here](https://github.com/vuejs/rfcs/discussions/369#discussioncomment-5059028).
+``` html
+<div id="example-2">
+  <!-- `greet` is the name of a method defined below -->
+  <button v-on:click="greet">Greet</button>
+</div>
+```
 
-## Reactivity Debugging {#reactivity-debugging}
+``` js
+var example2 = new Vue({
+  el: '#example-2',
+  data: {
+    name: 'Vue.js'
+  },
+  // define methods under the `methods` object
+  methods: {
+    greet: function (event) {
+      // `this` inside methods points to the Vue instance
+      alert('Hello ' + this.name + '!')
+      // `event` is the native DOM event
+      if (event) {
+        alert(event.target.tagName)
+      }
+    }
+  }
+})
 
-It's great that Vue's reactivity system automatically tracks dependencies, but in some cases we may want to figure out exactly what is being tracked, or what is causing a component to re-render.
+// you can invoke methods in JavaScript too
+example2.greet() // => 'Hello Vue.js!'
+```
 
-### Component Debugging Hooks {#component-debugging-hooks}
+Result:
 
-We can debug what dependencies are used during a component's render and which dependency is triggering an update using the <span class="options-api">`renderTracked`</span><span class="composition-api">`onRenderTracked`</span> and <span class="options-api">`renderTriggered`</span><span class="composition-api">`onRenderTriggered`</span> lifecycle hooks. Both hooks will receive a debugger event which contains information on the dependency in question. It is recommended to place a `debugger` statement in the callbacks to interactively inspect the dependency:
+{% raw %}
+<div id="example-2" class="demo">
+  <button v-on:click="greet">Greet</button>
+</div>
+<script>
+var example2 = new Vue({
+  el: '#example-2',
+  data: {
+    name: 'Vue.js'
+  },
+  methods: {
+    greet: function (event) {
+      alert('Hello ' + this.name + '!')
+      if (event) {
+        alert(event.target.tagName)
+      }
+    }
+  }
+})
+</script>
+{% endraw %}
+
+## Methods in Inline Handlers
+
+Instead of binding directly to a method name, we can also use methods in an inline JavaScript statement:
+
+``` html
+<div id="example-3">
+  <button v-on:click="say('hi')">Say hi</button>
+  <button v-on:click="say('what')">Say what</button>
+</div>
+```
+``` js
+new Vue({
+  el: '#example-3',
+  methods: {
+    say: function (message) {
+      alert(message)
+    }
+  }
+})
+```
+
+Result:
+{% raw %}
+<div id="example-3" class="demo">
+  <button v-on:click="say('hi')">Say hi</button>
+  <button v-on:click="say('what')">Say what</button>
+</div>
+<script>
+new Vue({
+  el: '#example-3',
+  methods: {
+    say: function (message) {
+      alert(message)
+    }
+  }
+})
+</script>
+{% endraw %}

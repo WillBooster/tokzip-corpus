@@ -1,6 +1,6 @@
-// Formatting library for C++ - optional OS-specific functionality
+// Tests of the C++ interface to POSIX functions that require mocks
 //
-// Copyright (c) 2012 - 2016, Victor Zverovich
+// Copyright (c) 2012 - present, Victor Zverovich
 // All rights reserved.
 //
 // For the license information refer to format.h.
@@ -10,394 +10,433 @@
 #  define _CRT_SECURE_NO_WARNINGS
 #endif
 
-#include "fmt/os.h"
+#include "posix-mock.h"
 
-#ifndef FMT_MODULE
-#  include <climits>
+#include <errno.h>
+#include <fcntl.h>
 
-#  if FMT_USE_FCNTL
-#    include <sys/stat.h>
-#    include <sys/types.h>
+#include <climits>
+#include <memory>
 
-#    ifdef _WRS_KERNEL    // VxWorks7 kernel
-#      include <ioLib.h>  // getpagesize
-#    endif
-
-#    ifndef _WIN32
-#      include <unistd.h>
-#    else
-#      ifndef WIN32_LEAN_AND_MEAN
-#        define WIN32_LEAN_AND_MEAN
-#      endif
-#      include <io.h>
-#    endif  // _WIN32
-#  endif    // FMT_USE_FCNTL
-
-#  ifdef _WIN32
-#    include <windows.h>
-#  endif
-#endif
+#include "../src/os.cc"
 
 #ifdef _WIN32
-#  ifndef S_IRUSR
-#    define S_IRUSR _S_IREAD
-#  endif
-#  ifndef S_IWUSR
-#    define S_IWUSR _S_IWRITE
-#  endif
-#  ifndef S_IRGRP
-#    define S_IRGRP 0
-#  endif
-#  ifndef S_IWGRP
-#    define S_IWGRP 0
-#  endif
-#  ifndef S_IROTH
-#    define S_IROTH 0
-#  endif
-#  ifndef S_IWOTH
-#    define S_IWOTH 0
-#  endif
+#  include <io.h>
+#  undef max
 #endif
+
+#include "gmock/gmock.h"
+#include "gtest-extra.h"
+#include "util.h"
+
+using fmt::buffered_file;
+
+using testing::_;
+using testing::Return;
+using testing::StrEq;
+
+template <typename Mock> struct scoped_mock : testing::StrictMock<Mock> {
+  scoped_mock() { Mock::instance = this; }
+  ~scoped_mock() { Mock::instance = nullptr; }
+};
 
 namespace {
-#ifdef _WIN32
-// Return type of read and write functions.
-using rwresult = int;
+int open_count;
+int close_count;
+int dup_count;
+int dup2_count;
+int fdopen_count;
+int read_count;
+int write_count;
+int pipe_count;
+int fopen_count;
+int fclose_count;
+int fileno_count;
+size_t read_nbyte;
+size_t write_nbyte;
+bool sysconf_error;
 
-// On Windows the count argument to read and write is unsigned, so convert
-// it from size_t preventing integer overflow.
-inline unsigned convert_rwcount(std::size_t count) {
-  return count <= UINT_MAX ? static_cast<unsigned>(count) : UINT_MAX;
-}
-#elif FMT_USE_FCNTL
-// Return type of read and write functions.
-using rwresult = ssize_t;
-
-inline std::size_t convert_rwcount(std::size_t count) { return count; }
-#endif
+enum { none, max_size, error } fstat_sim;
 }  // namespace
 
-FMT_BEGIN_NAMESPACE
-
-#ifdef _WIN32
-namespace detail {
-
-class system_message {
-  system_message(const system_message&) = delete;
-  void operator=(const system_message&) = delete;
-
-  unsigned long result_;
-  wchar_t* message_;
-
-  static bool is_whitespace(wchar_t c) noexcept {
-    return c == L' ' || c == L'\n' || c == L'\r' || c == L'\t' || c == L'\0';
+#define EMULATE_EINTR(func, error_result) \
+  if (func##_count != 0) {                \
+    if (func##_count++ != 3) {            \
+      errno = EINTR;                      \
+      return error_result;                \
+    }                                     \
   }
 
- public:
-  explicit system_message(unsigned long error_code)
-      : result_(0), message_(nullptr) {
-    result_ = FormatMessageW(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-            FORMAT_MESSAGE_IGNORE_INSERTS,
-        nullptr, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-        reinterpret_cast<wchar_t*>(&message_), 0, nullptr);
-    if (result_ != 0) {
-      while (result_ != 0 && is_whitespace(message_[result_ - 1])) {
-        --result_;
-      }
-    }
-  }
-  ~system_message() { LocalFree(message_); }
-  explicit operator bool() const noexcept { return result_ != 0; }
-  operator basic_string_view<wchar_t>() const noexcept {
-    return basic_string_view<wchar_t>(message_, result_);
-  }
-};
-
-class utf8_system_category final : public std::error_category {
- public:
-  const char* name() const noexcept override { return "system"; }
-  std::string message(int error_code) const override {
-    auto&& msg = system_message(error_code);
-    if (msg) {
-      auto utf8_message = to_utf8<wchar_t>();
-      if (utf8_message.convert(msg)) {
-        return utf8_message.str();
-      }
-    }
-    return "unknown error";
-  }
-};
-
-}  // namespace detail
-
-FMT_API const std::error_category& system_category() noexcept {
-  static const detail::utf8_system_category category;
-  return category;
+#ifndef _MSC_VER
+int test::open(const char* path, int oflag, int mode) {
+  EMULATE_EINTR(open, -1);
+  return ::open(path, oflag, mode);
 }
-
-std::system_error vwindows_error(int err_code, string_view format_str,
-                                 format_args args) {
-  auto ec = std::error_code(err_code, system_category());
-  return std::system_error(ec, vformat(format_str, args));
-}
-
-void detail::format_windows_error(detail::buffer<char>& out, int error_code,
-                                  const char* message) noexcept {
-  FMT_TRY {
-    auto&& msg = system_message(error_code);
-    if (msg) {
-      auto utf8_message = to_utf8<wchar_t>();
-      if (utf8_message.convert(msg)) {
-        fmt::format_to(appender(out), FMT_STRING("{}: {}"), message,
-                       string_view(utf8_message));
-        return;
-      }
-    }
-  }
-  FMT_CATCH(...) {}
-  format_error_code(out, error_code, message);
-}
-
-void report_windows_error(int error_code, const char* message) noexcept {
-  report_error(detail::format_windows_error, error_code, message);
-}
-#endif  // _WIN32
-
-buffered_file::~buffered_file() noexcept {
-  if (file_ && FMT_SYSTEM(fclose(file_)) != 0)
-    report_system_error(errno, "cannot close file");
-}
-
-buffered_file::buffered_file(cstring_view filename, cstring_view mode) {
-  FMT_RETRY_VAL(file_, FMT_SYSTEM(fopen(filename.c_str(), mode.c_str())),
-                nullptr);
-  if (!file_)
-    FMT_THROW(system_error(errno, FMT_STRING("cannot open file {}"),
-                           filename.c_str()));
-}
-
-void buffered_file::close() {
-  if (!file_) return;
-  int result = FMT_SYSTEM(fclose(file_));
-  file_ = nullptr;
-  if (result != 0)
-    FMT_THROW(system_error(errno, FMT_STRING("cannot close file")));
-}
-
-int buffered_file::descriptor() const {
-#ifdef FMT_HAS_SYSTEM
-  // fileno is a macro on OpenBSD.
-#  ifdef fileno
-#    undef fileno
-#  endif
-  int fd = FMT_POSIX_CALL(fileno(file_));
-#elif defined(_WIN32)
-  int fd = _fileno(file_);
-#else
-  int fd = fileno(file_);
 #endif
-  if (fd == -1)
-    FMT_THROW(system_error(errno, FMT_STRING("cannot get file descriptor")));
-  return fd;
+
+#ifndef _WIN32
+
+long test::sysconf(int name) {
+  long result = ::sysconf(name);
+  if (!sysconf_error) return result;
+  // Simulate an error.
+  errno = EINVAL;
+  return -1;
 }
+
+static off_t max_file_size() { return std::numeric_limits<off_t>::max(); }
+
+int test::fstat(int fd, struct stat* buf) {
+  int result = ::fstat(fd, buf);
+  if (fstat_sim == max_size) buf->st_size = max_file_size();
+  return result;
+}
+
+#else
+
+static LONGLONG max_file_size() { return std::numeric_limits<LONGLONG>::max(); }
+
+DWORD test::GetFileSize(HANDLE hFile, LPDWORD lpFileSizeHigh) {
+  if (fstat_sim == error) {
+    SetLastError(ERROR_ACCESS_DENIED);
+    return INVALID_FILE_SIZE;
+  }
+  if (fstat_sim == max_size) {
+    DWORD max = std::numeric_limits<DWORD>::max();
+    *lpFileSizeHigh = max >> 1;
+    return max;
+  }
+  return ::GetFileSize(hFile, lpFileSizeHigh);
+}
+
+#endif
+
+int test::close(int fildes) {
+  // Close the file first because close shouldn't be retried.
+  int result = ::FMT_POSIX(close(fildes));
+  EMULATE_EINTR(close, -1);
+  return result;
+}
+
+int test::dup(int fildes) {
+  EMULATE_EINTR(dup, -1);
+  return ::FMT_POSIX(dup(fildes));
+}
+
+int test::dup2(int fildes, int fildes2) {
+  EMULATE_EINTR(dup2, -1);
+  return ::FMT_POSIX(dup2(fildes, fildes2));
+}
+
+FILE* test::fdopen(int fildes, const char* mode) {
+  EMULATE_EINTR(fdopen, nullptr);
+  return ::FMT_POSIX(fdopen(fildes, mode));
+}
+
+test::ssize_t test::read(int fildes, void* buf, test::size_t nbyte) {
+  read_nbyte = nbyte;
+  EMULATE_EINTR(read, -1);
+  return ::FMT_POSIX(read(fildes, buf, nbyte));
+}
+
+test::ssize_t test::write(int fildes, const void* buf, test::size_t nbyte) {
+  write_nbyte = nbyte;
+  EMULATE_EINTR(write, -1);
+  return ::FMT_POSIX(write(fildes, buf, nbyte));
+}
+
+#ifndef _WIN32
+int test::pipe(int fildes[2]) {
+  EMULATE_EINTR(pipe, -1);
+  return ::pipe(fildes);
+}
+#else
+int test::pipe(int* pfds, unsigned psize, int textmode) {
+  EMULATE_EINTR(pipe, -1);
+  return _pipe(pfds, psize, textmode);
+}
+#endif
+
+FILE* test::fopen(const char* filename, const char* mode) {
+  EMULATE_EINTR(fopen, nullptr);
+  return ::fopen(filename, mode);
+}
+
+int test::fclose(FILE* stream) {
+  EMULATE_EINTR(fclose, EOF);
+  return ::fclose(stream);
+}
+
+int(test::fileno)(FILE* stream) {
+  EMULATE_EINTR(fileno, -1);
+#ifdef fileno
+  return FMT_POSIX(fileno(stream));
+#else
+  return ::FMT_POSIX(fileno(stream));
+#endif
+}
+
+#ifndef _WIN32
+#  define EXPECT_RETRY(statement, func, message) \
+    func##_count = 1;                            \
+    statement;                                   \
+    EXPECT_EQ(4, func##_count);                  \
+    func##_count = 0;
+#  define EXPECT_EQ_POSIX(expected, actual) EXPECT_EQ(expected, actual)
+#else
+#  define EXPECT_RETRY(statement, func, message)    \
+    func##_count = 1;                               \
+    EXPECT_SYSTEM_ERROR(statement, EINTR, message); \
+    func##_count = 0;
+#  define EXPECT_EQ_POSIX(expected, actual)
+#endif
 
 #if FMT_USE_FCNTL
+void write_file(fmt::cstring_view filename, fmt::string_view content) {
+  fmt::buffered_file f(filename, "w");
+  f.print("{}", content);
+}
+
+using fmt::file;
+
+TEST(os_test, getpagesize) {
 #  ifdef _WIN32
-using mode_t = int;
-#  endif
-
-constexpr mode_t default_open_mode =
-    S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
-
-file::file(cstring_view path, int oflag) {
-#  if defined(_WIN32) && !defined(__MINGW32__)
-  fd_ = -1;
-  auto converted = detail::utf8_to_utf16(string_view(path.c_str()));
-  *this = file::open_windows_file(converted.c_str(), oflag);
-#  else
-  FMT_RETRY(fd_, FMT_POSIX_CALL(open(path.c_str(), oflag, default_open_mode)));
-  if (fd_ == -1)
-    FMT_THROW(
-        system_error(errno, FMT_STRING("cannot open file {}"), path.c_str()));
-#  endif
-}
-
-file::~file() noexcept {
-  // Don't retry close in case of EINTR!
-  // See http://linux.derkeiler.com/Mailing-Lists/Kernel/2005-09/3000.html
-  if (fd_ != -1 && FMT_POSIX_CALL(close(fd_)) != 0)
-    report_system_error(errno, "cannot close file");
-}
-
-void file::close() {
-  if (fd_ == -1) return;
-  // Don't retry close in case of EINTR!
-  // See http://linux.derkeiler.com/Mailing-Lists/Kernel/2005-09/3000.html
-  int result = FMT_POSIX_CALL(close(fd_));
-  fd_ = -1;
-  if (result != 0)
-    FMT_THROW(system_error(errno, FMT_STRING("cannot close file")));
-}
-
-long long file::size() const {
-#  ifdef _WIN32
-  // Use GetFileSize instead of GetFileSizeEx for the case when _WIN32_WINNT
-  // is less than 0x0500 as is the case with some default MinGW builds.
-  // Both functions support large file sizes.
-  DWORD size_upper = 0;
-  HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd_));
-  DWORD size_lower = FMT_SYSTEM(GetFileSize(handle, &size_upper));
-  if (size_lower == INVALID_FILE_SIZE) {
-    DWORD error = GetLastError();
-    if (error != NO_ERROR)
-      FMT_THROW(windows_error(GetLastError(), "cannot get file size"));
-  }
-  unsigned long long long_size = size_upper;
-  return (long_size << sizeof(DWORD) * CHAR_BIT) | size_lower;
-#  else
-  using Stat = struct stat;
-  Stat file_stat = Stat();
-  if (FMT_POSIX_CALL(fstat(fd_, &file_stat)) == -1)
-    FMT_THROW(system_error(errno, FMT_STRING("cannot get file attributes")));
-  static_assert(sizeof(long long) >= sizeof(file_stat.st_size),
-                "return type of file::size is not large enough");
-  return file_stat.st_size;
-#  endif
-}
-
-std::size_t file::read(void* buffer, std::size_t count) {
-  rwresult result = 0;
-  FMT_RETRY(result, FMT_POSIX_CALL(read(fd_, buffer, convert_rwcount(count))));
-  if (result < 0)
-    FMT_THROW(system_error(errno, FMT_STRING("cannot read from file")));
-  return detail::to_unsigned(result);
-}
-
-std::size_t file::write(const void* buffer, std::size_t count) {
-  rwresult result = 0;
-  FMT_RETRY(result, FMT_POSIX_CALL(write(fd_, buffer, convert_rwcount(count))));
-  if (result < 0)
-    FMT_THROW(system_error(errno, FMT_STRING("cannot write to file")));
-  return detail::to_unsigned(result);
-}
-
-file file::dup(int fd) {
-  // Don't retry as dup doesn't return EINTR.
-  // http://pubs.opengroup.org/onlinepubs/009695399/functions/dup.html
-  int new_fd = FMT_POSIX_CALL(dup(fd));
-  if (new_fd == -1)
-    FMT_THROW(system_error(
-        errno, FMT_STRING("cannot duplicate file descriptor {}"), fd));
-  return file(new_fd);
-}
-
-void file::dup2(int fd) {
-  int result = 0;
-  FMT_RETRY(result, FMT_POSIX_CALL(dup2(fd_, fd)));
-  if (result == -1) {
-    FMT_THROW(system_error(
-        errno, FMT_STRING("cannot duplicate file descriptor {} to {}"), fd_,
-        fd));
-  }
-}
-
-void file::dup2(int fd, std::error_code& ec) noexcept {
-  int result = 0;
-  FMT_RETRY(result, FMT_POSIX_CALL(dup2(fd_, fd)));
-  if (result == -1) ec = std::error_code(errno, std::generic_category());
-}
-
-buffered_file file::fdopen(const char* mode) {
-// Don't retry as fdopen doesn't return EINTR.
-#  if defined(__MINGW32__) && defined(_POSIX_)
-  FILE* f = ::fdopen(fd_, mode);
-#  else
-  FILE* f = FMT_POSIX_CALL(fdopen(fd_, mode));
-#  endif
-  if (!f) {
-    FMT_THROW(system_error(
-        errno, FMT_STRING("cannot associate stream with file descriptor")));
-  }
-  buffered_file bf(f);
-  fd_ = -1;
-  return bf;
-}
-
-#  if defined(_WIN32) && !defined(__MINGW32__)
-file file::open_windows_file(wcstring_view path, int oflag) {
-  int fd = -1;
-  auto err = _wsopen_s(&fd, path.c_str(), oflag, _SH_DENYNO, default_open_mode);
-  if (fd == -1) {
-    FMT_THROW(system_error(err, FMT_STRING("cannot open file {}"),
-                           detail::to_utf8<wchar_t>(path.c_str()).c_str()));
-  }
-  return file(fd);
-}
-#  endif
-
-pipe::pipe() {
-  int fds[2] = {};
-#  ifdef _WIN32
-  // Make the default pipe capacity same as on Linux 2.6.11+.
-  enum { DEFAULT_CAPACITY = 65536 };
-  int result = FMT_POSIX_CALL(pipe(fds, DEFAULT_CAPACITY, _O_BINARY));
-#  else
-  // Don't retry as the pipe function doesn't return EINTR.
-  // http://pubs.opengroup.org/onlinepubs/009696799/functions/pipe.html
-  int result = FMT_POSIX_CALL(pipe(fds));
-#  endif
-  if (result != 0)
-    FMT_THROW(system_error(errno, FMT_STRING("cannot create pipe")));
-  // The following assignments don't throw.
-  read_end = file(fds[0]);
-  write_end = file(fds[1]);
-}
-
-#  if !defined(__MSDOS__)
-long getpagesize() {
-#    ifdef _WIN32
-  SYSTEM_INFO si;
+  SYSTEM_INFO si = {};
   GetSystemInfo(&si);
-  return si.dwPageSize;
-#    else
-#      ifdef _WRS_KERNEL
-  long size = FMT_POSIX_CALL(getpagesize());
-#      else
-  long size = FMT_POSIX_CALL(sysconf(_SC_PAGESIZE));
-#      endif
+  EXPECT_EQ(si.dwPageSize, fmt::getpagesize());
+#  else
+  EXPECT_EQ(sysconf(_SC_PAGESIZE), fmt::getpagesize());
+  sysconf_error = true;
+  EXPECT_SYSTEM_ERROR(fmt::getpagesize(), EINVAL,
+                      "cannot get memory page size");
+  sysconf_error = false;
+#  endif
+}
 
-  if (size < 0)
-    FMT_THROW(system_error(errno, FMT_STRING("cannot get memory page size")));
-  return size;
-#    endif
+TEST(file_test, open_retry) {
+#  ifndef _WIN32
+  write_file("temp", "there must be something here");
+  std::unique_ptr<file> f{nullptr};
+  EXPECT_RETRY(f.reset(new file("temp", file::RDONLY)), open,
+               "cannot open file temp");
+  char c = 0;
+  f->read(&c, 1);
+#  endif
+}
+
+TEST(file_test, close_no_retry_in_dtor) {
+  auto pipe = fmt::pipe();
+  std::unique_ptr<file> f(new file(std::move(pipe.read_end)));
+  int saved_close_count = 0;
+  EXPECT_WRITE(
+      stderr,
+      {
+        close_count = 1;
+        f.reset(nullptr);
+        saved_close_count = close_count;
+        close_count = 0;
+      },
+      system_error_message(EINTR, "cannot close file") + "\n");
+  EXPECT_EQ(2, saved_close_count);
+}
+
+TEST(file_test, close_no_retry) {
+  auto pipe = fmt::pipe();
+  close_count = 1;
+  EXPECT_SYSTEM_ERROR(pipe.read_end.close(), EINTR, "cannot close file");
+  EXPECT_EQ(2, close_count);
+  close_count = 0;
+}
+
+TEST(file_test, size) {
+  std::string content = "top secret, destroy before reading";
+  write_file("temp", content);
+  file f("temp", file::RDONLY);
+  EXPECT_GE(f.size(), 0);
+  EXPECT_EQ(content.size(), static_cast<unsigned long long>(f.size()));
+#  ifdef _WIN32
+  auto error_code = std::error_code();
+  fstat_sim = error;
+  try {
+    f.size();
+  } catch (const std::system_error& e) {
+    error_code = e.code();
+  }
+  fstat_sim = none;
+  EXPECT_EQ(error_code,
+            std::error_code(ERROR_ACCESS_DENIED, fmt::system_category()));
+#  else
+  f.close();
+  EXPECT_SYSTEM_ERROR(f.size(), EBADF, "cannot get file attributes");
+#  endif
+}
+
+TEST(file_test, max_size) {
+  write_file("temp", "");
+  file f("temp", file::RDONLY);
+  fstat_sim = max_size;
+  EXPECT_GE(f.size(), 0);
+  EXPECT_EQ(max_file_size(), f.size());
+  fstat_sim = none;
+}
+
+TEST(file_test, read_retry) {
+  auto pipe = fmt::pipe();
+  enum { SIZE = 4 };
+  pipe.write_end.write("test", SIZE);
+  pipe.write_end.close();
+  char buffer[SIZE];
+  size_t count = 0;
+  EXPECT_RETRY(count = pipe.read_end.read(buffer, SIZE), read,
+               "cannot read from file");
+  EXPECT_EQ_POSIX(static_cast<std::streamsize>(SIZE), count);
+}
+
+TEST(file_test, write_retry) {
+  auto pipe = fmt::pipe();
+  enum { SIZE = 4 };
+  size_t count = 0;
+  EXPECT_RETRY(count = pipe.write_end.write("test", SIZE), write,
+               "cannot write to file");
+  pipe.write_end.close();
+#  ifndef _WIN32
+  EXPECT_EQ(static_cast<std::streamsize>(SIZE), count);
+  char buffer[SIZE + 1];
+  pipe.read_end.read(buffer, SIZE);
+  buffer[SIZE] = '\0';
+  EXPECT_STREQ("test", buffer);
+#  endif
+}
+
+#  ifdef _WIN32
+TEST(file_test, convert_read_count) {
+  auto pipe = fmt::pipe();
+  char c;
+  size_t size = UINT_MAX;
+  if (sizeof(unsigned) != sizeof(size_t)) ++size;
+  read_count = 1;
+  read_nbyte = 0;
+  EXPECT_THROW(pipe.read_end.read(&c, size), std::system_error);
+  read_count = 0;
+  EXPECT_EQ(UINT_MAX, read_nbyte);
+}
+
+TEST(file_test, convert_write_count) {
+  auto pipe = fmt::pipe();
+  char c;
+  size_t size = UINT_MAX;
+  if (sizeof(unsigned) != sizeof(size_t)) ++size;
+  write_count = 1;
+  write_nbyte = 0;
+  EXPECT_THROW(pipe.write_end.write(&c, size), std::system_error);
+  write_count = 0;
+  EXPECT_EQ(UINT_MAX, write_nbyte);
 }
 #  endif
 
-namespace detail {
-
-void file_buffer::grow(buffer<char>& buf, size_t) {
-  if (buf.size() == buf.capacity()) static_cast<file_buffer&>(buf).flush();
+TEST(file_test, dup_no_retry) {
+  int stdout_fd = FMT_POSIX(fileno(stdout));
+  dup_count = 1;
+  EXPECT_SYSTEM_ERROR(
+      file::dup(stdout_fd), EINTR,
+      fmt::format("cannot duplicate file descriptor {}", stdout_fd));
+  dup_count = 0;
 }
 
-file_buffer::file_buffer(cstring_view path, const ostream_params& params)
-    : buffer<char>(grow), file_(path, params.oflag) {
-  set(new char[params.buffer_size], params.buffer_size);
+TEST(file_test, dup2_retry) {
+  int stdout_fd = FMT_POSIX(fileno(stdout));
+  file f1 = file::dup(stdout_fd), f2 = file::dup(stdout_fd);
+  EXPECT_RETRY(f1.dup2(f2.descriptor()), dup2,
+               fmt::format("cannot duplicate file descriptor {} to {}",
+                           f1.descriptor(), f2.descriptor()));
 }
 
-file_buffer::file_buffer(file_buffer&& other) noexcept
-    : buffer<char>(grow, other.data(), other.size(), other.capacity()),
-      file_(std::move(other.file_)) {
-  other.clear();
-  other.set(nullptr, 0);
+TEST(file_test, dup2_no_except_retry) {
+  int stdout_fd = FMT_POSIX(fileno(stdout));
+  file f1 = file::dup(stdout_fd), f2 = file::dup(stdout_fd);
+  std::error_code ec;
+  dup2_count = 1;
+  f1.dup2(f2.descriptor(), ec);
+#  ifndef _WIN32
+  EXPECT_EQ(4, dup2_count);
+#  else
+  EXPECT_EQ(EINTR, ec.value());
+#  endif
+  dup2_count = 0;
 }
 
-file_buffer::~file_buffer() {
-  flush();
-  delete[] data();
+TEST(file_test, pipe_no_retry) {
+  pipe_count = 1;
+  EXPECT_SYSTEM_ERROR(fmt::pipe(), EINTR, "cannot create pipe");
+  pipe_count = 0;
 }
-}  // namespace detail
 
-ostream::~ostream() = default;
+TEST(file_test, fdopen_no_retry) {
+  auto pipe = fmt::pipe();
+  fdopen_count = 1;
+  EXPECT_SYSTEM_ERROR(pipe.read_end.fdopen("r"), EINTR,
+                      "cannot associate stream with file descriptor");
+  fdopen_count = 0;
+}
+
+TEST(buffered_file_test, open_retry) {
+  write_file("temp", "there must be something here");
+  std::unique_ptr<buffered_file> f{nullptr};
+  EXPECT_RETRY(f.reset(new buffered_file("temp", "r")), fopen,
+               "cannot open file temp");
+#  ifndef _WIN32
+  char c = 0;
+  if (fread(&c, 1, 1, f->get()) < 1)
+    throw fmt::system_error(errno, "fread failed");
+#  endif
+}
+
+TEST(buffered_file_test, close_no_retry_in_dtor) {
+  auto pipe = fmt::pipe();
+  std::unique_ptr<buffered_file> f(
+      new buffered_file(pipe.read_end.fdopen("r")));
+  int saved_fclose_count = 0;
+  EXPECT_WRITE(
+      stderr,
+      {
+        fclose_count = 1;
+        f.reset(nullptr);
+        saved_fclose_count = fclose_count;
+        fclose_count = 0;
+      },
+      system_error_message(EINTR, "cannot close file") + "\n");
+  EXPECT_EQ(2, saved_fclose_count);
+}
+
+TEST(buffered_file_test, close_no_retry) {
+  auto pipe = fmt::pipe();
+  buffered_file f = pipe.read_end.fdopen("r");
+  fclose_count = 1;
+  EXPECT_SYSTEM_ERROR(f.close(), EINTR, "cannot close file");
+  EXPECT_EQ(2, fclose_count);
+  fclose_count = 0;
+}
+
+TEST(buffered_file_test, fileno_no_retry) {
+  auto pipe = fmt::pipe();
+  buffered_file f = pipe.read_end.fdopen("r");
+  fileno_count = 1;
+  EXPECT_SYSTEM_ERROR((f.descriptor)(), EINTR, "cannot get file descriptor");
+  EXPECT_EQ(2, fileno_count);
+  fileno_count = 0;
+}
 #endif  // FMT_USE_FCNTL
-FMT_END_NAMESPACE
+
+struct test_mock {
+  static test_mock* instance;
+}* test_mock::instance;
+
+TEST(scoped_mock, scope) {
+  {
+    scoped_mock<test_mock> mock;
+    EXPECT_EQ(&mock, test_mock::instance);
+    test_mock& copy = mock;
+    static_cast<void>(copy);
+  }
+  EXPECT_EQ(nullptr, test_mock::instance);
+}

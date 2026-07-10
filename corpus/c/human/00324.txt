@@ -21,123 +21,102 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-/* <DESC>
- * Shows HTTPS usage with client certs and optional ssl engine use.
- * </DESC>
- */
-#include <stdio.h>
+#include "test.h"
 
-#include <curl/curl.h>
+#include "testutil.h"
+#include "memdebug.h"
 
-/* some requirements for this to work:
-   1.   set pCertFile to the file with the client certificate
-   2.   if the key is passphrase protected, set pPassphrase to the
-        passphrase you use
-   3.   if you are using a crypto engine:
-   3.1. set a #define USE_ENGINE
-   3.2. set pEngine to the name of the crypto engine you use
-   3.3. set pKeyName to the key identifier you want to use
-   4.   if you do not use a crypto engine:
-   4.1. set pKeyName to the filename of your client key
-   4.2. if the format of the key file is DER, set pKeyType to "DER"
+struct chunk_data {
+  int remains;
+  int print_content;
+};
 
-   !! verify of the server certificate is not implemented here !!
-
-   **** This example only works with libcurl 7.9.3 and later! ****
-
-*/
-
-int main(void)
+static
+long chunk_bgn(const struct curl_fileinfo *finfo, void *ptr, int remains)
 {
-  CURL *curl;
-  CURLcode res;
-  FILE *headerfile;
-  const char *pPassphrase = NULL;
+  struct chunk_data *ch_d = ptr;
+  ch_d->remains = remains;
 
-  static const char *pCertFile = "testcert.pem";
-  static const char *pCACertFile = "cacert.pem";
-  static const char *pHeaderFile = "dumpit";
+  printf("=============================================================\n");
+  printf("Remains:      %d\n", remains);
+  printf("Filename:     %s\n", finfo->filename);
+  if(finfo->strings.perm) {
+    printf("Permissions:  %s", finfo->strings.perm);
+    if(finfo->flags & CURLFINFOFLAG_KNOWN_PERM)
+      printf(" (parsed => %o)", finfo->perm);
+    printf("\n");
+  }
+  printf("Size:         %ldB\n", (long)finfo->size);
+  if(finfo->strings.user)
+    printf("User:         %s\n", finfo->strings.user);
+  if(finfo->strings.group)
+    printf("Group:        %s\n", finfo->strings.group);
+  if(finfo->strings.time)
+    printf("Time:         %s\n", finfo->strings.time);
+  printf("Filetype:     ");
+  switch(finfo->filetype) {
+  case CURLFILETYPE_FILE:
+    printf("regular file\n");
+    break;
+  case CURLFILETYPE_DIRECTORY:
+    printf("directory\n");
+    break;
+  case CURLFILETYPE_SYMLINK:
+    printf("symlink\n");
+    printf("Target:       %s\n", finfo->strings.target);
+    break;
+  default:
+    printf("other type\n");
+    break;
+  }
+  if(finfo->filetype == CURLFILETYPE_FILE) {
+    ch_d->print_content = 1;
+    printf("Content:\n"
+      "-------------------------------------------------------------\n");
+  }
+  if(strcmp(finfo->filename, "someothertext.txt") == 0) {
+    printf("# THIS CONTENT WAS SKIPPED IN CHUNK_BGN CALLBACK #\n");
+    return CURL_CHUNK_BGN_FUNC_SKIP;
+  }
+  return CURL_CHUNK_BGN_FUNC_OK;
+}
 
-  const char *pKeyName;
-  const char *pKeyType;
+static
+long chunk_end(void *ptr)
+{
+  struct chunk_data *ch_d = ptr;
+  if(ch_d->print_content) {
+    ch_d->print_content = 0;
+    printf("-------------------------------------------------------------\n");
+  }
+  if(ch_d->remains == 1)
+    printf("=============================================================\n");
+  return CURL_CHUNK_END_FUNC_OK;
+}
 
-  const char *pEngine;
-
-#ifdef USE_ENGINE
-  pKeyName  = "rsa_test";
-  pKeyType  = "ENG";
-  pEngine   = "chil";            /* for nChiper HSM... */
-#else
-  pKeyName  = "testkey.pem";
-  pKeyType  = "PEM";
-  pEngine   = NULL;
-#endif
-
-  headerfile = fopen(pHeaderFile, "wb");
-
-  curl_global_init(CURL_GLOBAL_DEFAULT);
-
-  curl = curl_easy_init();
-  if(curl) {
-    /* what call to write: */
-    curl_easy_setopt(curl, CURLOPT_URL, "HTTPS://your.favourite.ssl.site");
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, headerfile);
-
-    do { /* dummy loop, just to break out from */
-      if(pEngine) {
-        /* use crypto engine */
-        if(curl_easy_setopt(curl, CURLOPT_SSLENGINE, pEngine) != CURLE_OK) {
-          /* load the crypto engine */
-          fprintf(stderr, "cannot set crypto engine\n");
-          break;
-        }
-        if(curl_easy_setopt(curl, CURLOPT_SSLENGINE_DEFAULT, 1L) != CURLE_OK) {
-          /* set the crypto engine as default */
-          /* only needed for the first time you load
-             an engine in a curl object... */
-          fprintf(stderr, "cannot set crypto engine as default\n");
-          break;
-        }
-      }
-      /* cert is stored PEM coded in file... */
-      /* since PEM is default, we needn't set it for PEM */
-      curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE, "PEM");
-
-      /* set the cert for client authentication */
-      curl_easy_setopt(curl, CURLOPT_SSLCERT, pCertFile);
-
-      /* sorry, for engine we must set the passphrase
-         (if the key has one...) */
-      if(pPassphrase)
-        curl_easy_setopt(curl, CURLOPT_KEYPASSWD, pPassphrase);
-
-      /* if we use a key stored in a crypto engine,
-         we must set the key type to "ENG" */
-      curl_easy_setopt(curl, CURLOPT_SSLKEYTYPE, pKeyType);
-
-      /* set the private key (file or ID in engine) */
-      curl_easy_setopt(curl, CURLOPT_SSLKEY, pKeyName);
-
-      /* set the file with the certs validating the server */
-      curl_easy_setopt(curl, CURLOPT_CAINFO, pCACertFile);
-
-      /* disconnect if we cannot validate server's cert */
-      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-
-      /* Perform the request, res gets the return code */
-      res = curl_easy_perform(curl);
-      /* Check for errors */
-      if(res != CURLE_OK)
-        fprintf(stderr, "curl_easy_perform() failed: %s\n",
-                curl_easy_strerror(res));
-
-      /* we are done... */
-    } while(0);
-    /* always cleanup */
-    curl_easy_cleanup(curl);
+CURLcode test(char *URL)
+{
+  CURL *handle = NULL;
+  CURLcode res = CURLE_OK;
+  struct chunk_data chunk_data = {0, 0};
+  curl_global_init(CURL_GLOBAL_ALL);
+  handle = curl_easy_init();
+  if(!handle) {
+    res = CURLE_OUT_OF_MEMORY;
+    goto test_cleanup;
   }
 
-  curl_global_cleanup();
+  test_setopt(handle, CURLOPT_URL, URL);
+  test_setopt(handle, CURLOPT_WILDCARDMATCH, 1L);
+  test_setopt(handle, CURLOPT_CHUNK_BGN_FUNCTION, chunk_bgn);
+  test_setopt(handle, CURLOPT_CHUNK_END_FUNCTION, chunk_end);
+  test_setopt(handle, CURLOPT_CHUNK_DATA, &chunk_data);
 
-  return 0;
+  res = curl_easy_perform(handle);
+
+test_cleanup:
+  if(handle)
+    curl_easy_cleanup(handle);
+  curl_global_cleanup();
+  return res;
 }

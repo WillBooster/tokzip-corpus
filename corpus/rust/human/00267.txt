@@ -1,208 +1,210 @@
-use crate::util::AnyValueId;
-use crate::util::FlatMap;
+#![cfg_attr(not(feature = "usage"), allow(dead_code))]
 
-#[derive(Default, Clone, Debug)]
-pub(crate) struct Extensions {
-    extensions: FlatMap<AnyValueId, BoxedExtension>,
-}
+/// Terminal-styling container
+///
+/// Styling may be encoded as [ANSI Escape Code](https://en.wikipedia.org/wiki/ANSI_escape_code)
+///
+/// # Examples
+///
+/// ```rust
+/// # use clap_builder as clap;
+/// // `cstr!` converts tags to ANSI codes
+/// let after_help: &'static str = color_print::cstr!(
+/// r#"<bold><underline>Examples</underline></bold>
+///
+///   <dim>$</dim> <bold>mybin --input file.toml</bold>
+/// "#);
+///
+/// let cmd = clap::Command::new("mybin")
+///     .after_help(after_help)  // The `&str` gets converted into a `StyledStr`
+///     // ...
+/// #   ;
+/// ```
+#[derive(Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StyledStr(String);
 
-impl Extensions {
-    #[allow(dead_code)]
-    pub(crate) fn get<T: Extension>(&self) -> Option<&T> {
-        let id = AnyValueId::of::<T>();
-        self.extensions.get(&id).map(|e| e.as_ref::<T>())
+impl StyledStr {
+    /// Create an empty buffer
+    pub const fn new() -> Self {
+        Self(String::new())
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn get_mut<T: Extension>(&mut self) -> Option<&mut T> {
-        let id = AnyValueId::of::<T>();
-        self.extensions.get_mut(&id).map(|e| e.as_mut::<T>())
+    /// Display using [ANSI Escape Code](https://en.wikipedia.org/wiki/ANSI_escape_code) styling
+    #[cfg(feature = "color")]
+    pub fn ansi(&self) -> impl std::fmt::Display + '_ {
+        self.0.as_str()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn get_or_insert_default<T: Extension + Default>(&mut self) -> &mut T {
-        let id = AnyValueId::of::<T>();
-        self.extensions
-            .entry(id)
-            .or_insert_with(|| BoxedExtension::new(T::default()))
-            .as_mut::<T>()
+    /// May allow the compiler to consolidate the `Drop`s for `msg`, reducing code size compared to
+    /// `styled.push_str(&msg)`
+    pub(crate) fn push_string(&mut self, msg: String) {
+        self.0.push_str(&msg);
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn set<T: Extension + Into<BoxedEntry>>(&mut self, tagged: T) -> bool {
-        let BoxedEntry { id, value } = tagged.into();
-        self.extensions.insert(id, value).is_some()
+    pub(crate) fn push_str(&mut self, msg: &str) {
+        self.0.push_str(msg);
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn remove<T: Extension>(&mut self) -> Option<Box<dyn Extension>> {
-        let id = AnyValueId::of::<T>();
-        self.extensions.remove(&id).map(BoxedExtension::into_inner)
-    }
-
-    pub(crate) fn update(&mut self, other: &Self) {
-        for (key, value) in other.extensions.iter() {
-            self.extensions.insert(*key, value.clone());
+    pub(crate) fn trim_start_lines(&mut self) {
+        if let Some(pos) = self.0.find('\n') {
+            let (leading, help) = self.0.split_at(pos + 1);
+            if leading.trim().is_empty() {
+                self.0 = help.to_owned();
+            }
         }
     }
+
+    pub(crate) fn trim_end(&mut self) {
+        self.0 = self.0.trim_end().to_owned();
+    }
+
+    #[cfg(feature = "help")]
+    pub(crate) fn replace_newline_var(&mut self) {
+        self.0 = self.0.replace("{n}", "\n");
+    }
+
+    #[cfg(feature = "help")]
+    pub(crate) fn indent(&mut self, initial: &str, trailing: &str) {
+        self.0.insert_str(0, initial);
+
+        let mut line_sep = "\n".to_owned();
+        line_sep.push_str(trailing);
+        self.0 = self.0.replace('\n', &line_sep);
+    }
+
+    #[cfg(all(not(feature = "wrap_help"), feature = "help"))]
+    pub(crate) fn wrap(&mut self, _hard_width: usize) {}
+
+    #[cfg(feature = "wrap_help")]
+    pub(crate) fn wrap(&mut self, hard_width: usize) {
+        let mut new = String::with_capacity(self.0.len());
+
+        let mut last = 0;
+        let mut wrapper = crate::output::textwrap::wrap_algorithms::LineWrapper::new(hard_width);
+        for content in self.iter_text() {
+            // Preserve styling
+            let current = content.as_ptr() as usize - self.0.as_str().as_ptr() as usize;
+            if last != current {
+                new.push_str(&self.0.as_str()[last..current]);
+            }
+            last = current + content.len();
+
+            for (i, line) in content.split_inclusive('\n').enumerate() {
+                if 0 < i {
+                    // reset char count on newline, skipping the start as we might have carried
+                    // over from a prior block of styled text
+                    wrapper.reset();
+                }
+                let line = crate::output::textwrap::word_separators::find_words_ascii_space(line)
+                    .collect::<Vec<_>>();
+                new.extend(wrapper.wrap(line));
+            }
+        }
+        if last != self.0.len() {
+            new.push_str(&self.0.as_str()[last..]);
+        }
+        new = new.trim_end().to_owned();
+
+        self.0 = new;
+    }
+
+    #[inline(never)]
+    #[cfg(feature = "help")]
+    pub(crate) fn display_width(&self) -> usize {
+        let mut width = 0;
+        for c in self.iter_text() {
+            width += crate::output::display_width(c);
+        }
+        width
+    }
+
+    #[cfg(feature = "help")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(feature = "help")]
+    pub(crate) fn as_styled_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(feature = "color")]
+    pub(crate) fn iter_text(&self) -> impl Iterator<Item = &str> {
+        anstream::adapter::strip_str(&self.0)
+    }
+
+    #[cfg(not(feature = "color"))]
+    pub(crate) fn iter_text(&self) -> impl Iterator<Item = &str> {
+        [self.0.as_str()].into_iter()
+    }
+
+    pub(crate) fn push_styled(&mut self, other: &Self) {
+        self.0.push_str(&other.0);
+    }
+
+    pub(crate) fn write_to(&self, buffer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        ok!(buffer.write_all(self.0.as_bytes()));
+
+        Ok(())
+    }
 }
 
-/// Supports conversion to `Any`. Traits to be extended by `impl_downcast!` must extend `Extension`.
-pub(crate) trait Extension: std::fmt::Debug + Send + Sync + 'static {
-    /// Clone `&Box<dyn Trait>` (where `Trait: Extension`) to `Box<dyn Extension>`.
-    ///
-    /// `Box<dyn Any>` can /// then be further `downcast` into
-    // `Box<ConcreteType>` where `ConcreteType` implements `Trait`.
-    fn clone_extension(&self) -> Box<dyn Extension>;
-    /// Convert `&Trait` (where `Trait: Extension`) to `&Any`.
-    ///
-    /// This is needed since Rust cannot /// generate `&Any`'s vtable from
-    /// `&Trait`'s.
-    fn as_any(&self) -> &dyn std::any::Any;
-    /// Convert `&mut Trait` (where `Trait: Extension`) to `&Any`.
-    ///
-    /// This is needed since Rust cannot /// generate `&mut Any`'s vtable from
-    /// `&mut Trait`'s.
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
-}
-
-impl<T> Extension for T
-where
-    T: Clone + std::fmt::Debug + Send + Sync + 'static,
-{
-    fn clone_extension(&self) -> Box<dyn Extension> {
-        Box::new(self.clone())
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+impl Default for &'_ StyledStr {
+    fn default() -> Self {
+        static DEFAULT: StyledStr = StyledStr::new();
+        &DEFAULT
     }
 }
 
-impl Clone for Box<dyn Extension> {
-    fn clone(&self) -> Self {
-        self.as_ref().clone_extension()
+impl From<String> for StyledStr {
+    fn from(name: String) -> Self {
+        StyledStr(name)
     }
 }
 
-#[derive(Clone)]
-#[repr(transparent)]
-struct BoxedExtension(Box<dyn Extension>);
-
-impl BoxedExtension {
-    fn new<T: Extension>(inner: T) -> Self {
-        Self(Box::new(inner))
-    }
-
-    fn into_inner(self) -> Box<dyn Extension> {
-        self.0
-    }
-
-    fn as_ref<T: Extension>(&self) -> &T {
-        self.0.as_ref().as_any().downcast_ref::<T>().unwrap()
-    }
-
-    fn as_mut<T: Extension>(&mut self) -> &mut T {
-        self.0.as_mut().as_any_mut().downcast_mut::<T>().unwrap()
+impl From<&'_ String> for StyledStr {
+    fn from(name: &'_ String) -> Self {
+        let mut styled = StyledStr::new();
+        styled.push_str(name);
+        styled
     }
 }
 
-impl std::fmt::Debug for BoxedExtension {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        self.0.fmt(f)
+impl From<&'static str> for StyledStr {
+    fn from(name: &'static str) -> Self {
+        let mut styled = StyledStr::new();
+        styled.push_str(name);
+        styled
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct BoxedEntry {
-    id: AnyValueId,
-    value: BoxedExtension,
-}
-
-impl BoxedEntry {
-    pub(crate) fn new(r: impl Extension) -> Self {
-        let id = AnyValueId::from(&r);
-        let value = BoxedExtension::new(r);
-        BoxedEntry { id, value }
+impl From<&'_ &'static str> for StyledStr {
+    fn from(name: &'_ &'static str) -> Self {
+        StyledStr::from(*name)
     }
 }
 
-impl<R: Extension> From<R> for BoxedEntry {
-    fn from(inner: R) -> Self {
-        BoxedEntry::new(inner)
+impl std::fmt::Write for StyledStr {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> Result<(), std::fmt::Error> {
+        self.0.push_str(s);
+        Ok(())
+    }
+
+    #[inline]
+    fn write_char(&mut self, c: char) -> Result<(), std::fmt::Error> {
+        self.0.push(c);
+        Ok(())
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
+/// Color-unaware printing. Never uses coloring.
+impl std::fmt::Display for StyledStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for part in self.iter_text() {
+            part.fmt(f)?;
+        }
 
-    #[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
-    struct Number(usize);
-
-    #[test]
-    fn get() {
-        let mut ext = Extensions::default();
-        ext.set(Number(10));
-        assert_eq!(ext.get::<Number>(), Some(&Number(10)));
-    }
-
-    #[test]
-    fn get_mut() {
-        let mut ext = Extensions::default();
-        ext.set(Number(10));
-        *ext.get_mut::<Number>().unwrap() = Number(20);
-        assert_eq!(ext.get::<Number>(), Some(&Number(20)));
-    }
-
-    #[test]
-    fn get_or_insert_default_empty() {
-        let mut ext = Extensions::default();
-        assert_eq!(ext.get_or_insert_default::<Number>(), &Number(0));
-    }
-
-    #[test]
-    fn get_or_insert_default_full() {
-        let mut ext = Extensions::default();
-        ext.set(Number(10));
-        assert_eq!(ext.get_or_insert_default::<Number>(), &Number(10));
-    }
-
-    #[test]
-    fn set() {
-        let mut ext = Extensions::default();
-        assert!(!ext.set(Number(10)));
-        assert_eq!(ext.get::<Number>(), Some(&Number(10)));
-        assert!(ext.set(Number(20)));
-        assert_eq!(ext.get::<Number>(), Some(&Number(20)));
-    }
-
-    #[test]
-    fn reset() {
-        let mut ext = Extensions::default();
-        assert_eq!(ext.get::<Number>(), None);
-
-        assert!(ext.remove::<Number>().is_none());
-        assert_eq!(ext.get::<Number>(), None);
-
-        assert!(!ext.set(Number(10)));
-        assert_eq!(ext.get::<Number>(), Some(&Number(10)));
-
-        assert!(ext.remove::<Number>().is_some());
-        assert_eq!(ext.get::<Number>(), None);
-    }
-
-    #[test]
-    fn update() {
-        let mut ext = Extensions::default();
-        assert_eq!(ext.get::<Number>(), None);
-
-        let mut new = Extensions::default();
-        assert!(!new.set(Number(10)));
-
-        ext.update(&new);
-        assert_eq!(ext.get::<Number>(), Some(&Number(10)));
+        Ok(())
     }
 }

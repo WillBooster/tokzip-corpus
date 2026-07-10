@@ -25,92 +25,99 @@
 
 #include "memdebug.h"
 
-static char data[]= "dummy";
+static char data[]="this is what we post to the silly web server\n";
 
 struct WriteThis {
   char *readptr;
-  curl_off_t sizeleft;
+  size_t sizeleft;
 };
 
 static size_t read_callback(char *ptr, size_t size, size_t nmemb, void *userp)
 {
   struct WriteThis *pooh = (struct WriteThis *)userp;
-  size_t len = strlen(pooh->readptr);
+  size_t tocopy = size * nmemb;
 
-  (void) size; /* Always 1.*/
+  /* Wait one second before return POST data          *
+   * so libcurl will wait before sending request body */
+  wait_ms(1000);
 
-  if(len > nmemb)
-    len = nmemb;
-  if(len) {
-    memcpy(ptr, pooh->readptr, len);
-    pooh->readptr += len;
-  }
-  return len;
+  if(tocopy < 1 || !pooh->sizeleft)
+    return 0;
+
+  if(pooh->sizeleft < tocopy)
+    tocopy = pooh->sizeleft;
+
+  memcpy(ptr, pooh->readptr, tocopy);/* copy requested data */
+  pooh->readptr += tocopy;           /* advance pointer */
+  pooh->sizeleft -= tocopy;          /* less data left */
+  return tocopy;
 }
 
 CURLcode test(char *URL)
 {
-  CURL *easy = NULL;
-  curl_mime *mime = NULL;
-  curl_mimepart *part;
-  CURLcode res = TEST_ERR_FAILURE;
-  struct WriteThis pooh1, pooh2;
+  CURL *curl;
+  CURLcode res = CURLE_OK;
 
-  /*
-   * Check early end of part data detection.
-   */
+  struct WriteThis pooh;
 
-  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+  if(!strcmp(URL, "check")) {
+#if (defined(_WIN32) || defined(__CYGWIN__))
+    printf("Windows TCP does not deliver response data but reports "
+           "CONNABORTED\n");
+    return (CURLcode)1; /* skip since it fails on Windows without workaround */
+#else
+    return CURLE_OK; /* sure, run this! */
+#endif
+  }
+
+  pooh.readptr = data;
+  pooh.sizeleft = strlen(data);
+
+  if(curl_global_init(CURL_GLOBAL_ALL)) {
     fprintf(stderr, "curl_global_init() failed\n");
     return TEST_ERR_MAJOR_BAD;
   }
 
-  easy = curl_easy_init();
-
-  /* First set the URL that is about to receive our POST. */
-  test_setopt(easy, CURLOPT_URL, URL);
-
-  /* get verbose debug output please */
-  test_setopt(easy, CURLOPT_VERBOSE, 1L);
-
-  /* include headers in the output */
-  test_setopt(easy, CURLOPT_HEADER, 1L);
-
-  /* Prepare the callback structures. */
-  pooh1.readptr = data;
-  pooh1.sizeleft = (curl_off_t) strlen(data);
-  pooh2 = pooh1;
-
-  /* Build the mime tree. */
-  mime = curl_mime_init(easy);
-  part = curl_mime_addpart(mime);
-  curl_mime_name(part, "field1");
-  /* Early end of data detection can be done because the data size is known. */
-  curl_mime_data_cb(part, (curl_off_t) strlen(data),
-                    read_callback, NULL, NULL, &pooh1);
-  part = curl_mime_addpart(mime);
-  curl_mime_name(part, "field2");
-  /* Using an undefined length forces chunked transfer and disables early
-     end of data detection for this part. */
-  curl_mime_data_cb(part, (curl_off_t) -1, read_callback, NULL, NULL, &pooh2);
-  part = curl_mime_addpart(mime);
-  curl_mime_name(part, "field3");
-  /* Regular file part sources early end of data can be detected because
-     the file size is known. In addition, and EOF test is performed. */
-  curl_mime_filedata(part, libtest_arg2);
-
-  /* Bind mime data to its easy handle. */
-  test_setopt(easy, CURLOPT_MIMEPOST, mime);
-
-  /* Send data. */
-  res = curl_easy_perform(easy);
-  if(res != CURLE_OK) {
-    fprintf(stderr, "curl_easy_perform() failed\n");
+  curl = curl_easy_init();
+  if(!curl) {
+    fprintf(stderr, "curl_easy_init() failed\n");
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
   }
 
+  /* First set the URL that is about to receive our POST. */
+  test_setopt(curl, CURLOPT_URL, URL);
+
+  /* Now specify we want to POST data */
+  test_setopt(curl, CURLOPT_POST, 1L);
+
+  /* Set the expected POST size */
+  test_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)pooh.sizeleft);
+
+  /* we want to use our own read function */
+  test_setopt(curl, CURLOPT_READFUNCTION, read_callback);
+
+  /* pointer to pass to our read function */
+  test_setopt(curl, CURLOPT_READDATA, &pooh);
+
+  /* get verbose debug output please */
+  test_setopt(curl, CURLOPT_VERBOSE, 1L);
+
+  /* include headers in the output */
+  test_setopt(curl, CURLOPT_HEADER, 1L);
+
+  /* detect HTTP error codes >= 400 */
+  /* test_setopt(curl, CURLOPT_FAILONERROR, 1L); */
+
+
+  /* Perform the request, res will get the return code */
+  res = curl_easy_perform(curl);
+
 test_cleanup:
-  curl_easy_cleanup(easy);
-  curl_mime_free(mime);
+
+  /* always cleanup */
+  curl_easy_cleanup(curl);
   curl_global_cleanup();
+
   return res;
 }

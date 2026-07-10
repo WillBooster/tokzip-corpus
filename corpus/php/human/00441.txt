@@ -10,114 +10,405 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Package\Version;
+namespace Composer\Test\Json;
 
-use Composer\Package\PackageInterface;
-use Composer\Package\Loader\ArrayLoader;
-use Composer\Package\Dumper\ArrayDumper;
-use Composer\Pcre\Preg;
-use Composer\Semver\Constraint\Constraint;
-use Composer\Semver\Constraint\ConstraintInterface;
-use Composer\Semver\Intervals;
-use Composer\Util\Platform;
+use Seld\JsonLint\ParsingException;
+use Composer\Json\JsonFile;
+use Composer\Json\JsonValidationException;
+use Composer\Test\TestCase;
 
-/**
- * @author Jordi Boggiano <j.boggiano@seld.be>
- * @internal
- */
-class VersionBumper
+class JsonFileTest extends TestCase
 {
-    /**
-     * Given a constraint, this returns a new constraint with
-     * the lower bound bumped to match the given package's version.
-     *
-     * For example:
-     *  * ^1.0 + 1.2.1            -> ^1.2.1
-     *  * ^1.2 + 1.2.0            -> ^1.2
-     *  * ^1.2.0 + 1.3.0          -> ^1.3.0
-     *  * ^1.2 || ^2.3 + 1.3.0    -> ^1.3 || ^2.3
-     *  * ^1.2 || ^2.3 + 2.4.0    -> ^1.2 || ^2.4
-     *  * ^3@dev + 3.2.99999-dev  -> ^3.2@dev
-     *  * ~2 + 2.0-beta.1         -> ~2
-     *  * dev-master + dev-master -> dev-master
-     *  * * + 1.2.3               -> >=1.2.3
-     */
-    public function bumpRequirement(ConstraintInterface $constraint, PackageInterface $package): string
+    public function testParseErrorDetectExtraComma(): void
     {
-        $parser = new VersionParser();
-        $prettyConstraint = $constraint->getPrettyString();
-        if (str_starts_with($constraint->getPrettyString(), 'dev-')) {
-            return $prettyConstraint;
+        $json = '{
+        "foo": "bar",
+}';
+        $this->expectParseException('Parse error on line 2', $json);
+    }
+
+    public function testParseErrorDetectExtraCommaInArray(): void
+    {
+        $json = '{
+        "foo": [
+            "bar",
+        ]
+}';
+        $this->expectParseException('Parse error on line 3', $json);
+    }
+
+    public function testParseErrorDetectUnescapedBackslash(): void
+    {
+        $json = '{
+        "fo\o": "bar"
+}';
+        $this->expectParseException('Parse error on line 1', $json);
+    }
+
+    public function testParseErrorSkipsEscapedBackslash(): void
+    {
+        $json = '{
+        "fo\\\\o": "bar"
+        "a": "b"
+}';
+        $this->expectParseException('Parse error on line 2', $json);
+    }
+
+    public function testParseErrorDetectSingleQuotes(): void
+    {
+        if (defined('JSON_PARSER_NOTSTRICT') && version_compare(phpversion('json'), '1.3.9', '<')) {
+            $this->markTestSkipped('jsonc issue, see https://github.com/remicollet/pecl-json-c/issues/23');
         }
+        $json = '{
+        \'foo\': "bar"
+}';
+        $this->expectParseException('Parse error on line 1', $json);
+    }
 
-        $version = $package->getVersion();
-        if (str_starts_with($package->getVersion(), 'dev-')) {
-            $loader = new ArrayLoader($parser);
-            $dumper = new ArrayDumper();
-            $extra = $loader->getBranchAlias($dumper->dump($package));
+    public function testParseErrorDetectMissingQuotes(): void
+    {
+        $json = '{
+        foo: "bar"
+}';
+        $this->expectParseException('Parse error on line 1', $json);
+    }
 
-            // dev packages without branch alias cannot be processed
-            if (null === $extra || $extra === VersionParser::DEFAULT_BRANCH_ALIAS) {
-                return $prettyConstraint;
-            }
+    public function testParseErrorDetectArrayAsHash(): void
+    {
+        $json = '{
+        "foo": ["bar": "baz"]
+}';
+        $this->expectParseException('Parse error on line 2', $json);
+    }
 
-            $version = $extra;
+    public function testParseErrorDetectMissingComma(): void
+    {
+        $json = '{
+        "foo": "bar"
+        "bar": "foo"
+}';
+        $this->expectParseException('Parse error on line 2', $json);
+    }
+
+    public function testSchemaValidation(): void
+    {
+        self::expectNotToPerformAssertions();
+
+        $json = new JsonFile(__DIR__.'/Fixtures/composer.json');
+        $json->validateSchema();
+        $json->validateSchema(JsonFile::LAX_SCHEMA);
+    }
+
+    public function testSchemaValidationError(): void
+    {
+        $file = $this->createTempFile();
+        file_put_contents($file, '{ "name": null }');
+        $json = new JsonFile($file);
+        $expectedMessage = sprintf('"%s" does not match the expected JSON schema', $file);
+        $expectedError = 'name : NULL value found, but a string is required';
+        try {
+            $json->validateSchema();
+            $this->fail('Expected exception to be thrown (strict)');
+        } catch (JsonValidationException $e) {
+            self::assertEquals($expectedMessage, $e->getMessage());
+            self::assertContains($expectedError, $e->getErrors());
         }
-
-        $intervals = Intervals::get($constraint);
-
-        // complex constraints with branch names are not bumped
-        if (\count($intervals['branches']['names']) > 0) {
-            return $prettyConstraint;
+        try {
+            $json->validateSchema(JsonFile::LAX_SCHEMA);
+            $this->fail('Expected exception to be thrown (lax)');
+        } catch (JsonValidationException $e) {
+            self::assertEquals($expectedMessage, $e->getMessage());
+            self::assertContains($expectedError, $e->getErrors());
         }
+        unlink($file);
+    }
 
-        $major = Preg::replace('{^(\d+).*}', '$1', $version);
-        $versionWithoutSuffix = Preg::replace('{(?:\.(?:0|9999999))+(-dev)?$}', '', $version);
-        $newPrettyConstraint = '^'.$versionWithoutSuffix;
-
-        // not a simple stable version, abort
-        if (!Preg::isMatch('{^\^\d+(\.\d+)*$}', $newPrettyConstraint)) {
-            return $prettyConstraint;
+    public function testSchemaValidationLaxAdditionalProperties(): void
+    {
+        $file = $this->createTempFile();
+        file_put_contents($file, '{ "name": "vendor/package", "description": "generic description", "foo": "bar" }');
+        $json = new JsonFile($file);
+        try {
+            $json->validateSchema();
+            $this->fail('Expected exception to be thrown (strict)');
+        } catch (JsonValidationException $e) {
+            self::assertEquals(sprintf('"%s" does not match the expected JSON schema', $file), $e->getMessage());
+            self::assertEquals(['The property foo is not defined and the definition does not allow additional properties'], $e->getErrors());
         }
+        $json->validateSchema(JsonFile::LAX_SCHEMA);
+        unlink($file);
+    }
 
-        $pattern = '{
-            (?<=,|\ |\||^) # leading separator
-            (?P<constraint>
-                \^v?'.$major.'(?:\.\d+)* # e.g. ^2.anything
-                | ~v?'.$major.'(?:\.\d+){0,2} # e.g. ~2 or ~2.2 or ~2.2.2 but no more
-                | v?'.$major.'(?:\.[*x])+ # e.g. 2.* or 2.*.* or 2.x.x.x etc
-                | >=v?\d(?:\.\d+)* # e.g. >=2 or >=1.2 etc
-                | \* # full wildcard
-            )
-            (?=,|$|\ |\||@) # trailing separator
-        }x';
-        if (Preg::isMatchAllWithOffsets($pattern, $prettyConstraint, $matches)) {
-            $modified = $prettyConstraint;
-            foreach (array_reverse($matches['constraint']) as $match) {
-                assert(is_string($match[0]));
-                $suffix = '';
-                if (substr_count($match[0], '.') === 2 && substr_count($versionWithoutSuffix, '.') === 1) {
-                    $suffix = '.0';
-                }
-                if (str_starts_with($match[0], '~') && substr_count($match[0], '.') === 2) {
-                    $replacement = '~'.$versionWithoutSuffix.$suffix;
-                } elseif ($match[0] === '*' || str_starts_with($match[0], '>=')) {
-                    $replacement = '>='.$versionWithoutSuffix.$suffix;
-                } else {
-                    $replacement = $newPrettyConstraint.$suffix;
-                }
-                $modified = substr_replace($modified, $replacement, $match[1], Platform::strlen($match[0]));
-            }
+    public function testSchemaValidationLaxRequired(): void
+    {
+        $file = $this->createTempFile();
+        $json = new JsonFile($file);
 
-            // if it is strictly equal to the previous one then no need to change anything
-            $newConstraint = $parser->parseConstraints($modified);
-            if (Intervals::isSubsetOf($newConstraint, $constraint) && Intervals::isSubsetOf($constraint, $newConstraint)) {
-                return $prettyConstraint;
-            }
+        $expectedMessage = sprintf('"%s" does not match the expected JSON schema', $file);
 
-            return $modified;
+        file_put_contents($file, '{ }');
+        try {
+            $json->validateSchema();
+            $this->fail('Expected exception to be thrown (strict)');
+        } catch (JsonValidationException $e) {
+            self::assertEquals($expectedMessage, $e->getMessage());
+            $errors = $e->getErrors();
+            self::assertContains('name : The property name is required', $errors);
+            self::assertContains('description : The property description is required', $errors);
         }
+        $json->validateSchema(JsonFile::LAX_SCHEMA);
 
-        return $prettyConstraint;
+        file_put_contents($file, '{ "name": "vendor/package" }');
+        try {
+            $json->validateSchema();
+            $this->fail('Expected exception to be thrown (strict)');
+        } catch (JsonValidationException $e) {
+            self::assertEquals($expectedMessage, $e->getMessage());
+            self::assertEquals(['description : The property description is required'], $e->getErrors());
+        }
+        $json->validateSchema(JsonFile::LAX_SCHEMA);
+
+        file_put_contents($file, '{ "description": "generic description" }');
+        try {
+            $json->validateSchema();
+            $this->fail('Expected exception to be thrown (strict)');
+        } catch (JsonValidationException $e) {
+            self::assertEquals($expectedMessage, $e->getMessage());
+            self::assertEquals(['name : The property name is required'], $e->getErrors());
+        }
+        $json->validateSchema(JsonFile::LAX_SCHEMA);
+
+        file_put_contents($file, '{ "type": "library" }');
+        try {
+            $json->validateSchema();
+            $this->fail('Expected exception to be thrown (strict)');
+        } catch (JsonValidationException $e) {
+            self::assertEquals($expectedMessage, $e->getMessage());
+            $errors = $e->getErrors();
+            self::assertContains('name : The property name is required', $errors);
+            self::assertContains('description : The property description is required', $errors);
+        }
+        $json->validateSchema(JsonFile::LAX_SCHEMA);
+
+        file_put_contents($file, '{ "type": "project" }');
+        try {
+            $json->validateSchema();
+            $this->fail('Expected exception to be thrown (strict)');
+        } catch (JsonValidationException $e) {
+            self::assertEquals($expectedMessage, $e->getMessage());
+            $errors = $e->getErrors();
+            self::assertContains('name : The property name is required', $errors);
+            self::assertContains('description : The property description is required', $errors);
+        }
+        $json->validateSchema(JsonFile::LAX_SCHEMA);
+
+        file_put_contents($file, '{ "name": "vendor/package", "description": "generic description" }');
+        $json->validateSchema();
+        $json->validateSchema(JsonFile::LAX_SCHEMA);
+
+        unlink($file);
+    }
+
+    public function testCustomSchemaValidationLax(): void
+    {
+        self::expectNotToPerformAssertions();
+        $file = $this->createTempFile();
+        file_put_contents($file, '{ "custom": "property", "another custom": "property" }');
+
+        $schema = $this->createTempFile();
+        file_put_contents($schema, '{ "properties": { "custom": { "type": "string" }}}');
+
+        $json = new JsonFile($file);
+
+        $json->validateSchema(JsonFile::LAX_SCHEMA, $schema);
+
+        unlink($file);
+        unlink($schema);
+    }
+
+    public function testCustomSchemaValidationStrict(): void
+    {
+        self::expectNotToPerformAssertions();
+        $file = $this->createTempFile();
+        file_put_contents($file, '{ "custom": "property" }');
+
+        $schema = $this->createTempFile();
+        file_put_contents($schema, '{ "properties": { "custom": { "type": "string" }}}');
+
+        $json = new JsonFile($file);
+
+        $json->validateSchema(JsonFile::STRICT_SCHEMA, $schema);
+
+        unlink($file);
+        unlink($schema);
+    }
+
+    public function testAuthSchemaValidationWithCustomDataSource(): void
+    {
+        $json = json_decode('{"github-oauth": "foo"}');
+        $expectedMessage = sprintf('"COMPOSER_AUTH" does not match the expected JSON schema');
+        $expectedError = 'github-oauth : String value found, but an object is required';
+        try {
+            JsonFile::validateJsonSchema('COMPOSER_AUTH', $json, JsonFile::AUTH_SCHEMA);
+            $this->fail('Expected exception to be thrown');
+        } catch (JsonValidationException $e) {
+            self::assertEquals($expectedMessage, $e->getMessage());
+            self::assertSame([$expectedError], $e->getErrors());
+        }
+    }
+
+    public function testParseErrorDetectMissingCommaMultiline(): void
+    {
+        $json = '{
+        "foo": "barbar"
+
+        "bar": "foo"
+}';
+        $this->expectParseException('Parse error on line 2', $json);
+    }
+
+    public function testParseErrorDetectMissingColon(): void
+    {
+        $json = '{
+        "foo": "bar",
+        "bar" "foo"
+}';
+        $this->expectParseException('Parse error on line 3', $json);
+    }
+
+    public function testSimpleJsonString(): void
+    {
+        $data = ['name' => 'composer/composer'];
+        $json = '{
+    "name": "composer/composer"
+}';
+        self::assertJsonFormat($json, $data);
+    }
+
+    public function testTrailingBackslash(): void
+    {
+        $data = ['Metadata\\' => 'src/'];
+        $json = '{
+    "Metadata\\\\": "src/"
+}';
+        self::assertJsonFormat($json, $data);
+    }
+
+    public function testFormatEmptyArray(): void
+    {
+        $data = ['test' => [], 'test2' => new \stdClass];
+        $json = '{
+    "test": [],
+    "test2": {}
+}';
+        self::assertJsonFormat($json, $data);
+    }
+
+    public function testEscape(): void
+    {
+        $data = ["Metadata\\\"" => 'src/'];
+        $json = '{
+    "Metadata\\\\\\"": "src/"
+}';
+
+        self::assertJsonFormat($json, $data);
+    }
+
+    public function testUnicode(): void
+    {
+        $data = ["Žluťoučký \" kůň" => "úpěl ďábelské ódy za €"];
+        $json = '{
+    "Žluťoučký \" kůň": "úpěl ďábelské ódy za €"
+}';
+
+        self::assertJsonFormat($json, $data);
+    }
+
+    public function testOnlyUnicode(): void
+    {
+        $data = "\\/ƌ";
+
+        self::assertJsonFormat('"\\\\\\/ƌ"', $data, JSON_UNESCAPED_UNICODE);
+    }
+
+    public function testEscapedSlashes(): void
+    {
+        $data = "\\/foo";
+
+        self::assertJsonFormat('"\\\\\\/foo"', $data, 0);
+    }
+
+    public function testEscapedBackslashes(): void
+    {
+        $data = "a\\b";
+
+        self::assertJsonFormat('"a\\\\b"', $data, 0);
+    }
+
+    public function testEscapedUnicode(): void
+    {
+        $data = "ƌ";
+
+        self::assertJsonFormat('"\\u018c"', $data, 0);
+    }
+
+    public function testDoubleEscapedUnicode(): void
+    {
+        $jsonFile = new JsonFile('composer.json');
+        $data = ["Zdjęcia","hjkjhl\\u0119kkjk"];
+        $encodedData = $jsonFile->encode($data);
+        $doubleEncodedData = $jsonFile->encode(['t' => $encodedData]);
+
+        $decodedData = json_decode($doubleEncodedData, true);
+        $doubleData = json_decode($decodedData['t'], true);
+        self::assertEquals($data, $doubleData);
+    }
+
+    public function testPreserveIndentationAfterRead(): void
+    {
+        copy(__DIR__.'/Fixtures/tabs.json', __DIR__.'/Fixtures/tabs2.json');
+        $jsonFile = new JsonFile(__DIR__.'/Fixtures/tabs2.json');
+        $data = $jsonFile->read();
+        $jsonFile->write(['foo' => 'baz']);
+
+        self::assertSame("{\n\t\"foo\": \"baz\"\n}\n", file_get_contents(__DIR__.'/Fixtures/tabs2.json'));
+
+        unlink(__DIR__.'/Fixtures/tabs2.json');
+    }
+
+    public function testOverwritesIndentationByDefault(): void
+    {
+        copy(__DIR__.'/Fixtures/tabs.json', __DIR__.'/Fixtures/tabs2.json');
+        $jsonFile = new JsonFile(__DIR__.'/Fixtures/tabs2.json');
+        $jsonFile->write(['foo' => 'baz']);
+
+        self::assertSame("{\n    \"foo\": \"baz\"\n}\n", file_get_contents(__DIR__.'/Fixtures/tabs2.json'));
+
+        unlink(__DIR__.'/Fixtures/tabs2.json');
+    }
+
+    private function expectParseException(string $text, string $json): void
+    {
+        try {
+            $result = JsonFile::parseJson($json);
+            $this->fail(sprintf("Parsing should have failed but didn't.\nExpected:\n\"%s\"\nFor:\n\"%s\"\nGot:\n\"%s\"", $text, $json, var_export($result, true)));
+        } catch (ParsingException $e) {
+            self::assertStringContainsString($text, $e->getMessage());
+        }
+    }
+
+    /**
+     * @param mixed $data
+     */
+    private function assertJsonFormat(string $json, $data, ?int $options = null): void
+    {
+        $file = new JsonFile('composer.json');
+
+        $json = str_replace("\r", '', $json);
+        if (null === $options) {
+            self::assertEquals($json, $file->encode($data));
+        } else {
+            self::assertEquals($json, $file->encode($data, $options));
+        }
     }
 }

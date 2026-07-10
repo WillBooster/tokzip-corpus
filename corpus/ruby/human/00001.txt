@@ -1,68 +1,45 @@
-require "childprocess"
-require "expect"
-require "minitest/autorun"
+# frozen_string_literal: true
 
-module IntegrationStartHelper
-  def command_for(app_file)
-    [
-      "ruby",
-      app_file,
-      "-p",
-      "0", # any free port
-      "-s",
-      "puma",
-    ]
-  end
+require 'rack/protection'
 
-  def with_process(command:, env: {}, debug: false)
-    process = ChildProcess.build(*command)
-    process.leader = true # ensure entire process tree dies
-    process.environment.merge!(env)
-    read_io, write_io = IO.pipe
-    process.io.stdout = write_io
-    process.io.stderr = write_io
-    process.start
-    # Close parent's copy of the write end of the pipe so when the (forked) child
-    # process closes its write end of the pipe the parent receives EOF when
-    # attempting to read from it. If the parent leaves its write end open, it
-    # will not detect EOF.
-    write_io.close
+module Rack
+  module Protection
+    ##
+    # Prevented attack::   Directory traversal
+    # Supported browsers:: all
+    # More infos::         http://en.wikipedia.org/wiki/Directory_traversal
+    #
+    # Unescapes '/' and '.', expands +path_info+.
+    # Thus <tt>GET /foo/%2e%2e%2fbar</tt> becomes <tt>GET /bar</tt>.
+    class PathTraversal < Base
+      def call(env)
+        path_was         = env['PATH_INFO']
+        env['PATH_INFO'] = cleanup path_was if path_was && !path_was.empty?
+        app.call env
+      ensure
+        env['PATH_INFO'] = path_was
+      end
 
-    echo_output(read_io) if debug || debug_all?
+      def cleanup(path)
+        encoding = path.encoding
+        dot   = '.'.encode(encoding)
+        slash = '/'.encode(encoding)
+        backslash = '\\'.encode(encoding)
 
-    yield process, read_io
-  ensure
-    read_io.close
-    process.stop
-  end
+        parts     = []
+        unescaped = path.gsub(/%2e/i, dot).gsub(/%2f/i, slash).gsub(/%5c/i, backslash)
+        unescaped = unescaped.gsub(backslash, slash)
 
-  def echo_output(read_io)
-    Thread.new do
-      begin
-        loop { print read_io.readpartial(8192) }
-      rescue EOFError
+        unescaped.split(slash).each do |part|
+          next if part.empty? || (part == dot)
+
+          part == '..' ? parts.pop : parts << part
+        end
+
+        cleaned = slash + parts.join(slash)
+        cleaned << slash if parts.any? && unescaped =~ (%r{/\.{0,2}$})
+        cleaned
       end
     end
-  end
-
-  def debug_all?
-    ENV.key?("DEBUG_START_PROCESS")
-  end
-
-  def wait_timeout
-    case RUBY_ENGINE
-    when "jruby", "truffleruby"
-      # takes some time to start the JVM
-      10.0
-    else
-      3.0
-    end
-  end
-
-  def wait_for_output(read_io, matcher, timeout = wait_timeout)
-    return true if read_io.expect(matcher, timeout).to_a.any?
-
-    raise "Waited for #{timeout} seconds, but received no output matching: " \
-          "#{matcher.source}"
   end
 end

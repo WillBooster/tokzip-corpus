@@ -1,171 +1,49 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
-using System;
+using System.Collections;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.Threading;
-using NUnit.Framework.Interfaces;
+using System.Collections.Specialized;
+using System.Linq;
+using NUnit.Framework.Internal.Extensions;
+using NUnit.Framework.Tests.TestUtilities.Collections;
 
-namespace NUnit.Framework.Internal
+namespace NUnit.Framework.Tests.Internal.Extensions
 {
-    internal sealed partial class SingleThreadedTestSynchronizationContext : SynchronizationContext, IDisposable
+    public class IEnumerableExtensionTests
     {
-        private const string ShutdownTimeoutMessage =
-            "Work posted to the synchronization context did not complete within ten seconds. Consider explicitly waiting for the work to complete.";
-
-        private readonly TimeSpan _shutdownTimeout;
-        private readonly Queue<ScheduledWork> _queue = new();
-        private Status _status;
-        private Stopwatch? _timeSinceShutdown;
-
-        public SingleThreadedTestSynchronizationContext(TimeSpan shutdownTimeout)
+        [TestCaseSource(nameof(SortableCollections))]
+        public void SortableCollectionsAreSortable(IEnumerable collection)
         {
-            _shutdownTimeout = shutdownTimeout;
+            Assert.That(collection.IsSortable(), Is.True);
         }
 
-        private enum Status
+        [TestCaseSource(nameof(UnsortableCollections))]
+        public void UnsortableCollectionsAreNotSortable(IEnumerable collection)
         {
-            NotStarted,
-            Running,
-            ShuttingDown,
-            ShutDown
+            Assert.That(collection.IsSortable(), Is.False);
         }
 
-        /// <summary>
-        /// May be called from any thread.
-        /// </summary>
-        public override void Post(SendOrPostCallback d, object? state)
+        public static IEnumerable<TestCaseData> SortableCollections => new[]
         {
-            Guard.ArgumentNotNull(d, nameof(d));
+            new TestCaseData(new[] { 1 }).SetArgDisplayNames("int[]"),
+            new TestCaseData(new[] { "1" }).SetArgDisplayNames("string[]"),
+            new TestCaseData(Enumerable.Range(0, 10)).SetArgDisplayNames("IEnumerable<int>"),
+            new TestCaseData(Enumerable.Range(0, 10).Select(n => n.ToString())).SetArgDisplayNames("IEnumerable<string>"),
+            new TestCaseData(new List<int> { 1 }).SetArgDisplayNames("List<int>"),
+            new TestCaseData(new List<string> { "1" }).SetArgDisplayNames("List<string>"),
+            new TestCaseData(new HashSet<int> { 1 }).SetArgDisplayNames("HashSet<int>"),
+            new TestCaseData(new HashSet<string> { "1" }).SetArgDisplayNames("HashSet<string>"),
+            new TestCaseData(new StringCollection { "1" }).SetArgDisplayNames("StringCollection"),
+        };
 
-            AddWork(new ScheduledWork(d, state, finished: null));
-        }
-
-        /// <summary>
-        /// May be called from any thread.
-        /// </summary>
-        public override void Send(SendOrPostCallback d, object? state)
+        public static IEnumerable<TestCaseData> UnsortableCollections => new[]
         {
-            Guard.ArgumentNotNull(d, nameof(d));
-
-            if (SynchronizationContext.Current == this)
-            {
-                d.Invoke(state);
-            }
-            else
-            {
-                using (var finished = new ManualResetEventSlim())
-                {
-                    AddWork(new ScheduledWork(d, state, finished));
-                    finished.Wait();
-                }
-            }
-        }
-
-        private void AddWork(ScheduledWork work)
-        {
-            lock (_queue)
-            {
-                switch (_status)
-                {
-                    case Status.ShuttingDown:
-                        if (_timeSinceShutdown!.Elapsed < _shutdownTimeout)
-                            break;
-                        goto case Status.ShutDown;
-
-                    case Status.ShutDown:
-                        throw ErrorAndGetExceptionForShutdownTimeout();
-                }
-
-                _queue.Enqueue(work);
-                Monitor.Pulse(_queue);
-            }
-        }
-
-        /// <summary>
-        /// May be called from any thread.
-        /// </summary>
-        public void ShutDown()
-        {
-            lock (_queue)
-            {
-                switch (_status)
-                {
-                    case Status.ShuttingDown:
-                    case Status.ShutDown:
-                        return;
-                }
-
-                _timeSinceShutdown = Stopwatch.StartNew();
-                _status = Status.ShuttingDown;
-                Monitor.Pulse(_queue);
-            }
-        }
-
-        /// <summary>
-        /// May be called from any thread, but may only be called once.
-        /// </summary>
-        public void Run()
-        {
-            lock (_queue)
-            {
-                switch (_status)
-                {
-                    case Status.Running:
-                        throw new InvalidOperationException("SingleThreadedTestSynchronizationContext.Run may not be reentered.");
-
-                    case Status.ShuttingDown:
-                    case Status.ShutDown:
-                        throw new InvalidOperationException("This SingleThreadedTestSynchronizationContext has been shut down.");
-                }
-
-                _status = Status.Running;
-            }
-
-            while (TryTake(out var scheduledWork))
-                scheduledWork.Execute();
-        }
-
-        private bool TryTake(out ScheduledWork scheduledWork)
-        {
-            lock (_queue)
-            {
-                while (_queue.Count == 0)
-                {
-                    if (_status == Status.ShuttingDown)
-                    {
-                        _status = Status.ShutDown;
-                        scheduledWork = default(ScheduledWork);
-                        return false;
-                    }
-
-                    Monitor.Wait(_queue);
-                }
-
-                if (_status == Status.ShuttingDown && _timeSinceShutdown!.Elapsed > _shutdownTimeout)
-                {
-                    _status = Status.ShutDown;
-                    throw ErrorAndGetExceptionForShutdownTimeout();
-                }
-
-                scheduledWork = _queue.Dequeue();
-            }
-
-            return true;
-        }
-
-        private static Exception ErrorAndGetExceptionForShutdownTimeout()
-        {
-            var testExecutionContext = TestExecutionContext.CurrentContext;
-
-            testExecutionContext?.CurrentResult.RecordAssertion(AssertionStatus.Error, ShutdownTimeoutMessage);
-
-            return new InvalidOperationException(ShutdownTimeoutMessage);
-        }
-
-        public void Dispose()
-        {
-            ShutDown();
-        }
+            new TestCaseData(null).SetArgDisplayNames("null"),
+            new TestCaseData(new ArrayList()).SetArgDisplayNames("ArrayList"),
+            new TestCaseData(new Hashtable()).SetArgDisplayNames("Hashtable"),
+            new TestCaseData(new Queue()).SetArgDisplayNames("Queue"),
+            new TestCaseData(new ListDictionary()).SetArgDisplayNames("ListDictionary"),
+            new TestCaseData(new SimpleObjectCollection()).SetArgDisplayNames("SimpleObjectCollection (ICollection)"),
+        };
     }
 }

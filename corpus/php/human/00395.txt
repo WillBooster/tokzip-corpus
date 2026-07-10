@@ -10,404 +10,214 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Installer;
+namespace Composer\Test\Util\Http;
 
-use Composer\IO\IOInterface;
-use Composer\Package\PackageInterface;
-use Composer\Pcre\Preg;
-use Composer\Util\Filesystem;
-use Composer\Util\Platform;
-use Composer\Util\ProcessExecutor;
-use Composer\Util\Silencer;
+use Composer\Util\Http\ProxyManager;
+use Composer\Test\TestCase;
 
 /**
- * Utility to handle installation of package "bin"/binaries
- *
- * @author Jordi Boggiano <j.boggiano@seld.be>
- * @author Konstantin Kudryashov <ever.zet@gmail.com>
- * @author Helmut Hummel <info@helhum.io>
+ * @phpstan-import-type contextOptions from \Composer\Util\Http\RequestProxy
  */
-class BinaryInstaller
+class ProxyManagerTest extends TestCase
 {
-    /** @var string */
-    protected $binDir;
-    /** @var string */
-    protected $binCompat;
-    /** @var IOInterface */
-    protected $io;
-    /** @var Filesystem */
-    protected $filesystem;
-    /** @var string|null */
-    private $vendorDir;
+    // isTransitional can be removed after the transition period
 
-    /**
-     * @param Filesystem  $filesystem
-     */
-    public function __construct(IOInterface $io, string $binDir, string $binCompat, ?Filesystem $filesystem = null, ?string $vendorDir = null)
+    /** @var bool */
+    private $isTransitional = true;
+
+    protected function setUp(): void
     {
-        $this->binDir = $binDir;
-        $this->binCompat = $binCompat;
-        $this->io = $io;
-        $this->filesystem = $filesystem ?: new Filesystem();
-        $this->vendorDir = $vendorDir;
+        unset(
+            $_SERVER['HTTP_PROXY'],
+            $_SERVER['http_proxy'],
+            $_SERVER['HTTPS_PROXY'],
+            $_SERVER['https_proxy'],
+            $_SERVER['NO_PROXY'],
+            $_SERVER['no_proxy'],
+            $_SERVER['CGI_HTTP_PROXY'],
+            $_SERVER['cgi_http_proxy']
+        );
+        ProxyManager::reset();
     }
 
-    public function installBinaries(PackageInterface $package, string $installPath, bool $warnOnOverwrite = true): void
+    protected function tearDown(): void
     {
-        $binaries = $this->getBinaries($package);
-        if (!$binaries) {
-            return;
-        }
-
-        Platform::workaroundFilesystemIssues();
-
-        foreach ($binaries as $bin) {
-            $binPath = $installPath.'/'.$bin;
-            if (!file_exists($binPath)) {
-                $this->io->writeError('    <warning>Skipped installation of bin '.$bin.' for package '.$package->getName().': file not found in package</warning>');
-                continue;
-            }
-            if (is_dir($binPath)) {
-                $this->io->writeError('    <warning>Skipped installation of bin '.$bin.' for package '.$package->getName().': found a directory at that path</warning>');
-                continue;
-            }
-            if (!$this->filesystem->isAbsolutePath($binPath)) {
-                // in case a custom installer returned a relative path for the
-                // $package, we can now safely turn it into a absolute path (as we
-                // already checked the binary's existence). The following helpers
-                // will require absolute paths to work properly.
-                $binPath = realpath($binPath);
-            }
-            $this->initializeBinDir();
-            $link = $this->binDir.'/'.basename($bin);
-            if (file_exists($link)) {
-                if (!is_link($link)) {
-                    if ($warnOnOverwrite) {
-                        $this->io->writeError('    Skipped installation of bin '.$bin.' for package '.$package->getName().': name conflicts with an existing file');
-                    }
-                    continue;
-                }
-                if (realpath($link) === realpath($binPath)) {
-                    // It is a linked binary from a previous installation, which can be replaced with a proxy file
-                    $this->filesystem->unlink($link);
-                }
-            }
-
-            $binCompat = $this->binCompat;
-            if ($binCompat === "auto" && (Platform::isWindows() || Platform::isWindowsSubsystemForLinux())) {
-                $binCompat = 'full';
-            }
-
-            if ($binCompat === "full") {
-                $this->installFullBinaries($binPath, $link, $bin, $package);
-            } else {
-                $this->installUnixyProxyBinaries($binPath, $link);
-            }
-            Silencer::call('chmod', $binPath, 0777 & ~umask());
-        }
+        parent::tearDown();
+        unset(
+            $_SERVER['HTTP_PROXY'],
+            $_SERVER['http_proxy'],
+            $_SERVER['HTTPS_PROXY'],
+            $_SERVER['https_proxy'],
+            $_SERVER['NO_PROXY'],
+            $_SERVER['no_proxy'],
+            $_SERVER['CGI_HTTP_PROXY'],
+            $_SERVER['cgi_http_proxy']
+        );
+        ProxyManager::reset();
     }
 
-    public function removeBinaries(PackageInterface $package): void
+    public function testInstantiation(): void
     {
-        $this->initializeBinDir();
+        $originalInstance = ProxyManager::getInstance();
+        $sameInstance = ProxyManager::getInstance();
+        self::assertTrue($originalInstance === $sameInstance);
 
-        $binaries = $this->getBinaries($package);
-        if (!$binaries) {
-            return;
-        }
-        foreach ($binaries as $bin) {
-            $link = $this->binDir.'/'.basename($bin);
-            if (is_link($link) || file_exists($link)) { // still checking for symlinks here for legacy support
-                $this->filesystem->unlink($link);
-            }
-            if (is_file($link.'.bat')) {
-                $this->filesystem->unlink($link.'.bat');
-            }
-        }
-
-        // attempt removing the bin dir in case it is left empty
-        if (is_dir($this->binDir) && $this->filesystem->isDirEmpty($this->binDir)) {
-            Silencer::call('rmdir', $this->binDir);
-        }
+        ProxyManager::reset();
+        $newInstance = ProxyManager::getInstance();
+        self::assertFalse($sameInstance === $newInstance);
     }
 
-    public static function determineBinaryCaller(string $bin): string
+    public function testGetProxyForRequestThrowsOnBadProxyUrl(): void
     {
-        if ('.bat' === substr($bin, -4) || '.exe' === substr($bin, -4)) {
-            return 'call';
-        }
+        $_SERVER['http_proxy'] = 'localhost';
+        $proxyManager = ProxyManager::getInstance();
 
-        $handle = fopen($bin, 'r');
-        $line = fgets($handle);
-        fclose($handle);
-        if (Preg::isMatchStrictGroups('{^#!/(?:usr/bin/env )?(?:[^/]+/)*(.+)$}m', (string) $line, $match)) {
-            return trim($match[1]);
-        }
-
-        return 'php';
+        self::expectException('Composer\Downloader\TransportException');
+        $proxyManager->getProxyForRequest('http://example.com');
     }
 
     /**
-     * @return string[]
+     * @dataProvider dataCaseOverrides
+     *
+     * @param array<string, string> $server
+     * @param non-empty-string      $url
      */
-    protected function getBinaries(PackageInterface $package): array
+    public function testLowercaseOverridesUppercase(array $server, string $url, string $expectedUrl): void
     {
-        return $package->getBinaries();
+        $_SERVER = array_merge($_SERVER, $server);
+        $proxyManager = ProxyManager::getInstance();
+
+        $proxy = $proxyManager->getProxyForRequest($url);
+        self::assertSame($expectedUrl, $proxy->getStatus());
     }
 
-    protected function installFullBinaries(string $binPath, string $link, string $bin, PackageInterface $package): void
+    /**
+     * @return list<array{0: array<string, string>, 1: string, 2: string}>
+     */
+    public static function dataCaseOverrides(): array
     {
-        // add unixy support for cygwin and similar environments
-        if ('.bat' !== substr($binPath, -4)) {
-            $this->installUnixyProxyBinaries($binPath, $link);
-            $link .= '.bat';
-            if (file_exists($link)) {
-                $this->io->writeError('    Skipped installation of bin '.$bin.'.bat proxy for package '.$package->getName().': a .bat proxy was already installed');
-            }
-        }
-        if (!file_exists($link)) {
-            file_put_contents($link, $this->generateWindowsProxyCode($binPath, $link));
-            Silencer::call('chmod', $link, 0777 & ~umask());
-        }
+        // server, url, expectedUrl
+        return [
+            [['HTTP_PROXY' => 'http://upper.com', 'http_proxy' => 'http://lower.com'], 'http://repo.org', 'http://lower.com:80'],
+            [['CGI_HTTP_PROXY' => 'http://upper.com', 'cgi_http_proxy' => 'http://lower.com'], 'http://repo.org', 'http://lower.com:80'],
+            [['HTTPS_PROXY' => 'http://upper.com', 'https_proxy' => 'http://lower.com'], 'https://repo.org', 'http://lower.com:80'],
+        ];
     }
 
-    protected function installUnixyProxyBinaries(string $binPath, string $link): void
+    /**
+     * @dataProvider dataCGIProxy
+     *
+     * @param array<string, string> $server
+     */
+    public function testCGIProxyIsOnlyUsedWhenNoHttpProxy(array $server, string $expectedUrl): void
     {
-        file_put_contents($link, $this->generateUnixyProxyCode($binPath, $link));
-        Silencer::call('chmod', $link, 0777 & ~umask());
+        $_SERVER = array_merge($_SERVER, $server);
+        $proxyManager = ProxyManager::getInstance();
+
+        $proxy = $proxyManager->getProxyForRequest('http://repo.org');
+        self::assertSame($expectedUrl, $proxy->getStatus());
     }
 
-    protected function initializeBinDir(): void
+    /**
+     * @return list<array{0: array<string, string>, 1: string}>
+     */
+    public static function dataCGIProxy(): array
     {
-        $this->filesystem->ensureDirectoryExists($this->binDir);
-        $this->binDir = realpath($this->binDir);
+        // server, expectedUrl
+        return [
+            [['CGI_HTTP_PROXY' => 'http://cgi.com:80'], 'http://cgi.com:80'],
+            [['http_proxy' => 'http://http.com:80', 'CGI_HTTP_PROXY' => 'http://cgi.com:80'], 'http://http.com:80'],
+        ];
     }
 
-    protected function generateWindowsProxyCode(string $bin, string $link): string
+    public function testNoHttpProxyDoesNotUseHttpsProxy(): void
     {
-        $binPath = $this->filesystem->findShortestPath($link, $bin);
-        $caller = self::determineBinaryCaller($bin);
+        $_SERVER['https_proxy'] = 'https://proxy.com:443';
+        $proxyManager = ProxyManager::getInstance();
 
-        // if the target is a php file, we run the unixy proxy file
-        // to ensure that _composer_autoload_path gets defined, instead
-        // of running the binary directly
-        if ($caller === 'php') {
-            return "@ECHO OFF\r\n".
-                "setlocal DISABLEDELAYEDEXPANSION\r\n".
-                "SET BIN_TARGET=%~dp0/".trim(ProcessExecutor::escape(basename($link, '.bat')), '"\'')."\r\n".
-                "SET COMPOSER_RUNTIME_BIN_DIR=%~dp0\r\n".
-                "{$caller} \"%BIN_TARGET%\" %*\r\n";
-        }
-
-        return "@ECHO OFF\r\n".
-            "setlocal DISABLEDELAYEDEXPANSION\r\n".
-            "SET BIN_TARGET=%~dp0/".trim(ProcessExecutor::escape($binPath), '"\'')."\r\n".
-            "SET COMPOSER_RUNTIME_BIN_DIR=%~dp0\r\n".
-            "{$caller} \"%BIN_TARGET%\" %*\r\n";
+        $proxy = $proxyManager->getProxyForRequest('http://repo.org');
+        self::assertSame('', $proxy->getStatus());
     }
 
-    protected function generateUnixyProxyCode(string $bin, string $link): string
+    public function testNoHttpsProxyDoesNotUseHttpProxy(): void
     {
-        $binPath = $this->filesystem->findShortestPath($link, $bin);
+        $_SERVER['http_proxy'] = 'http://proxy.com:80';
 
-        $binDir = ProcessExecutor::escape(dirname($binPath));
-        $binFile = basename($binPath);
-
-        $binContents = file_get_contents($bin);
-        // For php files, we generate a PHP proxy instead of a shell one,
-        // which allows calling the proxy with a custom php process
-        if (Preg::isMatch('{^(#!.*\r?\n)?[\r\n\t ]*<\?php}', $binContents, $match)) {
-            // carry over the existing shebang if present, otherwise add our own
-            $proxyCode = $match[1] === null ? '#!/usr/bin/env php' : trim($match[1]);
-            $binPathExported = $this->filesystem->findShortestPathCode($link, $bin, false, true);
-            $streamProxyCode = $streamHint = '';
-            $globalsCode = '$GLOBALS[\'_composer_bin_dir\'] = __DIR__;'."\n";
-            $phpunitHack1 = $phpunitHack2 = '';
-            // Don't expose autoload path when vendor dir was not set in custom installers
-            if ($this->vendorDir) {
-                // ensure comparisons work accurately if the CWD is a symlink, as $link is realpath'd already
-                $vendorDirReal = realpath($this->vendorDir);
-                if ($vendorDirReal === false) {
-                    $vendorDirReal = $this->vendorDir;
-                }
-                $globalsCode .= '$GLOBALS[\'_composer_autoload_path\'] = ' . $this->filesystem->findShortestPathCode($link, $vendorDirReal . '/autoload.php', false, true).";\n";
-            }
-            // Add workaround for PHPUnit process isolation
-            if ($this->filesystem->normalizePath($bin) === $this->filesystem->normalizePath($this->vendorDir.'/phpunit/phpunit/phpunit')) {
-                // workaround issue on PHPUnit 6.5+ running on PHP 8+
-                $globalsCode .= '$GLOBALS[\'__PHPUNIT_ISOLATION_EXCLUDE_LIST\'] = $GLOBALS[\'__PHPUNIT_ISOLATION_BLACKLIST\'] = array(realpath('.$binPathExported.'));'."\n";
-                // workaround issue on all PHPUnit versions running on PHP <8
-                $phpunitHack1 = "'phpvfscomposer://'.";
-                $phpunitHack2 = '
-                $data = str_replace(\'__DIR__\', var_export(dirname($this->realpath), true), $data);
-                $data = str_replace(\'__FILE__\', var_export($this->realpath, true), $data);';
-            }
-            if (trim((string) $match[0]) !== '<?php') {
-                $streamHint = ' using a stream wrapper to prevent the shebang from being output on PHP<8'."\n *";
-                $streamProxyCode = <<<STREAMPROXY
-if (PHP_VERSION_ID < 80000) {
-    if (!class_exists('Composer\BinProxyWrapper')) {
-        /**
-         * @internal
-         */
-        final class BinProxyWrapper
-        {
-            private \$handle;
-            private \$position;
-            private \$realpath;
-
-            public function stream_open(\$path, \$mode, \$options, &\$opened_path)
-            {
-                // get rid of phpvfscomposer:// prefix for __FILE__ & __DIR__ resolution
-                \$opened_path = substr(\$path, 17);
-                \$this->realpath = realpath(\$opened_path) ?: \$opened_path;
-                \$opened_path = $phpunitHack1\$this->realpath;
-                \$this->handle = fopen(\$this->realpath, \$mode);
-                \$this->position = 0;
-
-                return (bool) \$this->handle;
-            }
-
-            public function stream_read(\$count)
-            {
-                \$data = fread(\$this->handle, \$count);
-
-                if (\$this->position === 0) {
-                    \$data = preg_replace('{^#!.*\\r?\\n}', '', \$data);
-                }$phpunitHack2
-
-                \$this->position += strlen(\$data);
-
-                return \$data;
-            }
-
-            public function stream_cast(\$castAs)
-            {
-                return \$this->handle;
-            }
-
-            public function stream_close()
-            {
-                fclose(\$this->handle);
-            }
-
-            public function stream_lock(\$operation)
-            {
-                return \$operation ? flock(\$this->handle, \$operation) : true;
-            }
-
-            public function stream_seek(\$offset, \$whence)
-            {
-                if (0 === fseek(\$this->handle, \$offset, \$whence)) {
-                    \$this->position = ftell(\$this->handle);
-                    return true;
-                }
-
-                return false;
-            }
-
-            public function stream_tell()
-            {
-                return \$this->position;
-            }
-
-            public function stream_eof()
-            {
-                return feof(\$this->handle);
-            }
-
-            public function stream_stat()
-            {
-                return array();
-            }
-
-            public function stream_set_option(\$option, \$arg1, \$arg2)
-            {
-                return true;
-            }
-
-            public function url_stat(\$path, \$flags)
-            {
-                \$path = substr(\$path, 17);
-                if (file_exists(\$path)) {
-                    return stat(\$path);
-                }
-
-                return false;
-            }
-        }
-    }
-
-    if (
-        (function_exists('stream_get_wrappers') && in_array('phpvfscomposer', stream_get_wrappers(), true))
-        || (function_exists('stream_wrapper_register') && stream_wrapper_register('phpvfscomposer', 'Composer\BinProxyWrapper'))
-    ) {
-        return include("phpvfscomposer://" . $binPathExported);
-    }
-}
-
-STREAMPROXY;
-            }
-
-            return $proxyCode . "\n" . <<<PROXY
-<?php
-
-/**
- * Proxy PHP file generated by Composer
- *
- * This file includes the referenced bin path ($binPath)
- *$streamHint
- * @generated
- */
-
-namespace Composer;
-
-$globalsCode
-$streamProxyCode
-return include $binPathExported;
-
-PROXY;
+        // This can be removed after the transition period.
+        // An empty https_proxy value prevents using any http_proxy
+        if ($this->isTransitional) {
+            $_SERVER['https_proxy'] = '';
         }
 
-        return <<<PROXY
-#!/usr/bin/env sh
+        $proxyManager = ProxyManager::getInstance();
+        $proxy = $proxyManager->getProxyForRequest('https://repo.org');
+        self::assertSame('', $proxy->getStatus());
+    }
 
-# Support bash to support `source` with fallback on $0 if this does not run with bash
-# https://stackoverflow.com/a/35006505/6512
-selfArg="\$BASH_SOURCE"
-if [ -z "\$selfArg" ]; then
-    selfArg="\$0"
-fi
+    /**
+     * This test can be removed after the transition period
+     */
+    public function testTransitional(): void
+    {
+        $_SERVER['http_proxy'] = 'http://proxy.com:80';
+        $proxyManager = ProxyManager::getInstance();
 
-self=\$(realpath \$selfArg 2> /dev/null)
-if [ -z "\$self" ]; then
-    self="\$selfArg"
-fi
+        $proxy = $proxyManager->getProxyForRequest('https://repo.org');
+        self::assertSame('http://proxy.com:80', $proxy->getStatus());
+        self::assertTrue($proxyManager->needsTransitionWarning());
+    }
 
-dir=\$(cd "\${self%[/\\\\]*}" > /dev/null; cd $binDir && pwd)
+    /**
+     * @dataProvider dataRequest
+     *
+     * @param array<string, string> $server
+     * @param non-empty-string      $url
+     * @param ?contextOptions       $options
+     */
+    public function testGetProxyForRequest(array $server, string $url, ?array $options, string $status, bool $excluded): void
+    {
+        $_SERVER = array_merge($_SERVER, $server);
+        $proxyManager = ProxyManager::getInstance();
 
-if [ -d /proc/cygdrive ]; then
-    case \$(which php) in
-        \$(readlink -n /proc/cygdrive)/*)
-            # We are in Cygwin using Windows php, so the path must be translated
-            dir=\$(cygpath -m "\$dir");
-            ;;
-    esac
-fi
+        $proxy = $proxyManager->getProxyForRequest($url);
+        self::assertSame($options, $proxy->getContextOptions());
+        self::assertSame($status, $proxy->getStatus());
+        self::assertSame($excluded, $proxy->isExcludedByNoProxy());
+    }
 
-export COMPOSER_RUNTIME_BIN_DIR="\$(cd "\${self%[/\\\\]*}" > /dev/null; pwd)"
+    /**
+     * Tests context options. curl options are tested in RequestProxyTest.php
+     *
+     * @return list<array{0: array<string, string>, 1: string, 2: ?contextOptions, 3: string, 4: bool}>
+     */
+    public static function dataRequest(): array
+    {
+        $server = [
+            'http_proxy' => 'http://user:p%40ss@proxy.com',
+            'https_proxy' => 'https://proxy.com:443',
+            'no_proxy' => 'other.repo.org',
+        ];
 
-# If bash is sourcing this file, we have to source the target as well
-bashSource="\$BASH_SOURCE"
-if [ -n "\$bashSource" ]; then
-    if [ "\$bashSource" != "\$0" ]; then
-        source "\${dir}/$binFile" "\$@"
-        return
-    fi
-fi
-
-"\${dir}/$binFile" "\$@"
-
-PROXY;
+        // server, url, options, status, excluded
+        return [
+            [[], 'http://repo.org', null, '', false],
+            [$server, 'http://repo.org',
+                ['http' => [
+                    'proxy' => 'tcp://proxy.com:80',
+                    'header' => 'Proxy-Authorization: Basic dXNlcjpwQHNz',
+                    'request_fulluri' => true,
+                ]],
+                'http://***:***@proxy.com:80',
+                false,
+            ],
+            [$server, 'https://repo.org',
+                ['http' => [
+                    'proxy' => 'ssl://proxy.com:443',
+                ]],
+                'https://proxy.com:443',
+                false,
+            ],
+            [$server, 'https://other.repo.org', null, 'excluded by no_proxy', true],
+        ];
     }
 }

@@ -1,185 +1,276 @@
 require_relative 'test_helper'
 
-class BaseTest < Minitest::Test
-  describe 'Sinatra::Base subclasses' do
-    class TestApp < Sinatra::Base
-      get('/') { 'Hello World' }
-    end
-
-    class TestKeywordArgumentInitializerApp < Sinatra::Base
-      def initialize(argument:)
-        @argument = argument
-      end
-
-      get('/') { "Hello World with Keyword Arguments: #{@argument}" }
-    end
-
-    it 'include Rack::Utils' do
-      assert TestApp.included_modules.include?(Rack::Utils)
-    end
-
-    it 'processes requests with #call' do
-      assert TestApp.respond_to?(:call)
-
-      request = Rack::MockRequest.new(TestApp)
-      response = request.get('/')
-      assert response.ok?
-      assert_equal 'Hello World', response.body
-    end
-
-    class TestApp < Sinatra::Base
-      get '/state' do
-        @foo ||= "new"
-        body = "Foo: #{@foo}"
-        @foo = 'discard'
-        body
-      end
-    end
-
-    it 'does not maintain state between requests' do
-      request = Rack::MockRequest.new(TestApp)
-      2.times do
-        response = request.get('/state')
-        assert response.ok?
-        assert_equal 'Foo: new', response.body
-      end
-    end
-
-    it "passes the subclass to configure blocks" do
-      ref = nil
-      TestApp.configure { |app| ref = app }
-      assert_equal TestApp, ref
-    end
-
-    it "allows the configure block arg to be omitted and does not change context" do
-      context = nil
-      TestApp.configure { context = self }
-      assert_equal self, context
-    end
-
-    it "allows constructor to receive keyword arguments" do
-      app = TestKeywordArgumentInitializerApp.new(argument: "some argument")
-      request = Rack::MockRequest.new(app)
-
-      response = request.get('/')
-
-      assert response.ok?
-      assert_equal 'Hello World with Keyword Arguments: some argument', response.body
+class StaticTest < Minitest::Test
+  setup do
+    mock_app do
+      set :static, true
+      set :public_folder, __dir__
     end
   end
 
-  describe "Sinatra::Base#new" do
-    it 'returns a wrapper' do
-      assert_equal Sinatra::Wrapper, Sinatra::Base.new.class
-    end
+  it 'serves GET requests for files in the public directory' do
+    get "/#{File.basename(__FILE__)}"
+    assert ok?
+    assert_equal File.read(__FILE__), body
+    assert_equal File.size(__FILE__).to_s, response['Content-Length']
+    assert response.headers.include?('Last-Modified')
+  end
 
-    it 'implements a nice inspect' do
-      assert_equal '#<Sinatra::Base app_file=nil>', Sinatra::Base.new.inspect
-    end
+  it 'produces a body that can be iterated over multiple times' do
+    env = Rack::MockRequest.env_for("/#{File.basename(__FILE__)}")
+    _, _, body = @app.call(env)
+    buf1, buf2 = [], []
+    body.each { |part| buf1 << part }
+    body.each { |part| buf2 << part }
+    assert_equal buf1.join, buf2.join
+    assert_equal File.read(__FILE__), buf1.join
+  end
 
-    it 'exposes settings' do
-      assert_equal Sinatra::Base.settings, Sinatra::Base.new.settings
-    end
+  it 'sets the sinatra.static_file env variable if served' do
+    env = Rack::MockRequest.env_for("/#{File.basename(__FILE__)}")
+    @app.call(env)
+    assert_equal File.expand_path(__FILE__), env['sinatra.static_file']
+  end
 
-    it 'exposes helpers' do
-      assert_equal 'image/jpeg', Sinatra::Base.new.helpers.mime_type(:jpg)
+  it 'serves HEAD requests for files in the public directory' do
+    head "/#{File.basename(__FILE__)}"
+    assert ok?
+    assert_equal '', body
+    assert response.headers.include?('Last-Modified')
+    assert_equal File.size(__FILE__).to_s, response['Content-Length']
+  end
+
+  %w[POST PUT DELETE].each do |verb|
+    it "does not serve #{verb} requests" do
+      send verb.downcase, "/#{File.basename(__FILE__)}"
+      assert_equal 404, status
     end
   end
 
-  describe "Sinatra::Base as Rack middleware" do
-    app = lambda { |env|
-      headers = {'X-Downstream' => 'true'}
-      headers['X-Route-Missing'] = env['sinatra.route-missing'] || ''
-      [210, headers, ['Hello from downstream']] }
+  it 'serves files in preference to custom routes' do
+    @app.get("/#{File.basename(__FILE__)}") { 'Hello World' }
+    get "/#{File.basename(__FILE__)}"
+    assert ok?
+    assert body != 'Hello World'
+  end
 
-    class TestMiddleware < Sinatra::Base
+  it 'does not serve directories' do
+    get "/"
+    assert not_found?
+  end
+
+  it 'passes to the next handler when the path contains null bytes' do
+    get "/foo%00"
+    assert not_found?
+  end
+
+  it 'passes to the next handler when the static option is disabled' do
+    @app.set :static, false
+    get "/#{File.basename(__FILE__)}"
+    assert not_found?
+  end
+
+  it 'passes to the next handler when the public option is nil' do
+    @app.set :public_folder, nil
+    get "/#{File.basename(__FILE__)}"
+    assert not_found?
+  end
+
+  it '404s when a file is not found' do
+    get "/foobarbaz.txt"
+    assert not_found?
+  end
+
+  it 'there is no path is 404 error pages' do
+    env = Rack::MockRequest.env_for("/dummy").tap { |env| env["PATH_INFO"] = "/<script>" }
+    _, _, body = @app.call(env)
+    assert_equal(["<h1>Not Found</h1>"], body, "Unexpected response content.")
+  end
+
+  it 'serves files when .. path traverses within public directory' do
+    get "/data/../#{File.basename(__FILE__)}"
+    assert ok?
+    assert_equal File.read(__FILE__), body
+  end
+
+  it '404s when .. path traverses outside of public directory' do
+    mock_app do
+      set :static, true
+      set :public_folder, __dir__ + '/data'
+      disable :protection
+    end
+    get "/../#{File.basename(__FILE__)}"
+    assert not_found?
+  end
+
+  def assert_valid_range(http_range, range, path, file)
+    request = Rack::MockRequest.new(@app)
+    response = request.get("/#{File.basename(path)}", 'HTTP_RANGE' => http_range)
+
+    should_be = file[range]
+    expected_range = "bytes #{range.begin}-#{range.end}/#{file.length}"
+
+    assert_equal(
+      206,response.status,
+      "Should be HTTP/1.1 206 Partial content"
+    )
+    assert_equal(
+      should_be.length,
+      response.body.length,
+      "Unexpected response length for #{http_range}"
+    )
+    assert_equal(
+      should_be,
+      response.body,
+      "Unexpected response data for #{http_range}"
+    )
+    assert_equal(
+      should_be.length.to_s,
+      response['Content-Length'],
+      "Incorrect Content-Length for #{http_range}"
+    )
+    assert_equal(
+      expected_range,
+      response['Content-Range'],
+      "Incorrect Content-Range for #{http_range}"
+    )
+  end
+
+  it 'handles valid byte ranges correctly' do
+    # Use the biggest file in this dir so we can test ranges > 8k bytes. (StaticFile sends in 8k chunks.)
+    path = __dir__ + '/helpers_test.rb'  # currently 16k bytes
+    file = File.read(path)
+    length = file.length
+    assert length > 9000, "The test file #{path} is too short (#{length} bytes) to run these tests"
+
+    [0..0, 42..88, 1234..1234, 100..9000, 0..(length-1), (length-1)..(length-1)].each do |range|
+      assert_valid_range("bytes=#{range.begin}-#{range.end}", range, path, file)
     end
 
-    it 'creates a middleware that responds to #call with .new' do
-      middleware = TestMiddleware.new(app)
-      assert middleware.respond_to?(:call)
+    [0, 100, length-100, length-1].each do |start|
+      assert_valid_range("bytes=#{start}-", (start..length-1), path, file)
     end
 
-    it 'exposes the downstream app' do
-      middleware = TestMiddleware.new!(app)
-      assert_same app, middleware.app
+    [1, 100, length-100, length-1, length].each do |range_length|
+      assert_valid_range("bytes=-#{range_length}", (length-range_length..length-1), path, file)
     end
 
-    class TestMiddleware < Sinatra::Base
-      def route_missing
-        env['sinatra.route-missing'] = '1'
-        super
-      end
+    # Some valid ranges that exceed the length of the file:
+    assert_valid_range("bytes=100-999999", (100..length-1), path, file)
+    assert_valid_range("bytes=100-#{length}", (100..length-1), path, file)
+    assert_valid_range("bytes=-#{length}", (0..length-1), path, file)
+    assert_valid_range("bytes=-#{length+1}", (0..length-1), path, file)
+    assert_valid_range("bytes=-999999", (0..length-1), path, file)
+  end
 
-      get('/') { 'Hello from middleware' }
-    end
+  it 'correctly ignores syntactically invalid range requests' do
+    ["bytes=45-40", "octets=10-20", "bytes=", "bytes=3-1,4-5"].each do |http_range|
+      request = Rack::MockRequest.new(@app)
+      response = request.get("/#{File.basename(__FILE__)}", 'HTTP_RANGE' => http_range)
 
-    middleware = TestMiddleware.new(app)
-    request = Rack::MockRequest.new(middleware)
-
-    it 'intercepts requests' do
-      response = request.get('/')
-      assert response.ok?
-      assert_equal 'Hello from middleware', response.body
-    end
-
-    it 'automatically forwards requests downstream when no matching route found' do
-      response = request.get('/missing')
-      assert_equal 210, response.status
-      assert_equal 'Hello from downstream', response.body
-    end
-
-    it 'calls #route_missing before forwarding downstream' do
-      response = request.get('/missing')
-      assert_equal '1', response['X-Route-Missing']
-    end
-
-    class TestMiddleware < Sinatra::Base
-      get('/low-level-forward') { app.call(env) }
-    end
-
-    it 'can call the downstream app directly and return result' do
-      response = request.get('/low-level-forward')
-      assert_equal 210, response.status
-      assert_equal 'true', response['X-Downstream']
-      assert_equal 'Hello from downstream', response.body
-    end
-
-    class TestMiddleware < Sinatra::Base
-      get '/explicit-forward' do
-        response['X-Middleware'] = 'true'
-        res = forward
-        assert_nil res
-        assert_equal 210, response.status
-        assert_equal 'true', response['X-Downstream']
-        assert_equal ['Hello from downstream'], response.body
-        'Hello after explicit forward'
-      end
-    end
-
-    it 'forwards the request downstream and integrates the response into the current context' do
-      response = request.get('/explicit-forward')
-      assert_equal 210, response.status
-      assert_equal 'true', response['X-Downstream']
-      assert_equal 'Hello after explicit forward', response.body
-      assert_equal '28', response['Content-Length']
-    end
-
-    app_content_length = lambda {|env|
-      [200, {'Content-Length' => '16'}, 'From downstream!']}
-
-    class TestMiddlewareContentLength < Sinatra::Base
-      get '/forward' do
-        'From after explicit forward!'
-      end
-    end
-
-    middleware_content_length = TestMiddlewareContentLength.new(app_content_length)
-    request_content_length = Rack::MockRequest.new(middleware_content_length)
-
-    it "sets content length for last response" do
-      response = request_content_length.get('/forward')
-      assert_equal '28', response['Content-Length']
+      assert_equal(
+        200,
+        response.status,
+        "Invalid range '#{http_range}' should be ignored"
+      )
+      assert_nil(
+        response['Content-Range'],
+        "Invalid range '#{http_range}' should be ignored"
+      )
     end
   end
+
+  it 'returns error 416 for unsatisfiable range requests' do
+    # An unsatisfiable request is one that specifies a start that's at or past the end of the file.
+    length = File.read(__FILE__).length
+    ["bytes=888888-", "bytes=888888-999999", "bytes=#{length}-#{length}"].each do |http_range|
+      request = Rack::MockRequest.new(@app)
+      response = request.get("/#{File.basename(__FILE__)}", 'HTTP_RANGE' => http_range)
+
+      assert_equal(
+        416,
+        response.status,
+        "Unsatisfiable range '#{http_range}' should return 416"
+      )
+      assert_equal(
+        "bytes */#{length}",
+        response['Content-Range'],
+        "416 response should include actual length"
+      )
+    end
+  end
+
+  it 'does not include static cache control headers by default' do
+    env = Rack::MockRequest.env_for("/#{File.basename(__FILE__)}")
+    _, headers, _ = @app.call(env)
+    assert !headers.has_key?('Cache-Control')
+  end
+
+  it 'sets cache control headers on static files if set' do
+    @app.set :static_cache_control, :public
+    env = Rack::MockRequest.env_for("/#{File.basename(__FILE__)}")
+    _, headers, _ = @app.call(env)
+    assert headers.has_key?('Cache-Control')
+    assert_equal headers['Cache-Control'], 'public'
+
+    @app.set(
+      :static_cache_control,
+      [:public, :must_revalidate, {:max_age => 300}]
+    )
+    env = Rack::MockRequest.env_for("/#{File.basename(__FILE__)}")
+    _, headers, _ = @app.call(env)
+    assert headers.has_key?('Cache-Control')
+    assert_equal(
+      headers['Cache-Control'],
+      'public, must-revalidate, max-age=300'
+    )
+  end
+
+  it 'renders static assets with custom status via options' do
+    mock_app do
+      set :static, true
+      set :public_folder, __dir__
+
+      post '/*' do
+        static!(:status => params[:status])
+      end
+    end
+
+    post "/#{File.basename(__FILE__)}?status=422"
+    assert_equal response.status, 422
+    assert_equal File.read(__FILE__), body
+    assert_equal File.size(__FILE__).to_s, response['Content-Length']
+    assert response.headers.include?('Last-Modified')
+  end
+
+  it 'serves files with a + sign in the path' do
+    mock_app do
+      set :static, true
+      set :public_folder, File.join(__dir__, 'public')
+    end
+
+    get "/hello+world.txt"
+
+    real_path = File.join(__dir__, 'public', 'hello+world.txt')
+    assert ok?
+    assert_equal File.read(real_path), body
+    assert_equal File.size(real_path).to_s, response['Content-Length']
+    assert response.headers.include?('Last-Modified')
+  end
+
+  it 'serves files with a URL encoded + sign (%2B) in the path' do
+    mock_app do
+      set :static, true
+      set :public_folder, File.join(__dir__, 'public')
+    end
+
+    get "/hello%2bworld.txt"
+
+    real_path = File.join(__dir__, 'public', 'hello+world.txt')
+    assert ok?
+    assert_equal File.read(real_path), body
+    assert_equal File.size(real_path).to_s, response['Content-Length']
+    assert response.headers.include?('Last-Modified')
+  end
+
 end

@@ -10,480 +10,578 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Plugin;
+namespace Composer\Json;
 
-use Composer\Composer;
-use Composer\Config;
-use Composer\Installer\PluginInstaller;
-use Composer\Json\JsonFile;
-use Composer\Package\CompleteAliasPackage;
-use Composer\Package\CompletePackage;
-use Composer\Package\Loader\JsonLoader;
-use Composer\Package\Loader\ArrayLoader;
-use Composer\Package\Locker;
-use Composer\Package\RootPackage;
-use Composer\Plugin\PluginManager;
-use Composer\IO\BufferIO;
-use Composer\EventDispatcher\EventDispatcher;
-use Composer\Autoload\AutoloadGenerator;
-use Composer\Test\TestCase;
-use Composer\Util\Filesystem;
-use Composer\Util\Platform;
+use Composer\Pcre\Preg;
+use Composer\Repository\PlatformRepository;
 
-class PluginInstallerTest extends TestCase
+/**
+ * @author Jordi Boggiano <j.boggiano@seld.be>
+ */
+class JsonManipulator
 {
-    /**
-     * @var Composer
-     */
-    protected $composer;
+    /** @var string */
+    private const DEFINES = '(?(DEFINE)
+       (?<number>    -? (?= [1-9]|0(?!\d) ) \d++ (?:\.\d++)? (?:[eE] [+-]?+ \d++)? )
+       (?<boolean>   true | false | null )
+       (?<string>    " (?:[^"\\\\]*+ | \\\\ ["\\\\bfnrt\/] | \\\\ u [0-9A-Fa-f]{4} )* " )
+       (?<array>     \[  (?:  (?&json) \s*+ (?: , (?&json) \s*+ )*+  )?+  \s*+ \] )
+       (?<pair>      \s*+ (?&string) \s*+ : (?&json) \s*+ )
+       (?<object>    \{  (?:  (?&pair)  (?: , (?&pair)  )*+  )?+  \s*+ \} )
+       (?<json>      \s*+ (?: (?&number) | (?&boolean) | (?&string) | (?&array) | (?&object) ) )
+    )';
 
-    /**
-     * @var PluginManager
-     */
-    protected $pm;
+    /** @var string */
+    private $contents;
+    /** @var string */
+    private $newline;
+    /** @var string */
+    private $indent;
 
-    /**
-     * @var AutoloadGenerator
-     */
-    protected $autoloadGenerator;
-
-    /**
-     * @var array<CompletePackage|CompleteAliasPackage>
-     */
-    protected $packages;
-
-    /**
-     * @var string
-     */
-    protected $directory;
-
-    /**
-     * @var \PHPUnit\Framework\MockObject\MockObject&\Composer\Installer\InstallationManager
-     */
-    protected $im;
-
-    /**
-     * @var \PHPUnit\Framework\MockObject\MockObject&\Composer\Repository\InstalledRepositoryInterface
-     */
-    protected $repository;
-
-    /**
-     * @var BufferIO
-     */
-    protected $io;
-
-    protected function setUp(): void
+    public function __construct(string $contents)
     {
-        $loader = new JsonLoader(new ArrayLoader());
-        $this->packages = [];
-        $this->directory = self::getUniqueTmpDirectory();
-        for ($i = 1; $i <= 8; $i++) {
-            $filename = '/Fixtures/plugin-v'.$i.'/composer.json';
-            mkdir(dirname($this->directory . $filename), 0777, true);
-            $this->packages[] = $loader->load(__DIR__ . $filename);
+        $contents = trim($contents);
+        if ($contents === '') {
+            $contents = '{}';
+        }
+        if (!Preg::isMatch('#^\{(.*)\}$#s', $contents)) {
+            throw new \InvalidArgumentException('The json file must be an object ({})');
+        }
+        $this->newline = false !== strpos($contents, "\r\n") ? "\r\n" : "\n";
+        $this->contents = $contents === '{}' ? '{' . $this->newline . '}' : $contents;
+        $this->detectIndenting();
+    }
+
+    public function getContents(): string
+    {
+        return $this->contents . $this->newline;
+    }
+
+    public function addLink(string $type, string $package, string $constraint, bool $sortPackages = false): bool
+    {
+        $decoded = JsonFile::parseJson($this->contents);
+
+        // no link of that type yet
+        if (!isset($decoded[$type])) {
+            return $this->addMainKey($type, [$package => $constraint]);
         }
 
-        $dm = $this->getMockBuilder('Composer\Downloader\DownloadManager')
-            ->disableOriginalConstructor()
-            ->getMock();
-        $dm->expects($this->any())
-            ->method('install')
-            ->will($this->returnValue(\React\Promise\resolve(null)));
-        $dm->expects($this->any())
-            ->method('update')
-            ->will($this->returnValue(\React\Promise\resolve(null)));
-        $dm->expects($this->any())
-            ->method('remove')
-            ->will($this->returnValue(\React\Promise\resolve(null)));
+        $regex = '{'.self::DEFINES.'^(?P<start>\s*\{\s*(?:(?&string)\s*:\s*(?&json)\s*,\s*)*?)'.
+            '(?P<property>'.preg_quote(JsonFile::encode($type)).'\s*:\s*)(?P<value>(?&json))(?P<end>.*)}sx';
+        if (!Preg::isMatch($regex, $this->contents, $matches)) {
+            return false;
+        }
+        assert(is_string($matches['start']));
+        assert(is_string($matches['value']));
+        assert(is_string($matches['end']));
 
-        $this->repository = $this->getMockBuilder('Composer\Repository\InstalledRepositoryInterface')->getMock();
+        $links = $matches['value'];
 
-        $rm = $this->getMockBuilder('Composer\Repository\RepositoryManager')
-            ->disableOriginalConstructor()
-            ->getMock();
-        $rm->expects($this->any())
-            ->method('getLocalRepository')
-            ->will($this->returnValue($this->repository));
+        // try to find existing link
+        $packageRegex = str_replace('/', '\\\\?/', preg_quote($package));
+        $regex = '{'.self::DEFINES.'"(?P<package>'.$packageRegex.')"(\s*:\s*)(?&string)}ix';
+        if (Preg::isMatch($regex, $links, $packageMatches)) {
+            assert(is_string($packageMatches['package']));
+            // update existing link
+            $existingPackage = $packageMatches['package'];
+            $packageRegex = str_replace('/', '\\\\?/', preg_quote($existingPackage));
+            $links = Preg::replaceCallback('{'.self::DEFINES.'"'.$packageRegex.'"(?P<separator>\s*:\s*)(?&string)}ix', static function ($m) use ($existingPackage, $constraint): string {
+                return JsonFile::encode(str_replace('\\/', '/', $existingPackage)) . $m['separator'] . '"' . $constraint . '"';
+            }, $links);
+        } else {
+            if (Preg::isMatchStrictGroups('#^\s*\{\s*\S+.*?(\s*\}\s*)$#s', $links, $match)) {
+                // link missing but non empty links
+                $links = Preg::replace(
+                    '{'.preg_quote($match[1]).'$}',
+                    // addcslashes is used to double up backslashes/$ since preg_replace resolves them as back references otherwise, see #1588
+                    addcslashes(',' . $this->newline . $this->indent . $this->indent . JsonFile::encode($package).': '.JsonFile::encode($constraint) . $match[1], '\\$'),
+                    $links
+                );
+            } else {
+                // links empty
+                $links = '{' . $this->newline .
+                    $this->indent . $this->indent . JsonFile::encode($package).': '.JsonFile::encode($constraint) . $this->newline .
+                    $this->indent . '}';
+            }
+        }
 
-        $im = $this->getMockBuilder('Composer\Installer\InstallationManager')->disableOriginalConstructor()->getMock();
-        $im->expects($this->any())
-            ->method('getInstallPath')
-            ->will($this->returnCallback(static function ($package): string {
-                return __DIR__.'/Fixtures/'.$package->getPrettyName();
-            }));
+        if (true === $sortPackages) {
+            $requirements = json_decode($links, true);
+            $this->sortPackages($requirements);
+            $links = $this->format($requirements);
+        }
 
-        $this->io = new BufferIO();
+        $this->contents = $matches['start'] . $matches['property'] . $links . $matches['end'];
 
-        $dispatcher = $this->getMockBuilder('Composer\EventDispatcher\EventDispatcher')->disableOriginalConstructor()->getMock();
-        $this->autoloadGenerator = new AutoloadGenerator($dispatcher);
-
-        $this->composer = new Composer();
-        $config = new Config(false);
-        $this->composer->setConfig($config);
-        $this->composer->setDownloadManager($dm);
-        $this->composer->setRepositoryManager($rm);
-        $this->composer->setInstallationManager($im);
-        $this->composer->setAutoloadGenerator($this->autoloadGenerator);
-        $this->composer->setEventDispatcher(new EventDispatcher($this->composer, $this->io));
-        $this->composer->setPackage(new RootPackage('dummy/root', '1.0.0.0', '1.0.0'));
-        $this->composer->setLocker(new Locker($this->io, new JsonFile(Platform::getDevNull()), $im, '{}'));
-
-        $config->merge([
-            'config' => [
-                'vendor-dir' => $this->directory.'/Fixtures/',
-                'home' => $this->directory.'/Fixtures',
-                'bin-dir' => $this->directory.'/Fixtures/bin',
-                'allow-plugins' => true,
-            ],
-        ]);
-
-        $this->pm = new PluginManager($this->io, $this->composer);
-        $this->composer->setPluginManager($this->pm);
-    }
-
-    protected function tearDown(): void
-    {
-        parent::tearDown();
-        $filesystem = new Filesystem();
-        $filesystem->removeDirectory($this->directory);
-    }
-
-    public function testInstallNewPlugin(): void
-    {
-        $this->repository
-            ->expects($this->any())
-            ->method('getPackages')
-            ->will($this->returnValue([]));
-        $installer = new PluginInstaller($this->io, $this->composer);
-        $this->pm->loadInstalledPlugins();
-
-        $installer->install($this->repository, $this->packages[0]);
-
-        $plugins = $this->pm->getPlugins();
-        self::assertEquals('installer-v1', $plugins[0]->version);  // @phpstan-ignore property.notFound
-        self::assertEquals(
-            'activate v1'.PHP_EOL,
-            $this->io->getOutput()
-        );
-    }
-
-    public function testInstallPluginWithRootPackageHavingFilesAutoload(): void
-    {
-        $this->repository
-            ->expects($this->any())
-            ->method('getPackages')
-            ->will($this->returnValue([]));
-        $installer = new PluginInstaller($this->io, $this->composer);
-        $this->pm->loadInstalledPlugins();
-
-        $this->autoloadGenerator->setDevMode(true);
-        $this->composer->getPackage()->setAutoload(['files' => [__DIR__ . '/Fixtures/files_autoload_which_should_not_run.php']]);
-        $this->composer->getPackage()->setDevAutoload(['files' => [__DIR__ . '/Fixtures/files_autoload_which_should_not_run.php']]);
-        $installer->install($this->repository, $this->packages[0]);
-
-        $plugins = $this->pm->getPlugins();
-        self::assertEquals(
-            'activate v1'.PHP_EOL,
-            $this->io->getOutput()
-        );
-        self::assertEquals('installer-v1', $plugins[0]->version);  // @phpstan-ignore property.notFound
-    }
-
-    public function testInstallMultiplePlugins(): void
-    {
-        $this->repository
-            ->expects($this->any())
-            ->method('getPackages')
-            ->will($this->returnValue([$this->packages[3]]));
-        $installer = new PluginInstaller($this->io, $this->composer);
-        $this->pm->loadInstalledPlugins();
-
-        $installer->install($this->repository, $this->packages[3]);
-
-        $plugins = $this->pm->getPlugins();
-        self::assertEquals('plugin1', $plugins[0]->name); // @phpstan-ignore property.notFound
-        self::assertEquals('installer-v4', $plugins[0]->version); // @phpstan-ignore property.notFound
-        self::assertEquals('plugin2', $plugins[1]->name); // @phpstan-ignore property.notFound
-        self::assertEquals('installer-v4', $plugins[1]->version); // @phpstan-ignore property.notFound
-        self::assertEquals('activate v4-plugin1'.PHP_EOL.'activate v4-plugin2'.PHP_EOL, $this->io->getOutput());
-    }
-
-    public function testUpgradeWithNewClassName(): void
-    {
-        $this->repository
-            ->expects($this->any())
-            ->method('getPackages')
-            ->will($this->returnValue([$this->packages[0]]));
-        $this->repository
-            ->expects($this->exactly(2))
-            ->method('hasPackage')
-            ->will($this->onConsecutiveCalls(true, false));
-        $installer = new PluginInstaller($this->io, $this->composer);
-        $this->pm->loadInstalledPlugins();
-
-        $installer->update($this->repository, $this->packages[0], $this->packages[1]);
-
-        $plugins = $this->pm->getPlugins();
-        self::assertCount(1, $plugins);
-        self::assertEquals('installer-v2', $plugins[1]->version); // @phpstan-ignore property.notFound
-        self::assertEquals('activate v1'.PHP_EOL.'deactivate v1'.PHP_EOL.'activate v2'.PHP_EOL, $this->io->getOutput());
-    }
-
-    public function testUninstall(): void
-    {
-        $this->repository
-            ->expects($this->any())
-            ->method('getPackages')
-            ->will($this->returnValue([$this->packages[0]]));
-        $this->repository
-            ->expects($this->exactly(1))
-            ->method('hasPackage')
-            ->will($this->onConsecutiveCalls(true, false));
-        $installer = new PluginInstaller($this->io, $this->composer);
-        $this->pm->loadInstalledPlugins();
-
-        $installer->uninstall($this->repository, $this->packages[0]);
-
-        $plugins = $this->pm->getPlugins();
-        self::assertCount(0, $plugins);
-        self::assertEquals('activate v1'.PHP_EOL.'deactivate v1'.PHP_EOL.'uninstall v1'.PHP_EOL, $this->io->getOutput());
-    }
-
-    public function testUpgradeWithSameClassName(): void
-    {
-        $this->repository
-            ->expects($this->any())
-            ->method('getPackages')
-            ->will($this->returnValue([$this->packages[1]]));
-        $this->repository
-            ->expects($this->exactly(2))
-            ->method('hasPackage')
-            ->will($this->onConsecutiveCalls(true, false));
-        $installer = new PluginInstaller($this->io, $this->composer);
-        $this->pm->loadInstalledPlugins();
-
-        $installer->update($this->repository, $this->packages[1], $this->packages[2]);
-
-        $plugins = $this->pm->getPlugins();
-        self::assertEquals('installer-v3', $plugins[1]->version); // @phpstan-ignore property.notFound
-        self::assertEquals('activate v2'.PHP_EOL.'deactivate v2'.PHP_EOL.'activate v3'.PHP_EOL, $this->io->getOutput());
-    }
-
-    public function testRegisterPluginOnlyOneTime(): void
-    {
-        $this->repository
-            ->expects($this->any())
-            ->method('getPackages')
-            ->will($this->returnValue([]));
-        $installer = new PluginInstaller($this->io, $this->composer);
-        $this->pm->loadInstalledPlugins();
-
-        $installer->install($this->repository, $this->packages[0]);
-        $installer->install($this->repository, clone $this->packages[0]);
-
-        $plugins = $this->pm->getPlugins();
-        self::assertCount(1, $plugins);
-        self::assertEquals('installer-v1', $plugins[0]->version); // @phpstan-ignore property.notFound
-        self::assertEquals('activate v1'.PHP_EOL, $this->io->getOutput());
+        return true;
     }
 
     /**
-     * @param array<CompletePackage|CompleteAliasPackage> $plugins
+     * Sorts packages by importance (platform packages first, then PHP dependencies) and alphabetically.
+     *
+     * @link https://getcomposer.org/doc/02-libraries.md#platform-packages
+     *
+     * @param array<string> $packages
      */
-    private function setPluginApiVersionWithPlugins(string $newPluginApiVersion, array $plugins = []): void
+    private function sortPackages(array &$packages = []): void
     {
-        // reset the plugin manager's installed plugins
-        $this->pm = $this->getMockBuilder('Composer\Plugin\PluginManager')
-                         ->onlyMethods(['getPluginApiVersion'])
-                         ->setConstructorArgs([$this->io, $this->composer])
-                         ->getMock();
+        $prefix = static function ($requirement): string {
+            if (PlatformRepository::isPlatformPackage($requirement)) {
+                return Preg::replace(
+                    [
+                        '/^php/',
+                        '/^hhvm/',
+                        '/^ext/',
+                        '/^lib/',
+                        '/^\D/',
+                    ],
+                    [
+                        '0-$0',
+                        '1-$0',
+                        '2-$0',
+                        '3-$0',
+                        '4-$0',
+                    ],
+                    $requirement
+                );
+            }
 
-        // mock the Plugin API version
-        $this->pm->expects($this->any())
-                 ->method('getPluginApiVersion')
-                 ->will($this->returnValue($newPluginApiVersion));
+            return '5-'.$requirement;
+        };
 
-        $plugApiInternalPackage = self::getPackage(
-            'composer-plugin-api',
-            $newPluginApiVersion,
-            'Composer\Package\CompletePackage'
+        uksort($packages, static function ($a, $b) use ($prefix): int {
+            return strnatcmp($prefix($a), $prefix($b));
+        });
+    }
+
+    /**
+     * @param array<string, mixed>|false $config
+     */
+    public function addRepository(string $name, $config, bool $append = true): bool
+    {
+        return $this->addSubNode('repositories', $name, $config, $append);
+    }
+
+    public function removeRepository(string $name): bool
+    {
+        return $this->removeSubNode('repositories', $name);
+    }
+
+    /**
+     * @param mixed  $value
+     */
+    public function addConfigSetting(string $name, $value): bool
+    {
+        return $this->addSubNode('config', $name, $value);
+    }
+
+    public function removeConfigSetting(string $name): bool
+    {
+        return $this->removeSubNode('config', $name);
+    }
+
+    /**
+     * @param mixed $value
+     */
+    public function addProperty(string $name, $value): bool
+    {
+        if (strpos($name, 'suggest.') === 0) {
+            return $this->addSubNode('suggest', substr($name, 8), $value);
+        }
+
+        if (strpos($name, 'extra.') === 0) {
+            return $this->addSubNode('extra', substr($name, 6), $value);
+        }
+
+        if (strpos($name, 'scripts.') === 0) {
+            return $this->addSubNode('scripts', substr($name, 8), $value);
+        }
+
+        return $this->addMainKey($name, $value);
+    }
+
+    public function removeProperty(string $name): bool
+    {
+        if (strpos($name, 'suggest.') === 0) {
+            return $this->removeSubNode('suggest', substr($name, 8));
+        }
+
+        if (strpos($name, 'extra.') === 0) {
+            return $this->removeSubNode('extra', substr($name, 6));
+        }
+
+        if (strpos($name, 'scripts.') === 0) {
+            return $this->removeSubNode('scripts', substr($name, 8));
+        }
+
+        if (strpos($name, 'autoload.') === 0) {
+            return $this->removeSubNode('autoload', substr($name, 9));
+        }
+
+        if (strpos($name, 'autoload-dev.') === 0) {
+            return $this->removeSubNode('autoload-dev', substr($name, 13));
+        }
+
+        return $this->removeMainKey($name);
+    }
+
+    /**
+     * @param mixed  $value
+     */
+    public function addSubNode(string $mainNode, string $name, $value, bool $append = true): bool
+    {
+        $decoded = JsonFile::parseJson($this->contents);
+
+        $subName = null;
+        if (in_array($mainNode, ['config', 'extra', 'scripts']) && false !== strpos($name, '.')) {
+            [$name, $subName] = explode('.', $name, 2);
+        }
+
+        // no main node yet
+        if (!isset($decoded[$mainNode])) {
+            if ($subName !== null) {
+                $this->addMainKey($mainNode, [$name => [$subName => $value]]);
+            } else {
+                $this->addMainKey($mainNode, [$name => $value]);
+            }
+
+            return true;
+        }
+
+        // main node content not match-able
+        $nodeRegex = '{'.self::DEFINES.'^(?P<start> \s* \{ \s* (?: (?&string) \s* : (?&json) \s* , \s* )*?'.
+            preg_quote(JsonFile::encode($mainNode)).'\s*:\s*)(?P<content>(?&object))(?P<end>.*)}sx';
+
+        try {
+            if (!Preg::isMatch($nodeRegex, $this->contents, $match)) {
+                return false;
+            }
+        } catch (\RuntimeException $e) {
+            if ($e->getCode() === PREG_BACKTRACK_LIMIT_ERROR) {
+                return false;
+            }
+            throw $e;
+        }
+
+        assert(is_string($match['start']));
+        assert(is_string($match['content']));
+        assert(is_string($match['end']));
+
+        $children = $match['content'];
+        // invalid match due to un-regexable content, abort
+        if (!@json_decode($children)) {
+            return false;
+        }
+
+        // child exists
+        $childRegex = '{'.self::DEFINES.'(?P<start>"'.preg_quote($name).'"\s*:\s*)(?P<content>(?&json))(?P<end>,?)}x';
+        if (Preg::isMatch($childRegex, $children, $matches)) {
+            $children = Preg::replaceCallback($childRegex, function ($matches) use ($subName, $value): string {
+                if ($subName !== null && is_string($matches['content'])) {
+                    $curVal = json_decode($matches['content'], true);
+                    if (!is_array($curVal)) {
+                        $curVal = [];
+                    }
+                    $curVal[$subName] = $value;
+                    $value = $curVal;
+                }
+
+                return $matches['start'] . $this->format($value, 1) . $matches['end'];
+            }, $children);
+        } else {
+            Preg::match('#^{ (?P<leadingspace>\s*?) (?P<content>\S+.*?)? (?P<trailingspace>\s*) }$#sx', $children, $match);
+
+            $whitespace = '';
+            if (!empty($match['trailingspace'])) {
+                $whitespace = $match['trailingspace'];
+            }
+
+            if (!empty($match['content'])) {
+                if ($subName !== null) {
+                    $value = [$subName => $value];
+                }
+
+                // child missing but non empty children
+                if ($append) {
+                    $children = Preg::replace(
+                        '#'.$whitespace.'}$#',
+                        addcslashes(',' . $this->newline . $this->indent . $this->indent . JsonFile::encode($name).': '.$this->format($value, 1) . $whitespace . '}', '\\$'),
+                        $children
+                    );
+                } else {
+                    $whitespace = '';
+                    if (!empty($match['leadingspace'])) {
+                        $whitespace = $match['leadingspace'];
+                    }
+
+                    $children = Preg::replace(
+                        '#^{'.$whitespace.'#',
+                        addcslashes('{' . $whitespace . JsonFile::encode($name).': '.$this->format($value, 1) . ',' . $this->newline . $this->indent . $this->indent, '\\$'),
+                        $children
+                    );
+                }
+            } else {
+                if ($subName !== null) {
+                    $value = [$subName => $value];
+                }
+
+                // children present but empty
+                $children = '{' . $this->newline . $this->indent . $this->indent . JsonFile::encode($name).': '.$this->format($value, 1) . $whitespace . '}';
+            }
+        }
+
+        $this->contents = Preg::replaceCallback($nodeRegex, static function ($m) use ($children): string {
+            return $m['start'] . $children . $m['end'];
+        }, $this->contents);
+
+        return true;
+    }
+
+    public function removeSubNode(string $mainNode, string $name): bool
+    {
+        $decoded = JsonFile::parseJson($this->contents);
+
+        // no node or empty node
+        if (empty($decoded[$mainNode])) {
+            return true;
+        }
+
+        // no node content match-able
+        $nodeRegex = '{'.self::DEFINES.'^(?P<start> \s* \{ \s* (?: (?&string) \s* : (?&json) \s* , \s* )*?'.
+            preg_quote(JsonFile::encode($mainNode)).'\s*:\s*)(?P<content>(?&object))(?P<end>.*)}sx';
+        try {
+            if (!Preg::isMatch($nodeRegex, $this->contents, $match)) {
+                return false;
+            }
+        } catch (\RuntimeException $e) {
+            if ($e->getCode() === PREG_BACKTRACK_LIMIT_ERROR) {
+                return false;
+            }
+            throw $e;
+        }
+
+        assert(is_string($match['start']));
+        assert(is_string($match['content']));
+        assert(is_string($match['end']));
+
+        $children = $match['content'];
+
+        // invalid match due to un-regexable content, abort
+        if (!@json_decode($children, true)) {
+            return false;
+        }
+
+        $subName = null;
+        if (in_array($mainNode, ['config', 'extra', 'scripts']) && false !== strpos($name, '.')) {
+            [$name, $subName] = explode('.', $name, 2);
+        }
+
+        // no node to remove
+        if (!isset($decoded[$mainNode][$name]) || ($subName && !isset($decoded[$mainNode][$name][$subName]))) {
+            return true;
+        }
+
+        // try and find a match for the subkey
+        $keyRegex = str_replace('/', '\\\\?/', preg_quote($name));
+        if (Preg::isMatch('{"'.$keyRegex.'"\s*:}i', $children)) {
+            // find best match for the value of "name"
+            if (Preg::isMatchAll('{'.self::DEFINES.'"'.$keyRegex.'"\s*:\s*(?:(?&json))}x', $children, $matches)) {
+                $bestMatch = '';
+                foreach ($matches[0] as $match) {
+                    assert(is_string($match));
+                    if (strlen($bestMatch) < strlen($match)) {
+                        $bestMatch = $match;
+                    }
+                }
+                $childrenClean = Preg::replace('{,\s*'.preg_quote($bestMatch).'}i', '', $children, -1, $count);
+                if (1 !== $count) {
+                    $childrenClean = Preg::replace('{'.preg_quote($bestMatch).'\s*,?\s*}i', '', $childrenClean, -1, $count);
+                    if (1 !== $count) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            $childrenClean = $children;
+        }
+
+        if (!isset($childrenClean)) {
+            throw new \InvalidArgumentException("JsonManipulator: \$childrenClean is not defined. Please report at https://github.com/composer/composer/issues/new.");
+        }
+
+        // no child data left, $name was the only key in
+        unset($match);
+        Preg::match('#^{ \s*? (?P<content>\S+.*?)? (?P<trailingspace>\s*) }$#sx', $childrenClean, $match);
+        if (empty($match['content'])) {
+            $newline = $this->newline;
+            $indent = $this->indent;
+
+            $this->contents = Preg::replaceCallback($nodeRegex, static function ($matches) use ($indent, $newline): string {
+                return $matches['start'] . '{' . $newline . $indent . '}' . $matches['end'];
+            }, $this->contents);
+
+            // we have a subname, so we restore the rest of $name
+            if ($subName !== null) {
+                $curVal = json_decode($children, true);
+                unset($curVal[$name][$subName]);
+                if ($curVal[$name] === []) {
+                    $curVal[$name] = new \ArrayObject();
+                }
+                $this->addSubNode($mainNode, $name, $curVal[$name]);
+            }
+
+            return true;
+        }
+
+        $this->contents = Preg::replaceCallback($nodeRegex, function ($matches) use ($name, $subName, $childrenClean): string {
+            assert(is_string($matches['content']));
+            if ($subName !== null) {
+                $curVal = json_decode($matches['content'], true);
+                unset($curVal[$name][$subName]);
+                if ($curVal[$name] === []) {
+                    $curVal[$name] = new \ArrayObject();
+                }
+                $childrenClean = $this->format($curVal, 0, true);
+            }
+
+            return $matches['start'] . $childrenClean . $matches['end'];
+        }, $this->contents);
+
+        return true;
+    }
+
+    /**
+     * @param mixed  $content
+     */
+    public function addMainKey(string $key, $content): bool
+    {
+        $decoded = JsonFile::parseJson($this->contents);
+        $content = $this->format($content);
+
+        // key exists already
+        $regex = '{'.self::DEFINES.'^(?P<start>\s*\{\s*(?:(?&string)\s*:\s*(?&json)\s*,\s*)*?)'.
+            '(?P<key>'.preg_quote(JsonFile::encode($key)).'\s*:\s*(?&json))(?P<end>.*)}sx';
+        if (isset($decoded[$key]) && Preg::isMatch($regex, $this->contents, $matches)) {
+            // invalid match due to un-regexable content, abort
+            if (!@json_decode('{'.$matches['key'].'}')) {
+                return false;
+            }
+
+            $this->contents = $matches['start'] . JsonFile::encode($key).': '.$content . $matches['end'];
+
+            return true;
+        }
+
+        // append at the end of the file and keep whitespace
+        if (Preg::isMatch('#[^{\s](\s*)\}$#', $this->contents, $match)) {
+            $this->contents = Preg::replace(
+                '#'.$match[1].'\}$#',
+                addcslashes(',' . $this->newline . $this->indent . JsonFile::encode($key). ': '. $content . $this->newline . '}', '\\$'),
+                $this->contents
+            );
+
+            return true;
+        }
+
+        // append at the end of the file
+        $this->contents = Preg::replace(
+            '#\}$#',
+            addcslashes($this->indent . JsonFile::encode($key). ': '.$content . $this->newline . '}', '\\$'),
+            $this->contents
         );
 
-        // Add the plugins to the repo along with the internal Plugin package on which they all rely.
-        $this->repository
-            ->expects($this->any())
-            ->method('getPackages')
-            ->will($this->returnCallback(static function () use ($plugApiInternalPackage, $plugins): array {
-                return array_merge([$plugApiInternalPackage], $plugins);
-            }));
-
-        $this->pm->loadInstalledPlugins();
+        return true;
     }
 
-    public function testStarPluginVersionWorksWithAnyAPIVersion(): void
+    public function removeMainKey(string $key): bool
     {
-        $starVersionPlugin = [$this->packages[4]];
+        $decoded = JsonFile::parseJson($this->contents);
 
-        $this->setPluginApiVersionWithPlugins('1.0.0', $starVersionPlugin);
-        self::assertCount(1, $this->pm->getPlugins());
+        if (!array_key_exists($key, $decoded)) {
+            return true;
+        }
 
-        $this->setPluginApiVersionWithPlugins('1.9.9', $starVersionPlugin);
-        self::assertCount(1, $this->pm->getPlugins());
+        // key exists already
+        $regex = '{'.self::DEFINES.'^(?P<start>\s*\{\s*(?:(?&string)\s*:\s*(?&json)\s*,\s*)*?)'.
+            '(?P<removal>'.preg_quote(JsonFile::encode($key)).'\s*:\s*(?&json))\s*,?\s*(?P<end>.*)}sx';
+        if (Preg::isMatch($regex, $this->contents, $matches)) {
+            assert(is_string($matches['start']));
+            assert(is_string($matches['removal']));
+            assert(is_string($matches['end']));
 
-        $this->setPluginApiVersionWithPlugins('2.0.0-dev', $starVersionPlugin);
-        self::assertCount(1, $this->pm->getPlugins());
+            // invalid match due to un-regexable content, abort
+            if (!@json_decode('{'.$matches['removal'].'}')) {
+                return false;
+            }
 
-        $this->setPluginApiVersionWithPlugins('100.0.0-stable', $starVersionPlugin);
-        self::assertCount(1, $this->pm->getPlugins());
+            // check that we are not leaving a dangling comma on the previous line if the last line was removed
+            if (Preg::isMatchStrictGroups('#,\s*$#', $matches['start']) && Preg::isMatch('#^\}$#', $matches['end'])) {
+                $matches['start'] = rtrim(Preg::replace('#,(\s*)$#', '$1', $matches['start']), $this->indent);
+            }
+
+            $this->contents = $matches['start'] . $matches['end'];
+            if (Preg::isMatch('#^\{\s*\}\s*$#', $this->contents)) {
+                $this->contents = "{\n}";
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
-    public function testPluginConstraintWorksOnlyWithCertainAPIVersion(): void
+    public function removeMainKeyIfEmpty(string $key): bool
     {
-        $pluginWithApiConstraint = [$this->packages[5]];
+        $decoded = JsonFile::parseJson($this->contents);
 
-        $this->setPluginApiVersionWithPlugins('1.0.0', $pluginWithApiConstraint);
-        self::assertCount(0, $this->pm->getPlugins());
+        if (!array_key_exists($key, $decoded)) {
+            return true;
+        }
 
-        $this->setPluginApiVersionWithPlugins('1.1.9', $pluginWithApiConstraint);
-        self::assertCount(0, $this->pm->getPlugins());
+        if (is_array($decoded[$key]) && count($decoded[$key]) === 0) {
+            return $this->removeMainKey($key);
+        }
 
-        $this->setPluginApiVersionWithPlugins('1.2.0', $pluginWithApiConstraint);
-        self::assertCount(1, $this->pm->getPlugins());
-
-        $this->setPluginApiVersionWithPlugins('1.9.9', $pluginWithApiConstraint);
-        self::assertCount(1, $this->pm->getPlugins());
-    }
-
-    public function testPluginRangeConstraintsWorkOnlyWithCertainAPIVersion(): void
-    {
-        $pluginWithApiConstraint = [$this->packages[6]];
-
-        $this->setPluginApiVersionWithPlugins('1.0.0', $pluginWithApiConstraint);
-        self::assertCount(0, $this->pm->getPlugins());
-
-        $this->setPluginApiVersionWithPlugins('3.0.0', $pluginWithApiConstraint);
-        self::assertCount(1, $this->pm->getPlugins());
-
-        $this->setPluginApiVersionWithPlugins('5.5.0', $pluginWithApiConstraint);
-        self::assertCount(0, $this->pm->getPlugins());
-    }
-
-    public function testCommandProviderCapability(): void
-    {
-        $this->repository
-            ->expects($this->any())
-            ->method('getPackages')
-            ->will($this->returnValue([$this->packages[7]]));
-        $installer = new PluginInstaller($this->io, $this->composer);
-        $this->pm->loadInstalledPlugins();
-
-        /** @var \Composer\Plugin\Capability\CommandProvider[] $caps */
-        $caps = $this->pm->getPluginCapabilities('Composer\Plugin\Capability\CommandProvider', ['composer' => $this->composer, 'io' => $this->io]);
-        self::assertCount(1, $caps);
-        self::assertInstanceOf('Composer\Plugin\Capability\CommandProvider', $caps[0]);
-
-        $commands = $caps[0]->getCommands();
-        self::assertCount(1, $commands);
-        self::assertInstanceOf('Composer\Command\BaseCommand', $commands[0]);
-    }
-
-    public function testIncapablePluginIsCorrectlyDetected(): void
-    {
-        $plugin = $this->getMockBuilder('Composer\Plugin\PluginInterface')
-                       ->getMock();
-        self::assertNull($this->pm->getPluginCapability($plugin, 'Fake\Ability'));
-    }
-
-    public function testCapabilityImplementsComposerPluginApiClassAndIsConstructedWithArgs(): void
-    {
-        $capabilityApi = 'Composer\Plugin\Capability\Capability';
-        $capabilityImplementation = 'Composer\Test\Plugin\Mock\Capability';
-
-        $plugin = $this->getMockBuilder('Composer\Test\Plugin\Mock\CapablePluginInterface')
-                       ->getMock();
-
-        $plugin->expects($this->once())
-               ->method('getCapabilities')
-               ->will($this->returnCallback(static function () use ($capabilityImplementation, $capabilityApi): array {
-                   return [$capabilityApi => $capabilityImplementation];
-               }));
-
-        /** @var \Composer\Test\Plugin\Mock\Capability $capability */
-        $capability = $this->pm->getPluginCapability($plugin, $capabilityApi, ['a' => 1, 'b' => 2]);
-
-        self::assertInstanceOf($capabilityApi, $capability);
-        self::assertInstanceOf($capabilityImplementation, $capability);
-        self::assertSame(['a' => 1, 'b' => 2, 'plugin' => $plugin], $capability->args);
-    }
-
-    /** @return mixed[] */
-    public static function invalidImplementationClassNames(): array
-    {
-        return [
-            [null],
-            [""],
-            [0],
-            [1000],
-            ["   "],
-            [[1]],
-            [[]],
-            [new \stdClass()],
-        ];
+        return true;
     }
 
     /**
-     * @dataProvider invalidImplementationClassNames
-     * @param mixed $invalidImplementationClassNames
-     * @param class-string<\Throwable> $expect
+     * @param mixed $data
      */
-    public function testQueryingWithInvalidCapabilityClassNameThrows($invalidImplementationClassNames, string $expect = 'UnexpectedValueException'): void
+    public function format($data, int $depth = 0, bool $wasObject = false): string
     {
-        self::expectException($expect);
+        if ($data instanceof \stdClass || $data instanceof \ArrayObject) {
+            $data = (array) $data;
+            $wasObject = true;
+        }
 
-        $capabilityApi = 'Composer\Plugin\Capability\Capability';
+        if (is_array($data)) {
+            if (\count($data) === 0) {
+                return $wasObject ? '{' . $this->newline . str_repeat($this->indent, $depth + 1) . '}' : '[]';
+            }
 
-        $plugin = $this->getMockBuilder('Composer\Test\Plugin\Mock\CapablePluginInterface')
-                       ->getMock();
+            if (array_is_list($data)) {
+                foreach ($data as $key => $val) {
+                    $data[$key] = $this->format($val, $depth + 1);
+                }
 
-        $plugin->expects($this->once())
-               ->method('getCapabilities')
-               ->will($this->returnCallback(static function () use ($invalidImplementationClassNames, $capabilityApi): array {
-                   return [$capabilityApi => $invalidImplementationClassNames];
-               }));
+                return '['.implode(', ', $data).']';
+            }
 
-        $this->pm->getPluginCapability($plugin, $capabilityApi);
+            $out = '{' . $this->newline;
+            $elems = [];
+            foreach ($data as $key => $val) {
+                $elems[] = str_repeat($this->indent, $depth + 2) . JsonFile::encode((string) $key). ': '.$this->format($val, $depth + 1);
+            }
+
+            return $out . implode(','.$this->newline, $elems) . $this->newline . str_repeat($this->indent, $depth + 1) . '}';
+        }
+
+        return JsonFile::encode($data);
     }
 
-    public function testQueryingNonProvidedCapabilityReturnsNullSafely(): void
+    protected function detectIndenting(): void
     {
-        $capabilityApi = 'Composer\Plugin\Capability\MadeUpCapability';
-
-        $plugin = $this->getMockBuilder('Composer\Test\Plugin\Mock\CapablePluginInterface')
-                       ->getMock();
-
-        $plugin->expects($this->once())
-               ->method('getCapabilities')
-               ->will($this->returnCallback(static function (): array {
-                   return [];
-               }));
-
-        self::assertNull($this->pm->getPluginCapability($plugin, $capabilityApi));
-    }
-
-    /** @return mixed[] */
-    public static function nonExistingOrInvalidImplementationClassTypes(): array
-    {
-        return [
-            ['\stdClass'],
-            ['NonExistentClassLikeMiddleClass'],
-        ];
-    }
-
-    /**
-     * @dataProvider nonExistingOrInvalidImplementationClassTypes
-     */
-    public function testQueryingWithNonExistingOrWrongCapabilityClassTypesThrows(string $wrongImplementationClassTypes): void
-    {
-        $this->testQueryingWithInvalidCapabilityClassNameThrows($wrongImplementationClassTypes, 'RuntimeException');
+        $this->indent = JsonFile::detectIndenting($this->contents);
     }
 }

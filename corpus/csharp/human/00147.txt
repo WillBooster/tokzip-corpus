@@ -2,294 +2,247 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
-using System.Globalization;
+using System.Diagnostics;
+using System.IO;
 using System.Reflection;
+using NUnit.Common;
+using NUnit;
+using NUnit.Framework.Api;
 using NUnit.Framework.Interfaces;
 using NUnit.Framework.Internal;
-using NUnit.Framework.Internal.Builders;
-using NUnit.Framework.Internal.Extensions;
+using NUnit.Framework.Internal.Filters;
 
-namespace NUnit.Framework
+namespace NUnitLite
 {
     /// <summary>
-    /// Marks a method as a parameterized test suite and provides arguments for each test case.
+    /// TextRunner is a general purpose class that runs tests and
+    /// outputs to a text-based user interface (TextUI).
+    ///
+    /// Call it from your Main like this:
+    ///   new TextRunner(textWriter).Execute(args);
+    ///     OR
+    ///   new TextUI().Execute(args);
+    /// The provided TextWriter is used by default, unless the
+    /// arguments to Execute override it using -out. The second
+    /// form uses the Console, provided it exists on the platform.
+    ///
+    /// NOTE: When running on a platform without a Console, such
+    /// as Windows Phone, the results will simply not appear if
+    /// you fail to specify a file in the call itself or as an option.
     /// </summary>
-    [AttributeUsage(AttributeTargets.Method, AllowMultiple = true, Inherited = false)]
-    public class TestCaseAttribute : NUnitAttribute, ITestBuilder, ITestCaseData, IImplyFixture
+    public class TextRunner : ITestListener
     {
+        #region Runner Return Codes
+
+        /// <summary>OK</summary>
+        public const int OK = 0;
+        /// <summary>Invalid Arguments</summary>
+        public const int INVALID_ARG = -1;
+        /// <summary>File not found</summary>
+        public const int FILE_NOT_FOUND = -2;
+        /// <summary>Test fixture not found - No longer in use</summary>
+        //public const int FIXTURE_NOT_FOUND = -3;
+        /// <summary>Invalid test suite</summary>
+        public const int INVALID_TEST_FIXTURE = -4;
+        /// <summary>Unexpected error occurred</summary>
+        public const int UNEXPECTED_ERROR = -100;
+
+        #endregion
+
+        private Assembly _testAssembly;
+        private ITestAssemblyRunner _runner;
+
+        private NUnitLiteOptions _options;
+        private ITestListener _teamCity = null;
+
+        private TextUI _textUI;
+
         #region Constructors
 
         /// <summary>
-        /// Construct a TestCaseAttribute with a list of arguments.
-        /// This constructor is not CLS-Compliant
+        /// Initializes a new instance of the <see cref="TextRunner"/> class
+        /// without specifying an assembly. This is interpreted as allowing
+        /// a single input file in the argument list to Execute().
         /// </summary>
-        /// <param name="arguments"></param>
-        public TestCaseAttribute(params object?[]? arguments)
+        public TextRunner()
         {
-            RunState = RunState.Runnable;
+        }
 
-            if (arguments is null)
-                Arguments = new object?[] { null };
+        /// <summary>
+        /// Initializes a new instance of the <see cref="TextRunner"/> class
+        /// specifying a test assembly whose tests are to be run.
+        /// </summary>
+        /// <param name="testAssembly"></param>
+        /// </summary>
+        public TextRunner(Assembly testAssembly)
+        {
+            _testAssembly = testAssembly;
+        }
+
+        #endregion
+
+        #region Properties
+
+        public ResultSummary Summary { get; private set; }
+
+        #endregion
+
+        #region Public Methods
+
+        public int Execute(string[] args)
+        {
+            TextWriter originalStdOutWriter = null;
+            TextWriter originalStdErrWriter = null;
+
+            _options = new NUnitLiteOptions(_testAssembly is null, args);
+
+            ExtendedTextWriter outWriter = null;
+            if (_options.OutFile is not null)
+            {
+                var outFile = Path.Combine(_options.WorkDirectory, _options.OutFile);
+                var textWriter = TextWriter.Synchronized(new StreamWriter(outFile));
+                outWriter = new ExtendedTextWrapper(textWriter);
+                originalStdOutWriter = Console.Out;
+                Console.SetOut(outWriter);
+            }
             else
-                Arguments = arguments;
-
-            Properties = new PropertyBag();
-        }
-
-        /// <summary>
-        /// Construct a TestCaseAttribute with a single argument
-        /// </summary>
-        /// <param name="arg"></param>
-        public TestCaseAttribute(object? arg)
-        {
-            RunState = RunState.Runnable;
-            Arguments = new[] { arg };
-            Properties = new PropertyBag();
-        }
-
-        /// <summary>
-        /// Construct a TestCaseAttribute with a two arguments
-        /// </summary>
-        /// <param name="arg1"></param>
-        /// <param name="arg2"></param>
-        public TestCaseAttribute(object? arg1, object? arg2)
-        {
-            RunState = RunState.Runnable;
-            Arguments = new[] { arg1, arg2 };
-            Properties = new PropertyBag();
-        }
-
-        /// <summary>
-        /// Construct a TestCaseAttribute with a three arguments
-        /// </summary>
-        /// <param name="arg1"></param>
-        /// <param name="arg2"></param>
-        /// <param name="arg3"></param>
-        public TestCaseAttribute(object? arg1, object? arg2, object? arg3)
-        {
-            RunState = RunState.Runnable;
-            Arguments = new[] { arg1, arg2, arg3 };
-            Properties = new PropertyBag();
-        }
-
-        #endregion
-
-        #region ITestData Members
-
-        /// <summary>
-        /// Gets or sets the name of the test.
-        /// </summary>
-        /// <value>The name of the test.</value>
-        public string? TestName { get; set; }
-
-        /// <summary>
-        /// Gets or sets the RunState of this test case.
-        /// </summary>
-        public RunState RunState { get; private set; }
-
-        /// <summary>
-        /// Gets the list of arguments to a test case
-        /// </summary>
-        public object?[] Arguments { get; }
-
-        /// <summary>
-        /// Gets the properties of the test case
-        /// </summary>
-        public IPropertyBag Properties { get; }
-
-        #endregion
-
-        #region ITestCaseData Members
-
-        /// <summary>
-        /// Gets or sets the expected result.
-        /// </summary>
-        /// <value>The result.</value>
-        public object? ExpectedResult
-        {
-            get => _expectedResult;
-            set
             {
-                _expectedResult = value;
-                HasExpectedResult = true;
+                outWriter = new ColorConsoleWriter(!_options.NoColor);
             }
-        }
-        private object? _expectedResult;
 
-        /// <summary>
-        /// Returns true if the expected result has been set
-        /// </summary>
-        public bool HasExpectedResult { get; private set; }
-
-        #endregion
-
-        #region Instance Fields
-
-        private RunState _originalRunState;
-        private DateTimeOffset? _untilDate;
-
-        #endregion
-
-        #region Other Properties
-
-        /// <summary>
-        /// Gets or sets the description.
-        /// </summary>
-        /// <value>The description.</value>
-        [DisallowNull]
-        public string? Description
-        {
-            get => Properties.Get(PropertyNames.Description) as string;
-            set
+            try
             {
-                Guard.ArgumentNotNull(value, nameof(value));
-                Properties.Set(PropertyNames.Description, value);
-            }
-        }
-
-        /// <summary>
-        /// The author of this test
-        /// </summary>
-        [DisallowNull]
-        public string? Author
-        {
-            get => Properties.Get(PropertyNames.Author) as string;
-            set
-            {
-                Guard.ArgumentNotNull(value, nameof(value));
-                Properties.Set(PropertyNames.Author, value);
-            }
-        }
-
-        /// <summary>
-        /// The type that this test is testing
-        /// </summary>
-        [DisallowNull]
-        public Type? TestOf
-        {
-            get => _testOf;
-            set
-            {
-                Guard.ArgumentNotNull(value, nameof(value));
-                _testOf = value;
-                Properties.Set(PropertyNames.TestOf, value.FullName());
-            }
-        }
-        private Type? _testOf;
-
-        /// <summary>
-        /// Gets or sets the reason for ignoring the test
-        /// </summary>
-        [DisallowNull]
-        public string? Ignore
-        {
-            get => IgnoreReason;
-            set
-            {
-                Guard.ArgumentNotNull(value, nameof(value));
-                IgnoreReason = value;
-            }
-        }
-
-        /// <summary>
-        /// Gets or sets a value indicating whether this <see cref="NUnit.Framework.TestCaseAttribute"/> is explicit.
-        /// </summary>
-        /// <value>
-        /// <see langword="true"/> if explicit; otherwise, <see langword="false"/>.
-        /// </value>
-        public bool Explicit
-        {
-            get => RunState == RunState.Explicit;
-            set => RunState = value ? RunState.Explicit : RunState.Runnable;
-        }
-
-        /// <summary>
-        /// Gets or sets the reason for not running the test.
-        /// </summary>
-        /// <value>The reason.</value>
-        [DisallowNull]
-        public string? Reason
-        {
-            get => Properties.Get(PropertyNames.SkipReason) as string;
-            set
-            {
-                Guard.ArgumentNotNull(value, nameof(value));
-                Properties.Set(PropertyNames.SkipReason, value);
-            }
-        }
-
-        /// <summary>
-        /// Gets or sets the ignore reason. When set to a non-null
-        /// non-empty value, the test is marked as ignored.
-        /// </summary>
-        /// <value>The ignore reason.</value>
-        [DisallowNull]
-        public string? IgnoreReason
-        {
-            get => Reason;
-            set
-            {
-                Guard.ArgumentNotNull(value, nameof(value));
-                _originalRunState = RunState;
-                RunState = RunState.Ignored;
-                Reason = value;
-            }
-        }
-
-        /// <summary>
-        /// Comma-delimited list of platforms to run the test for
-        /// </summary>
-        public string? IncludePlatform { get; set; }
-
-        /// <summary>
-        /// Comma-delimited list of platforms to not run the test for
-        /// </summary>
-        public string? ExcludePlatform { get; set; }
-
-        /// <summary>
-        /// Get or set the type arguments for a generic test method.
-        /// If not set explicitly, the generic types will be inferred
-        /// based on the test case parameters.
-        /// </summary>
-        public Type[]? TypeArgs { get; set; } = null;
-
-        /// <summary>
-        /// Gets and sets the category for this test case.
-        /// May be a comma-separated list of categories.
-        /// </summary>
-        [DisallowNull]
-        public string? Category
-        {
-            get => Properties.Get(PropertyNames.Category) as string;
-            set
-            {
-                Guard.ArgumentNotNull(value, nameof(value));
-
-                foreach (string cat in value.Tokenize(','))
-                    Properties.Add(PropertyNames.Category, cat);
-            }
-        }
-
-        /// <summary>
-        /// Gets and sets the ignore until date for this test case.
-        /// </summary>
-        [StringSyntax(StringSyntaxAttribute.DateTimeFormat)]
-        [DisallowNull]
-        public string? Until
-        {
-            get => Properties.Get(PropertyNames.IgnoreUntilDate) as string;
-            set
-            {
-                if (!string.IsNullOrEmpty(IgnoreReason))
+                using (outWriter)
                 {
-                    _untilDate = DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
-                    Properties.Set(PropertyNames.IgnoreUntilDate, _untilDate.Value.ToString("u"));
+                    TextWriter errWriter = null;
+                    if (_options.ErrFile is not null)
+                    {
+                        var errFile = Path.Combine(_options.WorkDirectory, _options.ErrFile);
+                        errWriter = TextWriter.Synchronized(new StreamWriter(errFile));
+                        originalStdErrWriter = Console.Error;
+                        Console.SetError(errWriter);
+                    }
+
+                    try
+                    {
+                        using (errWriter)
+                        {
+                            _textUI = new TextUI(outWriter, Console.In, _options);
+                            return Execute();
+                        }
+                    }
+                    finally
+                    {
+                        if (originalStdErrWriter is not null)
+                        {
+                            Console.SetError(originalStdErrWriter);
+                        }
+                    }
                 }
-                else
+            }
+            finally
+            {
+                if (originalStdOutWriter is not null)
                 {
-                    RunState = RunState.NotRunnable;
+                    Console.SetOut(originalStdOutWriter);
                 }
+            }
+        }
+
+        // Entry point called by AutoRun and by the .NET Standard nunitlite.runner
+        public int Execute(ExtendedTextWriter writer, TextReader reader, string[] args)
+        {
+            _options = new NUnitLiteOptions(_testAssembly is null, args);
+
+            _textUI = new TextUI(writer, reader, _options);
+
+            return Execute();
+        }
+
+        // Internal Execute depends on _textUI and _options having been set already.
+        private int Execute()
+        {
+            _runner = new NUnitTestAssemblyRunner(new DefaultTestAssemblyBuilder());
+
+            InitializeInternalTrace();
+
+            try
+            {
+                if (!Directory.Exists(_options.WorkDirectory))
+                    Directory.CreateDirectory(_options.WorkDirectory);
+
+                if (_options.TeamCity)
+                    _teamCity = new TeamCityEventListener(_textUI.Writer);
+
+                if (_options.ShowVersion || !_options.NoHeader)
+                    _textUI.DisplayHeader();
+
+                if (_options.ShowHelp)
+                {
+                    _textUI.DisplayHelp();
+                    return TextRunner.OK;
+                }
+
+                // We already showed version as a part of the header
+                if (_options.ShowVersion)
+                    return TextRunner.OK;
+
+                if (_options.ErrorMessages.Count > 0)
+                {
+                    _textUI.DisplayErrors(_options.ErrorMessages);
+                    _textUI.Writer.WriteLine();
+                    _textUI.DisplayHelp();
+
+                    return TextRunner.INVALID_ARG;
+                }
+
+                if (_testAssembly is null && _options.InputFile is null)
+                {
+                    _textUI.DisplayError("No test assembly was specified.");
+                    _textUI.Writer.WriteLine();
+                    _textUI.DisplayHelp();
+
+                    return TextRunner.OK;
+                }
+
+                _textUI.DisplayRuntimeEnvironment();
+
+                var testFile = _testAssembly is not null
+                    ? AssemblyHelper.GetAssemblyPath(_testAssembly)
+                    : _options.InputFile;
+
+                _textUI.DisplayTestFiles(new[] { testFile });
+                if (_testAssembly is null)
+                    _testAssembly = AssemblyHelper.Load(testFile);
+
+                if (_options.WaitBeforeExit && _options.OutFile is not null)
+                    _textUI.DisplayWarning("Ignoring /wait option - only valid for Console");
+
+                var runSettings = MakeRunSettings(_options);
+                LoadTests(runSettings);
+
+                // We display the filters at this point so that any exception message
+                // thrown by CreateTestFilter will be understandable.
+                _textUI.DisplayTestFilters();
+
+                TestFilter filter = CreateTestFilter(_options);
+
+                return _options.Explore ? ExploreTests(filter) : RunTests(filter, runSettings);
+            }
+            catch (FileNotFoundException ex)
+            {
+                _textUI.DisplayError(ex.Message);
+                return FILE_NOT_FOUND;
+            }
+            catch (Exception ex)
+            {
+                _textUI.DisplayError(ex.ToString());
+                return UNEXPECTED_ERROR;
+            }
+            finally
+            {
+                if (_options.WaitBeforeExit)
+                    _textUI.WaitForUser("Press Enter key to continue . . .");
             }
         }
 
@@ -297,181 +250,241 @@ namespace NUnit.Framework
 
         #region Helper Methods
 
-        private TestCaseParameters GetParametersForTestCase(IMethodInfo method)
+        private void LoadTests(IDictionary<string, object> runSettings)
         {
-            TestCaseParameters parms;
+            TimeStamp startTime = new TimeStamp();
+            _runner.Load(_testAssembly, runSettings);
+            TimeStamp endTime = new TimeStamp();
 
-            try
+            _textUI.DisplayDiscoveryReport(startTime, endTime);
+        }
+
+        public int RunTests(TestFilter filter, IDictionary<string, object> runSettings)
+        {
+            ITestResult result = _runner.Run(this, filter);
+
+            ReportResults(result);
+
+            if (_options.ResultOutputSpecifications.Count > 0)
             {
-                IParameterInfo[] parameters = method.GetParameters();
-                int argsNeeded = parameters.Length;
-                int argsProvided = Arguments.Length;
+                var outputManager = new OutputManager(_options.WorkDirectory);
 
-                parms = new TestCaseParameters(this)
-                {
-                    TypeArgs = TypeArgs
-                };
-
-                // Special handling for ExpectedResult (see if it needs to be converted into method return type)
-                if (parms.HasExpectedResult
-                    && ParamAttributeTypeConversions.TryConvert(parms.ExpectedResult, method.ReturnType.Type, out var expectedResultInTargetType))
-                {
-                    parms.ExpectedResult = expectedResultInTargetType;
-                }
-
-                // Special handling for CancellationToken
-                if (parameters.LastParameterAcceptsCancellationToken() &&
-                   (!Arguments.LastArgumentIsCancellationToken()))
-                {
-                    // Implict CancellationToken argument
-                    argsProvided++;
-                }
-
-                // Special handling for params arguments
-                if (argsNeeded > 0 && argsProvided >= argsNeeded - 1)
-                {
-                    IParameterInfo lastParameter = parameters[argsNeeded - 1];
-                    Type lastParameterType = lastParameter.ParameterType;
-                    Type elementType = lastParameterType.GetElementType()!;
-
-                    if (lastParameterType.IsArray && lastParameter.IsDefined<ParamArrayAttribute>(false))
-                    {
-                        if (argsProvided == argsNeeded)
-                        {
-                            if (!lastParameterType.IsInstanceOfType(parms.Arguments[argsProvided - 1]))
-                            {
-                                Array array = Array.CreateInstance(elementType, 1);
-                                array.SetValue(parms.Arguments[argsProvided - 1], 0);
-                                parms.Arguments[argsProvided - 1] = array;
-                            }
-                        }
-                        else
-                        {
-                            object?[] newArglist = new object?[argsNeeded];
-                            for (int i = 0; i < argsNeeded && i < argsProvided; i++)
-                                newArglist[i] = parms.Arguments[i];
-
-                            int length = argsProvided - argsNeeded + 1;
-                            Array array = Array.CreateInstance(elementType, length);
-                            for (int i = 0; i < length; i++)
-                                array.SetValue(parms.Arguments[argsNeeded + i - 1], i);
-
-                            newArglist[argsNeeded - 1] = array;
-                            parms.Arguments = newArglist;
-                            argsProvided = argsNeeded;
-                        }
-                    }
-                }
-
-                // Special handling for optional parameters
-                if (argsProvided < argsNeeded)
-                {
-                    var newArgList = new object?[parameters.Length];
-                    Array.Copy(parms.Arguments, newArgList, parms.Arguments.Length);
-
-                    //Fill with Type.Missing for remaining required parameters where optional
-                    for (var i = parms.Arguments.Length; i < parameters.Length; i++)
-                    {
-                        if (parameters[i].IsOptional)
-                        {
-                            newArgList[i] = Type.Missing;
-                        }
-                        else
-                        {
-                            if (i < parms.Arguments.Length)
-                                newArgList[i] = parms.Arguments[i];
-                            else
-                                throw new TargetParameterCountException($"Method requires {argsNeeded} arguments but TestCaseAttribute only supplied {argsProvided}");
-                        }
-                    }
-                    parms.Arguments = newArgList;
-                }
-
-                // Special handling when sole argument is an object[]
-                if (argsNeeded == 1 && method.GetParameters()[0].ParameterType == typeof(object[]))
-                {
-                    if (argsProvided > 1 ||
-                        argsProvided == 1 && parms.Arguments[0]?.GetType() != typeof(object[]))
-                    {
-                        parms.Arguments = new object[] { parms.Arguments };
-                    }
-                }
-
-                if (argsProvided == argsNeeded)
-                    PerformSpecialConversions(parms.Arguments, parameters);
+                foreach (var spec in _options.ResultOutputSpecifications)
+                    outputManager.WriteResultFile(result, spec, runSettings, filter);
             }
-            catch (Exception ex)
+            if (Summary.InvalidTestFixtures > 0)
+                return INVALID_TEST_FIXTURE;
+
+            return Summary.FailureCount + Summary.ErrorCount + Summary.InvalidCount;
+        }
+
+        public void ReportResults(ITestResult result)
+        {
+            Summary = new ResultSummary(result);
+
+            if (Summary.ExplicitCount + Summary.SkipCount + Summary.IgnoreCount > 0)
+                _textUI.DisplayNotRunReport(result);
+
+            if (result.ResultState.Status == TestStatus.Failed || result.ResultState.Status == TestStatus.Warning)
+                _textUI.DisplayErrorsFailuresAndWarningsReport(result);
+
+#if FULL
+            if (_options.Full)
+                _textUI.PrintFullReport(_result);
+#endif
+
+            _textUI.DisplayRunSettings();
+
+            _textUI.DisplaySummaryReport(Summary);
+        }
+
+        private int ExploreTests(ITestFilter filter)
+        {
+            ITest testNode = _runner.ExploreTests(filter);
+
+            var specs = _options.ExploreOutputSpecifications;
+
+            if (specs.Count == 0)
             {
-                parms = new TestCaseParameters(ex);
+                new TestCaseOutputWriter().WriteTestFile(testNode, Console.Out);
+            }
+            else
+            {
+                var outputManager = new OutputManager(_options.WorkDirectory);
+
+                foreach (var spec in _options.ExploreOutputSpecifications)
+                    outputManager.WriteTestFile(testNode, spec);
             }
 
-            return parms;
+            return OK;
         }
 
         /// <summary>
-        /// Performs several special conversions allowed by NUnit in order to
-        /// permit arguments with types that cannot be used in the constructor
-        /// of an Attribute such as TestCaseAttribute or to simplify their use.
+        /// Make the settings for this run - this is public for testing
         /// </summary>
-        /// <param name="arglist">The arguments to be converted</param>
-        /// <param name="parameters">The ParameterInfo array for the method</param>
-        private static void PerformSpecialConversions(object?[] arglist, IParameterInfo[] parameters)
+        public static Dictionary<string, object> MakeRunSettings(NUnitLiteOptions options)
         {
-            for (int i = 0; i < arglist.Length; i++)
+            // Transfer command line options to run settings
+            var runSettings = new Dictionary<string, object>();
+
+            if (options.PreFilters.Count > 0)
             {
-                object? arg = arglist[i];
-                Type targetType = parameters[i].ParameterType;
-                if (ParamAttributeTypeConversions.TryConvert(arg, targetType, out var argAsTargetType))
+                runSettings[FrameworkPackageSettings.LOAD] = options.PreFilters;
+            }
+            else if (options.TestList.Count > 0)
+            {
+                var prefilters = new List<string>();
+
+                foreach (var testName in options.TestList)
                 {
-                    arglist[i] = argAsTargetType;
+                    int end = testName.IndexOfAny(new[] { '(', '<' });
+                    if (end > 0)
+                        prefilters.Add(testName.Substring(0, end).Trim());
+                    else
+                        prefilters.Add(testName);
                 }
+
+                runSettings[FrameworkPackageSettings.LOAD] = prefilters;
+            }
+
+            if (options.NumberOfTestWorkers >= 0)
+                runSettings[FrameworkPackageSettings.NumberOfTestWorkers] = options.NumberOfTestWorkers;
+
+            if (options.InternalTraceLevel is not null)
+                runSettings[FrameworkPackageSettings.InternalTraceLevel] = options.InternalTraceLevel;
+
+            if (options.RandomSeed >= 0)
+                runSettings[FrameworkPackageSettings.RandomSeed] = options.RandomSeed;
+
+            if (options.WorkDirectory is not null)
+                runSettings[FrameworkPackageSettings.WorkDirectory] = Path.GetFullPath(options.WorkDirectory);
+
+            if (options.DefaultTimeout >= 0)
+                runSettings[FrameworkPackageSettings.DefaultTimeout] = options.DefaultTimeout;
+
+            if (options.StopOnError)
+                runSettings[FrameworkPackageSettings.StopOnError] = true;
+
+            if (options.DefaultTestNamePattern is not null)
+                runSettings[FrameworkPackageSettings.DefaultTestNamePattern] = options.DefaultTestNamePattern;
+
+            if (options.TestParameters.Count != 0)
+                runSettings[FrameworkPackageSettings.TestParametersDictionary] = options.TestParameters;
+
+            return runSettings;
+        }
+
+        /// <summary>
+        /// Create the test filter for this run - public for testing
+        /// </summary>
+        /// <param name="options"></param>
+        /// <returns></returns>
+        public static TestFilter CreateTestFilter(NUnitLiteOptions options)
+        {
+            var filter = TestFilter.Empty;
+
+            if (options.TestList.Count > 0)
+            {
+                var testFilters = new List<TestFilter>();
+                foreach (var test in options.TestList)
+                    testFilters.Add(new FullNameFilter(test));
+
+                filter = testFilters.Count > 1
+                    ? new OrFilter(testFilters.ToArray())
+                    : testFilters[0];
+            }
+
+            if (options.WhereClauseSpecified)
+            {
+                string xmlText = new TestSelectionParser().Parse(options.WhereClause);
+                var whereFilter = TestFilter.FromXml(TNode.FromXml(xmlText));
+                filter = filter.IsEmpty
+                    ? whereFilter
+                    : new AndFilter(filter, whereFilter);
+            }
+
+            return filter;
+        }
+
+        private void InitializeInternalTrace()
+        {
+            var traceLevel = (InternalTraceLevel)Enum.Parse(typeof(InternalTraceLevel), _options.InternalTraceLevel ?? "Off", true);
+
+            if (traceLevel != InternalTraceLevel.Off)
+            {
+                var logName = GetLogFileName();
+
+                StreamWriter streamWriter = null;
+                if (traceLevel > InternalTraceLevel.Off)
+                {
+                    string logPath = Path.Combine(Directory.GetCurrentDirectory(), logName);
+                    streamWriter = new StreamWriter(new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.Write));
+                    streamWriter.AutoFlush = true;
+                }
+                InternalTrace.Initialize(streamWriter, traceLevel);
             }
         }
+
+        private string GetLogFileName()
+        {
+            const string logFileFormat = "InternalTrace.{0}.{1}.{2}";
+
+            // Some mobiles don't have an Open With menu item,
+            // so we use .txt, which is opened easily.
+            const string ext = "log";
+            var baseName = _testAssembly is not null
+                ? _testAssembly.GetName().Name
+                : _options.InputFile is not null
+                    ? Path.GetFileNameWithoutExtension(_options.InputFile)
+                    : "NUnitLite";
+
+            using var process = Process.GetCurrentProcess();
+            var id = process.Id;
+
+            return string.Format(logFileFormat, id, baseName, ext);
+        }
+
         #endregion
 
-        #region ITestBuilder Members
+        #region ITestListener Members
 
         /// <summary>
-        /// Builds a single test from the specified method and context.
+        /// Called when a test or suite has just started
         /// </summary>
-        /// <param name="method">The MethodInfo for which tests are to be constructed.</param>
-        /// <param name="suite">The suite to which the tests will be added.</param>
-        public IEnumerable<TestMethod> BuildFrom(IMethodInfo method, Test? suite)
+        /// <param name="test">The test that is starting</param>
+        public void TestStarted(ITest test)
         {
-            TestMethod test = new NUnitTestCaseBuilder().BuildTestMethod(method, suite, GetParametersForTestCase(method));
+            _teamCity?.TestStarted(test);
 
-            if (_untilDate.HasValue)
-            {
-                if (_untilDate > DateTimeOffset.UtcNow)
-                {
-                    test.RunState = RunState.Ignored;
-                    string reason = $"Ignoring until {_untilDate.Value:u}. {IgnoreReason}";
-                    test.Properties.Set(PropertyNames.SkipReason, reason);
-                }
-                else
-                {
-                    test.RunState = _originalRunState;
-                }
-            }
+            _textUI.TestStarted(test);
+        }
 
-            if (IncludePlatform is not null || ExcludePlatform is not null)
-            {
-                if (test.RunState is RunState.NotRunnable or RunState.Ignored)
-                {
-                    yield return test;
-                    yield break;
-                }
+        /// <summary>
+        /// Called when a test has finished
+        /// </summary>
+        /// <param name="result">The result of the test</param>
+        public void TestFinished(ITestResult result)
+        {
+            _teamCity?.TestFinished(result);
 
-                var platformHelper = new PlatformHelper();
+            _textUI.TestFinished(result);
+        }
 
-                if (!platformHelper.IsPlatformSupported(this))
-                {
-                    test.RunState = RunState.Skipped;
-                    test.Properties.Add(PropertyNames.SkipReason, platformHelper.Reason);
-                }
-            }
+        /// <summary>
+        /// Called when a test produces output for immediate display
+        /// </summary>
+        /// <param name="output">A TestOutput object containing the text to display</param>
+        public void TestOutput(TestOutput output)
+        {
+            _textUI.TestOutput(output);
+        }
 
-            yield return test;
+        /// <summary>
+        /// Called when a test produces a message to be sent to listeners
+        /// </summary>
+        /// <param name="message">A TestMessage object containing the text to send</param>
+        public void SendMessage(TestMessage message)
+        {
         }
 
         #endregion

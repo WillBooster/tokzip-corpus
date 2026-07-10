@@ -1,282 +1,264 @@
 const std = @import("std");
-const builtin = @import("builtin");
-const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
+const zig_builtin = @import("builtin");
+const zls = @import("zls");
+const exe_options = @import("exe_options");
 
-pub const Config = struct {
-    /// Whether the StringPool may be used simultaneously from multiple threads.
-    thread_safe: bool = !builtin.single_threaded,
+const tracy = @import("tracy");
+const binned_allocator = @import("binned_allocator.zig");
 
-    /// What type of mutex you'd like to use, for thread safety.
-    /// when specified, the mutex type must have the same shape as `std.Thread.Mutex` and
-    /// `DummyMutex`, and have no required fields. Specifying this field causes
-    /// the `thread_safe` field to be ignored.
-    ///
-    /// when null (default):
-    /// * the mutex type defaults to `std.Thread.Mutex` when thread_safe is enabled.
-    /// * the mutex type defaults to `DummyMutex` otherwise.
-    MutexType: ?type = null,
+const logger = std.log.scoped(.zls_main);
+
+var actual_log_level: std.log.Level = switch (zig_builtin.mode) {
+    .Debug => .debug,
+    else => @enumFromInt(@intFromEnum(exe_options.log_level)), // temporary fix to build failing on release-safe due to a Zig bug
 };
 
-/// The StringPool is a Data structure that stores only one copy of distinct and immutable strings i.e. `[]const u8`.
-///
-/// The `getOrPutString` function will intern a given string and return a unique identifier
-/// that can then be used to retrieve the original string with the `stringToSlice*` functions.
-pub fn StringPool(comptime config: Config) type {
-    return struct {
-        const Pool = @This();
+fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.EnumLiteral),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (@intFromEnum(level) > @intFromEnum(actual_log_level)) return;
 
-        /// A unique number that identifier a interned string.
-        ///
-        /// Two interned string can be checked for equality simply by checking
-        /// if this identifier are equal if they both come from the same StringPool.
-        pub const String = enum(u32) {
-            _,
+    const level_txt = comptime level.asText();
+    const scope_txt = comptime @tagName(scope);
 
-            pub fn toOptional(self: String) OptionalString {
-                return @enumFromInt(@intFromEnum(self));
-            }
+    const stderr = std.io.getStdErr().writer();
+    std.debug.lockStdErr();
+    defer std.debug.unlockStdErr();
 
-            pub fn fmt(self: String, pool: *Pool) std.fmt.Formatter(print) {
-                return .{ .data = .{ .string = self, .pool = pool } };
-            }
-        };
+    stderr.print("{s:<5}: ({s:^6}): ", .{ level_txt, if (comptime std.mem.startsWith(u8, scope_txt, "zls_")) scope_txt[4..] else scope_txt }) catch return;
+    stderr.print(format, args) catch return;
+    stderr.writeByte('\n') catch return;
+}
 
-        pub const OptionalString = enum(u32) {
-            none = std.math.maxInt(u32),
-            _,
+pub const std_options = std.Options{
+    // Always set this to debug to make std.log call into our handler, then control the runtime
+    // value in logFn itself
+    .log_level = .debug,
+    .logFn = logFn,
+};
 
-            pub fn unwrap(self: OptionalString) ?String {
-                if (self == .none) return null;
-                return @enumFromInt(@intFromEnum(self));
-            }
-        };
+const ParseArgsResult = struct {
+    action: enum { proceed, exit },
+    config_path: ?[]const u8,
+    message_tracing_enabled: bool,
 
-        /// Asserts that `str` contains no null bytes.
-        pub fn getString(pool: *Pool, str: []const u8) ?String {
-            assert(std.mem.indexOfScalar(u8, str, 0) == null);
+    zls_exe_path: []const u8,
 
-            // precompute the hash before acquiring the lock
-            const precomputed_key_hash = std.hash_map.hashString(str);
+    fn deinit(self: ParseArgsResult, allocator: std.mem.Allocator) void {
+        defer if (self.config_path) |path| allocator.free(path);
+        defer allocator.free(self.zls_exe_path);
+    }
+};
 
-            pool.mutex.lock();
-            defer pool.mutex.unlock();
-
-            const adapter = PrecomputedStringIndexAdapter{
-                .bytes = &pool.bytes,
-                .adapted_key = str,
-                .precomputed_key_hash = precomputed_key_hash,
-            };
-
-            const index = pool.map.getKeyAdapted(str, adapter) orelse return null;
-            return @enumFromInt(index);
-        }
-
-        /// Asserts that `str` contains no null bytes.
-        /// Returns `error.OutOfMemory` if adding this new string would increase the amount of allocated bytes above std.math.maxInt(u32)
-        pub fn getOrPutString(pool: *Pool, allocator: Allocator, str: []const u8) error{OutOfMemory}!String {
-            assert(std.mem.indexOfScalar(u8, str, 0) == null);
-
-            const start_index = std.math.cast(u32, pool.bytes.items.len) orelse return error.OutOfMemory;
-
-            // precompute the hash before acquiring the lock
-            const precomputed_key_hash = std.hash_map.hashString(str);
-
-            pool.mutex.lock();
-            defer pool.mutex.unlock();
-
-            const adapter = PrecomputedStringIndexAdapter{
-                .bytes = &pool.bytes,
-                .adapted_key = str,
-                .precomputed_key_hash = precomputed_key_hash,
-            };
-
-            pool.bytes.ensureUnusedCapacity(allocator, str.len + 1) catch {
-                // If allocation fails, try to do the lookup anyway.
-                const index = pool.map.getKeyAdapted(str, adapter) orelse return error.OutOfMemory;
-                return @enumFromInt(index);
-            };
-
-            const gop = try pool.map.getOrPutContextAdapted(
-                allocator,
-                str,
-                adapter,
-                std.hash_map.StringIndexContext{ .bytes = &pool.bytes },
-            );
-
-            if (!gop.found_existing) {
-                pool.bytes.appendSliceAssumeCapacity(str);
-                pool.bytes.appendAssumeCapacity(0);
-                gop.key_ptr.* = start_index;
-            }
-            return @enumFromInt(gop.key_ptr.*);
-        }
-
-        /// Caller owns the memory.
-        pub fn stringToSliceAlloc(pool: *Pool, allocator: Allocator, index: String) Allocator.Error![]const u8 {
-            pool.mutex.lock();
-            defer pool.mutex.unlock();
-            const string_bytes: [*:0]u8 = @ptrCast(pool.bytes.items.ptr);
-            const start = @intFromEnum(index);
-            return try allocator.dupe(u8, std.mem.sliceTo(string_bytes + start, 0));
-        }
-
-        /// Caller owns the memory.
-        pub fn stringToSliceAllocZ(pool: *Pool, allocator: Allocator, index: String) Allocator.Error![:0]const u8 {
-            pool.mutex.lock();
-            defer pool.mutex.unlock();
-            const string_bytes: [*:0]u8 = @ptrCast(pool.bytes.items.ptr);
-            const start = @intFromEnum(index);
-            return try allocator.dupeZ(u8, std.mem.sliceTo(string_bytes + start, 0));
-        }
-
-        /// storage a slice that points into the internal storage of the `StringPool`.
-        /// always call `release` method to unlock the `StringPool`.
-        ///
-        /// see `stringToSliceLock`
-        pub const LockedString = struct {
-            slice: [:0]const u8,
-
-            pub fn release(locked_string: LockedString, pool: *Pool) void {
-                _ = locked_string;
-                pool.mutex.unlock();
-            }
-        };
-
-        /// returns the underlying slice from an interned string
-        /// equal strings are guaranteed to share the same storage
-        ///
-        /// Will lock the `StringPool` until the `release` method is called on the returned locked string.
-        pub fn stringToSliceLock(pool: *Pool, index: String) LockedString {
-            pool.mutex.lock();
-            return .{ .slice = pool.stringToSliceUnsafe(index) };
-        }
-
-        // usingnamespace is used here instead of doing a @compileError if
-        // `config.thread_safe` so that `std.testing.refAllDeclsRecursive` works.
-        usingnamespace if (config.thread_safe) struct {} else struct {
-            /// returns the underlying slice from an interned string
-            /// equal strings are guaranteed to share the same storage
-            ///
-            /// only callable when thread safety is disabled.
-            pub fn stringToSlice(pool: *Pool, index: String) [:0]const u8 {
-                return pool.stringToSliceUnsafe(index);
-            }
-        };
-
-        /// returns the underlying slice from an interned string
-        /// equal strings are guaranteed to share the same storage
-        pub fn stringToSliceUnsafe(pool: *Pool, index: String) [:0]const u8 {
-            assert(@intFromEnum(index) < pool.bytes.items.len);
-            const string_bytes: [*:0]u8 = @ptrCast(pool.bytes.items.ptr);
-            const start = @intFromEnum(index);
-            return std.mem.sliceTo(string_bytes + start, 0);
-        }
-
-        mutex: @TypeOf(mutex_init) = mutex_init,
-        bytes: std.ArrayListUnmanaged(u8) = .{},
-        map: std.HashMapUnmanaged(u32, void, std.hash_map.StringIndexContext, std.hash_map.default_max_load_percentage) = .{},
-
-        pub fn deinit(pool: *Pool, allocator: Allocator) void {
-            pool.bytes.deinit(allocator);
-            pool.map.deinit(allocator);
-            if (builtin.mode == .Debug and !builtin.single_threaded and config.thread_safe) {
-                // detect deadlock when calling deinit while holding the lock
-                pool.mutex.lock();
-                pool.mutex.unlock();
-            }
-            pool.* = undefined;
-        }
-
-        const mutex_init = if (config.MutexType) |T|
-            T{}
-        else if (config.thread_safe)
-            std.Thread.Mutex{}
-        else
-            DummyMutex{};
-
-        const DummyMutex = struct {
-            pub fn lock(_: *@This()) void {}
-            pub fn unlock(_: *@This()) void {}
-        };
-
-        const FormatContext = struct {
-            string: String,
-            pool: *Pool,
-        };
-
-        fn print(ctx: FormatContext, comptime fmt_str: []const u8, _: std.fmt.FormatOptions, writer: anytype) @TypeOf(writer).Error!void {
-            if (fmt_str.len != 0) std.fmt.invalidFmtError(fmt_str, ctx.string);
-            const locked_string = ctx.pool.stringToSliceLock(ctx.string);
-            defer locked_string.release(ctx.pool);
-            try writer.writeAll(locked_string.slice);
-        }
+fn parseArgs(allocator: std.mem.Allocator) !ParseArgsResult {
+    var result = ParseArgsResult{
+        .action = .exit,
+        .config_path = null,
+        .message_tracing_enabled = false,
+        .zls_exe_path = "",
     };
+    errdefer result.deinit(allocator);
+
+    const ArgId = enum {
+        help,
+        version,
+        @"compiler-version",
+        @"enable-debug-log",
+        @"enable-message-tracing",
+        @"show-config-path",
+        @"config-path",
+    };
+    const help_message: []const u8 = comptime help_message: {
+        var help_message: []const u8 =
+            \\Usage: zls [command]
+            \\
+            \\Commands:
+            \\
+            \\
+        ;
+        const InfoMap = std.enums.EnumArray(ArgId, []const u8);
+        var cmd_infos: InfoMap = InfoMap.init(.{
+            .help = "Prints this message.",
+            .version = "Prints the version.",
+            .@"compiler-version" = "Prints the compiler version with which the server was compiled.",
+            .@"enable-debug-log" = "Enables debug logs.",
+            .@"enable-message-tracing" = "Enables message tracing.",
+            .@"config-path" = "Specify the path to a configuration file specifying LSP behaviour.",
+            .@"show-config-path" = "Prints the path to the configuration file to stdout",
+        });
+        var info_it = cmd_infos.iterator();
+        while (info_it.next()) |entry| {
+            help_message = help_message ++ std.fmt.comptimePrint("  --{s}: {s}\n", .{ @tagName(entry.key), entry.value.* });
+        }
+        help_message = help_message ++ "\n";
+        break :help_message help_message;
+    };
+
+    var args_it = try std.process.ArgIterator.initWithAllocator(allocator);
+    defer args_it.deinit();
+
+    const zls_exe_path = args_it.next() orelse @panic("");
+    result.zls_exe_path = try allocator.dupe(u8, zls_exe_path);
+
+    // Makes behavior of enabling debug more logging consistent regardless of argument order.
+    var specified = std.enums.EnumArray(ArgId, bool).initFill(false);
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+
+    while (args_it.next()) |tok| {
+        if (!std.mem.startsWith(u8, tok, "--") or tok.len == 2) {
+            try stderr.print("{s}\n", .{help_message});
+            try stderr.print("Unexpected positional argument '{s}'.\n", .{tok});
+            return result;
+        }
+
+        const argname = tok["--".len..];
+        const id = std.meta.stringToEnum(ArgId, argname) orelse {
+            try stderr.print("{s}\n", .{help_message});
+            try stderr.print("Unrecognized argument '{s}'.\n", .{argname});
+            return result;
+        };
+
+        if (specified.get(id)) {
+            try stderr.print("{s}\n", .{help_message});
+            try stderr.print("Duplicate argument '{s}'.\n", .{argname});
+            return result;
+        }
+        specified.set(id, true);
+
+        switch (id) {
+            .help,
+            .version,
+            .@"compiler-version",
+            .@"enable-debug-log",
+            .@"enable-message-tracing",
+            .@"show-config-path",
+            => {},
+            .@"config-path" => {
+                const path = args_it.next() orelse {
+                    try stderr.print("Expected configuration file path after --config-path argument.\n", .{});
+                    return result;
+                };
+                result.config_path = try allocator.dupe(u8, path);
+            },
+        }
+    }
+
+    if (specified.get(.help)) {
+        try stderr.print("{s}\n", .{help_message});
+        return result;
+    }
+    if (specified.get(.version)) {
+        try stdout.writeAll(zls.build_options.version_string ++ "\n");
+        return result;
+    }
+    if (specified.get(.@"compiler-version")) {
+        try stdout.writeAll(zig_builtin.zig_version_string ++ "\n");
+        return result;
+    }
+    if (specified.get(.@"enable-debug-log")) {
+        actual_log_level = .debug;
+        logger.info("Enabled debug logging.", .{});
+    }
+    if (specified.get(.@"enable-message-tracing")) {
+        result.message_tracing_enabled = true;
+        logger.info("Enabled message tracing.", .{});
+    }
+    if (specified.get(.@"config-path")) {
+        std.debug.assert(result.config_path != null);
+    }
+    if (specified.get(.@"show-config-path")) {
+        var config_result = if (result.config_path) |config_path|
+            try zls.configuration.loadFromFile(allocator, config_path)
+        else
+            try zls.configuration.load(allocator);
+        defer config_result.deinit(allocator);
+
+        switch (config_result) {
+            .success => |config_with_path| {
+                try stdout.writeAll(config_with_path.path);
+                try stdout.writeByte('\n');
+                return result;
+            },
+            .failure => |payload| blk: {
+                const message = try payload.toMessage(allocator) orelse break :blk;
+                defer allocator.free(message);
+                logger.err("Failed to load configuration options.", .{});
+                logger.err("{s}", .{message});
+            },
+            .not_found => logger.info("No config file zls.json found.", .{}),
+        }
+
+        logger.info("A path to the local configuration folder will be printed instead.", .{});
+        const local_config_path = zls.configuration.getLocalConfigPath(allocator) catch null orelse {
+            logger.err("failed to find local zls.json", .{});
+            std.process.exit(1);
+        };
+        defer allocator.free(local_config_path);
+        try stdout.writeAll(local_config_path);
+        try stdout.writeByte('\n');
+        return result;
+    }
+
+    result.action = .proceed;
+    return result;
 }
 
-/// same as `std.hash_map.StringIndexAdapter` but the hash of the adapted key is precomputed
-const PrecomputedStringIndexAdapter = struct {
-    bytes: *const std.ArrayListUnmanaged(u8),
-    adapted_key: []const u8,
-    precomputed_key_hash: u64,
-
-    pub fn eql(self: @This(), a_slice: []const u8, b: u32) bool {
-        const b_slice = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(self.bytes.items.ptr)) + b, 0);
-        return std.mem.eql(u8, a_slice, b_slice);
-    }
-
-    pub fn hash(self: @This(), adapted_key: []const u8) u64 {
-        assert(std.mem.eql(u8, self.adapted_key, adapted_key));
-        return self.precomputed_key_hash;
-    }
+const stack_frames = switch (zig_builtin.mode) {
+    .Debug => 10,
+    else => 0,
 };
 
-test StringPool {
-    const gpa = std.testing.allocator;
-    var pool = StringPool(.{}){};
-    defer pool.deinit(gpa);
+pub fn main() !void {
+    var allocator_state = if (exe_options.use_gpa)
+        std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = stack_frames }){}
+    else
+        binned_allocator.BinnedAllocator(.{}){};
 
-    const str = "All Your Codebase Are Belong To Us";
-    const index = try pool.getOrPutString(gpa, str);
-
-    {
-        const locked_string = pool.stringToSliceLock(index);
-        defer locked_string.release(&pool);
-
-        try std.testing.expectEqualStrings(str, locked_string.slice);
+    defer {
+        if (exe_options.use_gpa)
+            std.debug.assert(allocator_state.deinit() == .ok)
+        else
+            allocator_state.deinit();
     }
-    try std.testing.expectFmt(str, "{}", .{index.fmt(&pool)});
-}
 
-test "StringPool - check interning" {
-    const gpa = std.testing.allocator;
-    var pool = StringPool(.{ .thread_safe = false }){};
-    defer pool.deinit(gpa);
+    var tracy_state = if (tracy.enable_allocation) tracy.tracyAllocator(allocator_state.allocator()) else void{};
+    const inner_allocator: std.mem.Allocator = if (tracy.enable_allocation) tracy_state.allocator() else allocator_state.allocator();
 
-    const str = "All Your Codebase Are Belong To Us";
-    const index1 = try pool.getOrPutString(gpa, str);
-    const index2 = try pool.getOrPutString(gpa, str);
-    const index3 = pool.getString(str).?;
-    const storage1 = pool.stringToSlice(index1);
-    const storage2 = pool.stringToSliceUnsafe(index2);
+    var failing_allocator_state = if (exe_options.enable_failing_allocator) zls.debug.FailingAllocator.init(inner_allocator, exe_options.enable_failing_allocator_likelihood) else void{};
+    const allocator: std.mem.Allocator = if (exe_options.enable_failing_allocator) failing_allocator_state.allocator() else inner_allocator;
 
-    try std.testing.expectEqual(index1, index2);
-    try std.testing.expectEqual(index2, index3);
-    try std.testing.expectEqualStrings(str, storage1);
-    try std.testing.expectEqualStrings(str, storage2);
-    try std.testing.expectEqual(storage1.ptr, storage2.ptr);
-    try std.testing.expectEqual(storage1.len, storage2.len);
-}
+    const result = try parseArgs(allocator);
+    defer result.deinit(allocator);
+    switch (result.action) {
+        .proceed => {},
+        .exit => return,
+    }
 
-test "StringPool - getOrPut on existing string without allocation" {
-    const gpa = std.testing.allocator;
-    var failing_gpa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    logger.info("Starting ZLS {s} @ '{s}'", .{ zls.build_options.version_string, result.zls_exe_path });
 
-    var pool = StringPool(.{}){};
-    defer pool.deinit(gpa);
+    var transport = zls.Transport.init(
+        std.io.getStdIn().reader(),
+        std.io.getStdOut().writer(),
+    );
+    transport.message_tracing = result.message_tracing_enabled;
 
-    const hello_string = try pool.getOrPutString(gpa, "hello");
+    const server = try zls.Server.create(allocator);
+    defer server.destroy();
+    server.transport = &transport;
+    server.config_path = result.config_path;
 
-    try std.testing.expectError(error.OutOfMemory, pool.getOrPutString(failing_gpa.allocator(), "world"));
-    try std.testing.expectEqual(hello_string, try pool.getOrPutString(failing_gpa.allocator(), "hello"));
+    try server.loop();
+
+    if (server.status == .exiting_failure) {
+        if (zig_builtin.mode == .Debug) {
+            // make sure that GeneralPurposeAllocator.deinit gets run to detect leaks
+            return;
+        } else {
+            std.process.exit(1);
+        }
+    }
 }

@@ -1,181 +1,113 @@
-@TestOn('vm')
-import 'dart:io';
-
-import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
-import 'package:dio/io.dart';
 import 'package:test/test.dart';
 
-void main() {
-  final trustedCertUrl = 'https://sha256.badssl.com/';
-  final untrustedCertUrl = 'https://wrong.host.badssl.com/';
-
-  /// NOTE: Run scripts/prepare_pinning_certs.sh
-  /// to download the current certs to the file below.
-  String fingerprint() {
-    // OpenSSL output like: SHA256 Fingerprint=EE:5C:E1:DF:A7:A4...
-    // All badssl.com hosts have the same cert, they just have TLS
-    // setting or other differences (like host name) that make them bad.
-    final lines = File('test/_pinning.txt').readAsLinesSync();
-    return lines.first.split('=').last.toLowerCase().replaceAll(':', '');
-  }
-
-  group('pinning:', () {
-    test('trusted host allowed with no approver', () async {
-      await Dio().get(trustedCertUrl);
-    });
-
-    test('untrusted host rejected with no approver', () async {
-      DioException? error;
-      try {
-        final dio = Dio();
-        await dio.get(untrustedCertUrl);
-        fail('did not throw');
-      } on DioException catch (e) {
-        error = e;
-      }
-      expect(error, isNotNull);
-    });
-
-    test('every certificate tested and rejected', () async {
-      DioException? error;
-      try {
-        final dio = Dio();
-        dio.httpClientAdapter = IOHttpClientAdapter(
-          validateCertificate: (certificate, host, port) => false,
-        );
-        await dio.get(trustedCertUrl);
-        fail('did not throw');
-      } on DioException catch (e) {
-        error = e;
-      }
-      expect(error, isNotNull);
-    });
-
+void main() async {
+  group(MultipartFile, () {
     test(
-      'trusted certificate tested and allowed',
+      'fromFile sets correct content-type',
       () async {
-        final dio = Dio();
-        // badCertificateCallback never called for trusted certificate
-        dio.httpClientAdapter = IOHttpClientAdapter(
-          validateCertificate: (cert, host, port) =>
-              fingerprint() == sha256.convert(cert!.der).toString(),
+        final mediaType = DioMediaType.parse('text/plain');
+        final file = await MultipartFile.fromFile(
+          'test/mock/_testfile',
+          filename: '1.txt',
+          contentType: mediaType,
         );
-        final response = await dio.get(
-          trustedCertUrl,
-          options: Options(validateStatus: (status) => true),
-        );
-        expect(response, isNotNull);
+        expect(file.contentType, mediaType);
       },
-      tags: ['tls'],
+      testOn: 'vm',
     );
 
+    // Cloned multipart files should be able to be read again and be the same
+    // as the original ones.
     test(
-      'untrusted certificate tested and allowed',
+      'complex cloning MultipartFile',
       () async {
-        final dio = Dio();
-        // badCertificateCallback must allow the untrusted certificate through
-        dio.httpClientAdapter = IOHttpClientAdapter(
-          createHttpClient: () {
-            return HttpClient()
-              ..badCertificateCallback = (cert, host, port) => true;
-          },
-          validateCertificate: (cert, host, port) {
-            return fingerprint() == sha256.convert(cert!.der).toString();
+        final multipartFile1 = MultipartFile.fromString(
+          'hello world.',
+          headers: {
+            'test': <String>['a'],
           },
         );
-        final response = await dio.get(
-          untrustedCertUrl,
-          options: Options(validateStatus: (status) => true),
+        final multipartFile2 = await MultipartFile.fromFile(
+          'test/mock/_testfile',
+          filename: '1.txt',
+          headers: {
+            'test': <String>['b'],
+          },
         );
-        expect(response, isNotNull);
-      },
-      tags: ['tls'],
-    );
+        final multipartFile3 = MultipartFile.fromFileSync(
+          'test/mock/_testfile',
+          filename: '2.txt',
+          headers: {
+            'test': <String>['c'],
+          },
+        );
 
-    test(
-      'untrusted certificate rejected before validateCertificate',
-      () async {
-        DioException? error;
+        final fm = FormData.fromMap({
+          'name': 'wendux',
+          'age': 25,
+          'path': '/图片空间/地址',
+          'file': multipartFile1,
+          'files': [
+            multipartFile2,
+            multipartFile3,
+          ],
+        });
+        final fmStr = await fm.readAsBytes();
+
+        // Files are finalized after being read.
         try {
-          final dio = Dio();
-          dio.httpClientAdapter = IOHttpClientAdapter(
-            createHttpClient: () {
-              return HttpClient(
-                context: SecurityContext(withTrustedRoots: false),
-              );
-            },
-            validateCertificate: (cert, host, port) =>
-                fail('Should not be evaluated'),
+          multipartFile1.finalize();
+          fail('Should not be able to finalize a file twice.');
+        } catch (e) {
+          expect(e, isA<StateError>());
+          expect(
+            (e as StateError).message,
+            'The MultipartFile has already been finalized. This typically '
+            'means you are using the same MultipartFile in repeated requests.',
           );
-          await dio.get(
-            untrustedCertUrl,
-            options: Options(validateStatus: (status) => true),
-          );
-          fail('did not throw');
-        } on DioException catch (e) {
-          error = e;
         }
-        expect(error, isNotNull);
-      },
-    );
 
-    test(
-      'badCertCallback does not use leaf certificate',
-      () async {
-        DioException? error;
-        try {
-          final dio = Dio();
-          dio.httpClientAdapter = IOHttpClientAdapter(
-            createHttpClient: () {
-              final effectiveClient = HttpClient(
-                context: SecurityContext(withTrustedRoots: false),
-              );
-              // Comparison fails because fingerprint is for leaf cert, but
-              // this cert is from Let's Encrypt.
-              effectiveClient.badCertificateCallback = (cert, host, port) =>
-                  fingerprint() == sha256.convert(cert.der).toString();
-              return effectiveClient;
-            },
-          );
-          await dio.get(
-            trustedCertUrl,
-            options: Options(validateStatus: (status) => true),
-          );
-          fail('did not throw');
-        } on DioException catch (e) {
-          error = e;
-        }
-        expect(error, isNotNull);
-      },
-      tags: ['tls'],
-    );
+        final fm1 = FormData();
+        fm1.fields.add(const MapEntry('name', 'wendux'));
+        fm1.fields.add(const MapEntry('age', '25'));
+        fm1.fields.add(const MapEntry('path', '/图片空间/地址'));
+        fm1.files.add(
+          MapEntry(
+            'file',
+            multipartFile1.clone(),
+          ),
+        );
+        fm1.files.add(
+          MapEntry(
+            'files',
+            multipartFile2.clone(),
+          ),
+        );
+        fm1.files.add(
+          MapEntry(
+            'files',
+            multipartFile3.clone(),
+          ),
+        );
+        expect(fmStr.length, fm1.length);
 
-    test(
-      '2 requests == 2 approvals',
-      () async {
-        int approvalCount = 0;
-        final dio = Dio();
-        // badCertificateCallback never called for trusted certificate
-        dio.httpClientAdapter = IOHttpClientAdapter(
-          validateCertificate: (cert, host, port) {
-            approvalCount++;
-            return fingerprint() == sha256.convert(cert!.der).toString();
-          },
-        );
-        Response response = await dio.get(
-          trustedCertUrl,
-          options: Options(validateStatus: (status) => true),
-        );
-        expect(response.data, isNotNull);
-        response = await dio.get(
-          trustedCertUrl,
-          options: Options(validateStatus: (status) => true),
-        );
-        expect(response.data, isNotNull);
-        expect(approvalCount, 2);
+        // The cloned multipart files should be able to be read again.
+        expect(fm.files[0].value.isFinalized, true);
+        expect(fm.files[1].value.isFinalized, true);
+        expect(fm.files[2].value.isFinalized, true);
+        expect(fm1.files[0].value.isFinalized, false);
+        expect(fm1.files[1].value.isFinalized, false);
+        expect(fm1.files[2].value.isFinalized, false);
+
+        // The cloned multipart files' properties should be the same as the
+        // original ones.
+        expect(fm1.files[0].value.filename, multipartFile1.filename);
+        expect(fm1.files[0].value.contentType, multipartFile1.contentType);
+        expect(fm1.files[0].value.length, multipartFile1.length);
+        expect(fm1.files[0].value.headers, multipartFile1.headers);
       },
-      tags: ['tls'],
+      testOn: 'vm',
     );
   });
 }

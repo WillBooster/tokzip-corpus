@@ -10,118 +10,162 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Installer;
+namespace Composer\Package\Dumper;
 
-use Composer\Installer\BinaryInstaller;
-use Composer\Util\Filesystem;
-use Composer\Test\TestCase;
-use Composer\Util\ProcessExecutor;
+use Composer\Package\BasePackage;
+use Composer\Package\PackageInterface;
+use Composer\Package\CompletePackageInterface;
+use Composer\Package\RootPackageInterface;
 
-class BinaryInstallerTest extends TestCase
+/**
+ * @author Konstantin Kudryashiv <ever.zet@gmail.com>
+ * @author Jordi Boggiano <j.boggiano@seld.be>
+ */
+class ArrayDumper
 {
     /**
-     * @var string
+     * @return array<string, mixed>
      */
-    protected $rootDir;
-
-    /**
-     * @var string
-     */
-    protected $vendorDir;
-
-    /**
-     * @var string
-     */
-    protected $binDir;
-
-    /**
-     * @var \Composer\IO\IOInterface&\PHPUnit\Framework\MockObject\MockObject
-     */
-    protected $io;
-
-    /**
-     * @var \Composer\Util\Filesystem
-     */
-    protected $fs;
-
-    protected function setUp(): void
+    public function dump(PackageInterface $package): array
     {
-        $this->fs = new Filesystem;
-
-        $this->rootDir = self::getUniqueTmpDirectory();
-        $this->vendorDir = $this->rootDir.DIRECTORY_SEPARATOR.'vendor';
-        $this->ensureDirectoryExistsAndClear($this->vendorDir);
-
-        $this->binDir = $this->rootDir.DIRECTORY_SEPARATOR.'bin';
-        $this->ensureDirectoryExistsAndClear($this->binDir);
-
-        $this->io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
-    }
-
-    protected function tearDown(): void
-    {
-        parent::tearDown();
-        $this->fs->removeDirectory($this->rootDir);
-    }
-
-    /**
-     * @dataProvider executableBinaryProvider
-     */
-    public function testInstallAndExecBinaryWithFullCompat(string $contents): void
-    {
-        $package = $this->createPackageMock();
-        $package->expects($this->any())
-            ->method('getBinaries')
-            ->willReturn(['binary']);
-
-        $this->ensureDirectoryExistsAndClear($this->vendorDir.'/foo/bar');
-        file_put_contents($this->vendorDir.'/foo/bar/binary', $contents);
-
-        $installer = new BinaryInstaller($this->io, $this->binDir, 'full', $this->fs);
-        $installer->installBinaries($package, $this->vendorDir.'/foo/bar');
-
-        $proc = new ProcessExecutor();
-        $proc->execute($this->binDir.'/binary arg', $output);
-        self::assertEquals('', $proc->getErrorOutput());
-        self::assertEquals('success arg', $output);
-    }
-
-    public static function executableBinaryProvider(): array
-    {
-        return [
-            'simple php file' => [<<<'EOL'
-<?php
-
-echo 'success '.$_SERVER['argv'][1];
-EOL
-            ],
-            'php file with shebang' => [<<<'EOL'
-#!/usr/bin/env php
-<?php
-
-echo 'success '.$_SERVER['argv'][1];
-EOL
-            ],
-            'phar file' => [
-                base64_decode('IyEvdXNyL2Jpbi9lbnYgcGhwCjw/cGhwCgpQaGFyOjptYXBQaGFyKCd0ZXN0LnBoYXInKTsKCnJlcXVpcmUgJ3BoYXI6Ly90ZXN0LnBoYXIvcnVuLnBocCc7CgpfX0hBTFRfQ09NUElMRVIoKTsgPz4NCj4AAAABAAAAEQAAAAEACQAAAHRlc3QucGhhcgAAAAAHAAAAcnVuLnBocCoAAADb9n9hKgAAAMUDDWGkAQAAAAAAADw/cGhwIGVjaG8gInN1Y2Nlc3MgIi4kX1NFUlZFUlsiYXJndiJdWzFdO1SOC0IE3+UN0yzrHIwyspp9slhmAgAAAEdCTUI='),
-            ],
-            'shebang with strict types declare' => [<<<'EOL'
-#!/usr/bin/env php
-<?php declare(strict_types=1);
-
-echo 'success '.$_SERVER['argv'][1];
-EOL
-            ],
+        $keys = [
+            'binaries' => 'bin',
+            'type',
+            'extra',
+            'installationSource' => 'installation-source',
+            'autoload',
+            'devAutoload' => 'autoload-dev',
+            'notificationUrl' => 'notification-url',
+            'includePaths' => 'include-path',
         ];
+
+        $data = [];
+        $data['name'] = $package->getPrettyName();
+        $data['version'] = $package->getPrettyVersion();
+        $data['version_normalized'] = $package->getVersion();
+
+        if ($package->getTargetDir() !== null) {
+            $data['target-dir'] = $package->getTargetDir();
+        }
+
+        if ($package->getSourceType() !== null) {
+            $data['source']['type'] = $package->getSourceType();
+            $data['source']['url'] = $package->getSourceUrl();
+            if (null !== ($value = $package->getSourceReference())) {
+                $data['source']['reference'] = $value;
+            }
+            if ($mirrors = $package->getSourceMirrors()) {
+                $data['source']['mirrors'] = $mirrors;
+            }
+        }
+
+        if ($package->getDistType() !== null) {
+            $data['dist']['type'] = $package->getDistType();
+            $data['dist']['url'] = $package->getDistUrl();
+            if (null !== ($value = $package->getDistReference())) {
+                $data['dist']['reference'] = $value;
+            }
+            if (null !== ($value = $package->getDistSha1Checksum())) {
+                $data['dist']['shasum'] = $value;
+            }
+            if ($mirrors = $package->getDistMirrors()) {
+                $data['dist']['mirrors'] = $mirrors;
+            }
+        }
+
+        foreach (BasePackage::$supportedLinkTypes as $type => $opts) {
+            $links = $package->{'get'.ucfirst($opts['method'])}();
+            if (\count($links) === 0) {
+                continue;
+            }
+            foreach ($links as $link) {
+                $data[$type][$link->getTarget()] = $link->getPrettyConstraint();
+            }
+            ksort($data[$type]);
+        }
+
+        $packages = $package->getSuggests();
+        if (\count($packages) > 0) {
+            ksort($packages);
+            $data['suggest'] = $packages;
+        }
+
+        if ($package->getReleaseDate() instanceof \DateTimeInterface) {
+            $data['time'] = $package->getReleaseDate()->format(DATE_RFC3339);
+        }
+
+        if ($package->isDefaultBranch()) {
+            $data['default-branch'] = true;
+        }
+
+        $data = $this->dumpValues($package, $keys, $data);
+
+        if ($package instanceof CompletePackageInterface) {
+            if ($package->getArchiveName()) {
+                $data['archive']['name'] = $package->getArchiveName();
+            }
+            if ($package->getArchiveExcludes()) {
+                $data['archive']['exclude'] = $package->getArchiveExcludes();
+            }
+
+            $keys = [
+                'scripts',
+                'license',
+                'authors',
+                'description',
+                'homepage',
+                'keywords',
+                'repositories',
+                'support',
+                'funding',
+            ];
+
+            $data = $this->dumpValues($package, $keys, $data);
+
+            if (isset($data['keywords']) && \is_array($data['keywords'])) {
+                sort($data['keywords']);
+            }
+
+            if ($package->isAbandoned()) {
+                $data['abandoned'] = $package->getReplacementPackage() ?: true;
+            }
+        }
+
+        if ($package instanceof RootPackageInterface) {
+            $minimumStability = $package->getMinimumStability();
+            if ($minimumStability !== '') {
+                $data['minimum-stability'] = $minimumStability;
+            }
+        }
+
+        if (\count($package->getTransportOptions()) > 0) {
+            $data['transport-options'] = $package->getTransportOptions();
+        }
+
+        return $data;
     }
 
     /**
-     * @return \Composer\Package\PackageInterface&\PHPUnit\Framework\MockObject\MockObject
+     * @param array<int|string, string> $keys
+     * @param array<string, mixed>      $data
+     *
+     * @return array<string, mixed>
      */
-    protected function createPackageMock()
+    private function dumpValues(PackageInterface $package, array $keys, array $data): array
     {
-        return $this->getMockBuilder('Composer\Package\Package')
-            ->setConstructorArgs([md5((string) mt_rand()), '1.0.0.0', '1.0.0'])
-            ->getMock();
+        foreach ($keys as $method => $key) {
+            if (is_numeric($method)) {
+                $method = $key;
+            }
+
+            $getter = 'get'.ucfirst($method);
+            $value = $package->{$getter}();
+
+            if (null !== $value && !(\is_array($value) && 0 === \count($value))) {
+                $data[$key] = $value;
+            }
+        }
+
+        return $data;
     }
 }

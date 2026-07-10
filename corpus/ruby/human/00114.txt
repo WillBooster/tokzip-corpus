@@ -1,118 +1,150 @@
-require 'multi_json'
+require_relative 'test_helper'
 
-require 'spec_helper'
-require 'okjson'
+class StreamingTest < Minitest::Test
+  Stream = Sinatra::Helpers::Stream
 
-RSpec.shared_examples_for "a json encoder" do |lib, const|
-  before do
-    begin
-      require lib if lib
-      @encoder = eval(const)
-    rescue LoadError
-      skip "unable to load #{lib}"
-    end
-  end
-
-  it "allows setting :encoder to #{const}" do
-    enc = @encoder
-    mock_app { get('/') { json({'foo' => 'bar'}, :encoder => enc) }}
-    results_in 'foo' => 'bar'
-  end
-
-  it "allows setting settings.json_encoder to #{const}" do
-    enc = @encoder
+  it 'returns the concatenated body' do
     mock_app do
-      set :json_encoder, enc
-      get('/') { json 'foo' => 'bar' }
+      get('/') do
+        stream do |out|
+          out << "Hello" << " "
+          out << "World!"
+        end
+      end
     end
-    results_in 'foo' => 'bar'
-  end
-end
 
-RSpec.describe Sinatra::JSON do
-  def mock_app(&block)
-    super do
-      class_eval(&block)
+    get('/')
+    assert_body "Hello World!"
+  end
+
+  it 'always yields strings' do
+    stream = Stream.new { |out| out << :foo }
+    stream.each { |str| assert_equal 'foo', str }
+  end
+
+  it 'postpones body generation' do
+    step = 0
+
+    stream = Stream.new do |out|
+      10.times do
+        out << step
+        step += 1
+      end
+    end
+
+    stream.each do |s|
+      assert_equal s, step.to_s
+      step += 1
     end
   end
 
-  def results_in(obj)
-    expect(OkJson.decode(get('/').body)).to eq(obj)
+  it 'calls the callback after it is done' do
+    step   = 0
+    final  = 0
+    stream = Stream.new { |_| 10.times { step += 1 }}
+    stream.callback { final = step }
+    stream.each {|_|}
+    assert_equal 10, final
   end
 
-  it "encodes objects to json out of the box" do
-    mock_app { get('/') { json :foo => [1, 'bar', nil] } }
-    results_in 'foo' => [1, 'bar', nil]
+  it 'does not trigger the callback if close is set to :keep_open' do
+    step   = 0
+    final  = 0
+    stream = Stream.new(Stream, :keep_open) { |_| 10.times { step += 1 } }
+    stream.callback { final = step }
+    stream.each {|_|}
+    assert_equal 0, final
   end
 
-  it "sets the content type to 'application/json'" do
-    mock_app { get('/') { json({}) } }
-    expect(get('/')["Content-Type"]).to include("application/json")
+  it 'allows adding more than one callback' do
+    a = b = false
+    stream = Stream.new { }
+    stream.callback { a = true }
+    stream.callback { b = true }
+    stream.each {|_| }
+    assert a, 'should trigger first callback'
+    assert b, 'should trigger second callback'
   end
 
-  it "allows overriding content type with :content_type" do
-    mock_app { get('/') { json({}, :content_type => "foo/bar") } }
-    expect(get('/')["Content-Type"]).to eq("foo/bar")
+  class MockScheduler
+    def initialize(*)     @schedule, @defer = [], []                end
+    def schedule(&block)  @schedule << block                        end
+    def defer(&block)     @defer    << block                        end
+    def schedule!(*)      @schedule.pop.call until @schedule.empty? end
+    def defer!(*)         @defer.pop.call    until @defer.empty?    end
   end
 
-  it "accepts shorthands for :content_type" do
-    mock_app { get('/') { json({}, :content_type => :js) } }
-    # Changed to "text/javascript" in Rack >3.0
-    # https://github.com/sinatra/sinatra/pull/1857#issuecomment-1445062212
-    expect(get('/')["Content-Type"])
-      .to eq("application/javascript;charset=utf-8").or eq("text/javascript;charset=utf-8")
+  it 'allows dropping in another scheduler' do
+    scheduler  = MockScheduler.new
+    processing = sending = done = false
+
+    stream = Stream.new(scheduler) do |out|
+      processing = true
+      out << :foo
+    end
+
+    stream.each { sending = true}
+    stream.callback { done = true }
+
+    scheduler.schedule!
+    assert !processing
+    assert !sending
+    assert !done
+
+    scheduler.defer!
+    assert processing
+    assert !sending
+    assert !done
+
+    scheduler.schedule!
+    assert sending
+    assert done
   end
 
-  it 'calls generate on :encoder if available' do
-    enc = Object.new
-    def enc.generate(obj) obj.inspect end
-    mock_app { get('/') { json(42, :encoder => enc) }}
-    expect(get('/').body).to eq('42')
+  it 'schedules exceptions to be raised on the main thread/event loop/...' do
+    scheduler = MockScheduler.new
+    Stream.new(scheduler) { fail 'should be caught' }.each { }
+    scheduler.defer!
+    assert_raises(RuntimeError) { scheduler.schedule! }
   end
 
-  it 'calls encode on :encoder if available' do
-    enc = Object.new
-    def enc.encode(obj) obj.inspect end
-    mock_app { get('/') { json(42, :encoder => enc) }}
-    expect(get('/').body).to eq('42')
+  it 'does not trigger an infinite loop if you call close in a callback' do
+    stream = Stream.new { |out| out.callback { out.close }}
+    stream.each { |_| }
   end
 
-  it 'sends :encoder as method call if it is a Symbol' do
-    mock_app { get('/') { json(42, :encoder => :inspect) }}
-    expect(get('/').body).to eq('42')
-  end
-
-  it 'calls generate on settings.json_encoder if available' do
-    enc = Object.new
-    def enc.generate(obj) obj.inspect end
+  it 'gives access to route specific params' do
     mock_app do
-      set :json_encoder, enc
-      get('/') { json 42 }
+      get('/:name') do
+        stream { |o| o << params[:name] }
+      end
     end
-    expect(get('/').body).to eq('42')
+    get '/foo'
+    assert_body 'foo'
   end
 
-  it 'calls encode on settings.json_encode if available' do
-    enc = Object.new
-    def enc.encode(obj) obj.inspect end
+  it 'sets up async.close if available' do
+    ran = false
     mock_app do
-      set :json_encoder, enc
-      get('/') { json 42 }
+      get('/') do
+        close = Object.new
+        def close.callback; yield end
+        def close.errback; end
+        env['async.close'] = close
+        stream(:keep_open) do |out|
+          out.callback { ran = true }
+          out.close
+        end
+      end
     end
-    expect(get('/').body).to eq('42')
+    get '/'
+    assert ran
   end
 
-  it 'sends settings.json_encode  as method call if it is a Symbol' do
-    mock_app do
-      set :json_encoder, :inspect
-      get('/') { json 42 }
-    end
-    expect(get('/').body).to eq('42')
+  it 'has a public interface to inspect its open/closed state' do
+    stream = Stream.new(Stream) { |out| out << :foo }
+    assert !stream.closed?
+    stream.close
+    assert stream.closed?
   end
-
-  describe('Yajl')    { it_should_behave_like "a json encoder", "yajl", "Yajl::Encoder" } unless defined? JRUBY_VERSION
-  describe('JSON')    { it_should_behave_like "a json encoder", "json", "::JSON"        }
-  describe('OkJson')  { it_should_behave_like "a json encoder", nil,    "OkJson"        }
-  describe('to_json') { it_should_behave_like "a json encoder", "json", ":to_json"      }
-  describe('without') { it_should_behave_like "a json encoder", nil,    "Sinatra::JSON" }
 end

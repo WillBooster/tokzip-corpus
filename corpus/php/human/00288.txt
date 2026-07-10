@@ -10,259 +10,168 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test;
+namespace Composer\Test\Repository;
 
-use Composer\Pcre\Preg;
-use Composer\Util\Filesystem;
+use Composer\Repository\PathRepository;
+use Composer\Test\TestCase;
+use Composer\Util\HttpDownloader;
+use Composer\Util\Loop;
 use Composer\Util\Platform;
-use Symfony\Component\Finder\Finder;
-use Symfony\Component\Process\Process;
+use Composer\Util\ProcessExecutor;
 
-/**
- * @group slow
- */
-class AllFunctionalTest extends TestCase
+class PathRepositoryTest extends TestCase
 {
-    /** @var string|false */
-    protected $oldcwd;
-    /** @var ?string */
-    protected $testDir;
-    /**
-     * @var string
-     */
-    private static $pharPath;
-
-    public function setUp(): void
+    public function testLoadPackageFromFileSystemWithIncorrectPath(): void
     {
-        $this->oldcwd = Platform::getCwd();
+        self::expectException('RuntimeException');
 
-        chdir(__DIR__.'/Fixtures/functional');
+        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', 'missing']);
+        $repository = $this->createPathRepo(['url' => $repositoryUrl]);
+        $repository->getPackages();
     }
 
-    protected function tearDown(): void
+    public function testLoadPackageFromFileSystemWithVersion(): void
     {
-        parent::tearDown();
-        if ($this->oldcwd) {
-            chdir($this->oldcwd);
-        }
+        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', 'with-version']);
+        $repository = $this->createPathRepo(['url' => $repositoryUrl]);
+        $repository->getPackages();
 
-        if ($this->testDir) {
-            $fs = new Filesystem;
-            $fs->removeDirectory($this->testDir);
-            $this->testDir = null;
-        }
+        self::assertSame(1, $repository->count());
+        self::assertTrue($repository->hasPackage(self::getPackage('test/path-versioned', '0.0.2')));
     }
 
-    public static function setUpBeforeClass(): void
+    public function testLoadPackageFromFileSystemWithoutVersion(): void
     {
-        self::$pharPath = self::getUniqueTmpDirectory() . '/composer.phar';
+        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', 'without-version']);
+        $repository = $this->createPathRepo(['url' => $repositoryUrl]);
+        $packages = $repository->getPackages();
+
+        self::assertGreaterThanOrEqual(1, $repository->count());
+
+        $package = $packages[0];
+        self::assertSame('test/path-unversioned', $package->getName());
+
+        $packageVersion = $package->getVersion();
+        self::assertNotEmpty($packageVersion);
     }
 
-    public static function tearDownAfterClass(): void
+    public function testLoadPackageFromFileSystemWithWildcard(): void
     {
-        $fs = new Filesystem;
-        $fs->removeDirectory(dirname(self::$pharPath));
+        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', '*']);
+        $repository = $this->createPathRepo(['url' => $repositoryUrl]);
+        $packages = $repository->getPackages();
+        $names = [];
+
+        self::assertGreaterThanOrEqual(2, $repository->count());
+
+        $package = $packages[0];
+        $names[] = $package->getName();
+
+        $package = $packages[1];
+        $names[] = $package->getName();
+
+        sort($names);
+        self::assertEquals(['test/path-unversioned', 'test/path-versioned'], $names);
     }
 
-    public function testBuildPhar(): void
+    public function testLoadPackageWithExplicitVersions(): void
     {
-        if (defined('HHVM_VERSION')) {
-            $this->markTestSkipped('Building the phar does not work on HHVM.');
-        }
-
-        $target = dirname(self::$pharPath);
-        $fs = new Filesystem();
-        chdir($target);
-
-        $it = new \RecursiveDirectoryIterator(__DIR__.'/../../../', \RecursiveDirectoryIterator::SKIP_DOTS);
-        $ri = new \RecursiveIteratorIterator($it, \RecursiveIteratorIterator::SELF_FIRST);
-
-        foreach ($ri as $file) {
-            $targetPath = $target . DIRECTORY_SEPARATOR . $ri->getSubPathName();
-            if ($file->isDir()) {
-                $fs->ensureDirectoryExists($targetPath);
-            } else {
-                copy($file->getPathname(), $targetPath);
-            }
-        }
-
-        $proc = new Process([PHP_BINARY, '-dphar.readonly=0', './bin/compile'], $target);
-        $exitcode = $proc->run();
-
-        if ($exitcode !== 0 || trim($proc->getOutput())) {
-            $this->fail($proc->getOutput());
-        }
-
-        self::assertFileExists(self::$pharPath);
-        copy(self::$pharPath, __DIR__.'/../../composer-test.phar');
-    }
-
-    /**
-     * @dataProvider getTestFiles
-     * @depends testBuildPhar
-     */
-    public function testIntegration(string $testFile): void
-    {
-        $testData = $this->parseTestFile($testFile);
-        $this->testDir = self::getUniqueTmpDirectory();
-
-        // if a dir is present with the name of the .test file (without .test), we
-        // copy all its contents in the $testDir to be used to run the test with
-        $testFileSetupDir = substr($testFile, 0, -5);
-        if (is_dir($testFileSetupDir)) {
-            $fs = new Filesystem();
-            $fs->copy($testFileSetupDir, $this->testDir);
-        }
-
-        $env = [
-            'COMPOSER_HOME' => $this->testDir.'home',
-            'COMPOSER_CACHE_DIR' => $this->testDir.'cache',
+        $options = [
+            'versions' => [
+                'test/path-unversioned' => '4.3.2.1',
+                'test/path-versioned' => '3.2.1.0',
+            ],
         ];
+        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', '*']);
+        $repository = $this->createPathRepo(['url' => $repositoryUrl, 'options' => $options]);
+        $packages = $repository->getPackages();
 
-        $proc = Process::fromShellCommandline(escapeshellcmd(PHP_BINARY).' '.escapeshellarg(self::$pharPath).' --no-ansi '.$testData['RUN'], $this->testDir, $env, null, 300);
-        $output = '';
+        $versions = [];
 
-        $exitCode = $proc->run(static function ($type, $buffer) use (&$output): void {
-            $output .= $buffer;
-        });
+        self::assertEquals(2, $repository->count());
 
-        if (isset($testData['EXPECT'])) {
-            $output = trim($this->cleanOutput($output));
-            $expected = $testData['EXPECT'];
+        $package = $packages[0];
+        $versions[$package->getName()] = $package->getVersion();
 
-            $line = 1;
-            for ($i = 0, $j = 0; $i < strlen($expected);) {
-                if ($expected[$i] === "\n") {
-                    $line++;
-                }
-                if ($expected[$i] === '%') {
-                    Preg::isMatchStrictGroups('{%(.+?)%}', substr($expected, $i), $match);
-                    $regex = $match[1];
+        $package = $packages[1];
+        $versions[$package->getName()] = $package->getVersion();
 
-                    if (Preg::isMatch('{'.$regex.'}', substr($output, $j), $match)) {
-                        $i += strlen($regex) + 2;
-                        $j += strlen((string) $match[0]);
-                        continue;
-                    } else {
-                        $this->fail(
-                            'Failed to match pattern '.$regex.' at line '.$line.' / abs offset '.$i.': '
-                            .substr($output, $j, min(strpos($output, "\n", $j) - $j, 100)).PHP_EOL.PHP_EOL.
-                            'Output:'.PHP_EOL.$output
-                        );
-                    }
-                }
-                if ($expected[$i] !== $output[$j]) {
-                    $this->fail(
-                        'Output does not match expectation at line '.$line.' / abs offset '.$i.': '.PHP_EOL
-                        .'-'.substr($expected, $i, min(strpos($expected, "\n", $i) - $i, 100)).PHP_EOL
-                        .'+'.substr($output, $j, min(strpos($output, "\n", $j) - $j, 100)).PHP_EOL.PHP_EOL
-                        .'Output:'.PHP_EOL.$output
-                    );
-                }
-                $i++;
-                $j++;
-            }
+        ksort($versions);
+        self::assertSame(['test/path-unversioned' => '4.3.2.1', 'test/path-versioned' => '3.2.1.0'], $versions);
+    }
+
+    /**
+     * Verify relative repository URLs remain relative, see #4439
+     */
+    public function testUrlRemainsRelative(): void
+    {
+        // realpath() does not fully expand the paths
+        // PHP Bug https://bugs.php.net/bug.php?id=72642
+        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [realpath(realpath(__DIR__)), 'Fixtures', 'path', 'with-version']);
+        // getcwd() not necessarily match __DIR__
+        // PHP Bug https://bugs.php.net/bug.php?id=73797
+        $relativeUrl = ltrim(substr($repositoryUrl, strlen(realpath(realpath(Platform::getCwd())))), DIRECTORY_SEPARATOR);
+
+        $repository = $this->createPathRepo(['url' => $relativeUrl]);
+        $packages = $repository->getPackages();
+
+        self::assertSame(1, $repository->count());
+
+        $package = $packages[0];
+        self::assertSame('test/path-versioned', $package->getName());
+
+        // Convert platform specific separators back to generic URL slashes
+        $relativeUrl = str_replace(DIRECTORY_SEPARATOR, '/', $relativeUrl);
+        self::assertSame($relativeUrl, $package->getDistUrl());
+    }
+
+    public function testReferenceNone(): void
+    {
+        $options = [
+            'reference' => 'none',
+        ];
+        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', '*']);
+        $repository = $this->createPathRepo(['url' => $repositoryUrl, 'options' => $options]);
+        $packages = $repository->getPackages();
+
+        self::assertGreaterThanOrEqual(2, $repository->count());
+
+        foreach ($packages as $package) {
+            self::assertEquals($package->getDistReference(), null);
         }
-        if (isset($testData['EXPECT-REGEX'])) {
-            self::assertMatchesRegularExpression($testData['EXPECT-REGEX'], $this->cleanOutput($output));
-        }
-        if (isset($testData['EXPECT-REGEXES'])) {
-            $cleanOutput = $this->cleanOutput($output);
-            foreach (explode("\n", $testData['EXPECT-REGEXES']) as $regex) {
-                self::assertMatchesRegularExpression($regex, $cleanOutput, 'Output: '.$output);
-            }
-        }
-        if (isset($testData['EXPECT-EXIT-CODE'])) {
-            self::assertSame($testData['EXPECT-EXIT-CODE'], $exitCode);
+    }
+
+    public function testReferenceConfig(): void
+    {
+        $options = [
+            'reference' => 'config',
+            'relative' => true,
+        ];
+        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', '*']);
+        $repository = $this->createPathRepo(['url' => $repositoryUrl, 'options' => $options]);
+        $packages = $repository->getPackages();
+
+        self::assertGreaterThanOrEqual(2, $repository->count());
+
+        foreach ($packages as $package) {
+            self::assertEquals(
+                $package->getDistReference(),
+                sha1(file_get_contents($package->getDistUrl() . '/composer.json') . serialize($options))
+            );
         }
     }
 
     /**
-     * @return array<string, array<string>>
+     * @param array<mixed> $options
      */
-    public static function getTestFiles(): array
+    private function createPathRepo(array $options): PathRepository
     {
-        $tests = [];
-        foreach (Finder::create()->in(__DIR__.'/Fixtures/functional')->name('*.test')->files() as $file) {
-            $tests[$file->getFilename()] = [(string) $file];
-        }
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
 
-        return $tests;
-    }
+        $config = new \Composer\Config();
+        $proc = new ProcessExecutor();
+        $loop = new Loop(new HttpDownloader($io, $config), $proc);
 
-    /**
-     * @return array{RUN: string, EXPECT?: string, EXPECT-EXIT-CODE?: int, EXPECT-REGEX?: string, EXPECT-REGEXES?: string, TEST?: string}
-     */
-    private function parseTestFile(string $file): array
-    {
-        $tokens = Preg::split('#(?:^|\n*)--([A-Z-]+)--\n#', file_get_contents($file), -1, PREG_SPLIT_DELIM_CAPTURE);
-        $data = [];
-        $section = null;
-
-        foreach ($tokens as $token) {
-            if ('' === $token && null === $section) {
-                continue;
-            }
-
-            // Handle section headers.
-            if (null === $section) {
-                $section = $token;
-                continue;
-            }
-
-            $sectionData = $token;
-
-            // Allow sections to validate, or modify their section data.
-            switch ($section) {
-                case 'EXPECT-EXIT-CODE':
-                    $sectionData = (int) $sectionData;
-                    break;
-
-                case 'RUN':
-                case 'EXPECT':
-                case 'EXPECT-REGEX':
-                case 'EXPECT-REGEXES':
-                    $sectionData = trim($sectionData);
-                    break;
-
-                case 'TEST':
-                    break;
-
-                default:
-                    throw new \RuntimeException(sprintf(
-                        'Unknown section "%s". Allowed sections: "RUN", "EXPECT", "EXPECT-EXIT-CODE", "EXPECT-REGEX", "EXPECT-REGEXES". '
-                       .'Section headers must be written as "--HEADER_NAME--".',
-                        $section
-                    ));
-            }
-
-            $data[$section] = $sectionData;
-            $section = $sectionData = null;
-        }
-
-        // validate data
-        if (!isset($data['RUN'])) {
-            throw new \RuntimeException('The test file must have a section named "RUN".');
-        }
-        if (!isset($data['EXPECT']) && !isset($data['EXPECT-REGEX']) && !isset($data['EXPECT-REGEXES'])) {
-            throw new \RuntimeException('The test file must have a section named "EXPECT", "EXPECT-REGEX", or "EXPECT-REGEXES".');
-        }
-
-        return $data; // @phpstan-ignore return.type
-    }
-
-    private function cleanOutput(string $output): string
-    {
-        $processed = '';
-
-        for ($i = 0; $i < strlen($output); $i++) {
-            if ($output[$i] === "\x08") {
-                $processed = substr($processed, 0, -1);
-            } elseif ($output[$i] !== "\r") {
-                $processed .= $output[$i];
-            }
-        }
-
-        return $processed;
+        return new PathRepository($options, $io, $config, null, null, $proc);
     }
 }

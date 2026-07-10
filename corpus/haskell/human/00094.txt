@@ -1,112 +1,130 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecursiveDo #-}
-module UnitTests.MonadFix (monadFixTests) where
 
-import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase, Assertion, (@?=))
+module UnitTests.OptionalFields (optionalFields) where
 
-import qualified Data.Map as Map -- Lazy
+import GHC.Generics (Generic)
+import Data.Maybe (isNothing)
+import UnitTests.OptionalFields.Common
+import UnitTests.OptionalFields.Generics (omitGenerics)
+import UnitTests.OptionalFields.TH (omitTH)
+import UnitTests.OptionalFields.Manual (omitManual)
 
-import Data.Aeson
-import Data.Aeson.Types
-import qualified Data.Aeson.KeyMap as KM
+optionalFields :: TestTree
+optionalFields = testGroup "optional fields"
+  [ omitGenerics
+  , omitTH
+  , omitManual
+  , proofOfConcept
+  ]
 
--------------------------------------------------------------------------------
--- MonadFix
--------------------------------------------------------------------------------
+-- c.f. https://github.com/haskell/aeson/pull/839#issuecomment-782453060
+data P = P
+  { x :: Nullable Int -- Field is required, but can be null.
+  , y :: Undefineable Int -- Field is optional, but cannot be null.
+  , z :: NullOrUndefineable Int -- Field is optional, and can be null.
+  }
+  deriving (Eq, Show, Generic)
 
-monadFixDecoding1 :: (Value -> Data.Aeson.Types.Parser [Char]) -> Assertion
-monadFixDecoding1 p = do
-    fmap (take 10) (parseMaybe p value) @?= Just "xyzxyzxyzx"
-  where
-    value = object
-        [ "foo" .= ('x', "bar" :: String)
-        , "bar" .= ('y', "quu" :: String)
-        , "quu" .= ('z', "foo" :: String)
-        ]
+instance ToJSON P where
+  toJSON = genericToJSON opts
+  toEncoding = genericToEncoding opts
 
-monadFixDecoding2 :: (Value -> Data.Aeson.Types.Parser [Char]) -> Assertion
-monadFixDecoding2 p = do
-    fmap (take 10) (parseMaybe p value) @?= Nothing
-  where
-    value = object
-        [ "foo" .= ('x', "bar" :: String)
-        , "bar" .= ('y', "???" :: String)
-        , "quu" .= ('z', "foo" :: String)
-        ]
+instance FromJSON P where
+  parseJSON = genericParseJSON opts
 
-monadFixDecoding3 :: (Value -> Data.Aeson.Types.Parser [Char]) -> Assertion
-monadFixDecoding3 p =
-    fmap (take 10) (parseMaybe p value) @?= Nothing
-  where
-    value = object
-        [ "foo" .= ('x', "bar" :: String)
-        , "bar" .= Null
-        , "quu" .= ('z', "foo" :: String)
-        ]
+newtype Nullable a = Nullable (Maybe a)
+  deriving (Eq, Show, Generic)
 
-monadFixDecoding4 :: (Value -> Data.Aeson.Types.Parser [Char]) -> Assertion
-monadFixDecoding4 p =
-    fmap (take 10) (parseMaybe p value) @?= Nothing
-  where
-    value = object
-        [ "els" .= ('x', "bar" :: String)
-        , "bar" .= Null
-        , "quu" .= ('z', "foo" :: String)
-        ]
+instance ToJSON a => ToJSON (Nullable a) where
+  toJSON = genericToJSON opts
+  toEncoding = genericToEncoding opts
 
--- Parser with explicit references
-monadFixParserA :: Value -> Data.Aeson.Types.Parser [Char]
-monadFixParserA = withObject "Rec" $ \obj -> mdo
-    let p'' :: Value -> Data.Aeson.Types.Parser String
-        p'' "foo" = return foo
-        p'' "bar" = return bar
-        p'' "quu" = return quu
-        p'' _     = fail "Invalid reference"
+instance FromJSON a => FromJSON (Nullable a) where
+  parseJSON = genericParseJSON opts
 
-    let p' :: Value -> Data.Aeson.Types.Parser [Char]
-        p' v = do
-            (c, cs) <- liftParseJSON Nothing p'' (listParser p'') v
-            return (c : cs)
+newtype Undefineable a = Undefineable (Maybe a)
+  deriving (Eq, Show, Generic)
 
-    foo <- explicitParseField p' obj "foo"
-    bar <- explicitParseField p' obj "bar"
-    quu <- explicitParseField p' obj "quu"
-    return foo
+instance ToJSON a => ToJSON (Undefineable a) where
+  toJSON = genericToJSON opts
+  toEncoding = genericToEncoding opts
+  omitField (Undefineable a) = isNothing a
 
--- Parser with arbitrary references!
-monadFixParserB :: Value -> Data.Aeson.Types.Parser [Char]
-monadFixParserB = withObject "Rec" $ \obj -> mdo
-    let p'' :: Value -> Data.Aeson.Types.Parser String
-        p'' key' = do
-            key <- parseJSON key'
-            -- this is ugly: we look whether key is in original obj
-            -- but then query from refs.
-            --
-            -- This way we are lazier. Map.traverse isn't lazy enough.
-            case KM.lookup key obj of
-                Just _  -> return (refs Map.! key)
-                Nothing -> fail "Invalid reference"
+instance FromJSON a => FromJSON (Undefineable a) where
+  parseJSON Null = fail "Undefineable.parseJSON: expected non-null value"
+  parseJSON v = genericParseJSON opts v
+  omittedField = Just (Undefineable Nothing)
 
-    let p' :: Value -> Data.Aeson.Types.Parser [Char]
-        p' v = do
-            (c, cs) <- liftParseJSON Nothing p'' (listParser p'') v
-            return (c : cs)
+newtype NullOrUndefineable a = NullOrUndefineable (Maybe a)
+  deriving (Eq, Show, Generic)
 
-    refs <- traverse p' (KM.toMap obj)
-    case Map.lookup "foo" refs of
-        Nothing   -> fail "No foo node"
-        Just root -> return root
+instance ToJSON a => ToJSON (NullOrUndefineable a) where
+  toJSON = genericToJSON opts
+  toEncoding = genericToEncoding opts
+  omitField (NullOrUndefineable a) = isNothing a
 
-monadFixTests :: TestTree
-monadFixTests = testGroup "MonadFix"
-    [ testCase "Example1a" $ monadFixDecoding1 monadFixParserA
-    , testCase "Example2a" $ monadFixDecoding2 monadFixParserA
-    , testCase "Example3a" $ monadFixDecoding3 monadFixParserA
-    , testCase "Example4a" $ monadFixDecoding4 monadFixParserA
+instance FromJSON a => FromJSON (NullOrUndefineable a) where
+  parseJSON = genericParseJSON opts
+  omittedField = Just (NullOrUndefineable Nothing)
 
-    , testCase "Example1b" $ monadFixDecoding1 monadFixParserB
-    , testCase "Example2b" $ monadFixDecoding2 monadFixParserB
-    , testCase "Example3b" $ monadFixDecoding3 monadFixParserB
-    , testCase "Example4b" $ monadFixDecoding4 monadFixParserB
+opts :: Options
+opts = defaultOptions { omitNothingFields = True }
+
+fullP :: P
+fullP = P (Nullable $ Just 0) (Undefineable $ Just 0) (NullOrUndefineable $ Just 0)
+
+zero :: Key -> (Key, Value)
+zero k = k .= (0 :: Int)
+
+proofOfConcept :: TestTree
+proofOfConcept = testGroup "Type-directed optional fields Proof of Concept"
+  [ testGroup "toJSON"
+    [ testCase "x is not omitted when Nothing" $
+        let subject = fullP {x = Nullable Nothing}
+            expected = object ["x" .= Null, zero "y", zero "z"]
+         in toJSON subject @?= expected
+
+    , testCase "y is omitted when Nothing" $
+        let subject = fullP {y = Undefineable Nothing}
+            expected = object [zero "x", zero "z"]
+         in toJSON subject @?= expected
+
+    , testCase "z is omitted when Nothing" $
+        let subject = fullP {z = NullOrUndefineable Nothing}
+            expected = object [zero "x", zero "y"]
+         in toJSON subject @?= expected
     ]
+
+  , testGroup "parseJSON"
+    [ testCase "x can be null" $
+        let subject = object ["x" .= Null, zero "y", zero "z"]
+            expected = Just fullP {x = Nullable Nothing}
+         in decode (encode subject) @?= expected
+
+    , testCase "x cannot be omitted" $
+        let subject = object [zero "y", zero "z"]
+            expected = Nothing :: Maybe P
+         in decode (encode subject) @?= expected
+
+    , testCase "y can be omitted" $
+        let subject = object [zero "x", zero "z"]
+            expected = Just fullP {y = Undefineable Nothing}
+         in decode (encode subject) @?= expected
+
+    , testCase "y cannot be null" $
+        let subject = object [zero "x", "y" .= Null, zero "z"]
+            expected = Nothing :: Maybe P
+         in decode (encode subject) @?= expected
+
+    , testCase "z can be null" $
+        let subject = object [zero "x", zero "y", "z" .= Null]
+            expected = Just fullP {z = NullOrUndefineable Nothing}
+         in decode (encode subject) @?= expected
+
+    , testCase "z can be omitted" $
+        let subject = object [zero "x", zero "y"]
+            expected = Just fullP {z = NullOrUndefineable Nothing}
+         in decode (encode subject) @?= expected
+    ]
+  ]

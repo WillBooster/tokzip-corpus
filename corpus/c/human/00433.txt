@@ -21,226 +21,147 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-#include "test.h"
-#include "memdebug.h"
+/* <DESC>
+ * Stream-parse a document using the streaming Expat parser.
+ * </DESC>
+ */
+/* Written by David Strauss
+ *
+ * Expat => https://libexpat.github.io/
+ *
+ * gcc -Wall -I/usr/local/include xmlstream.c -lcurl -lexpat -o xmlstream
+ *
+ */
 
-#define THREADS 2
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-/* struct containing data of a thread */
-struct Tdata {
-  CURLSH *share;
-  char *url;
+#include <expat.h>
+#include <curl/curl.h>
+
+struct MemoryStruct {
+  char *memory;
+  size_t size;
 };
 
-struct userdata {
-  const char *text;
-  int counter;
+struct ParserStruct {
+  int ok;
+  size_t tags;
+  size_t depth;
+  struct MemoryStruct characters;
 };
 
-/* lock callback */
-static void my_lock(CURL *handle, curl_lock_data data,
-                    curl_lock_access laccess, void *useptr)
+static void startElement(void *userData, const XML_Char *name,
+                         const XML_Char **atts)
 {
-  const char *what;
-  struct userdata *user = (struct userdata *)useptr;
+  struct ParserStruct *state = (struct ParserStruct *) userData;
+  state->tags++;
+  state->depth++;
 
-  (void)handle;
-  (void)laccess;
-
-  switch(data) {
-    case CURL_LOCK_DATA_SHARE:
-      what = "share";
-      break;
-    case CURL_LOCK_DATA_DNS:
-      what = "dns";
-      break;
-    case CURL_LOCK_DATA_COOKIE:
-      what = "cookie";
-      break;
-    case CURL_LOCK_DATA_SSL_SESSION:
-      what = "ssl_session";
-      break;
-    default:
-      fprintf(stderr, "lock: no such data: %d\n", (int)data);
-      return;
-  }
-  printf("lock:   %-6s [%s]: %d\n", what, user->text, user->counter);
-  user->counter++;
+  /* Get a clean slate for reading in character data. */
+  free(state->characters.memory);
+  state->characters.memory = NULL;
+  state->characters.size = 0;
 }
 
-/* unlock callback */
-static void my_unlock(CURL *handle, curl_lock_data data, void *useptr)
+static void characterDataHandler(void *userData, const XML_Char *s, int len)
 {
-  const char *what;
-  struct userdata *user = (struct userdata *)useptr;
-  (void)handle;
-  switch(data) {
-    case CURL_LOCK_DATA_SHARE:
-      what = "share";
-      break;
-    case CURL_LOCK_DATA_DNS:
-      what = "dns";
-      break;
-    case CURL_LOCK_DATA_COOKIE:
-      what = "cookie";
-      break;
-    case CURL_LOCK_DATA_SSL_SESSION:
-      what = "ssl_session";
-      break;
-    default:
-      fprintf(stderr, "unlock: no such data: %d\n", (int)data);
-      return;
+  struct ParserStruct *state = (struct ParserStruct *) userData;
+  struct MemoryStruct *mem = &state->characters;
+
+  char *ptr = realloc(mem->memory, mem->size + len + 1);
+  if(!ptr) {
+    /* Out of memory. */
+    fprintf(stderr, "Not enough memory (realloc returned NULL).\n");
+    state->ok = 0;
+    return;
   }
-  printf("unlock: %-6s [%s]: %d\n", what, user->text, user->counter);
-  user->counter++;
+
+  mem->memory = ptr;
+  memcpy(&(mem->memory[mem->size]), s, len);
+  mem->size += len;
+  mem->memory[mem->size] = 0;
 }
 
-/* the dummy thread function */
-static void *fire(void *ptr)
+static void endElement(void *userData, const XML_Char *name)
 {
-  CURLcode code;
-  struct Tdata *tdata = (struct Tdata*)ptr;
-  CURL *curl;
+  struct ParserStruct *state = (struct ParserStruct *) userData;
+  state->depth--;
 
-  curl = curl_easy_init();
-  if(!curl) {
-    fprintf(stderr, "curl_easy_init() failed\n");
-    return NULL;
-  }
-
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-  curl_easy_setopt(curl, CURLOPT_VERBOSE,    1L);
-  curl_easy_setopt(curl, CURLOPT_URL,        tdata->url);
-  printf("CURLOPT_SHARE\n");
-  curl_easy_setopt(curl, CURLOPT_SHARE, tdata->share);
-
-  printf("PERFORM\n");
-  code = curl_easy_perform(curl);
-  if(code != CURLE_OK) {
-    int i = 0;
-    fprintf(stderr, "perform url '%s' repeat %d failed, curlcode %d\n",
-            tdata->url, i, (int)code);
-  }
-
-  printf("CLEANUP\n");
-  curl_easy_cleanup(curl);
-
-  return NULL;
+  printf("%5lu   %10lu   %s\n", state->depth, state->characters.size, name);
 }
 
-/* test function */
-CURLcode test(char *URL)
+static size_t parseStreamCallback(void *contents, size_t length, size_t nmemb,
+                                  void *userp)
 {
-  CURLcode res = CURLE_OK;
-  CURLSHcode scode = CURLSHE_OK;
-  char *url;
-  struct Tdata tdata;
-  CURL *curl;
-  CURLSH *share;
-  int i;
-  struct userdata user;
+  XML_Parser parser = (XML_Parser) userp;
+  size_t real_size = length * nmemb;
+  struct ParserStruct *state = (struct ParserStruct *) XML_GetUserData(parser);
 
-  user.text = "Pigs in space";
-  user.counter = 0;
-
-  printf("GLOBAL_INIT\n");
-  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
-    fprintf(stderr, "curl_global_init() failed\n");
-    return TEST_ERR_MAJOR_BAD;
+  /* Only parse if we are not already in a failure state. */
+  if(state->ok && XML_Parse(parser, contents, real_size, 0) == 0) {
+    int error_code = XML_GetErrorCode(parser);
+    fprintf(stderr, "Parsing response buffer of length %lu failed"
+            " with error code %d (%s).\n",
+            real_size, error_code, XML_ErrorString(error_code));
+    state->ok = 0;
   }
 
-  /* prepare share */
-  printf("SHARE_INIT\n");
-  share = curl_share_init();
-  if(!share) {
-    fprintf(stderr, "curl_share_init() failed\n");
-    curl_global_cleanup();
-    return TEST_ERR_MAJOR_BAD;
+  return real_size;
+}
+
+int main(void)
+{
+  CURL *curl_handle;
+  CURLcode res;
+  XML_Parser parser;
+  struct ParserStruct state;
+
+  /* Initialize the state structure for parsing. */
+  memset(&state, 0, sizeof(struct ParserStruct));
+  state.ok = 1;
+
+  /* Initialize a namespace-aware parser. */
+  parser = XML_ParserCreateNS(NULL, '\0');
+  XML_SetUserData(parser, &state);
+  XML_SetElementHandler(parser, startElement, endElement);
+  XML_SetCharacterDataHandler(parser, characterDataHandler);
+
+  /* Initialize a libcurl handle. */
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  curl_handle = curl_easy_init();
+  curl_easy_setopt(curl_handle, CURLOPT_URL,
+                   "https://www.w3schools.com/xml/simple.xml");
+  curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, parseStreamCallback);
+  curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)parser);
+
+  printf("Depth   Characters   Closing Tag\n");
+
+  /* Perform the request and any follow-up parsing. */
+  res = curl_easy_perform(curl_handle);
+  if(res != CURLE_OK) {
+    fprintf(stderr, "curl_easy_perform() failed: %s\n",
+            curl_easy_strerror(res));
+  }
+  else if(state.ok) {
+    /* Expat requires one final call to finalize parsing. */
+    if(XML_Parse(parser, NULL, 0, 1) == 0) {
+      int error_code = XML_GetErrorCode(parser);
+      fprintf(stderr, "Finalizing parsing failed with error code %d (%s).\n",
+              error_code, XML_ErrorString(error_code));
+    }
+    else {
+      printf("                     --------------\n");
+      printf("                     %lu tags total\n", state.tags);
+    }
   }
 
-  if(CURLSHE_OK == scode) {
-    printf("CURLSHOPT_LOCKFUNC\n");
-    scode = curl_share_setopt(share, CURLSHOPT_LOCKFUNC, my_lock);
-  }
-  if(CURLSHE_OK == scode) {
-    printf("CURLSHOPT_UNLOCKFUNC\n");
-    scode = curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, my_unlock);
-  }
-  if(CURLSHE_OK == scode) {
-    printf("CURLSHOPT_USERDATA\n");
-    scode = curl_share_setopt(share, CURLSHOPT_USERDATA, &user);
-  }
-  if(CURLSHE_OK == scode) {
-    printf("CURL_LOCK_DATA_SSL_SESSION\n");
-    scode = curl_share_setopt(share, CURLSHOPT_SHARE,
-                              CURL_LOCK_DATA_SSL_SESSION);
-  }
-
-  if(CURLSHE_OK != scode) {
-    fprintf(stderr, "curl_share_setopt() failed\n");
-    curl_share_cleanup(share);
-    curl_global_cleanup();
-    return TEST_ERR_MAJOR_BAD;
-  }
-
-
-  /* start treads */
-  for(i = 1; i <= THREADS; i++) {
-
-    /* set thread data */
-    tdata.url   = URL;
-    tdata.share = share;
-
-    /* simulate thread, direct call of "thread" function */
-    printf("*** run %d\n",i);
-    fire(&tdata);
-  }
-
-
-  /* fetch another one */
-  printf("*** run %d\n", i);
-  curl = curl_easy_init();
-  if(!curl) {
-    fprintf(stderr, "curl_easy_init() failed\n");
-    curl_share_cleanup(share);
-    curl_global_cleanup();
-    return TEST_ERR_MAJOR_BAD;
-  }
-
-  url = URL;
-  test_setopt(curl, CURLOPT_URL, url);
-  printf("CURLOPT_SHARE\n");
-  test_setopt(curl, CURLOPT_SHARE, share);
-
-  printf("PERFORM\n");
-  res = curl_easy_perform(curl);
-
-  /* try to free share, expect to fail because share is in use */
-  printf("try SHARE_CLEANUP...\n");
-  scode = curl_share_cleanup(share);
-  if(scode == CURLSHE_OK) {
-    fprintf(stderr, "curl_share_cleanup succeed but error expected\n");
-    share = NULL;
-  }
-  else {
-    printf("SHARE_CLEANUP failed, correct\n");
-  }
-
-test_cleanup:
-
-  /* clean up last handle */
-  printf("CLEANUP\n");
-  curl_easy_cleanup(curl);
-
-  /* free share */
-  printf("SHARE_CLEANUP\n");
-  scode = curl_share_cleanup(share);
-  if(scode != CURLSHE_OK)
-    fprintf(stderr, "curl_share_cleanup failed, code errno %d\n",
-            (int)scode);
-
-  printf("GLOBAL_CLEANUP\n");
+  /* Clean up. */
+  free(state.characters.memory);
+  XML_ParserFree(parser);
+  curl_easy_cleanup(curl_handle);
   curl_global_cleanup();
 
-  return res;
+  return 0;
 }

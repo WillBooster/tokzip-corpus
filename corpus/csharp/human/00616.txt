@@ -3,260 +3,247 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
-using NUnit.Framework.Internal;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using System.Reflection;
 
-namespace NUnit.Framework.Constraints
+namespace NUnit.Framework.Internal
 {
-    /// <summary>
-    /// EqualityAdapter class handles all equality comparisons
-    /// that use an <see cref="IEqualityComparer"/>, <see cref="IEqualityComparer{T}"/>
-    /// or a <see cref="ComparisonAdapter"/>.
-    /// </summary>
-    public abstract class EqualityAdapter
+    internal abstract class ValueGenerator<T> : ValueGenerator
     {
-        /// <summary>
-        /// Compares two objects, returning true if they are equal
-        /// </summary>
-        public abstract bool AreEqual(object x, object y);
-
-        /// <summary>
-        /// Compares two objects, within a tolerance returning true if they are equal
-        /// </summary>
-        public virtual bool AreEqual(object x, object y, ref Tolerance tolerance)
+        private static Exception CreateNotSupportedException(string description)
         {
-            // For backwards compatibility all existing equality operators can continue
-            // to use the existing AreEqual.  Attempting to use a tolerance when it's
-            // not supported is now thrown to the caller, rather than silently ignored.
-            if (!tolerance.HasVariance)
+            return new NotSupportedException($"{typeof(T)} is using the default value generator which does not support {description}.");
+        }
+
+        public virtual int Compare(T x, T y)
+        {
+            if (!typeof(IComparable<T>).IsAssignableFrom(typeof(T)))
+                throw CreateNotSupportedException("comparisons");
+
+            return Comparer<T>.Default.Compare(x, y);
+        }
+
+        public IEnumerable<T> GenerateRange(T start, T end, Step step)
+        {
+            var startToEnd = Compare(start, end);
+
+            if (startToEnd == 0)
             {
-                return AreEqual(x, y);
+                yield return start;
+            }
+            else if ((startToEnd < 0 && !step.IsPositive) || (startToEnd > 0 && !step.IsNegative))
+            {
+                throw new ArgumentException("Step must be in the direction of the end.");
             }
             else
             {
-                throw new InvalidOperationException("Tolerance is not supported for this comparison");
+                for (var current = start; ;)
+                {
+                    yield return current;
+
+                    T next;
+                    try
+                    {
+                        next = step.Apply(current);
+                    }
+                    catch (OverflowException)
+                    {
+                        // We overflowed which means we tried to step past the end.
+                        break;
+                    }
+
+                    if (startToEnd < 0)
+                    {
+                        if (Compare(next, end) > 0)
+                            break; // We stepped past the end of the range.
+
+                        if (Compare(next, current) <= 0)
+                            throw new InvalidOperationException("The step must strictly increase.");
+                    }
+                    else
+                    {
+                        if (Compare(next, end) < 0)
+                            break; // We stepped past the end of the range.
+
+                        if (Compare(next, current) >= 0)
+                            throw new InvalidOperationException("The step must strictly decrease.");
+                    }
+
+                    current = next;
+                }
             }
         }
 
-        /// <summary>
-        /// Returns true if the two objects can be compared by this adapter.
-        /// The base adapter cannot handle IEnumerables except for strings.
-        /// </summary>
-        public virtual bool CanCompare(object x, object y)
+        public sealed override IEnumerable GenerateRange(object start, object end, ValueGenerator.Step step)
         {
-            return (x is string || x is not IEnumerable) &&
-                   (y is string || y is not IEnumerable);
-        }
-
-        #region Nested IComparer Adapter
-
-        /// <summary>
-        /// Returns an <see cref="EqualityAdapter"/> that wraps an <see cref="IComparer"/>.
-        /// </summary>
-        public static EqualityAdapter For(IComparer comparer)
-        {
-            return new ComparerAdapter(comparer);
+            return GenerateRange((T)start, (T)end, (Step)step);
         }
 
         /// <summary>
-        /// <see cref="EqualityAdapter"/> that wraps an <see cref="IComparer"/>.
+        /// Provides a convenient shorthand when <typeparamref name="TStep"/> is <see cref="IComparable{TStep}"/>
+        /// and the default value of <typeparamref name="TStep"/> represents zero.
         /// </summary>
-        private class ComparerAdapter : EqualityAdapter
+        public sealed class ComparableStep<TStep> : Step
+            where TStep : IComparable<TStep>
         {
-            private readonly IComparer _comparer;
-
-            public ComparerAdapter(IComparer comparer)
-            {
-                _comparer = comparer;
-            }
-
-            public override bool AreEqual(object x, object y)
-            {
-                return _comparer.Compare(x, y) == 0;
-            }
-        }
-
-        #endregion
-
-        #region Nested IEqualityComparer Adapter
-
-        /// <summary>
-        /// Returns an <see cref="EqualityAdapter"/> that wraps an <see cref="IEqualityComparer"/>.
-        /// </summary>
-        public static EqualityAdapter For(IEqualityComparer comparer)
-        {
-            return new EqualityComparerAdapter(comparer);
-        }
-
-        private class EqualityComparerAdapter : EqualityAdapter
-        {
-            private readonly IEqualityComparer _comparer;
-
-            public EqualityComparerAdapter(IEqualityComparer comparer)
-            {
-                _comparer = comparer;
-            }
-
-            public override bool AreEqual(object x, object y)
-            {
-                return _comparer.Equals(x, y);
-            }
-        }
-
-        /// <summary>
-        /// Returns an EqualityAdapter that uses a predicate function for items comparison.
-        /// </summary>
-        /// <typeparam name="TExpected"></typeparam>
-        /// <typeparam name="TActual"></typeparam>
-        /// <param name="comparison"></param>
-        /// <returns></returns>
-        public static EqualityAdapter For<TExpected, TActual>(Func<TExpected, TActual, bool> comparison)
-        {
-            return new PredicateEqualityAdapter<TExpected, TActual>(comparison);
-        }
-
-        internal sealed class PredicateEqualityAdapter<TActual, TExpected> : EqualityAdapter
-        {
-            private readonly Func<TActual, TExpected, bool> _comparison;
+            private readonly TStep _step;
+            private readonly Func<T, TStep, T> _apply;
 
             /// <summary>
-            /// Returns true if the two objects can be compared by this adapter.
-            /// The base adapter cannot handle IEnumerables except for strings.
+            /// Initializes a new instance of the <see cref="ComparableStep{TStep}"/> class.
             /// </summary>
-            public override bool CanCompare(object x, object y)
+            /// <param name="value">The amount by which to increment each time this step is applied.</param>
+            /// <param name="apply">
+            /// Must increment the given value and return the result.
+            /// If the result is outside the range representable by <typeparamref name="T"/>,
+            /// must throw <see cref="OverflowException"/>. If the result does not change due to lack
+            /// of precision representable by <typeparamref name="T"/>, must throw <see cref="ArithmeticException"/>.
+            /// </param>
+            public ComparableStep(TStep value, Func<T, TStep, T> apply)
             {
-                return TypeHelper.CanCast<TExpected>(x) && TypeHelper.CanCast<TActual>(y);
+                if (apply is null)
+                    throw new ArgumentNullException(nameof(apply));
+                _step = value;
+                _apply = apply;
             }
+
+            public override bool IsPositive => Comparer<TStep>.Default.Compare(default, _step) < 0;
+            public override bool IsNegative => Comparer<TStep>.Default.Compare(_step, default) < 0;
 
             /// <summary>
-            /// Compares two objects, returning true if they are equal
+            /// Increments the given value and returns the result.
+            /// If the result is outside the range representable by <typeparamref name="T"/>,
+            /// throws <see cref="OverflowException"/>. If the result does not change due to lack
+            /// of precision representable by <typeparamref name="T"/>, throws <see cref="ArithmeticException"/>.
             /// </summary>
-            public override bool AreEqual(object x, object y)
-            {
-                return _comparison.Invoke((TActual)y, (TExpected)x);
-            }
-
-            public PredicateEqualityAdapter(Func<TActual, TExpected, bool> comparison)
-            {
-                _comparison = comparison;
-            }
+            /// <exception cref="OverflowException"/>
+            /// <exception cref="ArithmeticException"/>
+            public override T Apply(T value) => _apply.Invoke(value, _step);
         }
 
-        #endregion
-
-        #region Nested GenericEqualityAdapter<T>
-
-        private abstract class GenericEqualityAdapter<T> : EqualityAdapter
+        /// <summary>
+        /// Encapsulates the ability to increment a <typeparamref name="T"/> value by an amount
+        /// which may be of a different type.
+        /// </summary>
+        public new abstract class Step : ValueGenerator.Step
         {
             /// <summary>
-            /// Returns true if the two objects can be compared by this adapter.
-            /// Generic adapter requires objects of the specified type.
+            /// Increments the given value and returns the result.
+            /// If the result is outside the range representable by <typeparamref name="T"/>,
+            /// throws <see cref="OverflowException"/>. If the result does not change due to lack
+            /// of precision representable by <typeparamref name="T"/>, throws <see cref="ArithmeticException"/>.
             /// </summary>
-            public override bool CanCompare(object x, object y)
-            {
-                return TypeHelper.CanCast<T>(x) && TypeHelper.CanCast<T>(y);
-            }
-
-            protected void CastOrThrow(object? x, object? y, out T xValue, out T yValue)
-            {
-                if (!TypeHelper.TryCast(x, out T? xValueOrNull))
-                    throw new ArgumentException($"Cannot compare {x?.ToString() ?? "null"}");
-
-                if (!TypeHelper.TryCast(y, out T? yValueOrNull))
-                    throw new ArgumentException($"Cannot compare {y?.ToString() ?? "null"}");
-
-                // The are now verified to be not null.
-                xValue = xValueOrNull;
-                yValue = yValueOrNull;
-            }
-        }
-
-        #endregion
-
-        #region Nested IEqualityComparer<T> Adapter
-
-        /// <summary>
-        /// Returns an <see cref="EqualityAdapter"/> that wraps an <see cref="IEqualityComparer{T}"/>.
-        /// </summary>
-        public static EqualityAdapter For<T>(IEqualityComparer<T> comparer)
-        {
-            return new EqualityComparerAdapter<T>(comparer);
-        }
-
-        private class EqualityComparerAdapter<T> : GenericEqualityAdapter<T>
-        {
-            private readonly IEqualityComparer<T> _comparer;
-
-            public EqualityComparerAdapter(IEqualityComparer<T> comparer)
-            {
-                _comparer = comparer;
-            }
-
-            public override bool AreEqual(object x, object y)
-            {
-                CastOrThrow(x, y, out var xValue, out var yValue);
-                return _comparer.Equals(xValue, yValue);
-            }
-        }
-
-        #endregion
-
-        #region Nested IComparer<T> Adapter
-
-        /// <summary>
-        /// Returns an <see cref="EqualityAdapter"/> that wraps an <see cref="IComparer{T}"/>.
-        /// </summary>
-        public static EqualityAdapter For<T>(IComparer<T> comparer)
-        {
-            return new ComparerAdapter<T>(comparer);
+            /// <exception cref="OverflowException"/>
+            /// <exception cref="ArithmeticException"/>
+            public abstract T Apply(T value);
         }
 
         /// <summary>
-        /// <see cref="EqualityAdapter"/> that wraps an <see cref="IComparer"/>.
+        /// Creates a <see cref="Step"/> from the specified value if the current instance is able to
+        /// use it to increment values of type <typeparamref name="T"/>. If the creation fails,
+        /// <see cref="NotSupportedException"/> is thrown.
         /// </summary>
-        private class ComparerAdapter<T> : GenericEqualityAdapter<T>
+        /// <exception cref="NotSupportedException"/>
+        public sealed override ValueGenerator.Step CreateStep(object value)
         {
-            private readonly IComparer<T> _comparer;
-
-            public ComparerAdapter(IComparer<T> comparer)
-            {
-                _comparer = comparer;
-            }
-
-            public override bool AreEqual(object x, object y)
-            {
-                CastOrThrow(x, y, out var xValue, out var yValue);
-                return _comparer.Compare(xValue, yValue) == 0;
-            }
+            if (TryCreateStep(value, out var step))
+                return step;
+            throw CreateNotSupportedException($"creating a step of type {value.GetType()}");
         }
-
-        #endregion
-
-        #region Nested Comparison<T> Adapter
 
         /// <summary>
-        /// Returns an <see cref="EqualityAdapter"/> that wraps a <see cref="Comparison{T}"/>.
+        /// Creates a <see cref="Step"/> from the specified value if the current instance is able to
+        /// use it to increment values of type <typeparamref name="T"/>. A return value indicates
+        /// whether the creation succeeded.
         /// </summary>
-        public static EqualityAdapter For<T>(Comparison<T> comparer)
+        public override bool TryCreateStep(object value, [NotNullWhen(true)] out ValueGenerator.Step? step)
         {
-            return new ComparisonAdapter<T>(comparer);
+            Guard.ArgumentNotNull(value, nameof(value));
+            step = null;
+            return false;
+        }
+    }
+
+    internal abstract partial class ValueGenerator
+    {
+        public abstract IEnumerable GenerateRange(object start, object end, Step step);
+
+        private static readonly MethodInfo GenericCreateMethod =
+            typeof(ValueGenerator)
+                .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .Single(method => method.Name == nameof(Create) && method.IsGenericMethod);
+
+        public static ValueGenerator Create(Type valueType)
+        {
+            var genericInstantiation = GenericCreateMethod.MakeGenericMethod(valueType);
+            var @delegate = (Func<ValueGenerator>)genericInstantiation.CreateDelegate(typeof(Func<ValueGenerator>));
+            return @delegate.Invoke();
         }
 
-        private class ComparisonAdapter<T> : GenericEqualityAdapter<T>
+        public static ValueGenerator<T> Create<T>()
         {
-            private readonly Comparison<T> _comparer;
+            // The JIT removes all branches which do not match T since it generates a separate version
+            // of this method at runtime for every value type T.
 
-            public ComparisonAdapter(Comparison<T> comparer)
-            {
-                _comparer = comparer;
-            }
+            if (typeof(T) == typeof(sbyte))
+                return (ValueGenerator<T>)(object)new SByteValueGenerator();
 
-            public override bool AreEqual(object x, object y)
-            {
-                CastOrThrow(x, y, out var xValue, out var yValue);
-                return _comparer.Invoke(xValue, yValue) == 0;
-            }
+            if (typeof(T) == typeof(byte))
+                return (ValueGenerator<T>)(object)new ByteValueGenerator();
+
+            if (typeof(T) == typeof(short))
+                return (ValueGenerator<T>)(object)new Int16ValueGenerator();
+
+            if (typeof(T) == typeof(ushort))
+                return (ValueGenerator<T>)(object)new UInt16ValueGenerator();
+
+            if (typeof(T) == typeof(int))
+                return (ValueGenerator<T>)(object)new Int32ValueGenerator();
+
+            if (typeof(T) == typeof(uint))
+                return (ValueGenerator<T>)(object)new UInt32ValueGenerator();
+
+            if (typeof(T) == typeof(long))
+                return (ValueGenerator<T>)(object)new Int64ValueGenerator();
+
+            if (typeof(T) == typeof(ulong))
+                return (ValueGenerator<T>)(object)new UInt64ValueGenerator();
+
+            if (typeof(T) == typeof(float))
+                return (ValueGenerator<T>)(object)new SingleValueGenerator();
+
+            if (typeof(T) == typeof(double))
+                return (ValueGenerator<T>)(object)new DoubleValueGenerator();
+
+            if (typeof(T) == typeof(decimal))
+                return (ValueGenerator<T>)(object)new DecimalValueGenerator();
+
+            return new DefaultValueGenerator<T>();
         }
 
-        #endregion
+        /// <summary>
+        /// Encapsulates the ability to increment a value by an amount which may be of a different type.
+        /// </summary>
+        public abstract class Step
+        {
+            public abstract bool IsPositive { get; }
+            public abstract bool IsNegative { get; }
+        }
+
+        /// <summary>
+        /// Creates a <see cref="Step"/> from the specified value if the current instance is able to
+        /// use it to increment the on values which it operates. If the creation fails,
+        /// <see cref="NotSupportedException"/> is thrown.
+        /// </summary>
+        /// <exception cref="NotSupportedException"/>
+        public abstract Step CreateStep(object value);
+
+        /// <summary>
+        /// Creates a <see cref="Step"/> from the specified value if the current instance is able to
+        /// use it to increment values on which it operates. A return value indicates
+        /// whether the creation succeeded.
+        /// </summary>
+        public abstract bool TryCreateStep(object value, [NotNullWhen(true)] out Step? step);
     }
 }

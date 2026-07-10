@@ -1,3 +1,5 @@
+#ifndef HEADER_CURL_VTLS_INT_H
+#define HEADER_CURL_VTLS_INT_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -21,136 +23,207 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-#include "server_setup.h"
+#include "curl_setup.h"
+#include "cfilters.h"
+#include "urldata.h"
 
-/* Purpose
- *
- * Resolve the given name, using system name resolve functions (NOT any
- * function provided by libcurl). Used to see if the name exists and thus if
- * we can allow a test case to use it for testing.
- *
- * Like if 'localhost' actual exists etc.
- *
+#ifdef USE_SSL
+
+/* see https://www.iana.org/assignments/tls-extensiontype-values/ */
+#define ALPN_HTTP_1_1_LENGTH 8
+#define ALPN_HTTP_1_1 "http/1.1"
+#define ALPN_H2_LENGTH 2
+#define ALPN_H2 "h2"
+#define ALPN_H3_LENGTH 2
+#define ALPN_H3 "h3"
+
+/* conservative sizes on the ALPN entries and count we are handling,
+ * we can increase these if we ever feel the need or have to accommodate
+ * ALPN strings from the "outside". */
+#define ALPN_NAME_MAX     10
+#define ALPN_ENTRIES_MAX  3
+#define ALPN_PROTO_BUF_MAX   (ALPN_ENTRIES_MAX * (ALPN_NAME_MAX + 1))
+
+struct alpn_spec {
+  const char entries[ALPN_ENTRIES_MAX][ALPN_NAME_MAX];
+  size_t count; /* number of entries */
+};
+
+struct alpn_proto_buf {
+  unsigned char data[ALPN_PROTO_BUF_MAX];
+  int len;
+};
+
+CURLcode Curl_alpn_to_proto_buf(struct alpn_proto_buf *buf,
+                                const struct alpn_spec *spec);
+CURLcode Curl_alpn_to_proto_str(struct alpn_proto_buf *buf,
+                                const struct alpn_spec *spec);
+
+CURLcode Curl_alpn_set_negotiated(struct Curl_cfilter *cf,
+                                  struct Curl_easy *data,
+                                  const unsigned char *proto,
+                                  size_t proto_len);
+
+/* enum for the nonblocking SSL connection state machine */
+typedef enum {
+  ssl_connect_1,
+  ssl_connect_2,
+  ssl_connect_3,
+  ssl_connect_done
+} ssl_connect_state;
+
+typedef enum {
+  ssl_connection_none,
+  ssl_connection_negotiating,
+  ssl_connection_complete
+} ssl_connection_state;
+
+#define CURL_SSL_IO_NEED_NONE   (0)
+#define CURL_SSL_IO_NEED_RECV   (1<<0)
+#define CURL_SSL_IO_NEED_SEND   (1<<1)
+
+/* Information in each SSL cfilter context: cf->ctx */
+struct ssl_connect_data {
+  struct ssl_peer peer;
+  const struct alpn_spec *alpn;     /* ALPN to use or NULL for none */
+  void *backend;                    /* vtls backend specific props */
+  struct cf_call_data call_data;    /* data handle used in current call */
+  struct curltime handshake_done;   /* time when handshake finished */
+  ssl_connection_state state;
+  ssl_connect_state connecting_state;
+  int io_need;                      /* TLS signals special SEND/RECV needs */
+  BIT(use_alpn);                    /* if ALPN shall be used in handshake */
+  BIT(peer_closed);                 /* peer has closed connection */
+};
+
+
+#undef CF_CTX_CALL_DATA
+#define CF_CTX_CALL_DATA(cf)  \
+  ((struct ssl_connect_data *)(cf)->ctx)->call_data
+
+
+/* Definitions for SSL Implementations */
+
+struct Curl_ssl {
+  /*
+   * This *must* be the first entry to allow returning the list of available
+   * backends in curl_global_sslset().
+   */
+  curl_ssl_backend info;
+  unsigned int supports; /* bitfield, see above */
+  size_t sizeof_ssl_backend_data;
+
+  int (*init)(void);
+  void (*cleanup)(void);
+
+  size_t (*version)(char *buffer, size_t size);
+  int (*check_cxn)(struct Curl_cfilter *cf, struct Curl_easy *data);
+  CURLcode (*shut_down)(struct Curl_cfilter *cf, struct Curl_easy *data,
+                        bool send_shutdown, bool *done);
+  bool (*data_pending)(struct Curl_cfilter *cf,
+                       const struct Curl_easy *data);
+
+  /* return 0 if a find random is filled in */
+  CURLcode (*random)(struct Curl_easy *data, unsigned char *entropy,
+                     size_t length);
+  bool (*cert_status_request)(void);
+
+  CURLcode (*connect_blocking)(struct Curl_cfilter *cf,
+                               struct Curl_easy *data);
+  CURLcode (*connect_nonblocking)(struct Curl_cfilter *cf,
+                                  struct Curl_easy *data,
+                                  bool *done);
+
+  /* During handshake/shutdown, adjust the pollset to include the socket
+   * for POLLOUT or POLLIN as needed. Mandatory. */
+  void (*adjust_pollset)(struct Curl_cfilter *cf, struct Curl_easy *data,
+                          struct easy_pollset *ps);
+  void *(*get_internals)(struct ssl_connect_data *connssl, CURLINFO info);
+  void (*close)(struct Curl_cfilter *cf, struct Curl_easy *data);
+  void (*close_all)(struct Curl_easy *data);
+
+  CURLcode (*set_engine)(struct Curl_easy *data, const char *engine);
+  CURLcode (*set_engine_default)(struct Curl_easy *data);
+  struct curl_slist *(*engines_list)(struct Curl_easy *data);
+
+  bool (*false_start)(void);
+  CURLcode (*sha256sum)(const unsigned char *input, size_t inputlen,
+                    unsigned char *sha256sum, size_t sha256sumlen);
+
+  bool (*attach_data)(struct Curl_cfilter *cf, struct Curl_easy *data);
+  void (*detach_data)(struct Curl_cfilter *cf, struct Curl_easy *data);
+
+  ssize_t (*recv_plain)(struct Curl_cfilter *cf, struct Curl_easy *data,
+                        char *buf, size_t len, CURLcode *code);
+  ssize_t (*send_plain)(struct Curl_cfilter *cf, struct Curl_easy *data,
+                        const void *mem, size_t len, CURLcode *code);
+
+};
+
+extern const struct Curl_ssl *Curl_ssl;
+
+
+int Curl_none_init(void);
+void Curl_none_cleanup(void);
+CURLcode Curl_none_shutdown(struct Curl_cfilter *cf, struct Curl_easy *data,
+                            bool send_shutdown, bool *done);
+int Curl_none_check_cxn(struct Curl_cfilter *cf, struct Curl_easy *data);
+CURLcode Curl_none_random(struct Curl_easy *data, unsigned char *entropy,
+                          size_t length);
+void Curl_none_close_all(struct Curl_easy *data);
+void Curl_none_session_free(void *ptr);
+bool Curl_none_data_pending(struct Curl_cfilter *cf,
+                            const struct Curl_easy *data);
+bool Curl_none_cert_status_request(void);
+CURLcode Curl_none_set_engine(struct Curl_easy *data, const char *engine);
+CURLcode Curl_none_set_engine_default(struct Curl_easy *data);
+struct curl_slist *Curl_none_engines_list(struct Curl_easy *data);
+bool Curl_none_false_start(void);
+void Curl_ssl_adjust_pollset(struct Curl_cfilter *cf, struct Curl_easy *data,
+                              struct easy_pollset *ps);
+
+/**
+ * Get the SSL filter below the given one or NULL if there is none.
  */
+bool Curl_ssl_cf_is_proxy(struct Curl_cfilter *cf);
 
-#include <signal.h>
-#ifdef HAVE_NETINET_IN_H
-#include <netinet/in.h>
-#endif
-#ifdef _XOPEN_SOURCE_EXTENDED
-/* This define is "almost" required to build on HPUX 11 */
-#include <arpa/inet.h>
-#endif
-#ifdef HAVE_NETDB_H
-#include <netdb.h>
-#endif
+/* extract a session ID
+ * Sessionid mutex must be locked (see Curl_ssl_sessionid_lock).
+ * Caller must make sure that the ownership of returned sessionid object
+ * is properly taken (e.g. its refcount is incremented
+ * under sessionid mutex).
+ */
+bool Curl_ssl_getsessionid(struct Curl_cfilter *cf,
+                           struct Curl_easy *data,
+                           const struct ssl_peer *peer,
+                           void **ssl_sessionid,
+                           size_t *idsize); /* set 0 if unknown */
 
-#define ENABLE_CURLX_PRINTF
-/* make the curlx header define all printf() functions to use the curlx_*
-   versions instead */
-#include "curlx.h" /* from the private lib dir */
-#include "util.h"
+/* Set a TLS session ID for `peer`. Replaces an existing session ID if
+ * not already the very same.
+ * Sessionid mutex must be locked (see Curl_ssl_sessionid_lock).
+ * Call takes ownership of `ssl_sessionid`, using `sessionid_free_cb`
+ * to deallocate it. Is called in all outcomes, either right away or
+ * later when the session cache is cleaned up.
+ * Caller must ensure that it has properly shared ownership of this sessionid
+ * object with cache (e.g. incrementing refcount on success)
+ */
+CURLcode Curl_ssl_set_sessionid(struct Curl_cfilter *cf,
+                                struct Curl_easy *data,
+                                const struct ssl_peer *peer,
+                                void *sessionid,
+                                size_t sessionid_size,
+                                Curl_ssl_sessionid_dtor *sessionid_free_cb);
 
-/* include memdebug.h last */
-#include "memdebug.h"
+#include "openssl.h"        /* OpenSSL versions */
+#include "gtls.h"           /* GnuTLS versions */
+#include "wolfssl.h"        /* wolfSSL versions */
+#include "schannel.h"       /* Schannel SSPI version */
+#include "sectransp.h"      /* SecureTransport (Darwin) version */
+#include "mbedtls.h"        /* mbedTLS versions */
+#include "bearssl.h"        /* BearSSL versions */
+#include "rustls.h"         /* rustls versions */
 
-static bool use_ipv6 = FALSE;
-static const char *ipv_inuse = "IPv4";
+#endif /* USE_SSL */
 
-const char *serverlogfile = ""; /* for a util.c function we don't use */
-
-int main(int argc, char *argv[])
-{
-  int arg = 1;
-  const char *host = NULL;
-  int rc = 0;
-
-  while(argc>arg) {
-    if(!strcmp("--version", argv[arg])) {
-      printf("resolve IPv4%s\n",
-#if defined(CURLRES_IPV6)
-             "/IPv6"
-#else
-             ""
-#endif
-             );
-      return 0;
-    }
-    else if(!strcmp("--ipv6", argv[arg])) {
-      ipv_inuse = "IPv6";
-      use_ipv6 = TRUE;
-      arg++;
-    }
-    else if(!strcmp("--ipv4", argv[arg])) {
-      /* for completeness, we support this option as well */
-      ipv_inuse = "IPv4";
-      use_ipv6 = FALSE;
-      arg++;
-    }
-    else {
-      host = argv[arg++];
-    }
-  }
-  if(!host) {
-    puts("Usage: resolve [option] <host>\n"
-         " --version\n"
-         " --ipv4"
-#if defined(CURLRES_IPV6)
-         "\n --ipv6"
-#endif
-         );
-    return 1;
-  }
-
-#ifdef _WIN32
-  win32_init();
-  atexit(win32_cleanup);
-#endif
-
-#if defined(CURLRES_IPV6)
-  if(use_ipv6) {
-    /* Check that the system has IPv6 enabled before checking the resolver */
-    curl_socket_t s = socket(PF_INET6, SOCK_DGRAM, 0);
-    if(s == CURL_SOCKET_BAD)
-      /* an IPv6 address was requested and we can't get/use one */
-      rc = -1;
-    else {
-      sclose(s);
-    }
-  }
-
-  if(rc == 0) {
-    /* getaddrinfo() resolve */
-    struct addrinfo *ai;
-    struct addrinfo hints;
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = use_ipv6 ? PF_INET6 : PF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = 0;
-    /* Use parenthesis around functions to stop them from being replaced by
-       the macro in memdebug.h */
-    rc = (getaddrinfo)(host, "80", &hints, &ai);
-    if(rc == 0)
-      (freeaddrinfo)(ai);
-  }
-#else
-  if(use_ipv6) {
-    puts("IPv6 support has been disabled in this program");
-    return 1;
-  }
-  else {
-    /* gethostbyname() resolve */
-    struct hostent *he;
-
-    he = gethostbyname(host);
-
-    rc = !he;
-  }
-#endif
-
-  if(rc)
-    printf("Resolving %s '%s' didn't work\n", ipv_inuse, host);
-
-  return !!rc;
-}
+#endif /* HEADER_CURL_VTLS_INT_H */

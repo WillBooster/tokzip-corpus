@@ -10,137 +10,68 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Util;
+namespace Composer\Test;
 
-use Composer\Config;
-use Composer\IO\IOInterface;
-use Composer\Util\Filesystem;
-use Composer\Util\Git;
-use Composer\Test\Mock\ProcessExecutorMock;
-use Composer\Test\TestCase;
+use Composer\Console\Application;
+use Composer\Util\Platform;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\BufferedOutput;
 
-class GitTest extends TestCase
+class ApplicationTest extends TestCase
 {
-    /** @var Git */
-    private $git;
-    /** @var IOInterface&\PHPUnit\Framework\MockObject\MockObject */
-    private $io;
-    /** @var Config&\PHPUnit\Framework\MockObject\MockObject */
-    private $config;
-    /** @var ProcessExecutorMock */
-    private $process;
-    /** @var Filesystem&\PHPUnit\Framework\MockObject\MockObject */
-    private $fs;
+    protected function tearDown(): void
+    {
+        parent::tearDown();
+
+        Platform::clearEnv('COMPOSER_DISABLE_XDEBUG_WARN');
+    }
 
     protected function setUp(): void
     {
-        $this->io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
-        $this->config = $this->getMockBuilder('Composer\Config')->disableOriginalConstructor()->getMock();
-        $this->process = $this->getProcessExecutorMock();
-        $this->fs = $this->getMockBuilder('Composer\Util\Filesystem')->disableOriginalConstructor()->getMock();
-        $this->git = new Git($this->io, $this->config, $this->process, $this->fs);
+        parent::setUp();
+
+        Platform::putEnv('COMPOSER_DISABLE_XDEBUG_WARN', '1');
     }
 
     /**
-     * @dataProvider publicGithubNoCredentialsProvider
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
      */
-    public function testRunCommandPublicGitHubRepositoryNotInitialClone(string $protocol, string $expectedUrl): void
+    public function testDevWarning(): void
     {
-        $commandCallable = function ($url) use ($expectedUrl): string {
-            self::assertSame($expectedUrl, $url);
+        $application = new Application;
 
-            return 'git command';
-        };
+        if (!defined('COMPOSER_DEV_WARNING_TIME')) {
+            define('COMPOSER_DEV_WARNING_TIME', time() - 1);
+        }
 
-        $this->mockConfig($protocol);
+        $output = new BufferedOutput();
+        $application->doRun(new ArrayInput(['command' => 'about']), $output);
 
-        $this->process->expects(['git command'], true);
-
-        $this->git->runCommand($commandCallable, 'https://github.com/acme/repo', null, true);
-    }
-
-    public static function publicGithubNoCredentialsProvider(): array
-    {
-        return [
-            ['ssh', 'git@github.com:acme/repo'],
-            ['https', 'https://github.com/acme/repo'],
-        ];
-    }
-
-    public function testRunCommandPrivateGitHubRepositoryNotInitialCloneNotInteractiveWithoutAuthentication(): void
-    {
-        self::expectException('RuntimeException');
-
-        $commandCallable = function ($url): string {
-            self::assertSame('https://github.com/acme/repo', $url);
-
-            return 'git command';
-        };
-
-        $this->mockConfig('https');
-
-        $this->process->expects([
-            ['cmd' => 'git command', 'return' => 1],
-            ['cmd' => 'git --version', 'return' => 0],
-        ], true);
-
-        $this->git->runCommand($commandCallable, 'https://github.com/acme/repo', null, true);
+        $expectedOutput = sprintf('<warning>Warning: This development build of Composer is over 60 days old. It is recommended to update it by running "%s self-update" to get the latest version.</warning>', $_SERVER['PHP_SELF']).PHP_EOL;
+        self::assertStringContainsString($expectedOutput, $output->fetch());
     }
 
     /**
-     * @dataProvider privateGithubWithCredentialsProvider
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
      */
-    public function testRunCommandPrivateGitHubRepositoryNotInitialCloneNotInteractiveWithAuthentication(string $gitUrl, string $protocol, string $gitHubToken, string $expectedUrl, int $expectedFailuresBeforeSuccess): void
+    public function testDevWarningSuppressedForSelfUpdate(): void
     {
-        $commandCallable = static function ($url) use ($expectedUrl): string {
-            if ($url !== $expectedUrl) {
-                return 'git command failing';
-            }
+        if (Platform::isWindows()) {
+            $this->markTestSkipped('Does not run on windows');
+        }
 
-            return 'git command ok';
-        };
+        $application = new Application;
+        $application->add(new \Composer\Command\SelfUpdateCommand);
 
-        $this->mockConfig($protocol);
+        if (!defined('COMPOSER_DEV_WARNING_TIME')) {
+            define('COMPOSER_DEV_WARNING_TIME', time() - 1);
+        }
 
-        $expectedCalls = array_fill(0, $expectedFailuresBeforeSuccess, ['cmd' => 'git command failing', 'return' => 1]);
-        $expectedCalls[] = ['cmd' => 'git command ok', 'return' => 0];
+        $output = new BufferedOutput();
+        $application->doRun(new ArrayInput(['command' => 'self-update']), $output);
 
-        $this->process->expects($expectedCalls, true);
-
-        $this->io
-            ->method('isInteractive')
-            ->willReturn(false);
-
-        $this->io
-            ->expects($this->atLeastOnce())
-            ->method('hasAuthentication')
-            ->with($this->equalTo('github.com'))
-            ->willReturn(true);
-
-        $this->io
-            ->expects($this->atLeastOnce())
-            ->method('getAuthentication')
-            ->with($this->equalTo('github.com'))
-            ->willReturn(['username' => 'token', 'password' => $gitHubToken]);
-
-        $this->git->runCommand($commandCallable, $gitUrl, null, true);
-    }
-
-    public static function privateGithubWithCredentialsProvider(): array
-    {
-        return [
-            ['git@github.com:acme/repo.git', 'ssh', 'MY_GITHUB_TOKEN', 'https://token:MY_GITHUB_TOKEN@github.com/acme/repo.git', 1],
-            ['https://github.com/acme/repo', 'https', 'MY_GITHUB_TOKEN', 'https://token:MY_GITHUB_TOKEN@github.com/acme/repo.git', 2],
-        ];
-    }
-
-    private function mockConfig(string $protocol): void
-    {
-        $this->config
-            ->method('get')
-            ->willReturnMap([
-                ['github-domains', 0, ['github.com']],
-                ['github-protocols', 0, [$protocol]],
-            ]);
+        self::assertSame('', $output->fetch());
     }
 }

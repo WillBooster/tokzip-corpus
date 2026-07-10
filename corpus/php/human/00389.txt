@@ -10,120 +10,178 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Command;
+namespace Composer\Command;
 
-use Composer\Test\TestCase;
-use InvalidArgumentException;
+use Composer\Script\Event as ScriptEvent;
+use Composer\Script\ScriptEvents;
+use Composer\Util\ProcessExecutor;
+use Composer\Util\Platform;
+use Symfony\Component\Console\Input\InputInterface;
+use Composer\Console\Input\InputOption;
+use Composer\Console\Input\InputArgument;
+use Symfony\Component\Console\Output\OutputInterface;
 
-class SearchCommandTest extends TestCase
+/**
+ * @author Fabien Potencier <fabien.potencier@gmail.com>
+ */
+class RunScriptCommand extends BaseCommand
 {
     /**
-     * @dataProvider provideSearch
-     * @param array<mixed> $command
+     * @var string[] Array with command events
      */
-    public function testSearch(array $command, string $expected = ''): void
-    {
-        $this->initTempComposer([
-            'repositories' => [
-                'packages' => [
-                    'type' => 'package',
-                    'package' => [
-                        ['name' => 'vendor-1/package-1', 'description' => 'generic description', 'version' => '1.0.0'],
-                        ['name' => 'foo/bar', 'description' => 'generic description', 'version' => '1.0.0'],
-                        ['name' => 'bar/baz', 'description' => 'fancy baz', 'version' => '1.0.0', 'abandoned' => true],
-                        ['name' => 'vendor-2/fancy-package', 'fancy description', 'version' => '1.0.0', 'type' => 'foo'],
-                    ],
-                ],
-            ],
-        ]);
+    protected $scriptEvents = [
+        ScriptEvents::PRE_INSTALL_CMD,
+        ScriptEvents::POST_INSTALL_CMD,
+        ScriptEvents::PRE_UPDATE_CMD,
+        ScriptEvents::POST_UPDATE_CMD,
+        ScriptEvents::PRE_STATUS_CMD,
+        ScriptEvents::POST_STATUS_CMD,
+        ScriptEvents::POST_ROOT_PACKAGE_INSTALL,
+        ScriptEvents::POST_CREATE_PROJECT_CMD,
+        ScriptEvents::PRE_ARCHIVE_CMD,
+        ScriptEvents::POST_ARCHIVE_CMD,
+        ScriptEvents::PRE_AUTOLOAD_DUMP,
+        ScriptEvents::POST_AUTOLOAD_DUMP,
+    ];
 
-        $appTester = $this->getApplicationTester();
-        $appTester->run(array_merge(['command' => 'search'], $command));
-        self::assertSame(trim($expected), trim($appTester->getDisplay(true)));
+    protected function configure(): void
+    {
+        $this
+            ->setName('run-script')
+            ->setAliases(['run'])
+            ->setDescription('Runs the scripts defined in composer.json')
+            ->setDefinition([
+                new InputArgument('script', InputArgument::OPTIONAL, 'Script name to run.', null, function () {
+                    return array_map(static function ($script) { return $script['name']; }, $this->getScripts());
+                }),
+                new InputArgument('args', InputArgument::IS_ARRAY | InputArgument::OPTIONAL, ''),
+                new InputOption('timeout', null, InputOption::VALUE_REQUIRED, 'Sets script timeout in seconds, or 0 for never.'),
+                new InputOption('dev', null, InputOption::VALUE_NONE, 'Sets the dev mode.'),
+                new InputOption('no-dev', null, InputOption::VALUE_NONE, 'Disables the dev mode.'),
+                new InputOption('list', 'l', InputOption::VALUE_NONE, 'List scripts.'),
+            ])
+            ->setHelp(
+                <<<EOT
+The <info>run-script</info> command runs scripts defined in composer.json:
+
+<info>php composer.phar run-script post-update-cmd</info>
+
+Read more at https://getcomposer.org/doc/03-cli.md#run-script-run
+EOT
+            )
+        ;
     }
 
-    public function testInvalidFormat(): void
+    protected function interact(InputInterface $input, OutputInterface $output): void
     {
-        $this->initTempComposer([
-            'repositories' => [
-                'packagist.org' => false,
-            ],
-        ]);
+        $scripts = $this->getScripts();
+        if (count($scripts) === 0) {
+            return;
+        }
 
-        $appTester = $this->getApplicationTester();
-        $result = $appTester->run(['command' => 'search', '--format' => 'test-format', 'tokens' => ['test']]);
-        self::assertSame(1, $result);
-        self::assertSame('Unsupported format "test-format". See help for supported formats.', trim($appTester->getDisplay(true)));
+        if ($input->getArgument('script') !== null || $input->getOption('list')) {
+            return;
+        }
+
+        $options = [];
+        foreach ($scripts as $script) {
+            $options[$script['name']] = $script['description'];
+        }
+        $io = $this->getIO();
+        $script = $io->select(
+            'Script to run: ',
+            $options,
+            '',
+            1,
+            'Invalid script name "%s"'
+        );
+
+        $input->setArgument('script', $script);
     }
 
-    public function testInvalidFlags(): void
+    protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $this->initTempComposer([
-            'repositories' => [
-                'packagist.org' => false,
-            ],
-        ]);
+        if ($input->getOption('list')) {
+            return $this->listScripts($output);
+        }
 
-        $appTester = $this->getApplicationTester();
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('--only-name and --only-vendor cannot be used together');
-        $appTester->run(['command' => 'search', '--only-vendor' => true, '--only-name' => true, 'tokens' => ['test']]);
+        $script = $input->getArgument('script');
+        if ($script === null) {
+            throw new \RuntimeException('Missing required argument "script"');
+        }
+
+        if (!in_array($script, $this->scriptEvents)) {
+            if (defined('Composer\Script\ScriptEvents::'.str_replace('-', '_', strtoupper($script)))) {
+                throw new \InvalidArgumentException(sprintf('Script "%s" cannot be run with this command', $script));
+            }
+        }
+
+        $composer = $this->requireComposer();
+        $devMode = $input->getOption('dev') || !$input->getOption('no-dev');
+        $event = new ScriptEvent($script, $composer, $this->getIO(), $devMode);
+        $hasListeners = $composer->getEventDispatcher()->hasEventListeners($event);
+        if (!$hasListeners) {
+            throw new \InvalidArgumentException(sprintf('Script "%s" is not defined in this package', $script));
+        }
+
+        $args = $input->getArgument('args');
+
+        if (null !== $timeout = $input->getOption('timeout')) {
+            if (!ctype_digit($timeout)) {
+                throw new \RuntimeException('Timeout value must be numeric and positive if defined, or 0 for forever');
+            }
+            // Override global timeout set before in Composer by environment or config
+            ProcessExecutor::setTimeout((int) $timeout);
+        }
+
+        Platform::putEnv('COMPOSER_DEV_MODE', $devMode ? '1' : '0');
+
+        return $composer->getEventDispatcher()->dispatchScript($script, $devMode, $args);
     }
 
-    public static function provideSearch(): \Generator
+    protected function listScripts(OutputInterface $output): int
     {
-        yield 'by name and description' => [
-            ['tokens' => ['fancy']],
-            <<<OUTPUT
-bar/baz                <warning>! Abandoned !</warning> fancy baz
-vendor-2/fancy-package
-OUTPUT
-        ];
+        $scripts = $this->getScripts();
+        if (count($scripts) === 0) {
+            return 0;
+        }
 
-        yield 'by name and description with multiple tokens' => [
-            ['tokens' => ['fancy', 'vendor']],
-            <<<OUTPUT
-vendor-1/package-1     generic description
-bar/baz                <warning>! Abandoned !</warning> fancy baz
-vendor-2/fancy-package
-OUTPUT
-        ];
+        $io = $this->getIO();
+        $io->writeError('<info>scripts:</info>');
+        $table = [];
+        foreach ($scripts as $script) {
+            $table[] = ['  '.$script['name'], $script['description']];
+        }
 
-        yield 'by name only' => [
-            ['tokens' => ['fancy'], '--only-name' => true],
-            <<<OUTPUT
-vendor-2/fancy-package
-OUTPUT
-        ];
+        $this->renderTable($table, $output);
 
-        yield 'by vendor only' => [
-            ['tokens' => ['bar'], '--only-vendor' => true],
-            <<<OUTPUT
-bar
-OUTPUT
-        ];
-
-        yield 'by type' => [
-            ['tokens' => ['vendor'], '--type' => 'foo'],
-            <<<OUTPUT
-vendor-2/fancy-package
-OUTPUT
-        ];
-
-        yield 'json format' => [
-            ['tokens' => ['vendor-2/fancy'], '--format' => 'json'],
-            <<<OUTPUT
-[
-    {
-        "name": "vendor-2/fancy-package",
-        "description": null
+        return 0;
     }
-]
-OUTPUT
-        ];
 
-        yield 'no results' => [
-            ['tokens' => ['invalid-package-name']],
-        ];
+    /**
+     * @return list<array{name: string, description: string}>
+     */
+    private function getScripts(): array
+    {
+        $scripts = $this->requireComposer()->getPackage()->getScripts();
+        if (count($scripts) === 0) {
+            return [];
+        }
+
+        $result = [];
+        foreach ($scripts as $name => $script) {
+            $description = '';
+            try {
+                $cmd = $this->getApplication()->find($name);
+                if ($cmd instanceof ScriptAliasCommand) {
+                    $description = $cmd->getDescription();
+                }
+            } catch (\Symfony\Component\Console\Exception\CommandNotFoundException $e) {
+                // ignore scripts that have no command associated, like native Composer script listeners
+            }
+            $result[] = ['name' => $name, 'description' => $description];
+        }
+
+        return $result;
     }
 }

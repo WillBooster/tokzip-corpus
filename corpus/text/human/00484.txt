@@ -1,145 +1,55 @@
 ---
-c: Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
-SPDX-License-Identifier: curl
-Title: curl_ws_meta
-Section: 3
-Source: libcurl
-See-also:
-  - curl_easy_getinfo (3)
-  - curl_easy_setopt (3)
-  - curl_ws_recv (3)
-  - curl_ws_send (3)
-  - libcurl-ws (3)
-Protocol:
-  - WS
-Added-in: 7.86.0
+sidebar_position: 7
 ---
 
-# NAME
+# Cloud
 
-curl_ws_meta - meta data WebSocket information
+Tigerbeetle is [optimized for performance](../performance.md), exploiting "close to the metal"
+technologies such as **Direct I/O** and **io_uring**.
 
-# SYNOPSIS
+This raises the question of whether or not these benefits are realised in a cloud environment where
+the kernel is available to the app but where the network and the storage is virtualised.
 
-~~~c
-#include <curl/curl.h>
+## Direct I/O
 
-const struct curl_ws_frame *curl_ws_meta(CURL *curl);
-~~~
+Direct I/O eliminates memory copies between user space and the kernel within the OS, so whether the
+OS is virtualized or not beyond that, Direct I/O would still be of benefit, and perhaps even more so
+in a cloud environment by virtue of reducing memory pressure and freeing up the more limited
+per-core memory bandwidth, especially with noisy neighbors.
 
-# DESCRIPTION
+A quick example, tested with Ubuntu in a VM on a Mac, we still see a 7% relative throughput
+improvement for Direct I/O, regardless of whether Parallels is propagating O_DIRECT to the physical
+disk, it’s still saving the cost of the memcpy to Ubuntu’s page cache (and beyond that appears to
+also avoid polluting the CPU’s L1-3 cache by memcpy’ing through it - hard to be certain given all
+the various memcpy() implementations).
 
-This function call is EXPERIMENTAL.
+At the same time, where cloud environments support locally attached high-performance block devices
+(NVMe SSD), running local storage (as opposed to something like EBS) would definitely be preferable
+if only from a performance point of view.
 
-When the write callback (CURLOPT_WRITEFUNCTION(3)) is invoked on
-received WebSocket traffic, curl_ws_meta(3) can be called from within
-the callback to provide additional information about the current frame.
+From a safety point of view, we haven’t yet tested whether any VMs would disregard O_DIRECT for an
+NVMe device, or interpolate their own block device caching layer and mark dirty pages as clean
+despite an EIO disk fault, but after a physical system reboot our hash-chaining and ongoing disk
+scrubbing would at least be able to detect any issues related to this.
 
-This function only works from within the callback, and only when receiving
-WebSocket data.
+We are intentionally designing TigerBeetle to repair these local storage failures automatically on a
+fine-grained basis using cluster redundancy.
 
-This function requires an easy handle as input argument for libcurl to know
-what transfer the question is about, but as there is no such pointer provided
-to the callback by libcurl itself, applications that want to use
-curl_ws_meta(3) need to pass it on to the callback on its own.
+## io_uring
 
-# struct curl_ws_frame
+In a similar way, io_uring removes (or amortizes by orders of magnitude) the cost of syscalls
+between user space and the kernel, regardless of whether those are both within a virtualized
+environment or not. io_uring is being developed by Jens Axboe specifically to reduce the cost of
+large scale server fleets, which are typically cloud native, and there’s already been
+[work done](https://www.phoronix.com/scan.php?page=news_item&px=KVM-IO-uring-Passthrough-LF2020) to
+share the host’s io_uring queues with virtualized guests.
 
-~~~c
-struct curl_ws_frame {
-  int age;
-  int flags;
-  curl_off_t offset;
-  curl_off_t bytesleft;
-};
-~~~
+Our testing is only getting started though, we’re still building out the system end to end, so it
+will be great to benchmark more performance numbers in various environments (and across cloud
+providers) and share these as we go.
 
-## `age`
+Credit to @tdaly61 from the Mojaloop community for prompting us with some great questions about
+Tigerbeetle in the cloud.
 
-This field specify the age of this struct. It is always zero for now.
-
-## `flags`
-
-This is a bitmask with individual bits set that describes the WebSocket data.
-See the list below.
-
-## `offset`
-
-When this frame is a continuation of fragment data already delivered, this is
-the offset into the final fragment where this piece belongs.
-
-## `bytesleft`
-
-If this is not a complete fragment, the *bytesleft* field informs about how
-many additional bytes are expected to arrive before this fragment is complete.
-
-# FLAGS
-
-## CURLWS_TEXT
-
-The buffer contains text data. Note that this makes a difference to WebSocket
-but libcurl itself does not make any verification of the content or
-precautions that you actually receive valid UTF-8 content.
-
-## CURLWS_BINARY
-
-This is binary data.
-
-## CURLWS_CONT
-
-This is not the final fragment of the message, it implies that there is
-another fragment coming as part of the same message.
-
-## CURLWS_CLOSE
-
-This transfer is now closed.
-
-## CURLWS_PING
-
-This as an incoming ping message, that expects a pong response.
-
-# %PROTOCOLS%
-
-# EXAMPLE
-
-~~~c
-
-/* we pass a pointer to this struct to the callback */
-struct customdata {
-  CURL *easy;
-  void *ptr;
-};
-
-static size_t writecb(unsigned char *buffer,
-                      size_t size, size_t nitems, void *p)
-{
-  struct customdata *c = (struct customdata *)p;
-  const struct curl_ws_frame *m = curl_ws_meta(c->easy);
-
-  printf("flags: %x\n", m->flags);
-}
-
-int main(void)
-{
-  CURL *curl = curl_easy_init();
-  if(curl) {
-    struct customdata custom;
-    custom.easy = curl;
-    custom.ptr = NULL;
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writecb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &custom);
-
-    curl_easy_perform(curl);
-
-  }
-}
-~~~
-
-# %AVAILABILITY%
-
-# RETURN VALUE
-
-This function returns a pointer to a *curl_ws_frame* struct with read-only
-information that is valid for this specific callback invocation. If it cannot
-return this information, or if the function is called in the wrong context, it
-returns NULL.
+You can read more about how we use io_uring in
+[A Programmer-Friendly I/O Abstraction Over io_uring and kqueue](https://tigerbeetle.com/blog/a-friendly-abstraction-over-iouring-and-kqueue).

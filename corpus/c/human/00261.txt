@@ -1,5 +1,5 @@
-#ifndef HEADER_CURL_IF2IP_H
-#define HEADER_CURL_IF2IP_H
+#ifndef HEADER_CURL_SELECT_H
+#define HEADER_CURL_SELECT_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -23,70 +23,125 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+
 #include "curl_setup.h"
 
-/* IPv6 address scopes. */
-#define IPV6_SCOPE_GLOBAL       0       /* Global scope. */
-#define IPV6_SCOPE_LINKLOCAL    1       /* Link-local scope. */
-#define IPV6_SCOPE_SITELOCAL    2       /* Site-local scope (deprecated). */
-#define IPV6_SCOPE_UNIQUELOCAL  3       /* Unique local */
-#define IPV6_SCOPE_NODELOCAL    4       /* Loopback. */
-
-#ifdef USE_IPV6
-unsigned int Curl_ipv6_scope(const struct sockaddr *sa);
-#else
-#define Curl_ipv6_scope(x) 0
+#ifdef HAVE_POLL_H
+#include <poll.h>
+#elif defined(HAVE_SYS_POLL_H)
+#include <sys/poll.h>
 #endif
 
-typedef enum {
-  IF2IP_NOT_FOUND = 0, /* Interface not found */
-  IF2IP_AF_NOT_SUPPORTED = 1, /* Int. exists but has no address for this af */
-  IF2IP_FOUND = 2 /* The address has been stored in "buf" */
-} if2ip_result_t;
+/*
+ * Definition of pollfd struct and constants for platforms lacking them.
+ */
 
-if2ip_result_t Curl_if2ip(int af,
-#ifdef USE_IPV6
-                          unsigned int remote_scope,
-                          unsigned int local_scope_id,
-#endif
-                          const char *interf,
-                          char *buf, size_t buf_size);
+#if !defined(HAVE_SYS_POLL_H) && \
+    !defined(HAVE_POLL_H) && \
+    !defined(POLLIN)
 
-#ifdef __INTERIX
+#define POLLIN      0x01
+#define POLLPRI     0x02
+#define POLLOUT     0x04
+#define POLLERR     0x08
+#define POLLHUP     0x10
+#define POLLNVAL    0x20
 
-/* Nedelcho Stanev's work-around for SFU 3.0 */
-struct ifreq {
-#define IFNAMSIZ 16
-#define IFHWADDRLEN 6
-  union {
-    char ifrn_name[IFNAMSIZ]; /* if name, e.g. "en0" */
-  } ifr_ifrn;
-
- union {
-   struct sockaddr ifru_addr;
-   struct sockaddr ifru_broadaddr;
-   struct sockaddr ifru_netmask;
-   struct sockaddr ifru_hwaddr;
-   short ifru_flags;
-   int ifru_metric;
-   int ifru_mtu;
- } ifr_ifru;
+struct pollfd
+{
+    curl_socket_t fd;
+    short   events;
+    short   revents;
 };
 
-/* This define was added by Daniel to avoid an extra #ifdef INTERIX in the
-   C code. */
+#endif
 
-#define ifr_name ifr_ifrn.ifrn_name /* interface name */
-#define ifr_addr ifr_ifru.ifru_addr /* address */
-#define ifr_broadaddr ifr_ifru.ifru_broadaddr /* broadcast address */
-#define ifr_netmask ifr_ifru.ifru_netmask /* interface net mask */
-#define ifr_flags ifr_ifru.ifru_flags /* flags */
-#define ifr_hwaddr ifr_ifru.ifru_hwaddr /* MAC address */
-#define ifr_metric ifr_ifru.ifru_metric /* metric */
-#define ifr_mtu ifr_ifru.ifru_mtu /* mtu */
+#ifndef POLLRDNORM
+#define POLLRDNORM POLLIN
+#endif
 
-#define SIOCGIFADDR _IOW('s', 102, struct ifreq) /* Get if addr */
+#ifndef POLLWRNORM
+#define POLLWRNORM POLLOUT
+#endif
 
-#endif /* __INTERIX */
+#ifndef POLLRDBAND
+#define POLLRDBAND POLLPRI
+#endif
 
-#endif /* HEADER_CURL_IF2IP_H */
+/* there are three CSELECT defines that are defined in the public header that
+   are exposed to users, but this *IN2 bit is only ever used internally and
+   therefore defined here */
+#define CURL_CSELECT_IN2 (CURL_CSELECT_ERR << 1)
+
+int Curl_socket_check(curl_socket_t readfd, curl_socket_t readfd2,
+                      curl_socket_t writefd,
+                      timediff_t timeout_ms);
+#define SOCKET_READABLE(x,z) \
+  Curl_socket_check(x, CURL_SOCKET_BAD, CURL_SOCKET_BAD, z)
+#define SOCKET_WRITABLE(x,z) \
+  Curl_socket_check(CURL_SOCKET_BAD, CURL_SOCKET_BAD, x, z)
+
+int Curl_poll(struct pollfd ufds[], unsigned int nfds, timediff_t timeout_ms);
+int Curl_wait_ms(timediff_t timeout_ms);
+
+/*
+   With Winsock the valid range is [0..INVALID_SOCKET-1] according to
+   https://docs.microsoft.com/en-us/windows/win32/winsock/socket-data-type-2
+*/
+#ifdef USE_WINSOCK
+#define VALID_SOCK(s) ((s) < INVALID_SOCKET)
+#define FDSET_SOCK(x) 1
+#define VERIFY_SOCK(x) do { \
+  if(!VALID_SOCK(x)) { \
+    SET_SOCKERRNO(WSAEINVAL); \
+    return -1; \
+  } \
+} while(0)
+#else
+#define VALID_SOCK(s) ((s) >= 0)
+
+/* If the socket is small enough to get set or read from an fdset */
+#define FDSET_SOCK(s) ((s) < FD_SETSIZE)
+
+#define VERIFY_SOCK(x) do {                     \
+    if(!VALID_SOCK(x) || !FDSET_SOCK(x)) {      \
+      SET_SOCKERRNO(EINVAL);                    \
+      return -1;                                \
+    }                                           \
+  } while(0)
+#endif
+
+struct curl_pollfds {
+  struct pollfd *pfds;
+  unsigned int n;
+  unsigned int count;
+  BIT(allocated_pfds);
+};
+
+void Curl_pollfds_init(struct curl_pollfds *cpfds,
+                       struct pollfd *static_pfds,
+                       unsigned int static_count);
+
+void Curl_pollfds_cleanup(struct curl_pollfds *cpfds);
+
+CURLcode Curl_pollfds_add_ps(struct curl_pollfds *cpfds,
+                             struct easy_pollset *ps);
+
+CURLcode Curl_pollfds_add_sock(struct curl_pollfds *cpfds,
+                               curl_socket_t sock, short events);
+
+struct curl_waitfds {
+  struct curl_waitfd *wfds;
+  unsigned int n;
+  unsigned int count;
+};
+
+void Curl_waitfds_init(struct curl_waitfds *cwfds,
+                       struct curl_waitfd *static_wfds,
+                       unsigned int static_count);
+
+CURLcode Curl_waitfds_add_ps(struct curl_waitfds *cwfds,
+                             struct easy_pollset *ps);
+
+
+#endif /* HEADER_CURL_SELECT_H */

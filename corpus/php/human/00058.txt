@@ -10,150 +10,147 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Downloader;
 
-use Composer\Downloader\HgDownloader;
+namespace Composer\Test\Command;
+
 use Composer\Test\TestCase;
-use Composer\Util\Filesystem;
+use Composer\Util\Platform;
 
-class HgDownloaderTest extends TestCase
+class ValidateCommandTest extends TestCase
 {
-    /** @var string */
-    private $workingDir;
-
-    protected function setUp(): void
-    {
-        $this->workingDir = self::getUniqueTmpDirectory();
-    }
-
-    protected function tearDown(): void
-    {
-        parent::tearDown();
-        if (is_dir($this->workingDir)) {
-            $fs = new Filesystem;
-            $fs->removeDirectory($this->workingDir);
-        }
-    }
-
     /**
-     * @param \Composer\IO\IOInterface $io
-     * @param \Composer\Config $config
-     * @param \Composer\Test\Mock\ProcessExecutorMock $executor
-     * @param \Composer\Util\Filesystem $filesystem
+     * @dataProvider provideValidateTests
+     * @param array<mixed> $composerJson
+     * @param array<mixed> $command
      */
-    protected function getDownloaderMock(?\Composer\IO\IOInterface $io = null, ?\Composer\Config $config = null, ?\Composer\Test\Mock\ProcessExecutorMock $executor = null, ?Filesystem $filesystem = null): HgDownloader
+    public function testValidate(array $composerJson, array $command, string $expected): void
     {
-        $io = $io ?: $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
-        $config = $config ?: $this->getMockBuilder('Composer\Config')->getMock();
-        $executor = $executor ?: $this->getProcessExecutorMock();
-        $filesystem = $filesystem ?: $this->getMockBuilder('Composer\Util\Filesystem')->getMock();
+        $this->initTempComposer($composerJson);
 
-        return new HgDownloader($io, $config, $executor, $filesystem);
+        $appTester = $this->getApplicationTester();
+        $appTester->run(array_merge(['command' => 'validate'], $command));
+
+        self::assertSame(trim($expected), trim($appTester->getDisplay(true)));
     }
 
-    public function testDownloadForPackageWithoutSourceReference(): void
+    public function testValidateOnFileIssues(): void
     {
-        $packageMock = $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
-        $packageMock->expects($this->once())
-            ->method('getSourceReference')
-            ->will($this->returnValue(null));
+        $directory = $this->initTempComposer(self::MINIMAL_VALID_CONFIGURATION);
+        unlink($directory.'/composer.json');
 
-        self::expectException('InvalidArgumentException');
+        $appTester = $this->getApplicationTester();
+        $appTester->run(['command' => 'validate']);
+        $expected = './composer.json not found.';
 
-        $downloader = $this->getDownloaderMock();
-        $downloader->install($packageMock, '/path');
+        self::assertSame($expected, trim($appTester->getDisplay(true)));
     }
 
-    public function testDownload(): void
+    public function testWithComposerLock(): void
     {
-        $packageMock = $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
-        $packageMock->expects($this->any())
-            ->method('getSourceReference')
-            ->will($this->returnValue('ref'));
-        $packageMock->expects($this->once())
-            ->method('getSourceUrls')
-            ->will($this->returnValue(['https://mercurial.dev/l3l0/composer']));
+        $this->initTempComposer(self::MINIMAL_VALID_CONFIGURATION);
+        $this->createComposerLock();
 
-        $process = $this->getProcessExecutorMock();
-        $process->expects([
-            self::getCmd('hg clone -- \'https://mercurial.dev/l3l0/composer\' \''.$this->workingDir.'\''),
-            self::getCmd('hg up -- \'ref\''),
-        ], true);
+        $appTester = $this->getApplicationTester();
+        $appTester->run(['command' => 'validate']);
+        $expected = <<<OUTPUT
+<warning>Composer could not detect the root package (test/suite) version, defaulting to '1.0.0'. See https://getcomposer.org/root-version</warning>
+<warning>Composer could not detect the root package (test/suite) version, defaulting to '1.0.0'. See https://getcomposer.org/root-version</warning>
+./composer.json is valid but your composer.lock has some errors
+# Lock file errors
+- Required package "root/req" is not present in the lock file.
+This usually happens when composer files are incorrectly merged or the composer.json file is manually edited.
+Read more about correctly resolving merge conflicts https://getcomposer.org/doc/articles/resolving-merge-conflicts.md
+and prefer using the "require" command over editing the composer.json file directly https://getcomposer.org/doc/03-cli.md#require-r
+OUTPUT;
 
-        $downloader = $this->getDownloaderMock(null, null, $process);
-        $downloader->install($packageMock, $this->workingDir);
+        self::assertSame(trim($expected), trim($appTester->getDisplay(true)));
     }
 
-    public function testUpdateforPackageWithoutSourceReference(): void
+    public function testUnaccessibleFile(): void
     {
-        $initialPackageMock = $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
-        $sourcePackageMock = $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
-        $sourcePackageMock->expects($this->once())
-            ->method('getSourceReference')
-            ->will($this->returnValue(null));
+        if (Platform::isWindows()) {
+            $this->markTestSkipped('Does not run on windows');
+        }
 
-        self::expectException('InvalidArgumentException');
+        $directory = $this->initTempComposer(self::MINIMAL_VALID_CONFIGURATION);
+        chmod($directory.'/composer.json', 0200);
 
-        $downloader = $this->getDownloaderMock();
-        $downloader->prepare('update', $sourcePackageMock, '/path', $initialPackageMock);
-        $downloader->update($initialPackageMock, $sourcePackageMock, '/path');
-        $downloader->cleanup('update', $sourcePackageMock, '/path', $initialPackageMock);
+        $appTester = $this->getApplicationTester();
+        $appTester->run(['command' => 'validate']);
+        $expected = './composer.json is not readable.';
+
+        self::assertSame($expected, trim($appTester->getDisplay(true)));
+        self::assertSame(3, $appTester->getStatusCode());
+        chmod($directory.'/composer.json', 0700);
     }
 
-    public function testUpdate(): void
+    private const MINIMAL_VALID_CONFIGURATION = [
+        'name' => 'test/suite',
+        'type' => 'library',
+        'description' => 'A generical test suite',
+        'license' => 'MIT',
+        'repositories' => [
+            'packages' => [
+                'type' => 'package',
+                'package' => [
+                    ['name' => 'root/req', 'version' => '1.0.0', 'require' => ['dep/pkg' => '^1']],
+                    ['name' => 'dep/pkg', 'version' => '1.0.0'],
+                    ['name' => 'dep/pkg', 'version' => '1.0.1'],
+                    ['name' => 'dep/pkg', 'version' => '1.0.2'],
+                ],
+            ],
+        ],
+        'require' => [
+            'root/req' => '1.*',
+        ],
+    ];
+
+    public static function provideValidateTests(): \Generator
     {
-        $fs = new Filesystem;
-        $fs->ensureDirectoryExists($this->workingDir.'/.hg');
-        $packageMock = $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
-        $packageMock->expects($this->any())
-            ->method('getSourceReference')
-            ->will($this->returnValue('ref'));
-        $packageMock->expects($this->any())
-            ->method('getVersion')
-            ->will($this->returnValue('1.0.0.0'));
-        $packageMock->expects($this->any())
-            ->method('getSourceUrls')
-            ->will($this->returnValue(['https://github.com/l3l0/composer']));
 
-        $process = $this->getProcessExecutorMock();
-        $process->expects([
-            self::getCmd('hg st'),
-            self::getCmd("hg pull -- 'https://github.com/l3l0/composer' && hg up -- 'ref'"),
-        ], true);
+        yield 'validation passing' => [
+            self::MINIMAL_VALID_CONFIGURATION,
+            [],
+            <<<OUTPUT
+<warning>Composer could not detect the root package (test/suite) version, defaulting to '1.0.0'. See https://getcomposer.org/root-version</warning>
+<warning>Composer could not detect the root package (test/suite) version, defaulting to '1.0.0'. See https://getcomposer.org/root-version</warning>
+./composer.json is valid
+OUTPUT
+        ];
 
-        $downloader = $this->getDownloaderMock(null, null, $process);
-        $downloader->prepare('update', $packageMock, $this->workingDir, $packageMock);
-        $downloader->update($packageMock, $packageMock, $this->workingDir);
-        $downloader->cleanup('update', $packageMock, $this->workingDir, $packageMock);
-    }
+        $publishDataStripped= array_diff_key(
+            self::MINIMAL_VALID_CONFIGURATION,
+            ['name' => true, 'type' => true, 'description' => true, 'license' => true]
+        );
 
-    public function testRemove(): void
-    {
-        $fs = new Filesystem;
-        $fs->ensureDirectoryExists($this->workingDir.'/.hg');
-        $packageMock = $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
+        yield 'passing but with warnings' => [
+            $publishDataStripped,
+            [],
+            <<<OUTPUT
+./composer.json is valid for simple usage with Composer but has
+strict errors that make it unable to be published as a package
+<warning>See https://getcomposer.org/doc/04-schema.md for details on the schema</warning>
+# Publish errors
+- name : The property name is required
+- description : The property description is required
+<warning># General warnings</warning>
+- No license specified, it is recommended to do so. For closed-source software you may use "proprietary" as license.
+OUTPUT
+        ];
 
-        $process = $this->getProcessExecutorMock();
-        $process->expects([
-            self::getCmd('hg st'),
-        ], true);
-
-        $filesystem = $this->getMockBuilder('Composer\Util\Filesystem')->getMock();
-        $filesystem->expects($this->once())
-            ->method('removeDirectoryAsync')
-            ->with($this->equalTo($this->workingDir))
-            ->will($this->returnValue(\React\Promise\resolve(true)));
-
-        $downloader = $this->getDownloaderMock(null, null, $process, $filesystem);
-        $downloader->prepare('uninstall', $packageMock, $this->workingDir);
-        $downloader->remove($packageMock, $this->workingDir);
-        $downloader->cleanup('uninstall', $packageMock, $this->workingDir);
-    }
-
-    public function testGetInstallationSource(): void
-    {
-        $downloader = $this->getDownloaderMock(null);
-
-        self::assertEquals('source', $downloader->getInstallationSource());
+        yield 'passing without publish-check' => [
+            $publishDataStripped,
+            [ '--no-check-publish' => true],
+            <<<OUTPUT
+./composer.json is valid for simple usage with Composer but has
+strict errors that make it unable to be published as a package
+<warning>See https://getcomposer.org/doc/04-schema.md for details on the schema</warning>
+<warning># General warnings</warning>
+- No license specified, it is recommended to do so. For closed-source software you may use "proprietary" as license.
+<warning># Publish warnings</warning>
+- name : The property name is required
+- description : The property description is required
+OUTPUT
+        ];
     }
 }

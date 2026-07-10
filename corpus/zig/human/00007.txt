@@ -1,511 +1,504 @@
 const std = @import("std");
-const Ast = std.zig.Ast;
-const log = std.log.scoped(.zls_references);
+const builtin = @import("builtin");
 
-const Server = @import("../Server.zig");
-const DocumentStore = @import("../DocumentStore.zig");
-const Analyser = @import("../analysis.zig");
-const types = @import("../lsp.zig");
-const offsets = @import("../offsets.zig");
-const ast = @import("../ast.zig");
-const tracy = @import("tracy");
+const zls = @import("zls");
 
-fn labelReferences(
-    allocator: std.mem.Allocator,
-    decl: Analyser.DeclWithHandle,
-    encoding: offsets.Encoding,
-    include_decl: bool,
-) error{OutOfMemory}!std.ArrayListUnmanaged(types.Location) {
-    const tracy_zone = tracy.trace(@src());
-    defer tracy_zone.end();
+const offsets = zls.offsets;
 
-    std.debug.assert(decl.decl == .label); // use `symbolReferences` instead
-    const handle = decl.handle;
-    const tree = handle.tree;
-    const token_tags = tree.tokens.items(.tag);
+const ErrorBuilder = @This();
 
-    // Find while / for / block from label -> iterate over children nodes, find break and continues, change their labels if they match.
-    // This case can be implemented just by scanning tokens.
-    const first_tok = decl.decl.label.identifier;
-    const last_tok = ast.lastToken(tree, decl.decl.label.block);
+allocator: std.mem.Allocator,
+files: std.StringArrayHashMapUnmanaged(File) = .{},
+message_count: usize = 0,
+/// similar to `git diff --unified`
+/// show error messages with n lines of context.
+/// null will show the whole file
+unified: ?usize = 3,
+file_name_visibility: enum {
+    never,
+    multi_file,
+    always,
+} = .multi_file,
 
-    var locations = std.ArrayListUnmanaged(types.Location){};
-    errdefer locations.deinit(allocator);
-
-    if (include_decl) {
-        // The first token is always going to be the label
-        try locations.append(allocator, .{
-            .uri = handle.uri,
-            .range = offsets.tokenToRange(handle.tree, first_tok, encoding),
-        });
-    }
-
-    var curr_tok = first_tok + 1;
-    while (curr_tok < last_tok - 2) : (curr_tok += 1) {
-        const curr_id = token_tags[curr_tok];
-
-        if (curr_id != .keyword_break and curr_id != .keyword_continue) continue;
-        if (token_tags[curr_tok + 1] != .colon) continue;
-        if (token_tags[curr_tok + 2] != .identifier) continue;
-
-        if (!std.mem.eql(u8, tree.tokenSlice(curr_tok + 2), tree.tokenSlice(first_tok))) continue;
-
-        try locations.append(allocator, .{
-            .uri = handle.uri,
-            .range = offsets.tokenToRange(handle.tree, curr_tok + 2, encoding),
-        });
-    }
-
-    return locations;
+pub fn init(allocator: std.mem.Allocator) ErrorBuilder {
+    return ErrorBuilder{ .allocator = allocator };
 }
 
-const Builder = struct {
-    allocator: std.mem.Allocator,
-    locations: std.ArrayListUnmanaged(types.Location) = .{},
-    /// this is the declaration we are searching for
-    decl_handle: Analyser.DeclWithHandle,
-    analyser: *Analyser,
-    encoding: offsets.Encoding,
-
-    const Context = struct {
-        builder: *Builder,
-        handle: *DocumentStore.Handle,
-    };
-
-    fn deinit(self: *Builder) void {
-        self.locations.deinit(self.allocator);
-    }
-
-    fn add(self: *Builder, handle: *DocumentStore.Handle, token_index: Ast.TokenIndex) error{OutOfMemory}!void {
-        try self.locations.append(self.allocator, .{
-            .uri = handle.uri,
-            .range = offsets.tokenToRange(handle.tree, token_index, self.encoding),
-        });
-    }
-
-    fn collectReferences(self: *Builder, handle: *DocumentStore.Handle, node: Ast.Node.Index) error{OutOfMemory}!void {
-        const context = Context{
-            .builder = self,
-            .handle = handle,
-        };
-        try referenceNode(&context, handle.tree, node);
-        try ast.iterateChildrenRecursive(handle.tree, node, &context, error{OutOfMemory}, referenceNode);
-    }
-
-    fn referenceNode(self: *const Context, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
-        const builder = self.builder;
-        const handle = self.handle;
-
-        const node_tags = tree.nodes.items(.tag);
-        const datas = tree.nodes.items(.data);
-        const token_tags = tree.tokens.items(.tag);
-        const starts = tree.tokens.items(.start);
-
-        switch (node_tags[node]) {
-            .identifier,
-            .test_decl,
-            => {
-                const identifier_token = Analyser.getDeclNameToken(tree, node) orelse return;
-                if (token_tags[identifier_token] != .identifier) return;
-
-                const child = (try builder.analyser.lookupSymbolGlobal(
-                    handle,
-                    offsets.tokenToSlice(tree, identifier_token),
-                    starts[identifier_token],
-                )) orelse return;
-
-                if (builder.decl_handle.eql(child)) {
-                    try builder.add(handle, identifier_token);
-                }
-            },
-            .field_access => {
-                const lhs = try builder.analyser.resolveTypeOfNode(.{ .node = datas[node].lhs, .handle = handle }) orelse return;
-                const deref_lhs = try builder.analyser.resolveDerefType(lhs) orelse lhs;
-
-                const symbol = offsets.tokenToSlice(tree, datas[node].rhs);
-                const child = (try deref_lhs.lookupSymbol(builder.analyser, symbol)) orelse return;
-
-                if (builder.decl_handle.eql(child)) {
-                    try builder.add(handle, datas[node].rhs);
-                }
-            },
-            .struct_init_one,
-            .struct_init_one_comma,
-            .struct_init,
-            .struct_init_comma,
-            .struct_init_dot,
-            .struct_init_dot_comma,
-            .struct_init_dot_two,
-            .struct_init_dot_two_comma,
-            => {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const struct_init = tree.fullStructInit(&buffer, node).?;
-                for (struct_init.ast.fields) |value_node| { // the node of `value` in `.name = value`
-                    const name_token = tree.firstToken(value_node) - 2; // math our way two token indexes back to get the `name`
-                    const name_loc = offsets.tokenToLoc(tree, name_token);
-                    const name = offsets.locToSlice(tree.source, name_loc);
-
-                    var nodes = [_]Ast.Node.Index{datas[node].lhs};
-                    const lookup = try builder.analyser.lookupSymbolFieldInit(handle, name, &nodes) orelse continue;
-
-                    if (builder.decl_handle.eql(lookup)) {
-                        try builder.add(handle, name_token);
-                    }
-                }
-            },
-            else => {},
+pub fn deinit(builder: *ErrorBuilder) void {
+    for (builder.files.values()) |*file| {
+        for (file.messages.items) |item| {
+            builder.allocator.free(item.message);
         }
+        file.messages.deinit(builder.allocator);
     }
-};
+    builder.files.deinit(builder.allocator);
+    builder.* = undefined;
+}
 
-fn gatherReferences(
-    allocator: std.mem.Allocator,
-    analyser: *Analyser,
-    curr_handle: *DocumentStore.Handle,
-    skip_std_references: bool,
-    include_decl: bool,
-    builder: anytype,
-    handle_behavior: enum { get, get_or_load },
-) !void {
-    var dependencies = std.StringArrayHashMapUnmanaged(void){};
-    defer {
-        for (dependencies.keys()) |uri| {
-            allocator.free(uri);
+/// assumes `name` and `source` outlives the `ErrorBuilder`
+pub fn addFile(builder: *ErrorBuilder, name: []const u8, source: []const u8) error{OutOfMemory}!void {
+    const gop = try builder.files.getOrPutValue(builder.allocator, name, .{ .source = source });
+    assertFmt(!gop.found_existing, "file '{s}' already exists", .{name});
+}
+
+/// preserves insertion order
+pub fn removeFile(builder: *ErrorBuilder, name: []const u8) void {
+    const found = builder.files.fetchOrderedRemove(name);
+    assertFmt(found != null, "file '{s}' doesn't exist", .{name});
+    builder.message_count -= found.?.value.messages.items.len;
+}
+
+pub fn msgAtLoc(
+    builder: *ErrorBuilder,
+    comptime fmt: []const u8,
+    file_name: []const u8,
+    loc: offsets.Loc,
+    level: std.log.Level,
+    args: anytype,
+) error{OutOfMemory}!void {
+    const message = try std.fmt.allocPrint(builder.allocator, fmt, args);
+    errdefer builder.allocator.free(message);
+    try builder.appendMessage(message, file_name, loc, level);
+}
+
+pub fn msgAtIndex(
+    builder: *ErrorBuilder,
+    comptime fmt: []const u8,
+    file_name: []const u8,
+    source_index: usize,
+    level: std.log.Level,
+    args: anytype,
+) error{OutOfMemory}!void {
+    return msgAtLoc(builder, fmt, file_name, .{ .start = source_index, .end = source_index }, level, args);
+}
+
+pub fn hasMessages(builder: ErrorBuilder) bool {
+    return builder.message_count != 0;
+}
+
+/// remove every message from all files
+pub fn clearMessages(builder: *ErrorBuilder) void {
+    for (builder.files.values()) |*file| {
+        for (file.messages.items) |item| {
+            builder.allocator.free(item.message);
         }
-        dependencies.deinit(allocator);
+        file.messages.clearAndFree(builder.allocator);
     }
+    builder.message_count = 0;
+}
 
-    for (analyser.store.handles.values()) |handle| {
-        if (skip_std_references and std.mem.indexOf(u8, handle.uri, "std") != null) {
-            if (!include_decl or !std.mem.eql(u8, handle.uri, curr_handle.uri))
-                continue;
+/// remove all files that contain no messages
+pub fn removeUnusedFiles(builder: *ErrorBuilder) void {
+    var i: usize = 0;
+    while (i < builder.files.count()) : (i += 1) {
+        const file: *File = &builder.files.values()[i];
+        if (file.messages.items.len == 0) {
+            file.messages.deinit(builder.allocator); // there may still be capacity remaining
+            builder.files.swapRemoveAt(i);
+        } else {
+            i += 1;
         }
-
-        var handle_dependencies = std.ArrayListUnmanaged([]const u8){};
-        defer handle_dependencies.deinit(allocator);
-        try analyser.store.collectDependencies(allocator, handle, &handle_dependencies);
-
-        try dependencies.ensureUnusedCapacity(allocator, handle_dependencies.items.len);
-        for (handle_dependencies.items) |uri| {
-            const gop = dependencies.getOrPutAssumeCapacity(uri);
-            if (gop.found_existing) {
-                allocator.free(uri);
-            }
-        }
-    }
-
-    for (dependencies.keys()) |uri| {
-        if (std.mem.eql(u8, uri, curr_handle.uri)) continue;
-        const handle = switch (handle_behavior) {
-            .get => analyser.store.getHandle(uri),
-            .get_or_load => analyser.store.getOrLoadHandle(uri),
-        } orelse continue;
-
-        try builder.collectReferences(handle, 0);
     }
 }
 
-fn symbolReferences(
-    allocator: std.mem.Allocator,
-    analyser: *Analyser,
-    decl_handle: Analyser.DeclWithHandle,
-    encoding: offsets.Encoding,
-    /// add `decl_handle` as a references
-    include_decl: bool,
-    /// exclude references from the std library
-    skip_std_references: bool,
-    /// search other files for references
-    workspace: bool,
-) error{OutOfMemory}!std.ArrayListUnmanaged(types.Location) {
-    const tracy_zone = tracy.trace(@src());
-    defer tracy_zone.end();
+pub const FormatContext = struct {
+    builder: *const ErrorBuilder,
+    tty_config: ?std.io.tty.Config = null,
+};
 
-    std.debug.assert(decl_handle.decl != .label); // use `labelReferences` instead
-
-    var builder = Builder{
-        .allocator = allocator,
-        .analyser = analyser,
-        .decl_handle = decl_handle,
-        .encoding = encoding,
-    };
-    errdefer builder.deinit();
-
-    const curr_handle = decl_handle.handle;
-    if (include_decl) try builder.add(curr_handle, decl_handle.nameToken());
-
-    switch (decl_handle.decl) {
-        .ast_node => {
-            try builder.collectReferences(curr_handle, 0);
-            if (workspace) {
-                try gatherReferences(allocator, analyser, curr_handle, skip_std_references, include_decl, &builder, .get);
-            }
-        },
-        .optional_payload,
-        .error_union_payload,
-        .error_union_error,
-        .for_loop_payload,
-        .assign_destructure,
-        .switch_payload,
-        => {
-            try builder.collectReferences(curr_handle, 0);
-        },
-        .function_parameter => |payload| try builder.collectReferences(curr_handle, payload.func),
-        .label => unreachable, // handled separately by labelReferences
-        .error_token => {},
-    }
-
-    return builder.locations;
+pub fn format(
+    builder: *const ErrorBuilder,
+    comptime fmt: []const u8,
+    options: std.fmt.FormatOptions,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    _ = options;
+    if (fmt.len != 0) std.fmt.invalidFmtError(fmt, builder.*);
+    try write(.{ .builder = builder }, writer);
 }
 
-pub const Callsite = struct {
-    uri: []const u8,
-    call_node: Ast.Node.Index,
-};
-
-const CallBuilder = struct {
-    allocator: std.mem.Allocator,
-    callsites: std.ArrayListUnmanaged(Callsite) = .{},
-    /// this is the declaration we are searching for
-    decl_handle: Analyser.DeclWithHandle,
-    analyser: *Analyser,
-
-    const Context = struct {
-        builder: *CallBuilder,
-        handle: *DocumentStore.Handle,
-    };
-
-    fn deinit(self: *CallBuilder) void {
-        self.callsites.deinit(self.allocator);
-    }
-
-    fn add(self: *CallBuilder, handle: *DocumentStore.Handle, call_node: Ast.Node.Index) error{OutOfMemory}!void {
-        try self.callsites.append(self.allocator, .{
-            .uri = handle.uri,
-            .call_node = call_node,
-        });
-    }
-
-    fn collectReferences(self: *CallBuilder, handle: *DocumentStore.Handle, node: Ast.Node.Index) error{OutOfMemory}!void {
-        const context = Context{
-            .builder = self,
-            .handle = handle,
-        };
-        try ast.iterateChildrenRecursive(handle.tree, node, &context, error{OutOfMemory}, referenceNode);
-    }
-
-    fn referenceNode(self: *const Context, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
-        const builder = self.builder;
-        const handle = self.handle;
-
-        const node_tags = tree.nodes.items(.tag);
-        const datas = tree.nodes.items(.data);
-        const main_tokens = tree.nodes.items(.main_token);
-        // const token_tags = tree.tokens.items(.tag);
-        const starts = tree.tokens.items(.start);
-
-        switch (node_tags[node]) {
-            .call,
-            .call_comma,
-            .async_call,
-            .async_call_comma,
-            .call_one,
-            .call_one_comma,
-            .async_call_one,
-            .async_call_one_comma,
-            => {
-                var buf: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&buf, node).?;
-
-                const called_node = call.ast.fn_expr;
-
-                switch (node_tags[called_node]) {
-                    .identifier => {
-                        const identifier_token = main_tokens[called_node];
-
-                        const child = (try builder.analyser.lookupSymbolGlobal(
-                            handle,
-                            offsets.tokenToSlice(tree, identifier_token),
-                            starts[identifier_token],
-                        )) orelse return;
-
-                        if (builder.decl_handle.eql(child)) {
-                            try builder.add(handle, node);
-                        }
-                    },
-                    .field_access => {
-                        const lhs = (try builder.analyser.resolveTypeOfNode(.{ .node = datas[called_node].lhs, .handle = handle })) orelse return;
-                        const deref_lhs = try builder.analyser.resolveDerefType(lhs) orelse lhs;
-
-                        const symbol = offsets.tokenToSlice(tree, datas[called_node].rhs);
-                        const child = (try deref_lhs.lookupSymbol(builder.analyser, symbol)) orelse return;
-
-                        if (builder.decl_handle.eql(child)) {
-                            try builder.add(handle, node);
-                        }
-                    },
-                    else => {},
-                }
-            },
-            else => {},
-        }
-    }
-};
-
-pub fn callsiteReferences(
-    allocator: std.mem.Allocator,
-    analyser: *Analyser,
-    decl_handle: Analyser.DeclWithHandle,
-    /// add `decl_handle` as a references
-    include_decl: bool,
-    /// exclude references from the std library
-    skip_std_references: bool,
-    /// search other files for references
-    workspace: bool,
-) error{OutOfMemory}!std.ArrayListUnmanaged(Callsite) {
-    const tracy_zone = tracy.trace(@src());
-    defer tracy_zone.end();
-
-    std.debug.assert(decl_handle.decl == .ast_node);
-
-    var builder = CallBuilder{
-        .allocator = allocator,
-        .analyser = analyser,
-        .decl_handle = decl_handle,
-    };
-    errdefer builder.deinit();
-
-    const curr_handle = decl_handle.handle;
-    if (include_decl) try builder.add(curr_handle, decl_handle.nameToken());
-
-    try builder.collectReferences(curr_handle, 0);
-
-    if (!workspace) return builder.callsites;
-
-    try gatherReferences(allocator, analyser, curr_handle, skip_std_references, include_decl, &builder, .get_or_load);
-
-    return builder.callsites;
+pub fn formatContext(
+    context: FormatContext,
+    comptime fmt: []const u8,
+    options: std.fmt.FormatOptions,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    _ = options;
+    if (fmt.len != 0) std.fmt.invalidFmtError(fmt, context.builder.*);
+    try write(context, writer);
 }
 
-pub const GeneralReferencesRequest = union(enum) {
-    rename: types.RenameParams,
-    references: types.ReferenceParams,
-    highlight: types.DocumentHighlightParams,
+pub fn fmtContext(builder: *const ErrorBuilder, tty_config: std.io.tty.Config) std.fmt.Formatter(formatContext) {
+    return .{ .data = .{
+        .builder = builder,
+        .tty_config = tty_config,
+    } };
+}
 
-    fn uri(self: @This()) []const u8 {
-        return switch (self) {
-            .rename => |rename| rename.textDocument.uri,
-            .references => |ref| ref.textDocument.uri,
-            .highlight => |highlight| highlight.textDocument.uri,
-        };
+pub fn writeDebug(builder: *const ErrorBuilder) void {
+    const stderr = std.io.getStdErr();
+    const tty_config = std.io.tty.detectConfig(stderr);
+    // does zig trim the output or why is this needed?
+    stderr.writeAll(" ") catch return;
+    std.debug.print("\n{}\n", .{builder.fmtContext(tty_config)});
+}
+
+//
+//
+//
+
+fn assertFmt(ok: bool, comptime fmt: []const u8, args: anytype) void {
+    if (builtin.mode == .Debug or builtin.is_test) {
+        if (!ok) std.debug.panic(fmt, args);
+    } else {
+        std.debug.assert(ok);
     }
+}
 
-    fn position(self: @This()) types.Position {
-        return switch (self) {
-            .rename => |rename| rename.position,
-            .references => |ref| ref.position,
-            .highlight => |highlight| highlight.position,
-        };
-    }
-};
-
-pub const GeneralReferencesResponse = union {
-    rename: types.WorkspaceEdit,
-    references: []types.Location,
-    highlight: []types.DocumentHighlight,
-};
-
-pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: GeneralReferencesRequest) Server.Error!?GeneralReferencesResponse {
-    const tracy_zone = tracy.trace(@src());
-    defer tracy_zone.end();
-
-    const handle = server.document_store.getHandle(request.uri()) orelse return null;
-
-    if (request.position().character <= 0) return null;
-
-    const source_index = offsets.positionToIndex(handle.tree.source, request.position(), server.offset_encoding);
-    const name_loc = Analyser.identifierLocFromPosition(source_index, handle) orelse return null;
-    const name = offsets.locToSlice(handle.tree.source, name_loc);
-    const pos_context = try Analyser.getPositionContext(server.allocator, handle.tree.source, source_index, true);
-
-    var analyser = Analyser.init(
-        server.allocator,
-        &server.document_store,
-        &server.ip,
-        handle,
-        server.config.dangerous_comptime_experiments_do_not_enable,
+fn appendMessage(
+    builder: *ErrorBuilder,
+    message: []const u8,
+    file_name: []const u8,
+    loc: offsets.Loc,
+    level: std.log.Level,
+) error{OutOfMemory}!void {
+    assertFmt(loc.start <= loc.end, "invalid source location [{d}..{d}]", .{ loc.start, loc.end });
+    const file: *File = blk: {
+        const file = builder.files.getPtr(file_name);
+        assertFmt(file != null, "file '{s}' doesn't exist", .{file_name});
+        break :blk file.?;
+    };
+    assertFmt(
+        loc.end <= file.source.len,
+        "source location [{d}..{d}] is outside file source (len: {d})",
+        .{ loc.start, loc.end, file.source.len },
     );
-    defer analyser.deinit();
+    assertFmt(
+        std.mem.count(u8, offsets.locToSlice(file.source, loc), "\n") == 0,
+        "source location [{d}..{d}] must span a single line",
+        .{ loc.start, loc.end },
+    );
 
-    // TODO: Make this work with branching types
-    const decl = switch (pos_context) {
-        .var_access => try analyser.getSymbolGlobal(source_index, handle, name),
-        .field_access => |loc| z: {
-            const held_loc = offsets.locMerge(loc, name_loc);
-            const a = try analyser.getSymbolFieldAccesses(arena, handle, source_index, held_loc, name);
-            if (a) |b| {
-                if (b.len != 0) break :z b[0];
-            }
+    const Context = struct {
+        items: []MsgItem,
+        source: []const u8,
 
-            break :z null;
-        },
-        .label => try Analyser.getLabelGlobal(source_index, handle, name),
-        .enum_literal => try analyser.getSymbolEnumLiteral(arena, handle, source_index, name),
-        else => null,
-    } orelse return null;
+        pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+            return MsgItem.lessThan(ctx.source, ctx.items[a], ctx.items[b]);
+        }
 
-    const include_decl = switch (request) {
-        .references => |ref| ref.context.includeDeclaration,
-        else => true,
+        pub fn swap(ctx: @This(), a: usize, b: usize) void {
+            return std.mem.swap(MsgItem, &ctx.items[a], &ctx.items[b]);
+        }
     };
 
-    const locations = if (decl.decl == .label)
-        try labelReferences(arena, decl, server.offset_encoding, include_decl)
-    else
-        try symbolReferences(
-            arena,
-            &analyser,
-            decl,
-            server.offset_encoding,
-            include_decl,
-            server.config.skip_std_references,
-            request != .highlight, // scan the entire workspace except for highlight
-        );
+    try file.messages.append(builder.allocator, .{
+        .loc = loc,
+        .level = level,
+        .message = message,
+    });
+    // the `a` parameter of this function makes no sense.
+    std.sort.insertionContext(
+        0,
+        file.messages.items.len,
+        Context{ .items = file.messages.items, .source = file.source },
+    );
+    builder.message_count += 1;
+}
 
-    switch (request) {
-        .rename => |rename| {
-            var changes = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(types.TextEdit)){};
+fn write(context: FormatContext, writer: anytype) @TypeOf(writer).Error!void {
+    const builder = context.builder;
+    for (builder.files.keys(), builder.files.values()) |file_name, file| {
+        if (file.messages.items.len == 0) continue;
 
-            for (locations.items) |loc| {
-                const gop = try changes.getOrPutValue(arena, loc.uri, .{});
-                try gop.value_ptr.append(arena, .{
-                    .range = loc.range,
-                    .newText = rename.newName,
-                });
+        std.debug.assert(std.sort.isSorted(MsgItem, file.messages.items, file.source, MsgItem.lessThan));
+
+        if (builder.file_name_visibility == .always or
+            builder.file_name_visibility == .multi_file and builder.files.count() > 1)
+        {
+            try writer.print("{s}:\n", .{file_name});
+        }
+
+        var it = MsgItemIterator{
+            .source = file.source,
+            .messages = file.messages.items,
+        };
+
+        var last_line_end: usize = 0;
+        var last_line_end_with_unified: usize = 0;
+
+        while (it.next()) |line_messages| {
+            std.debug.assert(line_messages.len > 0);
+
+            const some_line_source_index = line_messages[0].loc.start;
+            const line_loc = offsets.lineLocAtIndex(file.source, some_line_source_index);
+            defer last_line_end = line_loc.end;
+
+            const unified_loc = if (builder.unified) |n|
+                offsets.multilineLocAtIndex(file.source, some_line_source_index, n)
+            else
+                offsets.Loc{
+                    .start = 0,
+                    .end = file.source.len,
+                };
+            defer last_line_end_with_unified = unified_loc.end;
+
+            if (last_line_end_with_unified == 0) { // start
+                try writer.writeAll(file.source[unified_loc.start..line_loc.end]);
+            } else if (last_line_end_with_unified < unified_loc.start) { // no intersection
+                try writer.writeAll(file.source[last_line_end..@min(last_line_end_with_unified + 1, file.source.len)]);
+                try writer.writeAll(file.source[unified_loc.start..line_loc.end]);
+            } else { // intersection (we can merge)
+                try writer.writeAll(file.source[last_line_end..line_loc.end]);
             }
 
-            // TODO can we avoid having to move map from `changes` to `new_changes`?
-            var new_changes: types.Map(types.DocumentUri, []const types.TextEdit) = .{};
-            try new_changes.map.ensureTotalCapacity(arena, @intCast(changes.count()));
+            for (line_messages) |item| {
+                try writer.writeByte('\n');
+                for (line_loc.start..item.loc.start) |_| try writer.writeByte(' ');
+                for (item.loc.start..item.loc.end) |_| try writer.writeByte('^');
+                if (item.loc.start == item.loc.end) try writer.writeByte('^');
 
-            var changes_it = changes.iterator();
-            while (changes_it.next()) |entry| {
-                new_changes.map.putAssumeCapacityNoClobber(entry.key_ptr.*, try entry.value_ptr.toOwnedSlice(arena));
+                const level_txt: []const u8 = switch (item.level) {
+                    .err => "error",
+                    .warn => "warning",
+                    .info => "info",
+                    .debug => "debug",
+                };
+                const color: std.io.tty.Color = switch (item.level) {
+                    .err => .red,
+                    .warn => .yellow,
+                    .info => .white,
+                    .debug => .white,
+                };
+                if (context.tty_config) |tty| tty.setColor(writer, color) catch {};
+                try writer.print(" {s}: ", .{level_txt});
+                if (context.tty_config) |tty| tty.setColor(writer, .reset) catch {};
+                try writer.writeAll(item.message);
             }
+        }
 
-            return .{ .rename = .{ .changes = new_changes } };
-        },
-        .references => return .{ .references = locations.items },
-        .highlight => {
-            var highlights = try std.ArrayListUnmanaged(types.DocumentHighlight).initCapacity(arena, locations.items.len);
-            const uri = handle.uri;
-            for (locations.items) |loc| {
-                if (!std.mem.eql(u8, loc.uri, uri)) continue;
-                highlights.appendAssumeCapacity(.{
-                    .range = loc.range,
-                    .kind = .Text,
-                });
-            }
-            return .{ .highlight = highlights.items };
-        },
+        try writer.writeAll(file.source[last_line_end..last_line_end_with_unified]);
     }
+}
+
+const File = struct {
+    source: []const u8,
+    messages: std.ArrayListUnmanaged(MsgItem) = .{},
+};
+
+const MsgItem = struct {
+    loc: offsets.Loc,
+    level: std.log.Level,
+    message: []const u8,
+
+    fn lessThan(source: []const u8, lhs: MsgItem, rhs: MsgItem) bool {
+        const is_less = lhs.loc.start < rhs.loc.start;
+        const text = if (is_less) source[lhs.loc.start..rhs.loc.start] else source[rhs.loc.start..lhs.loc.start];
+
+        // report messages on the same line in reverse order
+        if (std.mem.indexOfScalar(u8, text, '\n') == null) {
+            return lhs.loc.start > rhs.loc.start;
+        }
+
+        return is_less;
+    }
+};
+
+/// iterates through MsgItem's grouped by lines
+/// assumes that `messages` is sorted
+const MsgItemIterator = struct {
+    source: []const u8,
+    messages: []const MsgItem,
+    msg_index: usize = 0,
+
+    fn next(it: *MsgItemIterator) ?[]const MsgItem {
+        std.debug.assert(it.msg_index <= it.messages.len);
+        if (it.msg_index == it.messages.len) return null;
+
+        const msg = it.messages[it.msg_index];
+        const line_loc = offsets.lineLocAtIndex(it.source, msg.loc.start);
+
+        const start = it.msg_index;
+        const end = while (it.msg_index < it.messages.len) : (it.msg_index += 1) {
+            const loc = it.messages[it.msg_index].loc;
+            if (line_loc.start <= loc.start and loc.end <= line_loc.end) continue;
+            break it.msg_index;
+        } else it.messages.len;
+
+        it.msg_index = end;
+        return it.messages[start..end];
+    }
+};
+
+//
+//
+//
+
+test ErrorBuilder {
+    var eb = ErrorBuilder.init(std.testing.allocator);
+    defer eb.deinit();
+    try std.testing.expect(!eb.hasMessages());
+
+    try eb.addFile("example.zig", "");
+    try eb.msgAtIndex("", "example.zig", 0, .info, .{});
+    try std.testing.expect(eb.hasMessages());
+
+    eb.clearMessages();
+    try std.testing.expect(!eb.hasMessages());
+    eb.removeUnusedFiles();
+    try std.testing.expectEqual(@as(usize, 0), eb.files.count());
+}
+
+test "ErrorBuilder - write" {
+    var eb = ErrorBuilder.init(std.testing.allocator);
+    defer eb.deinit();
+
+    try std.testing.expectFmt("", "{}", .{eb});
+
+    try eb.addFile("",
+        \\The missile knows where it is at all times.
+        \\It knows this because it knows where it isn't.
+        \\By subtracting where it is from where it isn't, or where it isn't from where it is
+        \\(whichever is greater), it obtains a difference, or deviation.
+        \\The guidance subsystem uses deviations to generate corrective commands to drive
+        \\the missile from a position where it is to a position where it isn't, and
+        \\arriving at a position where it wasn't, it now is.
+        \\Consequently, the position where it is, is now the position that it wasn't, and it
+        \\follows that the position that it was, is now the position that it isn't.
+        \\In the event that the position that it is in is not the position that it wasn't,
+        \\the system has acquired a variation, the variation being the difference between where
+        \\the missile is, and where it wasn't.
+        \\If variation is considered to be a significant factor, it too may be correcte by the GEA.
+        \\However, the missile must also know where it was.
+        \\The missile guidance computer scenario works as follows.
+        \\Because a variation has modified some of the information the missile has obtained,
+        \\it is not sure just where it is.
+        \\However, it is sure where it isn't, within reason, and it knows where it was.
+        \\It now subtracts where it should be from where it wasn't, or vice-versa, and by
+        \\differentiating this from the algebraic sum of where it shouldn't be, and where
+        \\it was, it is able to obtain the deviation and its variation, which is called error.
+    );
+
+    try std.testing.expectFmt("", "{}", .{eb});
+
+    {
+        eb.clearMessages();
+        eb.unified = 0;
+        try eb.msgAtLoc("what about equallity?", "", .{ .start = 175, .end = 195 }, .warn, .{});
+
+        try std.testing.expectFmt(
+            \\(whichever is greater), it obtains a difference, or deviation.
+            \\ ^^^^^^^^^^^^^^^^^^^^ warning: what about equallity?
+        , "{}", .{eb});
+    }
+
+    {
+        eb.clearMessages();
+        eb.unified = 1;
+        try eb.msgAtLoc("are safety checks enabled?", "", .{ .start = 94, .end = 105 }, .info, .{});
+
+        try std.testing.expectFmt(
+            \\It knows this because it knows where it isn't.
+            \\By subtracting where it is from where it isn't, or where it isn't from where it is
+            \\   ^^^^^^^^^^^ info: are safety checks enabled?
+            \\(whichever is greater), it obtains a difference, or deviation.
+        , "{}", .{eb});
+    }
+
+    {
+        eb.clearMessages();
+        eb.unified = 1;
+        try eb.msgAtLoc("AAM or ASM?", "", .{ .start = 4, .end = 11 }, .info, .{});
+
+        try std.testing.expectFmt(
+            \\The missile knows where it is at all times.
+            \\    ^^^^^^^ info: AAM or ASM?
+            \\It knows this because it knows where it isn't.
+        , "{}", .{eb});
+    }
+
+    {
+        eb.clearMessages();
+        eb.unified = 2;
+        try eb.msgAtLoc("reserved keyword!", "", .{ .start = 1432, .end = 1437 }, .err, .{});
+
+        try std.testing.expectFmt(
+            \\It now subtracts where it should be from where it wasn't, or vice-versa, and by
+            \\differentiating this from the algebraic sum of where it shouldn't be, and where
+            \\it was, it is able to obtain the deviation and its variation, which is called error.
+            \\                                                                              ^^^^^ error: reserved keyword!
+        , "{}", .{eb});
+    }
+
+    {
+        eb.clearMessages();
+        try eb.msgAtLoc("redeclaration of work 'knows'", "", .{ .start = 69, .end = 74 }, .err, .{});
+        try eb.msgAtLoc("declared here", "", .{ .start = 12, .end = 17 }, .info, .{});
+
+        eb.unified = 0;
+        try std.testing.expectFmt(
+            \\The missile knows where it is at all times.
+            \\            ^^^^^ info: declared here
+            \\It knows this because it knows where it isn't.
+            \\                         ^^^^^ error: redeclaration of work 'knows'
+        , "{}", .{eb});
+
+        eb.unified = 1;
+        try std.testing.expectFmt(
+            \\The missile knows where it is at all times.
+            \\            ^^^^^ info: declared here
+            \\It knows this because it knows where it isn't.
+            \\                         ^^^^^ error: redeclaration of work 'knows'
+            \\By subtracting where it is from where it isn't, or where it isn't from where it is
+        , "{}", .{eb});
+    }
+
+    {
+        eb.clearMessages();
+        try eb.msgAtLoc("redeclaration of work 'knows'", "", .{ .start = 69, .end = 74 }, .err, .{});
+        try eb.msgAtLoc("declared here", "", .{ .start = 12, .end = 17 }, .info, .{});
+
+        eb.unified = 0;
+        try std.testing.expectFmt(
+            \\The missile knows where it is at all times.
+            \\            ^^^^^ info: declared here
+            \\It knows this because it knows where it isn't.
+            \\                         ^^^^^ error: redeclaration of work 'knows'
+        , "{}", .{eb});
+
+        eb.unified = 1;
+        try std.testing.expectFmt(
+            \\The missile knows where it is at all times.
+            \\            ^^^^^ info: declared here
+            \\It knows this because it knows where it isn't.
+            \\                         ^^^^^ error: redeclaration of work 'knows'
+            \\By subtracting where it is from where it isn't, or where it isn't from where it is
+        , "{}", .{eb});
+    }
+}
+
+test "ErrorBuilder - write on empty file" {
+    var eb = ErrorBuilder.init(std.testing.allocator);
+    defer eb.deinit();
+
+    try eb.addFile("empty.zig", "");
+    try eb.msgAtIndex("why is this empty?", "empty.zig", 0, .warn, .{});
+
+    eb.unified = null;
+    try std.testing.expectFmt(
+        \\
+        \\^ warning: why is this empty?
+    , "{}", .{eb});
+
+    eb.unified = 0;
+    try std.testing.expectFmt(
+        \\
+        \\^ warning: why is this empty?
+    , "{}", .{eb});
+
+    eb.unified = 2;
+    try std.testing.expectFmt(
+        \\
+        \\^ warning: why is this empty?
+    , "{}", .{eb});
 }

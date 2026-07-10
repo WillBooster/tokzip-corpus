@@ -1,86 +1,76 @@
-require_relative 'test_helper'
+# frozen_string_literal: true
 
-begin
-require 'sass-embedded'
+RSpec.describe Rack::Protection::CookieTossing do
+  it_behaves_like 'any rack application'
 
-class SassTest < Minitest::Test
-  def sass_app(options = {}, &block)
-    mock_app do
-      set :views, __dir__ + '/views'
-      set options
-      get('/', &block)
+  context 'with default reaction' do
+    before(:each) do
+      mock_app do
+        use Rack::Protection::CookieTossing
+        run DummyApp
+      end
     end
-    get '/'
-  end
 
-  it 'renders inline Sass strings' do
-    sass_app { sass "#sass\n  background-color: white\n" }
-    assert ok?
-    assert_equal "#sass {\n  background-color: white;\n}", body
-  end
-
-  it 'defaults content type to css' do
-    sass_app { sass "#sass\n  background-color: white\n" }
-    assert ok?
-    assert_equal "text/css;charset=utf-8", response['Content-Type']
-  end
-
-  it 'defaults allows setting content type per route' do
-    sass_app do
-      content_type :html
-      sass "#sass\n  background-color: white\n"
+    it 'accepts requests with a single session cookie' do
+      get '/', {}, 'HTTP_COOKIE' => 'rack.session=SESSION_TOKEN'
+      expect(last_response).to be_ok
     end
-    assert ok?
-    assert_equal "text/html;charset=utf-8", response['Content-Type']
-  end
 
-  it 'defaults allows setting content type globally' do
-    sass_app(:sass => { :content_type => 'html' }) {
-      sass "#sass\n  background-color: white\n"
-    }
-    assert ok?
-    assert_equal "text/html;charset=utf-8", response['Content-Type']
-  end
-
-  it 'renders .sass files in views path' do
-    sass_app { sass :hello }
-    assert ok?
-    assert_equal "#sass {\n  background-color: white;\n}", body
-  end
-
-  it 'ignores the layout option' do
-    sass_app { sass :hello, :layout => :layout2 }
-    assert ok?
-    assert_equal "#sass {\n  background-color: white;\n}", body
-  end
-
-  it "raises error if template not found" do
-    mock_app { get('/') { sass :no_such_template } }
-    assert_raises(Errno::ENOENT) { get('/') }
-  end
-
-  it "passes SASS options to the Sass engine" do
-    sass_app do
-      sass(
-        "#sass\n  background-color: white\n  color: black\n",
-        :style => :compressed
-      )
+    it 'denies requests with duplicate session cookies' do
+      get '/', {}, 'HTTP_COOKIE' => 'rack.session=EVIL_SESSION_TOKEN; rack.session=SESSION_TOKEN'
+      expect(last_response).not_to be_ok
     end
-    assert ok?
-    assert_equal("#sass{background-color:#fff;color:#000}", body)
-  end
 
-  it "passes default SASS options to the Sass engine" do
-    mock_app do
-      set :sass, {:style => :compressed} # default Sass style is :expanded
-      get('/') { sass("#sass\n  background-color: white\n  color: black\n") }
+    it 'denies requests with sneaky encoded session cookies' do
+      get '/', {}, 'HTTP_COOKIE' => 'rack.session=EVIL_SESSION_TOKEN; rack.%73ession=SESSION_TOKEN'
+      expect(last_response).not_to be_ok
     end
-    get '/'
-    assert ok?
-    assert_equal "#sass{background-color:#fff;color:#000}", body
-  end
-end
 
-rescue LoadError
-  warn "#{$!}: skipping sass tests"
+    it 'adds the correct Set-Cookie header' do
+      get '/some/path', {}, 'HTTP_COOKIE' => 'rack.%73ession=EVIL_SESSION_TOKEN; rack.session=EVIL_SESSION_TOKEN; rack.session=SESSION_TOKEN'
+
+      expected_header = <<-END.chomp.split("\n")
+rack.%2573ession=; domain=example.org; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT
+rack.%2573ession=; domain=example.org; path=/some; expires=Thu, 01 Jan 1970 00:00:00 GMT
+rack.%2573ession=; domain=example.org; path=/some/path; expires=Thu, 01 Jan 1970 00:00:00 GMT
+rack.session=; domain=example.org; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT
+rack.session=; domain=example.org; path=/some; expires=Thu, 01 Jan 1970 00:00:00 GMT
+rack.session=; domain=example.org; path=/some/path; expires=Thu, 01 Jan 1970 00:00:00 GMT
+      END
+      expect(last_response.headers['Set-Cookie']).to eq(expected_header)
+    end
+  end
+
+  context 'with redirect reaction' do
+    before(:each) do
+      mock_app do
+        use Rack::Protection::CookieTossing, reaction: :redirect
+        run DummyApp
+      end
+    end
+
+    it 'redirects requests with duplicate session cookies' do
+      get '/', {}, 'HTTP_COOKIE' => 'rack.session=EVIL_SESSION_TOKEN; rack.session=SESSION_TOKEN'
+      expect(last_response).to be_redirect
+      expect(last_response.location).to eq('/')
+    end
+
+    it 'redirects requests with sneaky encoded session cookies' do
+      get '/path', {}, 'HTTP_COOKIE' => 'rack.%73ession=EVIL_SESSION_TOKEN; rack.session=SESSION_TOKEN'
+      expect(last_response).to be_redirect
+      expect(last_response.location).to eq('/path')
+    end
+  end
+
+  context 'with custom session key' do
+    it 'denies requests with duplicate session cookies' do
+      mock_app do
+        use Rack::Protection::CookieTossing, session_key: '_session'
+        run DummyApp
+      end
+
+      get '/', {}, 'HTTP_COOKIE' => '_session=EVIL_SESSION_TOKEN; _session=SESSION_TOKEN'
+      expect(last_response).not_to be_ok
+    end
+  end
 end

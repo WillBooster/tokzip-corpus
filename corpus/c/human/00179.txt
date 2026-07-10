@@ -21,103 +21,376 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-/*
- * See https://github.com/curl/curl/issues/3371
- *
- * This test case checks whether curl_multi_remove_handle() cancels
- * asynchronous DNS resolvers without blocking where possible.  Obviously, it
- * only tests whichever resolver cURL is actually built with.
- */
 
-/* We're willing to wait a very generous two seconds for the removal.  This is
-   as low as we can go while still easily supporting SIGALRM timing for the
-   non-threaded blocking resolver.  It doesn't matter that much because when
-   the test passes, we never wait this long. We set it much higher to avoid
-   issues when running on overloaded CI machines. */
-#define TEST_HANG_TIMEOUT 60 * 1000
+#include "curl_setup.h"
+#include "dynhds.h"
+#include "strcase.h"
 
-#include "test.h"
-#include "testutil.h"
+/* The last 3 #include files should be in this order */
+#ifdef USE_NGHTTP2
+#include <stdint.h>
+#include <nghttp2/nghttp2.h>
+#endif /* USE_NGHTTP2 */
+#include "curl_printf.h"
+#include "curl_memory.h"
+#include "memdebug.h"
 
-#include <sys/stat.h>
 
-CURLcode test(char *URL)
+static struct dynhds_entry *
+entry_new(const char *name, size_t namelen,
+          const char *value, size_t valuelen, int opts)
 {
-  int stillRunning;
-  CURLM *multiHandle = NULL;
-  CURL *curl = NULL;
-  CURLcode res = CURLE_OK;
-  CURLMcode mres;
-  int timeout;
+  struct dynhds_entry *e;
+  char *p;
 
-  global_init(CURL_GLOBAL_ALL);
-
-  multi_init(multiHandle);
-
-  easy_init(curl);
-
-  easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-  easy_setopt(curl, CURLOPT_URL, URL);
-
-  /* Set a DNS server that hopefully will not respond when using c-ares. */
-  if(curl_easy_setopt(curl, CURLOPT_DNS_SERVERS, "0.0.0.0") == CURLE_OK)
-    /* Since we could set the DNS server, presume we are working with a
-       resolver that can be cancelled (i.e. c-ares).  Thus,
-       curl_multi_remove_handle() should not block even when the resolver
-       request is outstanding.  So, set a request timeout _longer_ than the
-       test hang timeout so we will fail if the handle removal call incorrectly
-       blocks. */
-    timeout = TEST_HANG_TIMEOUT * 2;
-  else {
-    /* If we can't set the DNS server, presume that we are configured to use a
-       resolver that can't be cancelled (i.e. the threaded resolver or the
-       non-threaded blocking resolver).  So, we just test that the
-       curl_multi_remove_handle() call does finish well within our test
-       timeout.
-
-       But, it is very unlikely that the resolver request will take any time at
-       all because we haven't been able to configure the resolver to use an
-       non-responsive DNS server.  At least we exercise the flow.
-       */
-    fprintf(stderr,
-            "CURLOPT_DNS_SERVERS not supported; "
-            "assuming curl_multi_remove_handle() will block\n");
-    timeout = TEST_HANG_TIMEOUT / 2;
-  }
-
-  /* Setting a timeout on the request should ensure that even if we have to
-     wait for the resolver during curl_multi_remove_handle(), it won't take
-     longer than this, because the resolver request inherits its timeout from
-     this. */
-  easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout);
-
-  multi_add_handle(multiHandle, curl);
-
-  /* This should move the handle from INIT => CONNECT => WAITRESOLVE. */
-  fprintf(stderr, "curl_multi_perform()...\n");
-  multi_perform(multiHandle, &stillRunning);
-  fprintf(stderr, "curl_multi_perform() succeeded\n");
-
-  /* Start measuring how long it takes to remove the handle. */
-  fprintf(stderr, "curl_multi_remove_handle()...\n");
-  start_test_timing();
-  mres = curl_multi_remove_handle(multiHandle, curl);
-  if(mres) {
-    fprintf(stderr, "curl_multi_remove_handle() failed, with code %d\n", mres);
-    res = TEST_ERR_MULTI;
-    goto test_cleanup;
-  }
-  fprintf(stderr, "curl_multi_remove_handle() succeeded\n");
-
-  /* Fail the test if it took too long to remove.  This happens after the fact,
-     and says "it seems that it would have run forever", which isn't true, but
-     it's close enough, and simple to do. */
-  abort_on_test_timeout();
-
-test_cleanup:
-  curl_easy_cleanup(curl);
-  curl_multi_cleanup(multiHandle);
-  curl_global_cleanup();
-
-  return res;
+  DEBUGASSERT(name);
+  DEBUGASSERT(value);
+  e = calloc(1, sizeof(*e) + namelen + valuelen + 2);
+  if(!e)
+    return NULL;
+  e->name = p = ((char *)e) + sizeof(*e);
+  memcpy(p, name, namelen);
+  e->namelen = namelen;
+  e->value = p += namelen + 1; /* leave a \0 at the end of name */
+  memcpy(p, value, valuelen);
+  e->valuelen = valuelen;
+  if(opts & DYNHDS_OPT_LOWERCASE)
+    Curl_strntolower(e->name, e->name, e->namelen);
+  return e;
 }
+
+static struct dynhds_entry *
+entry_append(struct dynhds_entry *e,
+             const char *value, size_t valuelen)
+{
+  struct dynhds_entry *e2;
+  size_t valuelen2 = e->valuelen + 1 + valuelen;
+  char *p;
+
+  DEBUGASSERT(value);
+  e2 = calloc(1, sizeof(*e) + e->namelen + valuelen2 + 2);
+  if(!e2)
+    return NULL;
+  e2->name = p = ((char *)e2) + sizeof(*e2);
+  memcpy(p, e->name, e->namelen);
+  e2->namelen = e->namelen;
+  e2->value = p += e->namelen + 1; /* leave a \0 at the end of name */
+  memcpy(p, e->value, e->valuelen);
+  p += e->valuelen;
+  p[0] = ' ';
+  memcpy(p + 1, value, valuelen);
+  e2->valuelen = valuelen2;
+  return e2;
+}
+
+static void entry_free(struct dynhds_entry *e)
+{
+  free(e);
+}
+
+void Curl_dynhds_init(struct dynhds *dynhds, size_t max_entries,
+                      size_t max_strs_size)
+{
+  DEBUGASSERT(dynhds);
+  DEBUGASSERT(max_strs_size);
+  dynhds->hds = NULL;
+  dynhds->hds_len = dynhds->hds_allc = dynhds->strs_len = 0;
+  dynhds->max_entries = max_entries;
+  dynhds->max_strs_size = max_strs_size;
+  dynhds->opts = 0;
+}
+
+void Curl_dynhds_free(struct dynhds *dynhds)
+{
+  DEBUGASSERT(dynhds);
+  if(dynhds->hds && dynhds->hds_len) {
+    size_t i;
+    DEBUGASSERT(dynhds->hds);
+    for(i = 0; i < dynhds->hds_len; ++i) {
+      entry_free(dynhds->hds[i]);
+    }
+  }
+  Curl_safefree(dynhds->hds);
+  dynhds->hds_len = dynhds->hds_allc = dynhds->strs_len = 0;
+}
+
+void Curl_dynhds_reset(struct dynhds *dynhds)
+{
+  DEBUGASSERT(dynhds);
+  if(dynhds->hds_len) {
+    size_t i;
+    DEBUGASSERT(dynhds->hds);
+    for(i = 0; i < dynhds->hds_len; ++i) {
+      entry_free(dynhds->hds[i]);
+      dynhds->hds[i] = NULL;
+    }
+  }
+  dynhds->hds_len = dynhds->strs_len = 0;
+}
+
+size_t Curl_dynhds_count(struct dynhds *dynhds)
+{
+  return dynhds->hds_len;
+}
+
+void Curl_dynhds_set_opts(struct dynhds *dynhds, int opts)
+{
+  dynhds->opts = opts;
+}
+
+struct dynhds_entry *Curl_dynhds_getn(struct dynhds *dynhds, size_t n)
+{
+  DEBUGASSERT(dynhds);
+  return (n < dynhds->hds_len)? dynhds->hds[n] : NULL;
+}
+
+struct dynhds_entry *Curl_dynhds_get(struct dynhds *dynhds, const char *name,
+                                     size_t namelen)
+{
+  size_t i;
+  for(i = 0; i < dynhds->hds_len; ++i) {
+    if(dynhds->hds[i]->namelen == namelen &&
+       strncasecompare(dynhds->hds[i]->name, name, namelen)) {
+      return dynhds->hds[i];
+    }
+  }
+  return NULL;
+}
+
+struct dynhds_entry *Curl_dynhds_cget(struct dynhds *dynhds, const char *name)
+{
+  return Curl_dynhds_get(dynhds, name, strlen(name));
+}
+
+CURLcode Curl_dynhds_add(struct dynhds *dynhds,
+                         const char *name, size_t namelen,
+                         const char *value, size_t valuelen)
+{
+  struct dynhds_entry *entry = NULL;
+  CURLcode result = CURLE_OUT_OF_MEMORY;
+
+  DEBUGASSERT(dynhds);
+  if(dynhds->max_entries && dynhds->hds_len >= dynhds->max_entries)
+    return CURLE_OUT_OF_MEMORY;
+  if(dynhds->strs_len + namelen + valuelen > dynhds->max_strs_size)
+    return CURLE_OUT_OF_MEMORY;
+
+entry = entry_new(name, namelen, value, valuelen, dynhds->opts);
+  if(!entry)
+    goto out;
+
+  if(dynhds->hds_len + 1 >= dynhds->hds_allc) {
+    size_t nallc = dynhds->hds_len + 16;
+    struct dynhds_entry **nhds;
+
+    if(dynhds->max_entries && nallc > dynhds->max_entries)
+      nallc = dynhds->max_entries;
+
+    nhds = calloc(nallc, sizeof(struct dynhds_entry *));
+    if(!nhds)
+      goto out;
+    if(dynhds->hds) {
+      memcpy(nhds, dynhds->hds,
+             dynhds->hds_len * sizeof(struct dynhds_entry *));
+      Curl_safefree(dynhds->hds);
+    }
+    dynhds->hds = nhds;
+    dynhds->hds_allc = nallc;
+  }
+  dynhds->hds[dynhds->hds_len++] = entry;
+  entry = NULL;
+  dynhds->strs_len += namelen + valuelen;
+  result = CURLE_OK;
+
+out:
+  if(entry)
+    entry_free(entry);
+  return result;
+}
+
+CURLcode Curl_dynhds_cadd(struct dynhds *dynhds,
+                          const char *name, const char *value)
+{
+  return Curl_dynhds_add(dynhds, name, strlen(name), value, strlen(value));
+}
+
+CURLcode Curl_dynhds_h1_add_line(struct dynhds *dynhds,
+                                 const char *line, size_t line_len)
+{
+  const char *p;
+  const char *name;
+  size_t namelen;
+  const char *value;
+  size_t valuelen, i;
+
+  if(!line || !line_len)
+    return CURLE_OK;
+
+  if((line[0] == ' ') || (line[0] == '\t')) {
+    struct dynhds_entry *e, *e2;
+    /* header continuation, yikes! */
+    if(!dynhds->hds_len)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+
+    while(line_len && ISBLANK(line[0])) {
+      ++line;
+      --line_len;
+    }
+    if(!line_len)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    e = dynhds->hds[dynhds->hds_len-1];
+    e2 = entry_append(e, line, line_len);
+    if(!e2)
+      return CURLE_OUT_OF_MEMORY;
+    dynhds->hds[dynhds->hds_len-1] = e2;
+    entry_free(e);
+    return CURLE_OK;
+  }
+  else {
+    p = memchr(line, ':', line_len);
+    if(!p)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    name = line;
+    namelen = p - line;
+    p++; /* move past the colon */
+    for(i = namelen + 1; i < line_len; ++i, ++p) {
+      if(!ISBLANK(*p))
+        break;
+    }
+    value = p;
+    valuelen = line_len - i;
+
+    p = memchr(value, '\r', valuelen);
+    if(!p)
+      p = memchr(value, '\n', valuelen);
+    if(p)
+      valuelen = (size_t)(p - value);
+
+    return Curl_dynhds_add(dynhds, name, namelen, value, valuelen);
+  }
+}
+
+CURLcode Curl_dynhds_h1_cadd_line(struct dynhds *dynhds, const char *line)
+{
+  return Curl_dynhds_h1_add_line(dynhds, line, line? strlen(line) : 0);
+}
+
+#ifdef UNITTESTS
+/* used by unit2602.c */
+
+bool Curl_dynhds_contains(struct dynhds *dynhds,
+                          const char *name, size_t namelen)
+{
+  return !!Curl_dynhds_get(dynhds, name, namelen);
+}
+
+bool Curl_dynhds_ccontains(struct dynhds *dynhds, const char *name)
+{
+  return Curl_dynhds_contains(dynhds, name, strlen(name));
+}
+
+size_t Curl_dynhds_count_name(struct dynhds *dynhds,
+                              const char *name, size_t namelen)
+{
+  size_t n = 0;
+  if(dynhds->hds_len) {
+    size_t i;
+    for(i = 0; i < dynhds->hds_len; ++i) {
+      if((namelen == dynhds->hds[i]->namelen) &&
+         strncasecompare(name, dynhds->hds[i]->name, namelen))
+        ++n;
+    }
+  }
+  return n;
+}
+
+size_t Curl_dynhds_ccount_name(struct dynhds *dynhds, const char *name)
+{
+  return Curl_dynhds_count_name(dynhds, name, strlen(name));
+}
+
+CURLcode Curl_dynhds_set(struct dynhds *dynhds,
+                         const char *name, size_t namelen,
+                         const char *value, size_t valuelen)
+{
+  Curl_dynhds_remove(dynhds, name, namelen);
+  return Curl_dynhds_add(dynhds, name, namelen, value, valuelen);
+}
+
+size_t Curl_dynhds_remove(struct dynhds *dynhds,
+                          const char *name, size_t namelen)
+{
+  size_t n = 0;
+  if(dynhds->hds_len) {
+    size_t i, len;
+    for(i = 0; i < dynhds->hds_len; ++i) {
+      if((namelen == dynhds->hds[i]->namelen) &&
+         strncasecompare(name, dynhds->hds[i]->name, namelen)) {
+        ++n;
+        --dynhds->hds_len;
+        dynhds->strs_len -= (dynhds->hds[i]->namelen +
+                             dynhds->hds[i]->valuelen);
+        entry_free(dynhds->hds[i]);
+        len = dynhds->hds_len - i; /* remaining entries */
+        if(len) {
+          memmove(&dynhds->hds[i], &dynhds->hds[i + 1],
+                  len * sizeof(dynhds->hds[i]));
+        }
+        --i; /* do this index again */
+      }
+    }
+  }
+  return n;
+}
+
+size_t Curl_dynhds_cremove(struct dynhds *dynhds, const char *name)
+{
+  return Curl_dynhds_remove(dynhds, name, strlen(name));
+}
+
+#endif
+
+CURLcode Curl_dynhds_h1_dprint(struct dynhds *dynhds, struct dynbuf *dbuf)
+{
+  CURLcode result = CURLE_OK;
+  size_t i;
+
+  if(!dynhds->hds_len)
+    return result;
+
+  for(i = 0; i < dynhds->hds_len; ++i) {
+    result = Curl_dyn_addf(dbuf, "%.*s: %.*s\r\n",
+               (int)dynhds->hds[i]->namelen, dynhds->hds[i]->name,
+               (int)dynhds->hds[i]->valuelen, dynhds->hds[i]->value);
+    if(result)
+      break;
+  }
+
+  return result;
+}
+
+#ifdef USE_NGHTTP2
+
+nghttp2_nv *Curl_dynhds_to_nva(struct dynhds *dynhds, size_t *pcount)
+{
+  nghttp2_nv *nva = calloc(1, sizeof(nghttp2_nv) * dynhds->hds_len);
+  size_t i;
+
+  *pcount = 0;
+  if(!nva)
+    return NULL;
+
+  for(i = 0; i < dynhds->hds_len; ++i) {
+    struct dynhds_entry *e = dynhds->hds[i];
+    DEBUGASSERT(e);
+    nva[i].name = (unsigned char *)e->name;
+    nva[i].namelen = e->namelen;
+    nva[i].value = (unsigned char *)e->value;
+    nva[i].valuelen = e->valuelen;
+    nva[i].flags = NGHTTP2_NV_FLAG_NONE;
+  }
+  *pcount = dynhds->hds_len;
+  return nva;
+}
+
+#endif /* USE_NGHTTP2 */

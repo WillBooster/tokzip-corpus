@@ -1,219 +1,145 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Reflection;
-using System.Text;
 
-namespace NUnit.Framework.Internal
+#nullable enable
+
+namespace NUnit.Framework.Tests.TestUtilities
 {
-    /// <summary>
-    /// ExceptionHelper provides static methods for working with exceptions
-    /// </summary>
-    public static class ExceptionHelper
+    public class TestFile : IDisposable
     {
-        /// <summary>
-        /// Rethrows an exception, preserving its stack trace
-        /// </summary>
-        /// <param name="exception">The exception to rethrow</param>
-        [DoesNotReturn]
-        public static void Rethrow(Exception exception)
+        private readonly string? _resourceName;
+        private readonly FileInfo _fileInfo;
+        private readonly long _fileLength;
+        private bool _disposedValue = false;
+
+        public TestFile(string resourceName)
+            : this(Path.GetTempFileName(), resourceName, false)
         {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception).Throw();
         }
 
-        /// <summary>
-        /// Builds up a message, using the Message field of the specified exception
-        /// as well as any InnerExceptions. Optionally excludes exception names,
-        /// creating a more readable message.
-        /// </summary>
-        /// <param name="exception">The exception.</param>
-        /// <param name="excludeExceptionNames">Flag indicating whether exception names should be excluded.</param>
-        /// <returns>A combined message string.</returns>
-        public static string BuildMessage(Exception exception, bool excludeExceptionNames = false)
+        public TestFile(string fileName, string contentSource, bool isContent)
         {
-            Guard.ArgumentNotNull(exception, nameof(exception));
-
-            StringBuilder sb = new StringBuilder();
-            if (!excludeExceptionNames)
-                sb.AppendFormat("{0} : ", exception.GetType());
-            sb.Append(GetExceptionMessage(exception));
-            AppendExceptionDataContents(exception, sb);
-
-            foreach (Exception inner in FlattenExceptionHierarchy(exception))
+            if (Path.IsPathRooted(fileName))
             {
-                sb.Append(Environment.NewLine);
-                sb.Append("  ----> ");
-                if (!excludeExceptionNames)
-                    sb.AppendFormat("{0} : ", inner.GetType());
-                sb.Append(GetExceptionMessage(inner));
-                AppendExceptionDataContents(inner, sb);
-            }
-
-            return sb.ToString();
-        }
-
-        /// <summary>
-        /// Builds up a message, using the Message field of the specified exception
-        /// as well as any InnerExceptions.
-        /// </summary>
-        /// <param name="exception">The exception.</param>
-        /// <returns>A combined stack trace.</returns>
-        public static string BuildStackTrace(Exception exception)
-        {
-            StringBuilder sb = new StringBuilder(exception.GetStackTraceWithoutThrowing());
-
-            foreach (Exception inner in FlattenExceptionHierarchy(exception))
-            {
-                sb.Append(Environment.NewLine);
-                sb.Append("--");
-                sb.Append(inner.GetType().Name);
-                sb.Append(Environment.NewLine);
-                sb.Append(inner.GetStackTraceWithoutThrowing());
-            }
-
-            return sb.ToString();
-        }
-
-        private static string GetExceptionMessage(Exception ex)
-        {
-            var message = ex.GetMessageWithoutThrowing();
-
-            if (string.IsNullOrEmpty(message))
-            {
-                // Special handling for Mono 5.0, which returns an empty message
-                return ex is System.IO.FileNotFoundException fnfEx
-                    ? "Could not load assembly. File not found: " + fnfEx.FileName
-                    : "No message provided";
-            }
-
-            return message;
-        }
-
-        private static void AppendExceptionDataContents(Exception ex, StringBuilder sb)
-        {
-            var data = ex.GetDataWithoutThrowing();
-
-            if (data.IsError(out var message))
-            {
-                sb.AppendLine();
-                sb.Append(message);
+                _fileInfo = new FileInfo(fileName);
             }
             else
             {
-                IDictionary dictionary = data.Value!;
-                if (dictionary.Count != 0)
+                var tempPath = Path.GetTempPath();
+                _fileInfo = new FileInfo(Path.Combine(tempPath, fileName));
+            }
+
+            if (isContent)
+            {
+                using (var fs = _fileInfo.CreateText())
                 {
-                    sb.AppendLine();
-                    sb.Append("Data:");
-                    foreach (DictionaryEntry kvp in dictionary)
+                    fs.Write(contentSource);
+                }
+
+                _fileLength = contentSource.Length;
+                return;
+            }
+
+            // HACK! Only way I can figure out to avoid having two copies of TestFile
+            _resourceName = GetType().Assembly.GetName().Name!.Contains("nunitlite")
+                ? "NUnitLite.Tests." + contentSource
+                : "NUnit.Framework.Tests." + contentSource;
+            _fileLength = 0L;
+
+            Assembly a = typeof(TestFile).Assembly;
+            using (Stream? s = a.GetManifestResourceStream(_resourceName))
+            {
+                if (s is null)
+                    throw new Exception("Manifest Resource Stream " + _resourceName + " was not found.");
+
+                var buffer = new byte[1024];
+                using (FileStream fs = _fileInfo.Create())
+                {
+                    while (true)
                     {
-                        sb.AppendLine();
-                        sb.AppendFormat("  {0}: {1}", kvp.Key, kvp.Value?.ToString() ?? "<null>");
+                        int count = s.Read(buffer, 0, buffer.Length);
+                        if (count == 0)
+                            break;
+                        fs.Write(buffer, 0, count);
+                        _fileLength += count;
                     }
                 }
             }
         }
 
-        private static List<Exception> FlattenExceptionHierarchy(Exception exception)
+        public long FileLength => _fileLength;
+
+        public long OffsetOf(char target)
         {
-            var result = new List<Exception>();
+            if (_resourceName is null)
+                return -1L;
 
-            if (exception is ReflectionTypeLoadException reflectionException)
+            Assembly a = typeof(TestFile).Assembly;
+            using (Stream? s = a.GetManifestResourceStream(_resourceName))
             {
-                foreach (var innerException in reflectionException.LoaderExceptions)
+                if (s is null)
+                    throw new Exception("Manifest Resource Stream " + _resourceName + " was not found.");
+
+                byte[] buffer = new byte[1024];
+                long offset = 0L;
+
+                while (true)
                 {
-                    if (innerException is not null)
-                        result.Add(exception);
+                    int count = s.Read(buffer, 0, buffer.Length);
+                    if (count == 0)
+                        break;
+                    foreach (char c in buffer)
+                    {
+                        if (c == target)
+                            return offset;
+                        else
+                            offset++;
+                    }
                 }
 
-                foreach (var innerException in reflectionException.LoaderExceptions)
-                {
-                    if (innerException is not null)
-                        result.AddRange(FlattenExceptionHierarchy(innerException));
-                }
+                return -1L;
             }
-            if (exception is AggregateException aggregateException)
-            {
-                result.AddRange(aggregateException.InnerExceptions);
-
-                foreach (var innerException in aggregateException.InnerExceptions)
-                    result.AddRange(FlattenExceptionHierarchy(innerException));
-            }
-            else if (exception.InnerException is not null)
-            {
-                result.Add(exception.InnerException);
-                result.AddRange(FlattenExceptionHierarchy(exception.InnerException));
-            }
-
-            return result;
         }
 
         /// <summary>
-        /// Executes a parameterless synchronous or async delegate and returns the exception it throws, if any.
+        /// Gets the test file.
         /// </summary>
-        internal static Exception? RecordException(Delegate parameterlessDelegate, string parameterName)
-        {
-            Guard.ArgumentNotNull(parameterlessDelegate, parameterName);
-
-            Guard.ArgumentValid(
-                parameterlessDelegate.GetType().GetMethod("Invoke")?.GetParameters().Length == 0,
-                $"The actual value must be a parameterless delegate but was {parameterlessDelegate.GetType().Name}.",
-                parameterName);
-
-            Guard.ArgumentNotAsyncVoid(parameterlessDelegate, parameterName);
-
-            using (new TestExecutionContext.IsolatedContext())
-            {
-                if (AsyncToSyncAdapter.IsAsyncOperation(parameterlessDelegate))
-                {
-                    try
-                    {
-                        AsyncToSyncAdapter.Await(parameterlessDelegate.DynamicInvokeWithTransparentExceptions);
-                    }
-                    catch (Exception ex)
-                    {
-                        return ex;
-                    }
-                }
-                else
-                {
-                    try
-                    {
-                        parameterlessDelegate.DynamicInvokeWithTransparentExceptions();
-                    }
-                    catch (Exception ex)
-                    {
-                        return ex;
-                    }
-                }
-            }
-
-            return null;
-        }
+        public FileInfo File => _fileInfo;
 
         /// <summary>
-        /// Unwraps the exception of type <see cref="TargetInvocationException"/> to its InnerException.
+        /// Returns the full path of the contained test directory
         /// </summary>
-        /// <param name="exception">The exception to unwrap.</param>
-        /// <returns>The InnerException is available, otherwise the <paramref name="exception"/>.</returns>
-        public static Exception Unwrap(this Exception exception)
+        public override string ToString()
         {
-            if (exception is NUnitException nUnitException &&
-                nUnitException.InnerException is not null)
-            {
-                exception = nUnitException.InnerException;
-            }
-
-            while (exception is TargetInvocationException targetInvocationException &&
-                targetInvocationException.InnerException is not null)
-            {
-                exception = targetInvocationException.InnerException;
-            }
-
-            return exception;
+            return _fileInfo is null ? string.Empty : _fileInfo.FullName;
         }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!_disposedValue)
+            {
+                if (disposing)
+                {
+                    if (_fileInfo.Exists)
+                        _fileInfo.Delete();
+                }
+            }
+
+            _disposedValue = true;
+        }
+
+        #region IDisposable Members
+
+        public void Dispose()
+        {
+            // Do not change this code.  Put cleanup code in Dispose(bool disposing) above.
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        #endregion
     }
 }

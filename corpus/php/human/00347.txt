@@ -10,179 +10,105 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Repository;
-
-use Composer\IO\IOInterface;
-use Composer\Config;
-use Composer\EventDispatcher\EventDispatcher;
-use Composer\Package\PackageInterface;
-use Composer\Util\HttpDownloader;
-use Composer\Util\ProcessExecutor;
+namespace Composer\DependencyResolver;
 
 /**
- * Repositories manager.
+ * Wrapper around a Rule which keeps track of the two literals it watches
  *
- * @author Jordi Boggiano <j.boggiano@seld.be>
- * @author Konstantin Kudryashov <ever.zet@gmail.com>
- * @author François Pluchino <francois.pluchino@opendisplay.com>
+ * Used by RuleWatchGraph to store rules in two RuleWatchChains.
+ *
+ * @author Nils Adermann <naderman@naderman.de>
  */
-class RepositoryManager
+class RuleWatchNode
 {
-    /** @var InstalledRepositoryInterface */
-    private $localRepository;
-    /** @var list<RepositoryInterface> */
-    private $repositories = [];
-    /** @var array<string, class-string<RepositoryInterface>> */
-    private $repositoryClasses = [];
-    /** @var IOInterface */
-    private $io;
-    /** @var Config */
-    private $config;
-    /** @var HttpDownloader */
-    private $httpDownloader;
-    /** @var ?EventDispatcher */
-    private $eventDispatcher;
-    /** @var ProcessExecutor */
-    private $process;
+    /** @var int */
+    public $watch1;
+    /** @var int */
+    public $watch2;
 
-    public function __construct(IOInterface $io, Config $config, HttpDownloader $httpDownloader, ?EventDispatcher $eventDispatcher = null, ?ProcessExecutor $process = null)
+    /** @var Rule */
+    protected $rule;
+
+    /**
+     * Creates a new node watching the first and second literals of the rule.
+     *
+     * @param Rule $rule The rule to wrap
+     */
+    public function __construct(Rule $rule)
     {
-        $this->io = $io;
-        $this->config = $config;
-        $this->httpDownloader = $httpDownloader;
-        $this->eventDispatcher = $eventDispatcher;
-        $this->process = $process ?? new ProcessExecutor($io);
+        $this->rule = $rule;
+
+        $literals = $rule->getLiterals();
+
+        $literalCount = \count($literals);
+        $this->watch1 = $literalCount > 0 ? $literals[0] : 0;
+        $this->watch2 = $literalCount > 1 ? $literals[1] : 0;
     }
 
     /**
-     * Searches for a package by its name and version in managed repositories.
+     * Places the second watch on the rule's literal, decided at the highest level
      *
-     * @param string                                                 $name       package name
-     * @param string|\Composer\Semver\Constraint\ConstraintInterface $constraint package version or version constraint to match against
+     * Useful for learned rules where the literal for the highest rule is most
+     * likely to quickly lead to further decisions.
+     *
+     * @param Decisions $decisions The decisions made so far by the solver
      */
-    public function findPackage(string $name, $constraint): ?PackageInterface
+    public function watch2OnHighest(Decisions $decisions): void
     {
-        foreach ($this->repositories as $repository) {
-            /** @var RepositoryInterface $repository */
-            if ($package = $repository->findPackage($name, $constraint)) {
-                return $package;
+        $literals = $this->rule->getLiterals();
+
+        // if there are only 2 elements, both are being watched anyway
+        if (\count($literals) < 3 || $this->rule instanceof MultiConflictRule) {
+            return;
+        }
+
+        $watchLevel = 0;
+
+        foreach ($literals as $literal) {
+            $level = $decisions->decisionLevel($literal);
+
+            if ($level > $watchLevel) {
+                $this->watch2 = $literal;
+                $watchLevel = $level;
             }
         }
-
-        return null;
     }
 
     /**
-     * Searches for all packages matching a name and optionally a version in managed repositories.
-     *
-     * @param string                                                 $name       package name
-     * @param string|\Composer\Semver\Constraint\ConstraintInterface $constraint package version or version constraint to match against
-     *
-     * @return PackageInterface[]
+     * Returns the rule this node wraps
      */
-    public function findPackages(string $name, $constraint): array
+    public function getRule(): Rule
     {
-        $packages = [];
+        return $this->rule;
+    }
 
-        foreach ($this->getRepositories() as $repository) {
-            $packages = array_merge($packages, $repository->findPackages($name, $constraint));
+    /**
+     * Given one watched literal, this method returns the other watched literal
+     *
+     * @param  int $literal The watched literal that should not be returned
+     * @return int A literal
+     */
+    public function getOtherWatch(int $literal): int
+    {
+        if ($this->watch1 === $literal) {
+            return $this->watch2;
         }
 
-        return $packages;
+        return $this->watch1;
     }
 
     /**
-     * Adds repository
+     * Moves a watch from one literal to another
      *
-     * @param RepositoryInterface $repository repository instance
+     * @param int $from The previously watched literal
+     * @param int $to   The literal to be watched now
      */
-    public function addRepository(RepositoryInterface $repository): void
+    public function moveWatch(int $from, int $to): void
     {
-        $this->repositories[] = $repository;
-    }
-
-    /**
-     * Adds a repository to the beginning of the chain
-     *
-     * This is useful when injecting additional repositories that should trump Packagist, e.g. from a plugin.
-     *
-     * @param RepositoryInterface $repository repository instance
-     */
-    public function prependRepository(RepositoryInterface $repository): void
-    {
-        array_unshift($this->repositories, $repository);
-    }
-
-    /**
-     * Returns a new repository for a specific installation type.
-     *
-     * @param  string                    $type   repository type
-     * @param  array<string, mixed>      $config repository configuration
-     * @param  string                    $name   repository name
-     * @throws \InvalidArgumentException if repository for provided type is not registered
-     */
-    public function createRepository(string $type, array $config, ?string $name = null): RepositoryInterface
-    {
-        if (!isset($this->repositoryClasses[$type])) {
-            throw new \InvalidArgumentException('Repository type is not registered: '.$type);
+        if ($this->watch1 === $from) {
+            $this->watch1 = $to;
+        } else {
+            $this->watch2 = $to;
         }
-
-        if (isset($config['packagist']) && false === $config['packagist']) {
-            $this->io->writeError('<warning>Repository "'.$name.'" ('.json_encode($config).') has a packagist key which should be in its own repository definition</warning>');
-        }
-
-        $class = $this->repositoryClasses[$type];
-
-        if (isset($config['only']) || isset($config['exclude']) || isset($config['canonical'])) {
-            $filterConfig = $config;
-            unset($config['only'], $config['exclude'], $config['canonical']);
-        }
-
-        $repository = new $class($config, $this->io, $this->config, $this->httpDownloader, $this->eventDispatcher, $this->process);
-
-        if (isset($filterConfig)) {
-            $repository = new FilterRepository($repository, $filterConfig);
-        }
-
-        return $repository;
-    }
-
-    /**
-     * Stores repository class for a specific installation type.
-     *
-     * @param string $type  installation type
-     * @param class-string<RepositoryInterface> $class class name of the repo implementation
-     */
-    public function setRepositoryClass(string $type, $class): void
-    {
-        $this->repositoryClasses[$type] = $class;
-    }
-
-    /**
-     * Returns all repositories, except local one.
-     *
-     * @return RepositoryInterface[]
-     */
-    public function getRepositories(): array
-    {
-        return $this->repositories;
-    }
-
-    /**
-     * Sets local repository for the project.
-     *
-     * @param InstalledRepositoryInterface $repository repository instance
-     */
-    public function setLocalRepository(InstalledRepositoryInterface $repository): void
-    {
-        $this->localRepository = $repository;
-    }
-
-    /**
-     * Returns local repository for the project.
-     */
-    public function getLocalRepository(): InstalledRepositoryInterface
-    {
-        return $this->localRepository;
     }
 }

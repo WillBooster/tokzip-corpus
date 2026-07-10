@@ -23,150 +23,112 @@
  ***************************************************************************/
 #include "test.h"
 
-/*
-  Check range/resume returned error codes and data presence.
-
-  The input parameters are:
-  - CURLOPT_RANGE/CURLOPT_RESUME_FROM
-  - CURLOPT_FAILONERROR
-  - Returned http code (2xx/416)
-  - Content-Range header present in reply.
-
-*/
-
+#include "testutil.h"
+#include "warnless.h"
 #include "memdebug.h"
 
-#define F_RESUME        (1 << 0)        /* resume/range. */
-#define F_HTTP416       (1 << 1)        /* Server returns http code 416. */
-#define F_FAIL          (1 << 2)        /* Fail on error. */
-#define F_CONTENTRANGE  (1 << 3)        /* Server sends content-range hdr. */
-#define F_IGNOREBODY    (1 << 4)        /* Body should be ignored. */
-
-struct testparams {
-  unsigned int flags; /* ORed flags as above. */
-  CURLcode result; /* Code that should be returned by curl_easy_perform(). */
-};
-
-static const struct testparams params[] = {
-  { 0,                                                             CURLE_OK },
-  {                                 F_CONTENTRANGE,                CURLE_OK },
-  {                        F_FAIL,                                 CURLE_OK },
-  {                        F_FAIL | F_CONTENTRANGE,                CURLE_OK },
-  {            F_HTTP416,                                          CURLE_OK },
-  {            F_HTTP416 |          F_CONTENTRANGE,                CURLE_OK },
-  {            F_HTTP416 | F_FAIL |                  F_IGNOREBODY,
-                                                  CURLE_HTTP_RETURNED_ERROR },
-  {            F_HTTP416 | F_FAIL | F_CONTENTRANGE | F_IGNOREBODY,
-                                                  CURLE_HTTP_RETURNED_ERROR },
-  { F_RESUME |                                       F_IGNOREBODY,
-                                                          CURLE_RANGE_ERROR },
-  { F_RESUME |                      F_CONTENTRANGE,                CURLE_OK },
-  { F_RESUME |             F_FAIL |                  F_IGNOREBODY,
-                                                          CURLE_RANGE_ERROR },
-  { F_RESUME |             F_FAIL | F_CONTENTRANGE,                CURLE_OK },
-  { F_RESUME | F_HTTP416 |                           F_IGNOREBODY, CURLE_OK },
-  { F_RESUME | F_HTTP416 |          F_CONTENTRANGE | F_IGNOREBODY, CURLE_OK },
-  { F_RESUME | F_HTTP416 | F_FAIL |                  F_IGNOREBODY, CURLE_OK },
-  { F_RESUME | F_HTTP416 | F_FAIL | F_CONTENTRANGE | F_IGNOREBODY,
-                                                                   CURLE_OK }
-};
-
-static int      hasbody;
-
-static size_t writedata(char *data, size_t size, size_t nmemb, void *userdata)
-{
-  (void) data;
-  (void) userdata;
-
-  if(size && nmemb)
-    hasbody = 1;
-  return size * nmemb;
-}
-
-static int onetest(CURL *curl, const char *url, const struct testparams *p,
-                   size_t num)
-{
-  CURLcode res;
-  unsigned int replyselector;
-  char urlbuf[256];
-
-  replyselector = (p->flags & F_CONTENTRANGE)? 1: 0;
-  if(p->flags & F_HTTP416)
-    replyselector += 2;
-  msnprintf(urlbuf, sizeof(urlbuf), "%s%04u", url, replyselector);
-  test_setopt(curl, CURLOPT_URL, urlbuf);
-  test_setopt(curl, CURLOPT_VERBOSE, 1L);
-  test_setopt(curl, CURLOPT_RESUME_FROM, (p->flags & F_RESUME)? 3: 0);
-  test_setopt(curl, CURLOPT_RANGE, !(p->flags & F_RESUME)?
-                                   "3-1000000": (char *) NULL);
-  test_setopt(curl, CURLOPT_FAILONERROR, (p->flags & F_FAIL)? 1: 0);
-  hasbody = 0;
-  res = curl_easy_perform(curl);
-  if(res != p->result) {
-    printf("%zd: bad error code (%d): resume=%s, fail=%s, http416=%s, "
-           "content-range=%s, expected=%d\n", num, res,
-           (p->flags & F_RESUME)? "yes": "no",
-           (p->flags & F_FAIL)? "yes": "no",
-           (p->flags & F_HTTP416)? "yes": "no",
-           (p->flags & F_CONTENTRANGE)? "yes": "no",
-           p->result);
-    return 1;
-  }
-  if(hasbody && (p->flags & F_IGNOREBODY)) {
-    printf("body should be ignored and is not: resume=%s, fail=%s, "
-           "http416=%s, content-range=%s\n",
-           (p->flags & F_RESUME)? "yes": "no",
-           (p->flags & F_FAIL)? "yes": "no",
-           (p->flags & F_HTTP416)? "yes": "no",
-           (p->flags & F_CONTENTRANGE)? "yes": "no");
-    return 1;
-  }
-  return 0;
-
-test_cleanup:
-
-  return 1;
-}
-
-/* for debugging: */
-/* #define SINGLETEST 9 */
+#define TEST_HANG_TIMEOUT 60 * 1000
+#define WAKEUP_NUM 10
 
 CURLcode test(char *URL)
 {
-  CURLcode res;
-  CURL *curl;
-  size_t i;
-  int status = 0;
+  CURLM *multi = NULL;
+  int numfds;
+  int i;
+  CURLcode res = CURLE_OK;
+  struct timeval time_before_wait, time_after_wait;
 
-  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
-    fprintf(stderr, "curl_global_init() failed\n");
-    return TEST_ERR_MAJOR_BAD;
+  (void)URL;
+
+  start_test_timing();
+
+  global_init(CURL_GLOBAL_ALL);
+
+  multi_init(multi);
+
+  /* no wakeup */
+
+  time_before_wait = tutil_tvnow();
+  multi_poll(multi, NULL, 0, 1000, &numfds);
+  time_after_wait = tutil_tvnow();
+
+  if(tutil_tvdiff(time_after_wait, time_before_wait) < 500) {
+    fprintf(stderr, "%s:%d curl_multi_poll returned too early\n",
+            __FILE__, __LINE__);
+    res = TEST_ERR_MAJOR_BAD;
+    goto test_cleanup;
   }
 
-  for(i = 0; i < sizeof(params) / sizeof(params[0]); i++) {
-    curl = curl_easy_init();
-    if(!curl) {
-      fprintf(stderr, "curl_easy_init() failed\n");
-      curl_global_cleanup();
-      return TEST_ERR_MAJOR_BAD;
-    }
+  abort_on_test_timeout();
 
-    test_setopt(curl, CURLOPT_WRITEFUNCTION, writedata);
+  /* try a single wakeup */
 
-#ifdef SINGLETEST
-    if(SINGLETEST == i)
-#endif
-      status |= onetest(curl, URL, params + i, i);
-    curl_easy_cleanup(curl);
+  res_multi_wakeup(multi);
+
+  time_before_wait = tutil_tvnow();
+  multi_poll(multi, NULL, 0, 1000, &numfds);
+  time_after_wait = tutil_tvnow();
+
+  if(tutil_tvdiff(time_after_wait, time_before_wait) > 500) {
+    fprintf(stderr, "%s:%d curl_multi_poll returned too late\n",
+            __FILE__, __LINE__);
+    res = TEST_ERR_MAJOR_BAD;
+    goto test_cleanup;
   }
 
-  curl_global_cleanup();
-  printf("%d\n", status);
-  return (CURLcode)status;
+  abort_on_test_timeout();
+
+  /* previous wakeup should not wake up this */
+
+  time_before_wait = tutil_tvnow();
+  multi_poll(multi, NULL, 0, 1000, &numfds);
+  time_after_wait = tutil_tvnow();
+
+  if(tutil_tvdiff(time_after_wait, time_before_wait) < 500) {
+    fprintf(stderr, "%s:%d curl_multi_poll returned too early\n",
+            __FILE__, __LINE__);
+    res = TEST_ERR_MAJOR_BAD;
+    goto test_cleanup;
+  }
+
+  abort_on_test_timeout();
+
+  /* try lots of wakeup */
+
+  for(i = 0; i < WAKEUP_NUM; ++i)
+    res_multi_wakeup(multi);
+
+  time_before_wait = tutil_tvnow();
+  multi_poll(multi, NULL, 0, 1000, &numfds);
+  time_after_wait = tutil_tvnow();
+
+  if(tutil_tvdiff(time_after_wait, time_before_wait) > 500) {
+    fprintf(stderr, "%s:%d curl_multi_poll returned too late\n",
+            __FILE__, __LINE__);
+    res = TEST_ERR_MAJOR_BAD;
+    goto test_cleanup;
+  }
+
+  abort_on_test_timeout();
+
+  /* Even lots of previous wakeups should not wake up this. */
+
+  time_before_wait = tutil_tvnow();
+  multi_poll(multi, NULL, 0, 1000, &numfds);
+  time_after_wait = tutil_tvnow();
+
+  if(tutil_tvdiff(time_after_wait, time_before_wait) < 500) {
+    fprintf(stderr, "%s:%d curl_multi_poll returned too early\n",
+            __FILE__, __LINE__);
+    res = TEST_ERR_MAJOR_BAD;
+    goto test_cleanup;
+  }
+
+  abort_on_test_timeout();
 
 test_cleanup:
 
-  curl_easy_cleanup(curl);
+  curl_multi_cleanup(multi);
   curl_global_cleanup();
 
   return res;

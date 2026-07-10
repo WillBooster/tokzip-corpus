@@ -10,139 +10,73 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\DependencyResolver;
+namespace Composer\Downloader;
 
+use React\Promise\PromiseInterface;
 use Composer\Util\IniHelper;
-use Composer\Repository\RepositorySet;
+use Composer\Util\Platform;
+use Composer\Util\ProcessExecutor;
+use Composer\Package\PackageInterface;
+use RarArchive;
 
 /**
- * @author Nils Adermann <naderman@naderman.de>
+ * RAR archive downloader.
  *
- * @method self::ERROR_DEPENDENCY_RESOLUTION_FAILED getCode()
+ * Based on previous work by Jordi Boggiano ({@see ZipDownloader}).
+ *
+ * @author Derrick Nelson <drrcknlsn@gmail.com>
  */
-class SolverProblemsException extends \RuntimeException
+class RarDownloader extends ArchiveDownloader
 {
-    public const ERROR_DEPENDENCY_RESOLUTION_FAILED = 2;
-
-    /** @var Problem[] */
-    protected $problems;
-    /** @var array<Rule[]> */
-    protected $learnedPool;
-
-    /**
-     * @param Problem[] $problems
-     * @param array<Rule[]> $learnedPool
-     */
-    public function __construct(array $problems, array $learnedPool)
+    protected function extract(PackageInterface $package, string $file, string $path): PromiseInterface
     {
-        $this->problems = $problems;
-        $this->learnedPool = $learnedPool;
+        $processError = null;
 
-        parent::__construct('Failed resolving dependencies with '.count($problems).' problems, call getPrettyString to get formatted details', self::ERROR_DEPENDENCY_RESOLUTION_FAILED);
-    }
+        // Try to use unrar on *nix
+        if (!Platform::isWindows()) {
+            $command = 'unrar x -- ' . ProcessExecutor::escape($file) . ' ' . ProcessExecutor::escape($path) . ' >/dev/null && chmod -R u+w ' . ProcessExecutor::escape($path);
 
-    public function getPrettyString(RepositorySet $repositorySet, Request $request, Pool $pool, bool $isVerbose, bool $isDevExtraction = false): string
-    {
-        $installedMap = $request->getPresentMap(true);
-        $missingExtensions = [];
-        $isCausedByLock = false;
+            if (0 === $this->process->execute($command, $ignoredOutput)) {
+                return \React\Promise\resolve(null);
+            }
 
-        $problems = [];
-        foreach ($this->problems as $problem) {
-            $problems[] = $problem->getPrettyString($repositorySet, $request, $pool, $isVerbose, $installedMap, $this->learnedPool)."\n";
-
-            $missingExtensions = array_merge($missingExtensions, $this->getExtensionProblems($problem->getReasons()));
-
-            $isCausedByLock = $isCausedByLock || $problem->isCausedByLock($repositorySet, $request, $pool);
+            $processError = 'Failed to execute ' . $command . "\n\n" . $this->process->getErrorOutput();
         }
 
-        $i = 1;
-        $text = "\n";
-        foreach (array_unique($problems) as $problem) {
-            $text .= "  Problem ".($i++).$problem;
+        if (!class_exists('RarArchive')) {
+            // php.ini path is added to the error message to help users find the correct file
+            $iniMessage = IniHelper::getMessage();
+
+            $error = "Could not decompress the archive, enable the PHP rar extension or install unrar.\n"
+                . $iniMessage . "\n" . $processError;
+
+            if (!Platform::isWindows()) {
+                $error = "Could not decompress the archive, enable the PHP rar extension.\n" . $iniMessage;
+            }
+
+            throw new \RuntimeException($error);
         }
 
-        $hints = [];
-        if (!$isDevExtraction && (strpos($text, 'could not be found') || strpos($text, 'no matching package found'))) {
-            $hints[] = "Potential causes:\n - A typo in the package name\n - The package is not available in a stable-enough version according to your minimum-stability setting\n   see <https://getcomposer.org/doc/04-schema.md#minimum-stability> for more details.\n - It's a private package and you forgot to add a custom repository to find it\n\nRead <https://getcomposer.org/doc/articles/troubleshooting.md> for further common problems.";
+        $rarArchive = RarArchive::open($file);
+
+        if (false === $rarArchive) {
+            throw new \UnexpectedValueException('Could not open RAR archive: ' . $file);
         }
 
-        if (!empty($missingExtensions)) {
-            $hints[] = $this->createExtensionHint($missingExtensions);
+        $entries = $rarArchive->getEntries();
+
+        if (false === $entries) {
+            throw new \RuntimeException('Could not retrieve RAR archive entries');
         }
 
-        if ($isCausedByLock && !$isDevExtraction && !$request->getUpdateAllowTransitiveRootDependencies()) {
-            $hints[] = "Use the option --with-all-dependencies (-W) to allow upgrades, downgrades and removals for packages currently locked to specific versions.";
-        }
-
-        if (strpos($text, 'found composer-plugin-api[2.0.0] but it does not match') && strpos($text, '- ocramius/package-versions')) {
-            $hints[] = "<warning>ocramius/package-versions only provides support for Composer 2 in 1.8+, which requires PHP 7.4.</warning>\nIf you can not upgrade PHP you can require <info>composer/package-versions-deprecated</info> to resolve this with PHP 7.0+.";
-        }
-
-        if (!class_exists('PHPUnit\Framework\TestCase', false)) {
-            if (strpos($text, 'found composer-plugin-api[2.0.0] but it does not match')) {
-                $hints[] = "You are using Composer 2, which some of your plugins seem to be incompatible with. Make sure you update your plugins or report a plugin-issue to ask them to support Composer 2.";
+        foreach ($entries as $entry) {
+            if (false === $entry->extract($path)) {
+                throw new \RuntimeException('Could not extract entry');
             }
         }
 
-        if ($hints) {
-            $text .= "\n" . implode("\n\n", $hints);
-        }
+        $rarArchive->close();
 
-        return $text;
-    }
-
-    /**
-     * @return Problem[]
-     */
-    public function getProblems(): array
-    {
-        return $this->problems;
-    }
-
-    /**
-     * @param string[] $missingExtensions
-     */
-    private function createExtensionHint(array $missingExtensions): string
-    {
-        $paths = IniHelper::getAll();
-
-        if ('' === $paths[0]) {
-            if (count($paths) === 1) {
-                return '';
-            }
-
-            array_shift($paths);
-        }
-
-        $ignoreExtensionsArguments = implode(" ", array_map(static function ($extension) {
-            return "--ignore-platform-req=$extension";
-        }, array_unique($missingExtensions)));
-
-        $text = "To enable extensions, verify that they are enabled in your .ini files:\n    - ";
-        $text .= implode("\n    - ", $paths);
-        $text .= "\nYou can also run `php --ini` in a terminal to see which files are used by PHP in CLI mode.";
-        $text .= "\nAlternatively, you can run Composer with `$ignoreExtensionsArguments` to temporarily ignore these required extensions.";
-
-        return $text;
-    }
-
-    /**
-     * @param Rule[][] $reasonSets
-     * @return string[]
-     */
-    private function getExtensionProblems(array $reasonSets): array
-    {
-        $missingExtensions = [];
-        foreach ($reasonSets as $reasonSet) {
-            foreach ($reasonSet as $rule) {
-                $required = $rule->getRequiredPackage();
-                if (null !== $required && 0 === strpos($required, 'ext-')) {
-                    $missingExtensions[$required] = 1;
-                }
-            }
-        }
-
-        return array_keys($missingExtensions);
+        return \React\Promise\resolve(null);
     }
 }

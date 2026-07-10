@@ -1,257 +1,297 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
-const log = std.log.scoped(.zls_document_symbol);
+const log = std.log.scoped(.zls_goto);
 
+const Server = @import("../Server.zig");
+const ast = @import("../ast.zig");
 const types = @import("../lsp.zig");
 const offsets = @import("../offsets.zig");
-const ast = @import("../ast.zig");
-const analysis = @import("../analysis.zig");
+const URI = @import("../uri.zig");
 const tracy = @import("tracy");
 
-const Symbol = struct {
-    name: []const u8,
-    detail: ?[]const u8 = null,
-    kind: types.SymbolKind,
-    loc: offsets.Loc,
-    selection_loc: offsets.Loc,
-    children: std.ArrayListUnmanaged(Symbol),
+const Analyser = @import("../analysis.zig");
+const DocumentStore = @import("../DocumentStore.zig");
+
+pub const GotoKind = enum {
+    declaration,
+    definition,
+    type_definition,
 };
 
-const Context = struct {
-    arena: std.mem.Allocator,
-    last_var_decl_name: ?[]const u8,
-    parent_container: Ast.Node.Index,
-    parent_node: Ast.Node.Index,
-    parent_symbols: *std.ArrayListUnmanaged(Symbol),
-    total_symbol_count: *usize,
-};
-
-fn callback(ctx: *Context, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
-    if (node == 0) return;
-
-    const node_tags = tree.nodes.items(.tag);
-    const main_tokens = tree.nodes.items(.main_token);
-    const token_tags = tree.tokens.items(.tag);
-
-    const decl_name_token = analysis.getContainerDeclNameToken(tree, ctx.parent_container, node);
-    const decl_name = if (decl_name_token) |name_token| analysis.declNameTokenToSlice(tree, name_token) else null;
-
-    var new_ctx = ctx.*;
-    const maybe_symbol: ?Symbol = switch (node_tags[node]) {
-        .global_var_decl,
-        .local_var_decl,
-        .simple_var_decl,
-        .aligned_var_decl,
-        => blk: {
-            new_ctx.last_var_decl_name = decl_name;
-            if (!ast.isContainer(tree, ctx.parent_node)) break :blk null;
-
-            const kind: types.SymbolKind = switch (token_tags[main_tokens[node]]) {
-                .keyword_var => .Variable,
-                .keyword_const => .Constant,
-                else => unreachable,
-            };
-
-            break :blk .{
-                .name = decl_name orelse break :blk null,
-                .detail = null,
-                .kind = kind,
-                .loc = offsets.nodeToLoc(tree, node),
-                .selection_loc = offsets.tokenToLoc(tree, decl_name_token.?),
-                .children = .{},
-            };
-        },
-
-        .test_decl,
-        .fn_decl,
-        => |tag| blk: {
-            const kind: types.SymbolKind = switch (tag) {
-                .test_decl => .Method, // there is no SymbolKind that represents a tests
-                .fn_decl => .Function,
-                else => unreachable,
-            };
-
-            var buffer: [1]Ast.Node.Index = undefined;
-            const detail = if (tree.fullFnProto(&buffer, node)) |fn_info| analysis.getFunctionSignature(tree, fn_info) else null;
-
-            break :blk .{
-                .name = decl_name orelse break :blk null,
-                .detail = detail,
-                .kind = kind,
-                .loc = offsets.nodeToLoc(tree, node),
-                .selection_loc = offsets.tokenToLoc(tree, decl_name_token.?),
-                .children = .{},
-            };
-        },
-
-        .container_field_init,
-        .container_field_align,
-        .container_field,
-        => blk: {
-            const kind: types.SymbolKind = switch (node_tags[ctx.parent_container]) {
-                .root => .Field,
-                .container_decl,
-                .container_decl_trailing,
-                .container_decl_arg,
-                .container_decl_arg_trailing,
-                .container_decl_two,
-                .container_decl_two_trailing,
-                => switch (token_tags[main_tokens[ctx.parent_container]]) {
-                    .keyword_struct => .Field,
-                    .keyword_union => .Field,
-                    .keyword_enum => .EnumMember,
-                    .keyword_opaque => break :blk null,
-                    else => unreachable,
-                },
-                .tagged_union,
-                .tagged_union_trailing,
-                .tagged_union_enum_tag,
-                .tagged_union_enum_tag_trailing,
-                .tagged_union_two,
-                .tagged_union_two_trailing,
-                => .Field,
-                else => unreachable,
-            };
-
-            break :blk .{
-                .name = decl_name orelse break :blk null,
-                .detail = ctx.last_var_decl_name,
-                .kind = kind,
-                .loc = offsets.nodeToLoc(tree, node),
-                .selection_loc = offsets.tokenToLoc(tree, decl_name_token.?),
-                .children = .{},
-            };
-        },
-        .container_decl,
-        .container_decl_trailing,
-        .container_decl_arg,
-        .container_decl_arg_trailing,
-        .container_decl_two,
-        .container_decl_two_trailing,
-        .tagged_union,
-        .tagged_union_trailing,
-        .tagged_union_enum_tag,
-        .tagged_union_enum_tag_trailing,
-        .tagged_union_two,
-        .tagged_union_two_trailing,
-        => blk: {
-            new_ctx.parent_container = node;
-            break :blk null;
-        },
-        else => null,
-    };
-
-    new_ctx.parent_node = node;
-    if (maybe_symbol) |symbol| {
-        var symbol_ptr = try ctx.parent_symbols.addOne(ctx.arena);
-        symbol_ptr.* = symbol;
-        new_ctx.parent_symbols = &symbol_ptr.children;
-        ctx.total_symbol_count.* += 1;
-    }
-
-    try ast.iterateChildren(tree, node, &new_ctx, error{OutOfMemory}, callback);
-}
-
-/// a mapping from a source index to a line character pair
-const IndexToPositionEntry = struct {
-    output: *types.Position,
-    source_index: usize,
-
-    const Self = @This();
-
-    fn lessThan(_: void, lhs: Self, rhs: Self) bool {
-        return lhs.source_index < rhs.source_index;
-    }
-};
-
-/// converts `Symbol` to `types.DocumentSymbol`
-fn convertSymbols(
-    arena: std.mem.Allocator,
-    tree: Ast,
-    from: []const Symbol,
-    total_symbol_count: usize,
-    encoding: offsets.Encoding,
-) error{OutOfMemory}![]types.DocumentSymbol {
+fn gotoDefinitionSymbol(
+    analyser: *Analyser,
+    name_range: types.Range,
+    decl_handle: Analyser.DeclWithHandle,
+    kind: GotoKind,
+    offset_encoding: offsets.Encoding,
+) error{OutOfMemory}!?types.DefinitionLink {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    var symbol_buffer = std.ArrayListUnmanaged(types.DocumentSymbol){};
-    try symbol_buffer.ensureTotalCapacityPrecise(arena, total_symbol_count);
+    const token_handle = switch (kind) {
+        .declaration => try decl_handle.definitionToken(analyser, false),
+        .definition => try decl_handle.definitionToken(analyser, true),
+        .type_definition => blk: {
+            // we should actually resolve the definition but declaration is can be more reliably implemented.
+            const type_declaration = try decl_handle.typeDeclarationNode() orelse {
+                // just resolve the type and guess
+                if (try decl_handle.resolveType(analyser)) |resolved_type| {
+                    if (resolved_type.typeDefinitionToken()) |token_handle| {
+                        break :blk token_handle;
+                    }
+                }
+                return null;
+            };
+            const target_range = offsets.nodeToRange(type_declaration.handle.tree, type_declaration.node, offset_encoding);
 
-    // instead of converting every `offsets.Loc` to `types.Range` by calling `offsets.locToRange`
-    // we instead store a mapping from source indices to their desired position, sort them by their source index
-    // and then iterate through them which avoids having to re-iterate through the source file to find out the line number
-    // this reduces algorithmic complexity from `O(file_size*symbol_count)` to `O(symbol_count*log(symbol_count))`
-    var mappings = std.ArrayListUnmanaged(IndexToPositionEntry){};
-    try mappings.ensureTotalCapacityPrecise(arena, total_symbol_count * 4);
-
-    const result = convertSymbolsInternal(from, &symbol_buffer, &mappings);
-
-    // sort items based on their source position
-    std.mem.sort(IndexToPositionEntry, mappings.items, {}, IndexToPositionEntry.lessThan);
-
-    var last_index: usize = 0;
-    var last_position: types.Position = .{ .line = 0, .character = 0 };
-    for (mappings.items) |mapping| {
-        const index = mapping.source_index;
-        const position = offsets.advancePosition(tree.source, last_position, last_index, index, encoding);
-        defer last_index = index;
-        defer last_position = position;
-
-        mapping.output.* = position;
-    }
-
-    return result;
-}
-
-fn convertSymbolsInternal(
-    from: []const Symbol,
-    symbol_buffer: *std.ArrayListUnmanaged(types.DocumentSymbol),
-    mappings: *std.ArrayListUnmanaged(IndexToPositionEntry),
-) []types.DocumentSymbol {
-    // acquire storage for exactly `from.len` symbols
-    const prev_len = symbol_buffer.items.len;
-    symbol_buffer.items.len += from.len;
-    const to: []types.DocumentSymbol = symbol_buffer.items[prev_len..];
-
-    for (from, to) |symbol, *out| {
-        out.* = .{
-            .name = symbol.name,
-            .detail = symbol.detail,
-            .kind = symbol.kind,
-            // will be set later through the mapping below
-            .range = undefined,
-            .selectionRange = undefined,
-            .children = convertSymbolsInternal(symbol.children.items, symbol_buffer, mappings),
-        };
-        mappings.appendSliceAssumeCapacity(&[4]IndexToPositionEntry{
-            .{ .output = &out.range.start, .source_index = symbol.loc.start },
-            .{ .output = &out.selectionRange.start, .source_index = symbol.selection_loc.start },
-            .{ .output = &out.selectionRange.end, .source_index = symbol.selection_loc.end },
-            .{ .output = &out.range.end, .source_index = symbol.loc.end },
-        });
-    }
-
-    return to;
-}
-
-pub fn getDocumentSymbols(
-    arena: std.mem.Allocator,
-    tree: Ast,
-    encoding: offsets.Encoding,
-) error{OutOfMemory}![]types.DocumentSymbol {
-    var root_symbols = std.ArrayListUnmanaged(Symbol){};
-    var total_symbol_count: usize = 0;
-
-    var ctx = Context{
-        .arena = arena,
-        .last_var_decl_name = null,
-        .parent_node = 0, // root-node
-        .parent_container = 0, // root-node
-        .parent_symbols = &root_symbols,
-        .total_symbol_count = &total_symbol_count,
+            return types.DefinitionLink{
+                .originSelectionRange = name_range,
+                .targetUri = type_declaration.handle.uri,
+                .targetRange = target_range,
+                .targetSelectionRange = target_range,
+            };
+        },
     };
-    try ast.iterateChildren(tree, 0, &ctx, error{OutOfMemory}, callback);
+    const target_range = offsets.tokenToRange(token_handle.handle.tree, token_handle.token, offset_encoding);
 
-    return try convertSymbols(arena, tree, root_symbols.items, ctx.total_symbol_count.*, encoding);
+    return types.DefinitionLink{
+        .originSelectionRange = name_range,
+        .targetUri = token_handle.handle.uri,
+        .targetRange = target_range,
+        .targetSelectionRange = target_range,
+    };
+}
+
+fn gotoDefinitionLabel(
+    analyser: *Analyser,
+    arena: std.mem.Allocator,
+    handle: *DocumentStore.Handle,
+    pos_index: usize,
+    kind: GotoKind,
+    offset_encoding: offsets.Encoding,
+) error{OutOfMemory}!?types.DefinitionLink {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+    _ = arena;
+
+    const name_loc = Analyser.identifierLocFromPosition(pos_index, handle) orelse return null;
+    const name = offsets.locToSlice(handle.tree.source, name_loc);
+    const decl = (try Analyser.getLabelGlobal(pos_index, handle, name)) orelse return null;
+    return try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), decl, kind, offset_encoding);
+}
+
+fn gotoDefinitionGlobal(
+    analyser: *Analyser,
+    arena: std.mem.Allocator,
+    handle: *DocumentStore.Handle,
+    pos_index: usize,
+    kind: GotoKind,
+    offset_encoding: offsets.Encoding,
+) error{OutOfMemory}!?types.DefinitionLink {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+    _ = arena;
+
+    const name_loc = Analyser.identifierLocFromPosition(pos_index, handle) orelse return null;
+    const name = offsets.locToSlice(handle.tree.source, name_loc);
+    const decl = (try analyser.getSymbolGlobal(pos_index, handle, name)) orelse return null;
+    return try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), decl, kind, offset_encoding);
+}
+
+fn gotoDefinitionEnumLiteral(
+    analyser: *Analyser,
+    arena: std.mem.Allocator,
+    handle: *DocumentStore.Handle,
+    source_index: usize,
+    kind: GotoKind,
+    offset_encoding: offsets.Encoding,
+) error{OutOfMemory}!?types.DefinitionLink {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    const name_loc = Analyser.identifierLocFromPosition(source_index, handle) orelse return null;
+    const name = offsets.locToSlice(handle.tree.source, name_loc);
+    const decl = (try analyser.getSymbolEnumLiteral(arena, handle, source_index, name)) orelse return null;
+    return try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), decl, kind, offset_encoding);
+}
+
+fn gotoDefinitionBuiltin(
+    document_store: *DocumentStore,
+    handle: *DocumentStore.Handle,
+    loc: offsets.Loc,
+    offset_encoding: offsets.Encoding,
+) error{OutOfMemory}!?types.DefinitionLink {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    const name_loc = offsets.tokenIndexToLoc(handle.tree.source, loc.start);
+    const name = offsets.locToSlice(handle.tree.source, name_loc);
+    if (std.mem.eql(u8, name, "@cImport")) {
+        const tree = handle.tree;
+        const index = for (handle.cimports.items(.node), 0..) |cimport_node, index| {
+            const main_token = tree.nodes.items(.main_token)[cimport_node];
+            if (loc.start == offsets.tokenToIndex(tree, main_token)) break index;
+        } else return null;
+        const hash = handle.cimports.items(.hash)[index];
+
+        const result = document_store.cimports.get(hash) orelse return null;
+        const target_range = types.Range{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 0 },
+        };
+        switch (result) {
+            .failure => return null,
+            .success => |uri| return types.DefinitionLink{
+                .originSelectionRange = offsets.locToRange(handle.tree.source, name_loc, offset_encoding),
+                .targetUri = uri,
+                .targetRange = target_range,
+                .targetSelectionRange = target_range,
+            },
+        }
+    }
+
+    return null;
+}
+
+fn gotoDefinitionFieldAccess(
+    analyser: *Analyser,
+    arena: std.mem.Allocator,
+    handle: *DocumentStore.Handle,
+    source_index: usize,
+    loc: offsets.Loc,
+    kind: GotoKind,
+    offset_encoding: offsets.Encoding,
+) error{OutOfMemory}!?[]const types.DefinitionLink {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    const name_loc = Analyser.identifierLocFromPosition(source_index, handle) orelse return null;
+    const name = offsets.locToSlice(handle.tree.source, name_loc);
+    const held_loc = offsets.locMerge(loc, name_loc);
+    const accesses = (try analyser.getSymbolFieldAccesses(arena, handle, source_index, held_loc, name)) orelse return null;
+    var locs = std.ArrayListUnmanaged(types.DefinitionLink){};
+
+    for (accesses) |access| {
+        if (try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), access, kind, offset_encoding)) |l|
+            try locs.append(arena, l);
+    }
+
+    if (locs.items.len == 0)
+        return null;
+
+    return try locs.toOwnedSlice(arena);
+}
+
+fn gotoDefinitionString(
+    document_store: *DocumentStore,
+    arena: std.mem.Allocator,
+    pos_context: Analyser.PositionContext,
+    handle: *DocumentStore.Handle,
+    offset_encoding: offsets.Encoding,
+) error{OutOfMemory}!?types.DefinitionLink {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    const loc = pos_context.loc().?;
+    var import_str_loc = offsets.tokenIndexToLoc(handle.tree.source, loc.start);
+    if (import_str_loc.end - import_str_loc.start < 2) return null;
+    import_str_loc.start += 1;
+    if (std.mem.endsWith(u8, offsets.locToSlice(handle.tree.source, import_str_loc), "\"")) {
+        import_str_loc.end -= 1;
+    }
+    const import_str = offsets.locToSlice(handle.tree.source, import_str_loc);
+
+    const uri = switch (pos_context) {
+        .import_string_literal,
+        .embedfile_string_literal,
+        => try document_store.uriFromImportStr(arena, handle, import_str),
+        .cinclude_string_literal => try URI.fromPath(
+            arena,
+            blk: {
+                if (std.fs.path.isAbsolute(import_str)) break :blk import_str;
+                var include_dirs: std.ArrayListUnmanaged([]const u8) = .{};
+                _ = document_store.collectIncludeDirs(arena, handle, &include_dirs) catch |err| {
+                    log.err("failed to resolve include paths: {}", .{err});
+                    return null;
+                };
+                for (include_dirs.items) |dir| {
+                    const path = try std.fs.path.join(arena, &.{ dir, import_str });
+                    std.fs.accessAbsolute(path, .{}) catch continue;
+                    break :blk path;
+                }
+                return null;
+            },
+        ),
+        else => unreachable,
+    };
+
+    const target_range = types.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = 0 },
+    };
+    return types.DefinitionLink{
+        .originSelectionRange = offsets.locToRange(handle.tree.source, import_str_loc, offset_encoding),
+        .targetUri = uri orelse return null,
+        .targetRange = target_range,
+        .targetSelectionRange = target_range,
+    };
+}
+
+pub fn gotoHandler(
+    server: *Server,
+    arena: std.mem.Allocator,
+    kind: GotoKind,
+    request: types.DefinitionParams,
+) Server.Error!Server.ResultType("textDocument/definition") {
+    if (request.position.character == 0) return null;
+
+    const handle = server.document_store.getHandle(request.textDocument.uri) orelse return null;
+    const source_index = offsets.positionToIndex(handle.tree.source, request.position, server.offset_encoding);
+
+    var analyser = Analyser.init(
+        server.allocator,
+        &server.document_store,
+        &server.ip,
+        handle,
+        server.config.dangerous_comptime_experiments_do_not_enable,
+    );
+    defer analyser.deinit();
+
+    const pos_context = try Analyser.getPositionContext(arena, handle.tree.source, source_index, true);
+
+    const response = switch (pos_context) {
+        .builtin => |loc| try gotoDefinitionBuiltin(&server.document_store, handle, loc, server.offset_encoding),
+        .var_access => try gotoDefinitionGlobal(&analyser, arena, handle, source_index, kind, server.offset_encoding),
+        .field_access => |loc| blk: {
+            const links = try gotoDefinitionFieldAccess(&analyser, arena, handle, source_index, loc, kind, server.offset_encoding) orelse return null;
+            if (server.client_capabilities.supports_textDocument_definition_linkSupport) {
+                return .{ .array_of_DefinitionLink = links };
+            }
+            switch (links.len) {
+                0 => unreachable,
+                1 => break :blk links[0],
+                else => return null,
+            }
+        },
+        .import_string_literal,
+        .cinclude_string_literal,
+        .embedfile_string_literal,
+        => try gotoDefinitionString(&server.document_store, arena, pos_context, handle, server.offset_encoding),
+        .label => try gotoDefinitionLabel(&analyser, arena, handle, source_index, kind, server.offset_encoding),
+        .enum_literal => try gotoDefinitionEnumLiteral(&analyser, arena, handle, source_index, kind, server.offset_encoding),
+        else => null,
+    } orelse return null;
+
+    if (server.client_capabilities.supports_textDocument_definition_linkSupport) {
+        return .{
+            .array_of_DefinitionLink = try arena.dupe(types.DefinitionLink, &.{response}),
+        };
+    }
+
+    return .{
+        .Definition = .{ .Location = .{
+            .uri = response.targetUri,
+            .range = response.targetSelectionRange,
+        } },
+    };
 }

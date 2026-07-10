@@ -5,7 +5,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) Steve Holme, <steve_holme@hotmail.com>.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -22,124 +22,142 @@
  *
  ***************************************************************************/
 
-#include "test.h"
-#include "testutil.h"
-#include "testtrace.h"
+#include "curl_setup.h"
+
+#include <curl/curl.h>
+
+#include "vauth.h"
+#include "urldata.h"
+#include "strcase.h"
+#include "curl_multibyte.h"
+#include "curl_printf.h"
+
+/* The last #include files should be: */
+#include "curl_memory.h"
 #include "memdebug.h"
 
-struct libtest_trace_cfg libtest_debug_config;
-
-static time_t epoch_offset; /* for test time tracing */
-static int    known_offset; /* for test time tracing */
-
-static
-void libtest_debug_dump(const char *timebuf, const char *text, FILE *stream,
-                        const unsigned char *ptr, size_t size, int nohex)
+/*
+ * Curl_auth_build_spn()
+ *
+ * This is used to build a SPN string in the following formats:
+ *
+ * service/host@realm (Not currently used)
+ * service/host       (Not used by GSS-API)
+ * service@realm      (Not used by Windows SSPI)
+ *
+ * Parameters:
+ *
+ * service  [in] - The service type such as http, smtp, pop or imap.
+ * host     [in] - The hostname.
+ * realm    [in] - The realm.
+ *
+ * Returns a pointer to the newly allocated SPN.
+ */
+#if !defined(USE_WINDOWS_SSPI)
+char *Curl_auth_build_spn(const char *service, const char *host,
+                          const char *realm)
 {
-  size_t i;
-  size_t c;
+  char *spn = NULL;
 
-  unsigned int width = 0x10;
+  /* Generate our SPN */
+  if(host && realm)
+    spn = aprintf("%s/%s@%s", service, host, realm);
+  else if(host)
+    spn = aprintf("%s/%s", service, host);
+  else if(realm)
+    spn = aprintf("%s@%s", service, realm);
 
-  if(nohex)
-    /* without the hex output, we can fit more on screen */
-    width = 0x40;
+  /* Return our newly allocated SPN */
+  return spn;
+}
+#else
+TCHAR *Curl_auth_build_spn(const char *service, const char *host,
+                           const char *realm)
+{
+  char *utf8_spn = NULL;
+  TCHAR *tchar_spn = NULL;
+  TCHAR *dupe_tchar_spn = NULL;
 
-  fprintf(stream, "%s%s, %zu bytes (0x%zx)\n", timebuf, text,
-          size, size);
+  (void) realm;
 
-  for(i = 0; i < size; i += width) {
+  /* Note: We could use DsMakeSPN() or DsClientMakeSpnForTargetServer() rather
+     than doing this ourselves but the first is only available in Windows XP
+     and Windows Server 2003 and the latter is only available in Windows 2000
+     but not Windows95/98/ME or Windows NT4.0 unless the Active Directory
+     Client Extensions are installed. As such it is far simpler for us to
+     formulate the SPN instead. */
 
-    fprintf(stream, "%04zx: ", i);
+  /* Generate our UTF8 based SPN */
+  utf8_spn = aprintf("%s/%s", service, host);
+  if(!utf8_spn)
+    return NULL;
 
-    if(!nohex) {
-      /* hex not disabled, show it */
-      for(c = 0; c < width; c++)
-        if(i + c < size)
-          fprintf(stream, "%02x ", ptr[i + c]);
-        else
-          fputs("   ", stream);
-    }
+  /* Allocate and return a TCHAR based SPN. Since curlx_convert_UTF8_to_tchar
+     must be freed by curlx_unicodefree we will dupe the result so that the
+     pointer this function returns can be normally free'd. */
+  tchar_spn = curlx_convert_UTF8_to_tchar(utf8_spn);
+  free(utf8_spn);
+  if(!tchar_spn)
+    return NULL;
+  dupe_tchar_spn = _tcsdup(tchar_spn);
+  curlx_unicodefree(tchar_spn);
+  return dupe_tchar_spn;
+}
+#endif /* USE_WINDOWS_SSPI */
 
-    for(c = 0; (c < width) && (i + c < size); c++) {
-      /* check for 0D0A; if found, skip past and start a new line of output */
-      if(nohex &&
-         (i + c + 1 < size) && (ptr[i + c] == 0x0D) &&
-         (ptr[i + c + 1] == 0x0A)) {
-        i += (c + 2 - width);
-        break;
-      }
-      fprintf(stream, "%c", ((ptr[i + c] >= 0x20) && (ptr[i + c] < 0x80)) ?
-              ptr[i + c] : '.');
-      /* check again for 0D0A, to avoid an extra \n if it's at width */
-      if(nohex &&
-         (i + c + 2 < size) && (ptr[i + c + 1] == 0x0D) &&
-         (ptr[i + c + 2] == 0x0A)) {
-        i += (c + 3 - width);
-        break;
-      }
-    }
-    fputc('\n', stream); /* newline */
+/*
+ * Curl_auth_user_contains_domain()
+ *
+ * This is used to test if the specified user contains a Windows domain name as
+ * follows:
+ *
+ * Domain\User (Down-level Logon Name)
+ * Domain/User (curl Down-level format - for compatibility with existing code)
+ * User@Domain (User Principal Name)
+ *
+ * Note: The username may be empty when using a GSS-API library or Windows
+ * SSPI as the user and domain are either obtained from the credentials cache
+ * when using GSS-API or via the currently logged in user's credentials when
+ * using Windows SSPI.
+ *
+ * Parameters:
+ *
+ * user  [in] - The username.
+ *
+ * Returns TRUE on success; otherwise FALSE.
+ */
+bool Curl_auth_user_contains_domain(const char *user)
+{
+  bool valid = FALSE;
+
+  if(user && *user) {
+    /* Check we have a domain name or UPN present */
+    char *p = strpbrk(user, "\\/@");
+
+    valid = (p != NULL && p > user && p < user + strlen(user) - 1 ? TRUE :
+                                                                    FALSE);
   }
-  fflush(stream);
+#if defined(HAVE_GSSAPI) || defined(USE_WINDOWS_SSPI)
+  else
+    /* User and domain are obtained from the GSS-API credentials cache or the
+       currently logged in user from Windows */
+    valid = TRUE;
+#endif
+
+  return valid;
 }
 
-int libtest_debug_cb(CURL *handle, curl_infotype type,
-                     unsigned char *data, size_t size,
-                     void *userp)
+/*
+ * Curl_auth_ollowed_to_host() tells if authentication, cookies or other
+ * "sensitive data" can (still) be sent to this host.
+ */
+bool Curl_auth_allowed_to_host(struct Curl_easy *data)
 {
-
-  struct libtest_trace_cfg *trace_cfg = userp;
-  const char *text;
-  struct timeval tv;
-  char timebuf[20];
-  char *timestr;
-  time_t secs;
-
-  (void)handle;
-
-  timebuf[0] = '\0';
-  timestr = &timebuf[0];
-
-  if(trace_cfg->tracetime) {
-    struct tm *now;
-    tv = tutil_tvnow();
-    if(!known_offset) {
-      epoch_offset = time(NULL) - tv.tv_sec;
-      known_offset = 1;
-    }
-    secs = epoch_offset + tv.tv_sec;
-    now = localtime(&secs);  /* not thread safe but we don't care */
-    msnprintf(timebuf, sizeof(timebuf), "%02d:%02d:%02d.%06ld ",
-              now->tm_hour, now->tm_min, now->tm_sec, (long)tv.tv_usec);
-  }
-
-  switch(type) {
-  case CURLINFO_TEXT:
-    fprintf(stderr, "%s== Info: %s", timestr, (char *)data);
-    return 0;
-  case CURLINFO_HEADER_OUT:
-    text = "=> Send header";
-    break;
-  case CURLINFO_DATA_OUT:
-    text = "=> Send data";
-    break;
-  case CURLINFO_SSL_DATA_OUT:
-    text = "=> Send SSL data";
-    break;
-  case CURLINFO_HEADER_IN:
-    text = "<= Recv header";
-    break;
-  case CURLINFO_DATA_IN:
-    text = "<= Recv data";
-    break;
-  case CURLINFO_SSL_DATA_IN:
-    text = "<= Recv SSL data";
-    break;
-  default: /* in case a new one is introduced to shock us */
-    return 0;
-  }
-
-  libtest_debug_dump(timebuf, text, stderr, data, size, trace_cfg->nohex);
-  return 0;
+  struct connectdata *conn = data->conn;
+  return (!data->state.this_is_a_follow ||
+          data->set.allow_auth_to_other_hosts ||
+          (data->state.first_host &&
+           strcasecompare(data->state.first_host, conn->host.name) &&
+           (data->state.first_remote_port == conn->remote_port) &&
+           (data->state.first_remote_protocol == conn->handler->protocol)));
 }

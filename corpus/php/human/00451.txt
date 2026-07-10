@@ -10,139 +10,142 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Repository;
+namespace Composer\Command;
 
+use Composer\Json\JsonFile;
+use Composer\Package\AliasPackage;
+use Composer\Package\BasePackage;
+use Composer\Package\CompletePackageInterface;
+use Composer\Pcre\Preg;
 use Composer\Repository\CompositeRepository;
-use Composer\Repository\ArrayRepository;
-use Composer\Test\TestCase;
+use Composer\Semver\Constraint\MatchAllConstraint;
+use Symfony\Component\Console\Formatter\OutputFormatter;
+use Symfony\Component\Console\Input\InputInterface;
+use Composer\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
 
-class CompositeRepositoryTest extends TestCase
+/**
+ * @author Nicolas Grekas <p@tchwork.com>
+ * @author Jordi Boggiano <j.boggiano@seld.be>
+ */
+class FundCommand extends BaseCommand
 {
-    public function testHasPackage(): void
+    protected function configure(): void
     {
-        $arrayRepoOne = new ArrayRepository;
-        $arrayRepoOne->addPackage(self::getPackage('foo', '1'));
-
-        $arrayRepoTwo = new ArrayRepository;
-        $arrayRepoTwo->addPackage(self::getPackage('bar', '1'));
-
-        $repo = new CompositeRepository([$arrayRepoOne, $arrayRepoTwo]);
-
-        self::assertTrue($repo->hasPackage(self::getPackage('foo', '1')), "Should have package 'foo/1'");
-        self::assertTrue($repo->hasPackage(self::getPackage('bar', '1')), "Should have package 'bar/1'");
-
-        self::assertFalse($repo->hasPackage(self::getPackage('foo', '2')), "Should not have package 'foo/2'");
-        self::assertFalse($repo->hasPackage(self::getPackage('bar', '2')), "Should not have package 'bar/2'");
+        $this->setName('fund')
+            ->setDescription('Discover how to help fund the maintenance of your dependencies')
+            ->setDefinition([
+                new InputOption('format', 'f', InputOption::VALUE_REQUIRED, 'Format of the output: text or json', 'text', ['text', 'json']),
+            ])
+        ;
     }
 
-    public function testFindPackage(): void
+    protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $arrayRepoOne = new ArrayRepository;
-        $arrayRepoOne->addPackage(self::getPackage('foo', '1'));
+        $composer = $this->requireComposer();
 
-        $arrayRepoTwo = new ArrayRepository;
-        $arrayRepoTwo->addPackage(self::getPackage('bar', '1'));
+        $repo = $composer->getRepositoryManager()->getLocalRepository();
+        $remoteRepos = new CompositeRepository($composer->getRepositoryManager()->getRepositories());
+        $fundings = [];
 
-        $repo = new CompositeRepository([$arrayRepoOne, $arrayRepoTwo]);
+        $packagesToLoad = [];
+        foreach ($repo->getPackages() as $package) {
+            if ($package instanceof AliasPackage) {
+                continue;
+            }
+            $packagesToLoad[$package->getName()] = new MatchAllConstraint();
+        }
 
-        self::assertEquals('foo', $repo->findPackage('foo', '1')->getName(), "Should find package 'foo/1' and get name of 'foo'");
-        self::assertEquals('1', $repo->findPackage('foo', '1')->getPrettyVersion(), "Should find package 'foo/1' and get pretty version of '1'");
-        self::assertEquals('bar', $repo->findPackage('bar', '1')->getName(), "Should find package 'bar/1' and get name of 'bar'");
-        self::assertEquals('1', $repo->findPackage('bar', '1')->getPrettyVersion(), "Should find package 'bar/1' and get pretty version of '1'");
-        self::assertNull($repo->findPackage('foo', '2'), "Should not find package 'foo/2'");
-    }
+        // load all packages dev versions in parallel
+        $result = $remoteRepos->loadPackages($packagesToLoad, ['dev' => BasePackage::STABILITY_DEV], []);
 
-    public function testFindPackages(): void
-    {
-        $arrayRepoOne = new ArrayRepository;
-        $arrayRepoOne->addPackage(self::getPackage('foo', '1'));
-        $arrayRepoOne->addPackage(self::getPackage('foo', '2'));
-        $arrayRepoOne->addPackage(self::getPackage('bat', '1'));
+        // collect funding data from default branches
+        foreach ($result['packages'] as $package) {
+            if (
+                !$package instanceof AliasPackage
+                && $package instanceof CompletePackageInterface
+                && $package->isDefaultBranch()
+                && $package->getFunding()
+                && isset($packagesToLoad[$package->getName()])
+            ) {
+                $fundings = $this->insertFundingData($fundings, $package);
+                unset($packagesToLoad[$package->getName()]);
+            }
+        }
 
-        $arrayRepoTwo = new ArrayRepository;
-        $arrayRepoTwo->addPackage(self::getPackage('bar', '1'));
-        $arrayRepoTwo->addPackage(self::getPackage('bar', '2'));
-        $arrayRepoTwo->addPackage(self::getPackage('foo', '3'));
+        // collect funding from installed packages if none was found in the default branch above
+        foreach ($repo->getPackages() as $package) {
+            if ($package instanceof AliasPackage || !isset($packagesToLoad[$package->getName()])) {
+                continue;
+            }
 
-        $repo = new CompositeRepository([$arrayRepoOne, $arrayRepoTwo]);
+            if ($package instanceof CompletePackageInterface && $package->getFunding()) {
+                $fundings = $this->insertFundingData($fundings, $package);
+            }
+        }
 
-        $bats = $repo->findPackages('bat');
-        self::assertCount(1, $bats, "Should find one instance of 'bats' (defined in just one repository)");
-        self::assertEquals('bat', $bats[0]->getName(), "Should find packages named 'bat'");
+        ksort($fundings);
 
-        $bars = $repo->findPackages('bar');
-        self::assertCount(2, $bars, "Should find two instances of 'bar' (both defined in the same repository)");
-        self::assertEquals('bar', $bars[0]->getName(), "Should find packages named 'bar'");
+        $io = $this->getIO();
 
-        $foos = $repo->findPackages('foo');
-        self::assertCount(3, $foos, "Should find three instances of 'foo' (two defined in one repository, the third in the other)");
-        self::assertEquals('foo', $foos[0]->getName(), "Should find packages named 'foo'");
-    }
+        $format = $input->getOption('format');
+        if (!in_array($format, ['text', 'json'])) {
+            $io->writeError(sprintf('Unsupported format "%s". See help for supported formats.', $format));
 
-    public function testGetPackages(): void
-    {
-        $arrayRepoOne = new ArrayRepository;
-        $arrayRepoOne->addPackage(self::getPackage('foo', '1'));
+            return 1;
+        }
 
-        $arrayRepoTwo = new ArrayRepository;
-        $arrayRepoTwo->addPackage(self::getPackage('bar', '1'));
+        if ($fundings && $format === 'text') {
+            $prev = null;
 
-        $repo = new CompositeRepository([$arrayRepoOne, $arrayRepoTwo]);
+            $io->write('The following packages were found in your dependencies which publish funding information:');
 
-        $packages = $repo->getPackages();
-        self::assertCount(2, $packages, "Should get two packages");
-        self::assertEquals("foo", $packages[0]->getName(), "First package should have name of 'foo'");
-        self::assertEquals("1", $packages[0]->getPrettyVersion(), "First package should have pretty version of '1'");
-        self::assertEquals("bar", $packages[1]->getName(), "Second package should have name of 'bar'");
-        self::assertEquals("1", $packages[1]->getPrettyVersion(), "Second package should have pretty version of '1'");
-    }
+            foreach ($fundings as $vendor => $links) {
+                $io->write('');
+                $io->write(sprintf("<comment>%s</comment>", $vendor));
+                foreach ($links as $url => $packages) {
+                    $line = sprintf('  <info>%s</info>', implode(', ', $packages));
 
-    public function testAddRepository(): void
-    {
-        $arrayRepoOne = new ArrayRepository;
-        $arrayRepoOne->addPackage(self::getPackage('foo', '1'));
+                    if ($prev !== $line) {
+                        $io->write($line);
+                        $prev = $line;
+                    }
 
-        $arrayRepoTwo = new ArrayRepository;
-        $arrayRepoTwo->addPackage(self::getPackage('bar', '1'));
-        $arrayRepoTwo->addPackage(self::getPackage('bar', '2'));
-        $arrayRepoTwo->addPackage(self::getPackage('bar', '3'));
+                    $io->write(sprintf('    <href=%s>%s</>', OutputFormatter::escape($url), $url));
+                }
+            }
 
-        $repo = new CompositeRepository([$arrayRepoOne]);
-        self::assertCount(1, $repo, "Composite repository should have just one package before addRepository() is called");
-        $repo->addRepository($arrayRepoTwo);
-        self::assertCount(4, $repo, "Composite repository should have four packages after addRepository() is called");
-    }
+            $io->write("");
+            $io->write("Please consider following these links and sponsoring the work of package authors!");
+            $io->write("Thank you!");
+        } elseif ($format === 'json') {
+            $io->write(JsonFile::encode($fundings));
+        } else {
+            $io->write("No funding links were found in your package dependencies. This doesn't mean they don't need your support!");
+        }
 
-    public function testCount(): void
-    {
-        $arrayRepoOne = new ArrayRepository;
-        $arrayRepoOne->addPackage(self::getPackage('foo', '1'));
-
-        $arrayRepoTwo = new ArrayRepository;
-        $arrayRepoTwo->addPackage(self::getPackage('bar', '1'));
-
-        $repo = new CompositeRepository([$arrayRepoOne, $arrayRepoTwo]);
-
-        self::assertCount(2, $repo, "Should return '2' for count(\$repo)");
+        return 0;
     }
 
     /**
-     * @dataProvider provideMethodCalls
-     *
-     * @param mixed[] $args
+     * @param mixed[] $fundings
+     * @return mixed[]
      */
-    public function testNoRepositories(string $method, array $args): void
+    private function insertFundingData(array $fundings, CompletePackageInterface $package): array
     {
-        $repo = new CompositeRepository([]);
-        self::assertEquals([], call_user_func_array([$repo, $method], $args));
-    }
+        foreach ($package->getFunding() as $fundingOption) {
+            [$vendor, $packageName] = explode('/', $package->getPrettyName());
+            // ignore malformed funding entries
+            if (empty($fundingOption['url'])) {
+                continue;
+            }
+            $url = $fundingOption['url'];
+            if (!empty($fundingOption['type']) && $fundingOption['type'] === 'github' && Preg::isMatch('{^https://github.com/([^/]+)$}', $url, $match)) {
+                $url = 'https://github.com/sponsors/'.$match[1];
+            }
+            $fundings[$vendor][$url][] = $packageName;
+        }
 
-    public static function provideMethodCalls(): array
-    {
-        return [
-            ['findPackages', ['foo']],
-            ['search', ['foo']],
-            ['getPackages', []],
-        ];
+        return $fundings;
     }
 }

@@ -2,698 +2,466 @@
 
 using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
-using System.Globalization;
 using System.IO;
-using System.Linq;
+using System.Text.RegularExpressions;
+using NUnit.Options;
 using System.Text;
-using System.Threading;
-using NUnit.Compatibility;
-using NUnit.Framework.Interfaces;
 
-namespace NUnit.Framework.Internal
+namespace NUnit.Common
 {
     /// <summary>
-    /// The TestResult class represents the result of a test.
+    /// CommandLineOptions is the base class the specific option classes
+    /// used for nunit3-console and nunitlite. It encapsulates all common
+    /// settings and features of both. This is done to ensure that common
+    /// features remain common and for the convenience of having the code
+    /// in a common location. The class inherits from the Mono
+    /// Options OptionSet class and provides a central location
+    /// for defining and parsing options.
     /// </summary>
-    public abstract class TestResult : LongLivedMarshalByRefObject, ITestResult
+    public class CommandLineOptions : OptionSet
     {
-        #region Fields
+        private static readonly string DEFAULT_WORK_DIRECTORY =
+            Directory.GetCurrentDirectory();
 
-        /// <summary>
-        /// Error message for when child tests have errors
-        /// </summary>
-        internal static readonly string CHILD_ERRORS_MESSAGE = "One or more child tests had errors";
+        private bool _validated;
+        private bool _noresult;
 
-        /// <summary>
-        /// Error message for when child tests have warnings
-        /// </summary>
-        internal static readonly string CHILD_WARNINGS_MESSAGE = "One or more child tests had warnings";
+        #region Constructors
 
-        /// <summary>
-        /// Error message for when child tests are ignored
-        /// </summary>
-        internal static readonly string CHILD_IGNORE_MESSAGE = "One or more child tests were ignored";
-
-        /// <summary>
-        /// Error message for when user has cancelled the test run
-        /// </summary>
-        internal const string USER_CANCELLED_MESSAGE = "Test run cancelled by user";
-
-        /// <summary>
-        /// The minimum duration for tests
-        /// </summary>
-        internal const double MIN_DURATION = 0.000001d;
-
-        //        static Logger log = InternalTrace.GetLogger("TestResult");
-
-        private readonly StringBuilder _output = new();
-        private double _duration;
-
-        /// <summary>
-        /// Aggregate assertion count
-        /// </summary>
-        protected int InternalAssertCount;
-
-        private ResultState _resultState;
-        private string _message;
-        private string? _stackTrace;
-
-        private readonly List<AssertionResult> _assertionResults = new();
-        private readonly List<TestAttachment> _testAttachments = new();
-
-        /// <summary>
-        /// ReaderWriterLock
-        /// </summary>
-        protected ReaderWriterLockSlim RwLock = new(LockRecursionPolicy.SupportsRecursion);
-
-        #endregion
-
-        #region Constructor
-
-        /// <summary>
-        /// Construct a test result given a Test
-        /// </summary>
-        /// <param name="test">The test to be used</param>
-        public TestResult(ITest test)
+        // Currently used only by tests
+        internal CommandLineOptions(IDefaultOptionsProvider defaultOptionsProvider, bool requireInputFile, params string[] args)
         {
-            Test = test;
-            _resultState = ResultState.Inconclusive;
-            _message = string.Empty;
+            // Apply default options
+            if (defaultOptionsProvider is null)
+                throw new ArgumentNullException(nameof(defaultOptionsProvider));
 
-            OutWriter = TextWriter.Synchronized(new StringWriter(_output));
+            TeamCity = defaultOptionsProvider.TeamCity;
+
+            ConfigureOptions(requireInputFile);
+            if (args is not null)
+                Parse(PreParse(args));
         }
 
-        #endregion
-
-        #region ITestResult Members
-
-        /// <summary>
-        /// Gets the test with which this result is associated.
-        /// </summary>
-        public ITest Test { get; }
-
-        /// <summary>
-        /// Gets the ResultState of the test result, which
-        /// indicates the success or failure of the test.
-        /// </summary>
-        public ResultState ResultState
+        public CommandLineOptions(bool requireInputFile, params string[] args)
         {
-            get
+            ConfigureOptions(requireInputFile);
+            if (args is not null)
+                Parse(PreParse(args));
+        }
+
+        private int _nesting = 0;
+
+        internal IEnumerable<string> PreParse(IEnumerable<string> args)
+        {
+            if (++_nesting > 3)
             {
-                RwLock.EnterReadLock();
+                ErrorMessages.Add("@ nesting exceeds maximum depth of 3.");
+                --_nesting;
+                return args;
+            }
+
+            var listArgs = new List<string>();
+
+            foreach (var arg in args)
+            {
+                if (arg.Length == 0 || arg[0] != '@')
+                {
+                    listArgs.Add(arg);
+                    continue;
+                }
+
+                if (arg.Length == 1)
+                {
+                    ErrorMessages.Add("You must include a file name after @.");
+                    continue;
+                }
+
+                var filename = arg.Substring(1);
+
+                if (!File.Exists(filename))
+                {
+                    ErrorMessages.Add("The file \"" + filename + "\" was not found.");
+                    continue;
+                }
+
                 try
                 {
-                    return _resultState;
+                    listArgs.AddRange(PreParse(GetArgsFromFile(filename)));
                 }
-                finally
+                catch (IOException ex)
                 {
-                    RwLock.ExitReadLock();
+                    ErrorMessages.Add("Error reading \"" + filename + "\": " + ex.Message);
                 }
             }
-            private set => _resultState = value;
+
+            --_nesting;
+            return listArgs;
         }
 
-        /// <summary>
-        /// Gets the name of the test result
-        /// </summary>
-        public virtual string Name => Test.Name;
+        private static readonly Regex ArgsRegex = new Regex(@"\G(""((""""|[^""])+)""|(\S+)) *", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-        /// <summary>
-        /// Gets the full name of the test result
-        /// </summary>
-        public virtual string FullName => Test.FullName;
-
-        /// <summary>
-        /// Gets or sets the elapsed time for running the test in seconds
-        /// </summary>
-        public double Duration
+        // Get args from a string of args
+        internal static IEnumerable<string> GetArgs(string commandLine)
         {
-            get => _duration;
-            set => _duration = value >= MIN_DURATION ? value : MIN_DURATION;
+            foreach (Match m in ArgsRegex.Matches(commandLine))
+                yield return Regex.Replace(m.Groups[2].Success ? m.Groups[2].Value : m.Groups[4].Value, @"""""", @"""");
         }
 
-        /// <summary>
-        /// Gets or sets the time the test started running.
-        /// </summary>
-        public DateTime StartTime { get; set; }
-
-        /// <summary>
-        /// Gets or sets the time the test finished running.
-        /// </summary>
-        public DateTime EndTime { get; set; }
-
-        /// <summary>
-        /// Adds a test attachment to the test result
-        /// </summary>
-        /// <param name="attachment">The TestAttachment object to attach</param>
-        internal void AddTestAttachment(TestAttachment attachment)
+        // Get args from an included file
+        private static IEnumerable<string> GetArgsFromFile(string filename)
         {
-            _testAttachments.Add(attachment);
-        }
+            var sb = new StringBuilder();
 
-        /// <summary>
-        /// Gets the collection of files attached to the test
-        /// </summary>
-        public ICollection<TestAttachment> TestAttachments => new ReadOnlyCollection<TestAttachment>(_testAttachments);
-
-        /// <summary>
-        /// Gets the message associated with a test
-        /// failure or with not running the test
-        /// </summary>
-        public string Message
-        {
-            get
+            foreach (var line in File.ReadAllLines(filename))
             {
-                RwLock.EnterReadLock();
-                try
+                if (!string.IsNullOrEmpty(line) && line[0] != '#' && line.Trim().Length > 0)
                 {
-                    return _message;
-                }
-                finally
-                {
-                    RwLock.ExitReadLock();
-                }
-            }
-            private set => _message = value;
-        }
-
-        /// <summary>
-        /// Gets any stack trace associated with an
-        /// error or failure.
-        /// </summary>
-        public virtual string? StackTrace
-        {
-            get
-            {
-                RwLock.EnterReadLock();
-                try
-                {
-                    return _stackTrace;
-                }
-                finally
-                {
-                    RwLock.ExitReadLock();
+                    if (sb.Length > 0)
+                        sb.Append(' ');
+                    sb.Append(line);
                 }
             }
 
-            private set => _stackTrace = value;
-        }
-
-        /// <summary>
-        /// Gets or sets the count of asserts executed
-        /// when running the test.
-        /// </summary>
-        public int AssertCount
-        {
-            get
-            {
-                RwLock.EnterReadLock();
-                try
-                {
-                    return InternalAssertCount;
-                }
-                finally
-                {
-                    RwLock.ExitReadLock();
-                }
-            }
-
-            internal set => InternalAssertCount = value;
-        }
-
-        /// <summary>
-        /// Gets the number of test cases executed
-        /// when running the test and all its children.
-        /// </summary>
-        public abstract int TotalCount { get; }
-
-        /// <summary>
-        /// Gets the number of test cases that failed
-        /// when running the test and all its children.
-        /// </summary>
-        public abstract int FailCount { get; }
-
-        /// <summary>
-        /// Gets the number of test cases that had warnings
-        /// when running the test and all its children.
-        /// </summary>
-        public abstract int WarningCount { get; }
-
-        /// <summary>
-        /// Gets the number of test cases that passed
-        /// when running the test and all its children.
-        /// </summary>
-        public abstract int PassCount { get; }
-
-        /// <summary>
-        /// Gets the number of test cases that were skipped
-        /// when running the test and all its children.
-        /// </summary>
-        public abstract int SkipCount { get; }
-
-        /// <summary>
-        /// Gets the number of test cases that were inconclusive
-        /// when running the test and all its children.
-        /// </summary>
-        public abstract int InconclusiveCount { get; }
-
-        /// <summary>
-        /// Indicates whether this result has any child results.
-        /// </summary>
-        public abstract bool HasChildren { get; }
-
-        /// <summary>
-        /// Gets the collection of child results.
-        /// </summary>
-        public abstract IEnumerable<ITestResult> Children { get; }
-
-        /// <summary>
-        /// Gets a TextWriter, which will write output to be included in the result.
-        /// </summary>
-        public TextWriter OutWriter { get; }
-
-        /// <summary>
-        /// Gets any text output written to this result.
-        /// </summary>
-        public string Output
-        {
-            get
-            {
-                lock (OutWriter)
-                {
-                    return _output.ToString();
-                }
-            }
-        }
-
-        /// <summary>
-        /// Gets a list of assertion results associated with the test.
-        /// </summary>
-        public IList<AssertionResult> AssertionResults => _assertionResults;
-
-        #endregion
-
-        #region IXmlNodeBuilder Members
-
-        /// <summary>
-        /// Returns the XML representation of the result.
-        /// </summary>
-        /// <param name="recursive">If true, descendant results are included</param>
-        /// <returns>An XmlNode representing the result</returns>
-        public TNode ToXml(bool recursive)
-        {
-            return AddToXml(new TNode("dummy"), recursive);
-        }
-
-        /// <summary>
-        /// Adds the XML representation of the result as a child of the
-        /// supplied parent node..
-        /// </summary>
-        /// <param name="parentNode">The parent node.</param>
-        /// <param name="recursive">If true, descendant results are included</param>
-        /// <returns></returns>
-        public virtual TNode AddToXml(TNode parentNode, bool recursive)
-        {
-            // A result node looks like a test node with extra info added
-            TNode thisNode = Test.AddToXml(parentNode, false);
-
-            thisNode.AddAttribute("result", ResultState.Status.ToString());
-            if (ResultState.Label != string.Empty) // && ResultState.Label != ResultState.Status.ToString())
-                thisNode.AddAttribute("label", ResultState.Label);
-            if (ResultState.Site != FailureSite.Test)
-                thisNode.AddAttribute("site", ResultState.Site.ToString());
-
-            thisNode.AddAttribute("start-time", StartTime.ToString("o"));
-            thisNode.AddAttribute("end-time", EndTime.ToString("o"));
-            thisNode.AddAttribute("duration", Duration.ToString("0.000000", NumberFormatInfo.InvariantInfo));
-
-            if (Test is TestSuite)
-            {
-                thisNode.AddAttribute("total", TotalCount.ToString());
-                thisNode.AddAttribute("passed", PassCount.ToString());
-                thisNode.AddAttribute("failed", FailCount.ToString());
-                thisNode.AddAttribute("warnings", WarningCount.ToString());
-                thisNode.AddAttribute("inconclusive", InconclusiveCount.ToString());
-                thisNode.AddAttribute("skipped", SkipCount.ToString());
-            }
-
-            thisNode.AddAttribute("asserts", AssertCount.ToString());
-
-            switch (ResultState.Status)
-            {
-                case TestStatus.Failed:
-                    AddFailureElement(thisNode);
-                    break;
-                case TestStatus.Skipped:
-                case TestStatus.Passed:
-                case TestStatus.Inconclusive:
-                case TestStatus.Warning:
-                    if (!string.IsNullOrWhiteSpace(Message))
-                    {
-                        TNode reasonNode = thisNode.AddElement("reason");
-                        reasonNode.AddElementWithCDATA("message", Message);
-                    }
-                    break;
-            }
-
-            if (Output.Length > 0)
-                AddOutputElement(thisNode);
-
-            if (AssertionResults.Count > 0)
-                AddAssertionsElement(thisNode);
-
-            if (_testAttachments.Count > 0)
-                AddAttachmentsElement(thisNode);
-
-            if (recursive && HasChildren)
-            {
-                foreach (var child in Children)
-                    child.AddToXml(thisNode, recursive);
-            }
-
-            return thisNode;
+            return GetArgs(sb.ToString());
         }
 
         #endregion
 
-        #region Other Public Properties
+        #region Properties
 
         /// <summary>
-        /// Gets a count of pending failures (from Multiple Assert)
+        /// Indicates whether an input file is required on the command-line.
+        /// Note that multiple input files are never allowed.
         /// </summary>
-        public int PendingFailures => AssertionResults.Count(ar => ar.Status == AssertionStatus.Failed);
+        public bool InputFileRequired { get; set; }
 
-        /// <summary>
-        /// Gets the worst assertion status (highest enum) in all the assertion results
-        /// </summary>
-        public AssertionStatus WorstAssertionStatus => AssertionResults.Aggregate((ar1, ar2) => ar1.Status > ar2.Status ? ar1 : ar2).Status;
+        // Action to Perform
+
+        public bool Explore { get; private set; }
+
+        public bool ShowHelp { get; private set; }
+
+        public bool ShowVersion { get; private set; }
+
+        // Select tests
+
+        public string InputFile { get; private set; }
+
+        public IList<string> TestList { get; } = new List<string>();
+        public IList<string> PreFilters { get; } = new List<string>();
+
+        public IDictionary<string, string> TestParameters { get; } = new Dictionary<string, string>();
+
+        public string WhereClause { get; private set; }
+        public bool WhereClauseSpecified => WhereClause is not null;
+
+        public int DefaultTimeout { get; private set; } = -1;
+        public bool DefaultTimeoutSpecified => DefaultTimeout >= 0;
+
+        public int RandomSeed { get; private set; } = -1;
+        public bool RandomSeedSpecified => RandomSeed >= 0;
+
+        public string DefaultTestNamePattern { get; private set; }
+
+        public int NumberOfTestWorkers { get; private set; } = -1;
+        public bool NumberOfTestWorkersSpecified => NumberOfTestWorkers >= 0;
+
+        public bool StopOnError { get; private set; }
+
+        public bool WaitBeforeExit { get; private set; }
+
+        // Output Control
+        public bool NoHeader { get; private set; }
+
+        public bool NoColor { get; private set; }
+
+        public bool TeamCity { get; private set; }
+
+        public string OutFile { get; private set; }
+        public bool OutFileSpecified => OutFile is not null;
+
+        public string ErrFile { get; private set; }
+        public bool ErrFileSpecified => ErrFile is not null;
+
+        public string DisplayTestLabels { get; private set; }
+
+        private string _workDirectory = null;
+        public string WorkDirectory => _workDirectory ?? DEFAULT_WORK_DIRECTORY;
+        public bool WorkDirectorySpecified => _workDirectory is not null;
+
+        public string InternalTraceLevel { get; private set; }
+        public bool InternalTraceLevelSpecified => InternalTraceLevel is not null;
+
+        private readonly List<OutputSpecification> _resultOutputSpecifications = new List<OutputSpecification>();
+        public IList<OutputSpecification> ResultOutputSpecifications
+        {
+            get
+            {
+                if (_noresult)
+                    return Array.Empty<OutputSpecification>();
+
+                if (_resultOutputSpecifications.Count == 0)
+                    _resultOutputSpecifications.Add(new OutputSpecification("TestResult.xml"));
+
+                return _resultOutputSpecifications;
+            }
+        }
+
+        public IList<OutputSpecification> ExploreOutputSpecifications { get; } = new List<OutputSpecification>();
+
+        // Error Processing
+
+        public IList<string> ErrorMessages { get; } = new List<string>();
 
         #endregion
 
-        #region Other Public Methods
+        #region Public Methods
 
-        /// <summary>
-        /// Set the result of the test
-        /// </summary>
-        /// <param name="resultState">The ResultState to use in the result</param>
-        public void SetResult(ResultState resultState)
+        public bool Validate()
         {
-            SetResult(resultState, string.Empty, null);
-        }
-
-        /// <summary>
-        /// Set the result of the test
-        /// </summary>
-        /// <param name="resultState">The ResultState to use in the result</param>
-        /// <param name="message">A message associated with the result state</param>
-        public void SetResult(ResultState resultState, string message)
-        {
-            SetResult(resultState, message, null);
-        }
-
-        /// <summary>
-        /// Set the result of the test
-        /// </summary>
-        /// <param name="resultState">The ResultState to use in the result</param>
-        /// <param name="message">A message associated with the result state</param>
-        /// <param name="stackTrace">Stack trace giving the location of the command</param>
-        public void SetResult(ResultState resultState, string message, string? stackTrace)
-        {
-            RwLock.EnterWriteLock();
-            try
+            if (!_validated)
             {
-                ResultState = resultState;
-                Message = message;
-                StackTrace = stackTrace;
+                CheckOptionCombinations();
+
+                _validated = true;
             }
-            finally
-            {
-                RwLock.ExitWriteLock();
-            }
-        }
 
-        /// <summary>
-        /// Set the test result based on the type of exception thrown
-        /// </summary>
-        /// <param name="ex">The exception that was thrown</param>
-        public void RecordException(Exception ex)
-        {
-            var result = new ExceptionResult(ex, FailureSite.Test);
-
-            SetResult(result.ResultState, result.Message, result.StackTrace);
-
-            if (AssertionResults.Count > 0 && result.ResultState == ResultState.Error)
-            {
-                // Add pending failures to the legacy result message
-                Message += Environment.NewLine + Environment.NewLine + CreateLegacyFailureMessage();
-
-                // Add to the list of assertion errors, so that newer runners will see it
-                AssertionResults.Add(new AssertionResult(AssertionStatus.Error, result.Message, result.StackTrace));
-            }
-        }
-
-        /// <summary>
-        /// Set the test result based on the type of exception thrown
-        /// </summary>
-        /// <param name="ex">The exception that was thrown</param>
-        /// <param name="site">The FailureSite to use in the result</param>
-        public void RecordException(Exception ex, FailureSite site)
-        {
-            var result = new ExceptionResult(ex, site);
-
-            SetResult(result.ResultState, result.Message, result.StackTrace);
-        }
-
-        /// <summary>
-        /// RecordTearDownException appends the message and stack trace
-        /// from an exception arising during teardown of the test
-        /// to any previously recorded information, so that any
-        /// earlier failure information is not lost. Note that
-        /// calling Assert.Ignore, Assert.Inconclusive, etc. during
-        /// teardown is treated as an error. If the current result
-        /// represents a suite, it may show a teardown error even
-        /// though all contained tests passed.
-        /// </summary>
-        /// <param name="ex">The Exception to be recorded</param>
-        public void RecordTearDownException(Exception ex)
-        {
-            var result = new ExceptionResult(ex, FailureSite.TearDown);
-
-            ResultState resultState = ResultState == ResultState.Cancelled
-                ? ResultState.Cancelled
-                : ResultState.Error;
-            if (Test.IsSuite)
-                resultState = resultState.WithSite(FailureSite.TearDown);
-
-            string message = "TearDown : " + result.Message;
-            if (!string.IsNullOrEmpty(Message))
-                message = Message + Environment.NewLine + message;
-
-            string stackTrace = "--TearDown" + Environment.NewLine + result.StackTrace;
-            if (StackTrace is not null)
-                stackTrace = StackTrace + Environment.NewLine + stackTrace;
-
-            SetResult(resultState, message, stackTrace);
-        }
-
-        private static Exception ValidateAndUnwrap(Exception ex)
-        {
-            Guard.ArgumentNotNull(ex, nameof(ex));
-
-            return ex.Unwrap();
-        }
-
-        private struct ExceptionResult
-        {
-            public ResultState ResultState { get; }
-            public string Message { get; }
-            public string? StackTrace { get; }
-
-            public ExceptionResult(Exception ex, FailureSite site)
-            {
-                ex = ValidateAndUnwrap(ex);
-
-                if (ex is ResultStateException exception)
-                {
-                    ResultState = exception.ResultState.WithSite(site);
-                    Message = ex.GetMessageWithoutThrowing();
-                    StackTrace = StackFilter.DefaultFilter.Filter(ex.GetStackTraceWithoutThrowing());
-                }
-#if THREAD_ABORT
-                else if (ex is ThreadAbortException)
-                {
-                    ResultState = ResultState.Cancelled.WithSite(site);
-                    Message = "Test cancelled by user";
-                    StackTrace = ex.GetStackTraceWithoutThrowing();
-                }
-#endif
-                else if (ex is OperationCanceledException && TestExecutionContext.CurrentContext.CancellationToken.IsCancellationRequested)
-                {
-                    ResultState = ResultState.Failure.WithSite(site);
-                    Message = $"Test exceeded CancelAfter value of {TestExecutionContext.CurrentContext.TestCaseTimeout}ms";
-                    StackTrace = ExceptionHelper.BuildStackTrace(ex);
-                }
-                else
-                {
-                    ResultState = ResultState.Error.WithSite(site);
-                    Message = ExceptionHelper.BuildMessage(ex);
-                    StackTrace = ExceptionHelper.BuildStackTrace(ex);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Update overall test result, including legacy Message, based
-        /// on AssertionResults that have been saved to this point.
-        /// </summary>
-        public void RecordTestCompletion()
-        {
-            switch (AssertionResults.Count)
-            {
-                case 0:
-                    SetResult(ResultState.Success);
-                    break;
-                case 1:
-                    SetResult(
-                        AssertionStatusToResultState(AssertionResults[0].Status),
-                        AssertionResults[0].Message,
-                        AssertionResults[0].StackTrace);
-                    break;
-                default:
-                    SetResult(
-                        AssertionStatusToResultState(WorstAssertionStatus),
-                        CreateLegacyFailureMessage());
-                    break;
-            }
-        }
-
-        /// <summary>
-        /// Record an assertion result
-        /// </summary>
-        public void RecordAssertion(AssertionResult assertion)
-        {
-            _assertionResults.Add(assertion);
-        }
-
-        /// <summary>
-        /// Record an assertion result
-        /// </summary>
-        public void RecordAssertion(AssertionStatus status, string message, string? stackTrace)
-        {
-            RecordAssertion(new AssertionResult(status, message, stackTrace));
-        }
-
-        /// <summary>
-        /// Record an assertion result
-        /// </summary>
-        public void RecordAssertion(AssertionStatus status, string message)
-        {
-            RecordAssertion(status, message, null);
-        }
-
-        /// <summary>
-        /// Creates a failure message incorporating failures
-        /// from a Multiple Assert block for use by runners
-        /// that don't know about AssertionResults.
-        /// </summary>
-        /// <returns>Message as a string</returns>
-        private string CreateLegacyFailureMessage()
-        {
-            var writer = new StringWriter();
-
-            if (AssertionResults.Count > 1)
-                writer.WriteLine("Multiple failures or warnings in test:");
-
-            int counter = 0;
-            foreach (var assertion in AssertionResults)
-                writer.WriteLine($"  {++counter}) {assertion.Message}");
-
-            return writer.ToString();
+            return ErrorMessages.Count == 0;
         }
 
         #endregion
 
         #region Helper Methods
 
-        /// <summary>
-        /// Adds a failure element to a node and returns it.
-        /// </summary>
-        /// <param name="targetNode">The target node.</param>
-        /// <returns>The new failure element.</returns>
-        private TNode AddFailureElement(TNode targetNode)
+        protected virtual void CheckOptionCombinations()
         {
-            TNode failureNode = targetNode.AddElement("failure");
-
-            if (!string.IsNullOrWhiteSpace(Message))
-                failureNode.AddElementWithCDATA("message", Message);
-
-            if (!string.IsNullOrWhiteSpace(StackTrace))
-                failureNode.AddElementWithCDATA("stack-trace", StackTrace);
-
-            return failureNode;
-        }
-
-        private TNode AddOutputElement(TNode targetNode)
-        {
-            return targetNode.AddElementWithCDATA("output", Output);
-        }
-
-        private TNode AddAssertionsElement(TNode targetNode)
-        {
-            var assertionsNode = targetNode.AddElement("assertions");
-
-            foreach (var assertion in AssertionResults)
-            {
-                TNode assertionNode = assertionsNode.AddElement("assertion");
-                assertionNode.AddAttribute("result", assertion.Status.ToString());
-                if (assertion.Message is not null)
-                    assertionNode.AddElementWithCDATA("message", assertion.Message);
-                if (assertion.StackTrace is not null)
-                    assertionNode.AddElementWithCDATA("stack-trace", assertion.StackTrace);
-            }
-
-            return assertionsNode;
-        }
-
-        private ResultState AssertionStatusToResultState(AssertionStatus status)
-        {
-            switch (status)
-            {
-                case AssertionStatus.Inconclusive:
-                    return ResultState.Inconclusive;
-                default:
-                case AssertionStatus.Passed:
-                    return ResultState.Success;
-                case AssertionStatus.Warning:
-                    return ResultState.Warning;
-                case AssertionStatus.Failed:
-                    return ResultState.Failure;
-                case AssertionStatus.Error:
-                    return ResultState.Error;
-            }
         }
 
         /// <summary>
-        /// Adds an attachments element to a node and returns it.
+        /// Case is ignored when val is compared to validValues. When a match is found, the
+        /// returned value will be in the canonical case from validValues.
         /// </summary>
-        /// <param name="targetNode">The target node.</param>
-        /// <returns>The new attachments element.</returns>
-        private TNode AddAttachmentsElement(TNode targetNode)
+        protected string RequiredValue(string val, string option, params string[] validValues)
         {
-            TNode attachmentsNode = targetNode.AddElement("attachments");
+            if (string.IsNullOrEmpty(val))
+                ErrorMessages.Add("Missing required value for option '" + option + "'.");
 
-            foreach (var attachment in _testAttachments)
+            bool isValid = true;
+
+            if (validValues is not null && validValues.Length > 0)
             {
-                var attachmentNode = attachmentsNode.AddElement("attachment");
+                isValid = false;
 
-                attachmentNode.AddElement("filePath", attachment.FilePath);
-
-                if (attachment.Description is not null)
-                    attachmentNode.AddElementWithCDATA("description", attachment.Description);
+                foreach (string valid in validValues)
+                {
+                    if (string.Compare(valid, val, StringComparison.OrdinalIgnoreCase) == 0)
+                        return valid;
+                }
             }
 
-            return attachmentsNode;
+            if (!isValid)
+                ErrorMessages.Add($"The value '{val}' is not valid for option '{option}'.");
+
+            return val;
+        }
+
+        protected int RequiredInt(string val, string option)
+        {
+            if (int.TryParse(val, out var result))
+                return result;
+
+            ErrorMessages.Add(string.IsNullOrEmpty(val)
+                ? "Missing required value for option '" + option + "'."
+                : "An int value was expected for option '{0}' but a value of '{1}' was used");
+
+            // We have to return something even though the value will
+            // be ignored if an error is reported. The -1 value seems
+            // like a safe bet in case it isn't ignored due to a bug.
+            return -1;
+        }
+
+        private string ExpandToFullPath(string path)
+        {
+            if (path is null)
+                return null;
+
+            return Path.GetFullPath(path);
+        }
+
+        protected virtual void ConfigureOptions(bool allowInputFile)
+        {
+            InputFileRequired = allowInputFile;
+
+            // NOTE: The order in which patterns are added
+            // determines the display order for the help.
+
+            // Select Tests
+            Add("test=", "Comma-separated list of {NAMES} of tests to run or explore. This option may be repeated.",
+                v => ((List<string>)TestList).AddRange(TestNameParser.Parse(RequiredValue(v, "--test"))));
+
+            Add("testlist=", "File {PATH} containing a list of tests to run, one per line. This option may be repeated.",
+                v =>
+                {
+                    string testListFile = RequiredValue(v, "--testlist");
+
+                    var fullTestListPath = ExpandToFullPath(testListFile);
+
+                    if (!File.Exists(fullTestListPath))
+                    {
+                        ErrorMessages.Add("Unable to locate file: " + testListFile);
+                    }
+                    else
+                    {
+                        try
+                        {
+                            using (var str = new FileStream(fullTestListPath, FileMode.Open))
+                            using (var rdr = new StreamReader(str))
+                            {
+                                while (!rdr.EndOfStream)
+                                {
+                                    var line = rdr.ReadLine().Trim();
+
+                                    if (!string.IsNullOrEmpty(line) && line[0] != '#')
+                                        ((List<string>)TestList).Add(line);
+                                }
+                            }
+                        }
+                        catch (IOException)
+                        {
+                            ErrorMessages.Add("Unable to read file: " + testListFile);
+                        }
+                    }
+                });
+
+            Add("prefilter=", "Comma-separated list of {NAMES} of test classes or namespaces to be loaded. This option may be repeated.",
+                v => ((List<string>)PreFilters).AddRange(TestNameParser.Parse(RequiredValue(v, "--prefilter"))));
+
+            Add("where=", "Test selection {EXPRESSION} indicating what tests will be run. See description below.",
+                v => WhereClause = RequiredValue(v, "--where"));
+
+            Add("params|p=", "Define a test parameter.",
+                v =>
+                {
+                    string parameters = RequiredValue(v, "--params");
+
+                    // This can be changed without breaking backwards compatibility with frameworks.
+                    foreach (string param in parameters.Split(new[] { ';' }))
+                    {
+                        int eq = param.IndexOf('=');
+                        if (eq == -1 || eq == param.Length - 1)
+                        {
+                            ErrorMessages.Add("Invalid format for test parameter. Use NAME=VALUE.");
+                        }
+                        else
+                        {
+                            string name = param.Substring(0, eq);
+                            string val = param.Substring(eq + 1);
+
+                            TestParameters[name] = val;
+                        }
+                    }
+                });
+            Add("timeout=", "Set timeout for each test case in {MILLISECONDS}.",
+                v => DefaultTimeout = RequiredInt(v, "--timeout"));
+
+            Add("seed=", "Set the random {SEED} used to generate test cases.",
+                v => RandomSeed = RequiredInt(v, "--seed"));
+
+            Add("workers=", "Specify the {NUMBER} of worker threads to be used in running tests. If not specified, defaults to 2 or the number of processors, whichever is greater.",
+                v => NumberOfTestWorkers = RequiredInt(v, "--workers"));
+
+            Add("stoponerror", "Stop run immediately upon any test failure or error.",
+                v => StopOnError = v is not null);
+
+            Add("wait", "Wait for input before closing console window.",
+                v => WaitBeforeExit = v is not null);
+
+            // Output Control
+            Add("work=", "{PATH} of the directory to use for output files. If not specified, defaults to the current directory.",
+                v => _workDirectory = RequiredValue(v, "--work"));
+
+            Add("output|out=", "File {PATH} to contain text output from the tests.",
+                v => OutFile = RequiredValue(v, "--output"));
+
+            Add("err=", "File {PATH} to contain error output from the tests.",
+                v => ErrFile = RequiredValue(v, "--err"));
+
+            Add("result=", "An output {SPEC} for saving the test results. This option may be repeated.",
+                v => ResolveOutputSpecification(RequiredValue(v, "--resultxml"), _resultOutputSpecifications));
+
+            Add("explore:", "Display or save test info rather than running tests. Optionally provide an output {SPEC} for saving the test info. This option may be repeated.", v =>
+            {
+                Explore = true;
+                ResolveOutputSpecification(v, ExploreOutputSpecifications);
+            });
+
+            Add("noresult", "Don't save any test results.",
+                v => _noresult = v is not null);
+
+            Add("labels=", "Specify whether to write test case names to the output. Values: Off, On, All",
+                v => DisplayTestLabels = RequiredValue(v, "--labels", "Off", "On", "Before", "After", "All"));
+
+            Add("test-name-format=", "Non-standard naming pattern to use in generating test names.",
+                v => DefaultTestNamePattern = RequiredValue(v, "--test-name-format"));
+
+            Add("teamcity", "Turns on use of TeamCity service messages.",
+                v => TeamCity = v is not null);
+
+            Add("trace=", "Set internal trace {LEVEL}.\nValues: Off, Error, Warning, Info, Verbose (Debug)",
+                v => InternalTraceLevel = RequiredValue(v, "--trace", "Off", "Error", "Warning", "Info", "Verbose", "Debug"));
+
+            Add("noheader|noh", "Suppress display of program information at start of run.",
+                v => NoHeader = v is not null);
+
+            Add("nocolor|noc", "Displays console output without color.",
+                v => NoColor = v is not null);
+
+            Add("help|h", "Display this message and exit.",
+                v => ShowHelp = v is not null);
+
+            Add("version|V", "Display the header and exit.",
+                v => ShowVersion = v is not null);
+
+            // Default
+            Add("<>", v =>
+            {
+                if (LooksLikeAnOption(v))
+                {
+                    ErrorMessages.Add("Invalid argument: " + v);
+                }
+                else if (InputFileRequired)
+                {
+                    if (InputFile is null)
+                        InputFile = v;
+                    else
+                        ErrorMessages.Add("Multiple file names are not allowed on the command-line.\n    Invalid entry: " + v);
+                }
+                else
+                {
+                    ErrorMessages.Add("Do not provide a file name when running a self-executing test.\n    Invalid entry: " + v);
+                }
+            });
+        }
+
+        private bool LooksLikeAnOption(string v)
+        {
+            return v.StartsWith("-", StringComparison.Ordinal) || (v.StartsWith("/", StringComparison.Ordinal) && Path.DirectorySeparatorChar != '/');
+        }
+
+        private void ResolveOutputSpecification(string value, IList<OutputSpecification> outputSpecifications)
+        {
+            if (value is null)
+                return;
+
+            try
+            {
+                var spec = new OutputSpecification(value);
+                outputSpecifications.Add(spec);
+            }
+            catch (ArgumentException e)
+            {
+                ErrorMessages.Add(e.Message);
+            }
         }
 
         #endregion

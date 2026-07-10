@@ -1,73 +1,88 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
-using System.ComponentModel;
 using NUnit.Framework.Interfaces;
-using NUnit.Framework.Internal;
+using NUnit.Framework.Internal.Builders;
 using NUnit.Framework.Internal.Extensions;
 
-namespace NUnit.Framework
+namespace NUnit.Framework.Internal.Commands
 {
     /// <summary>
-    /// The IgnoredTestCaseData class represents a ignored TestCaseData. It adds
-    /// the ability to set a date until which the test will be ignored.
+    /// TestMethodCommand is the lowest level concrete command
+    /// used to run actual test cases.
     /// </summary>
-    [EditorBrowsable(EditorBrowsableState.Never)]
-    public sealed class IgnoredTestCaseData : TestCaseData
+    public class TestMethodCommand : TestCommand
     {
-        #region Instance Fields
+        private readonly TestMethod _testMethod;
+        private readonly object?[] _arguments;
 
         /// <summary>
-        /// The previous RunState
+        /// Initializes a new instance of the <see cref="TestMethodCommand"/> class.
         /// </summary>
-        private readonly RunState _prevRunState;
-
-        #endregion
-
-        #region Constructors
-
-        internal IgnoredTestCaseData(TestCaseData data, RunState prevRunState)
+        /// <param name="testMethod">The test.</param>
+        public TestMethodCommand(TestMethod testMethod) : base(testMethod)
         {
-            Arguments = data.Arguments;
-            ArgDisplayNames = data.ArgDisplayNames;
-            ExpectedResult = data.ExpectedResult;
-            HasExpectedResult = data.HasExpectedResult;
-            OriginalArguments = data.OriginalArguments;
-            Properties = data.Properties;
-            RunState = data.RunState;
-            TestName = data.TestName;
-            _prevRunState = prevRunState;
+            _testMethod = testMethod;
+            _arguments = testMethod.Arguments;
         }
 
-        #endregion
-
-        #region Fluent Instance Modifiers
-
         /// <summary>
-        /// Set the date that the test is being ignored until
+        /// Runs the test, saving a TestResult in the execution context, as
+        /// well as returning it. If the test has an expected result, it
+        /// is asserts on that value. Since failed tests and errors throw
+        /// an exception, this command must be wrapped in an outer command,
+        /// will handle that exception and records the failure. This role
+        /// is usually played by the SetUpTearDown command.
         /// </summary>
-        /// <param name="datetime">The date that the test is being ignored until</param>
-        /// <returns>A modified TestCaseData.</returns>
-        public TestCaseData Until(DateTimeOffset datetime)
+        /// <param name="context">The execution context</param>
+        public override TestResult Execute(TestExecutionContext context)
         {
-            if (_prevRunState != RunState.NotRunnable)
+            // NOTE: Things would be cleaner if we could handle
+            // exceptions in this command. However, that would
+            // make it impossible to write a wrapper command to
+            // implement ExpectedException, among other things.
+
+            var result = RunTestMethod(context);
+
+            if (_testMethod.HasExpectedResult)
+                Assert.That(result, Is.EqualTo(_testMethod.ExpectedResult));
+
+            context.CurrentResult.SetResult(ResultState.Success);
+
+            if (context.CurrentResult.AssertionResults.Count > 0)
+                context.CurrentResult.RecordTestCompletion();
+
+            return context.CurrentResult;
+        }
+
+        private object? RunTestMethod(TestExecutionContext context)
+        {
+            var methodInfo = MethodInfoCache.Get(_testMethod.Method);
+
+            bool lastParameterAcceptsCancellationToken = methodInfo.Parameters.LastParameterAcceptsCancellationToken();
+
+            if (methodInfo.IsAsyncOperation)
             {
-                if (datetime > DateTimeOffset.UtcNow)
-                {
-                    RunState = RunState.Ignored;
-                    string? reason = (string?)Properties.Get(PropertyNames.SkipReason);
-                    Properties.AddIgnoreUntilReason(datetime, reason);
-                }
-                else
-                {
-                    RunState = _prevRunState;
-                }
-                Properties.Set(PropertyNames.IgnoreUntilDate, datetime.ToString("u"));
+                return AsyncToSyncAdapter.Await(() => InvokeTestMethod(context, lastParameterAcceptsCancellationToken));
             }
-            return this;
+
+            return InvokeTestMethod(context, lastParameterAcceptsCancellationToken);
         }
 
-        #endregion
+        private object? InvokeTestMethod(TestExecutionContext context, bool lastParameterAcceptsCancellationToken)
+        {
+            object?[] arguments = _arguments;
 
+            if (lastParameterAcceptsCancellationToken &&
+                !arguments.LastArgumentIsCancellationToken())
+            {
+                // Add our CancellationToken as an extra argument to the test method
+                arguments = new object?[_arguments.Length + 1];
+                Array.Copy(_arguments, arguments, _arguments.Length);
+                arguments[_arguments.Length] = context.CancellationToken;
+            }
+
+            return _testMethod.Method.Invoke(context.TestObject, arguments);
+        }
     }
 }
