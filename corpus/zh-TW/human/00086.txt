@@ -1,0 +1,258 @@
+讓我們來看一個 Vue SSR 最基礎的實戰示例。
+
+1. 創建一個新的文件夾，`cd` 進入
+2. 執行 `npm init -y`
+3. 在 `package.json` 中添加 `"type": "module"` 使 Node.js 以 [ES modules mode](https://nodejs.org/api/esm.html#modules-ecmascript-modules) 運行
+4. 執行 `npm install vue`
+5. 創建一個 `example.js` 文件：
+
+```js
+// 此文件運行在 Node.js 服務器上
+import { createSSRApp } from 'vue'
+// Vue 的服務端渲染 API 位於 `vue/server-renderer` 路徑下
+import { renderToString } from 'vue/server-renderer'
+
+const app = createSSRApp({
+  data: () => ({ count: 1 }),
+  template: `<button @click="count++">{{ count }}</button>`
+})
+
+renderToString(app).then((html) => {
+  console.log(html)
+})
+```
+
+接著運行：
+
+```sh
+> node example.js
+```
+
+它應該會在命令行中打印出如下內容：
+
+```
+<button>1</button>
+```
+
+[`renderToString()`](/api/ssr#rendertostring) 接收一個 Vue 應用實例作為參數，返回一個 Promise，當 Promise resolve 時得到應用渲染的 HTML。當然你也可以使用 [Node.js Stream API](https://nodejs.org/api/stream.html) 或者 [Web Streams API](https://developer.mozilla.org/zh-CN/docs/Web/API/Streams_API) 來執行流式渲染。查看 [SSR API 參考](/api/ssr)獲取完整的相關細節。
+
+然後我們可以把 Vue SSR 的代碼移動到一個服務器請求處理函數里，它將應用的 HTML 片段包裝為完整的頁面 HTML。接下來的幾步我們將會使用 [`express`](https://expressjs.com/)：
+
+- 執行 `npm install express`
+- 創建下面的 `server.js` 文件：
+
+```js
+import express from 'express'
+import { createSSRApp } from 'vue'
+import { renderToString } from 'vue/server-renderer'
+
+const server = express()
+
+server.get('/', (req, res) => {
+  const app = createSSRApp({
+    data: () => ({ count: 1 }),
+    template: `<button @click="count++">{{ count }}</button>`
+  })
+
+  renderToString(app).then((html) => {
+    res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Vue SSR Example</title>
+      </head>
+      <body>
+        <div id="app">${html}</div>
+      </body>
+    </html>
+    `)
+  })
+})
+
+server.listen(3000, () => {
+  console.log('ready')
+})
+```
+
+最後，執行 `node server.js`，訪問 `http://localhost:3000`。你應該可以看到頁面中的按鈕了。
+
+[在 StackBlitz 上試試](https://stackblitz.com/fork/vue-ssr-example-basic?file=index.js)
+
+### 客戶端激活 {#client-hydration}
+
+如果你點擊該按鈕，你會發現數字並沒有改變。這段 HTML 在客戶端是完全靜態的，因為我們沒有在瀏覽器中加載 Vue。
+
+為了使客戶端的應用可交互，Vue 需要執行一個**激活**步驟。在激活過程中，Vue 會創建一個與服務端完全相同的應用實例，然後將每個組件與它應該控制的 DOM 節點相匹配，並添加 DOM 事件監聽器。
+
+為了在激活模式下掛載應用，我們應該使用 [`createSSRApp()`](/api/application#createssrapp) 而不是 `createApp()`：
+
+```js{2}
+// 該文件運行在瀏覽器中
+import { createSSRApp } from 'vue'
+
+const app = createSSRApp({
+  // ...和服務端完全一致的應用實例
+})
+
+// 在客戶端掛載一個 SSR 應用時會假定
+// HTML 是預渲染的，然後執行激活過程，
+// 而不是掛載新的 DOM 節點
+app.mount('#app')
+```
+
+### 代碼結構 {#code-structure}
+
+想想我們該如何在客戶端複用服務端的應用實現。這時我們就需要開始考慮 SSR 應用中的代碼結構了——我們如何在服務器和客戶端之間共享相同的應用代碼呢？
+
+這裡我們將演示最基礎的設置。首先，讓我們將應用的創建邏輯拆分到一個單獨的文件 `app.js` 中：
+
+```js [app.js]
+// (在服務器和客戶端之間共享)
+import { createSSRApp } from 'vue'
+
+export function createApp() {
+  return createSSRApp({
+    data: () => ({ count: 1 }),
+    template: `<button @click="count++">{{ count }}</button>`
+  })
+}
+```
+
+該文件及其依賴項在服務器和客戶端之間共享——我們稱它們為**通用代碼**。編寫通用代碼時有一些注意事項，我們將[在下面討論](#writing-ssr-friendly-code)。
+
+我們在客戶端入口導入通用代碼，創建應用並執行掛載：
+
+```js [client.js]
+import { createApp } from './app.js'
+
+createApp().mount('#app')
+```
+
+服務器在請求處理函數中使用相同的應用創建邏輯：
+
+```js{2,5} [server.js]
+// (不相關的代碼省略)
+import { createApp } from './app.js'
+
+server.get('/', (req, res) => {
+  const app = createApp()
+  renderToString(app).then(html => {
+    // ...
+  })
+})
+```
+
+此外，為了在瀏覽器中加載客戶端文件，我們還需要：
+
+1. 在 `server.js` 中添加 `server.use(express.static('.'))` 來託管客戶端文件。
+2. 將 `<script type="module" src="/client.js"></script>` 添加到 HTML 外殼以加載客戶端入口文件。
+3. 通過在 HTML 外殼中添加 [Import Map](https://html.spec.whatwg.org/multipage/webappapis.html#import-maps) 以支持在瀏覽器中使用 `import * from 'vue'`。
+
+[在 StackBlitz 上嘗試完整的示例](https://stackblitz.com/fork/vue-ssr-example?file=index.js)。按鈕現在可以交互了！
+
+## 更通用的解決方案 {#higher-level-solutions}
+
+從上面的例子到一個生產就緒的 SSR 應用還需要很多工作。我們將需要：
+
+- 支持 Vue SFC 且滿足其他構建步驟要求。事實上，我們需要為同一個應用執行兩次構建過程：一次用於客戶端，一次用於服務器。
+
+  :::tip
+  Vue 組件用在 SSR 時的編譯產物不同——模板被編譯為字符串拼接而不是 render 函數，以此提高渲染性能。
+  :::
+
+- 在服務器請求處理函數中，確保返回的 HTML 包含正確的客戶端資源鏈接和最優的資源加載提示 (如 prefetch 和 preload)。我們可能還需要在 SSR 和 SSG 模式之間切換，甚至在同一個應用中混合使用這兩種模式。
+
+- 以一種通用的方式管理路由、數據獲取和狀態存儲。
+
+完整的實現會非常複雜，並且取決於你選擇使用的構建工具鏈。因此，我們強烈建議你使用一種更通用的、更集成化的解決方案，幫你抽象掉那些複雜的東西。下面推薦幾個 Vue 生態中的 SSR 解決方案。
+
+### Nuxt {#nuxt}
+
+[Nuxt](https://nuxt.com/) 是一個構建於 Vue 生態系統之上的全棧框架，它為編寫 Vue SSR 應用提供了流暢的開發體驗。更好的是，你還可以把它當作一個靜態站點生成器來用！我們強烈建議你試一試。
+
+### Quasar {#quasar}
+
+[Quasar](https://quasar.dev) 是一個基於 Vue 的完整解決方案，它可以讓你用同一套代碼庫構建不同目標的應用，如 SPA、SSR、PWA、移動端應用、桌面端應用以及瀏覽器插件。除此之外，它還提供了一整套 Material Design 風格的組件庫。
+
+### Vite SSR {#vite-ssr}
+
+Vite 提供了內置的 [Vue 服務端渲染支持](https://vite.dev/guide/ssr.html)，但它在設計上是偏底層的。如果你想要直接使用 Vite，可以看看 [vite-plugin-ssr](https://vite-plugin-ssr.com/)，一個幫你抽象掉許多複雜細節的社區插件。
+
+你也可以在[這裡](https://github.com/vitejs/vite-plugin-vue/tree/main/playground/ssr-vue)查看一個使用手動配置的 Vue + Vite SSR 的示例項目，以它作為基礎來構建。請注意，這種方式只有在你有豐富的 SSR 和構建工具經驗，並希望對應用的架構做深入的定製時才推薦使用。
+
+## 書寫 SSR 友好的代碼 {#writing-ssr-friendly-code}
+
+無論你的構建配置或頂層框架的選擇如何，下面的原則在所有 Vue SSR 應用中都適用。
+
+### 服務端的響應性 {#reactivity-on-the-server}
+
+在 SSR 期間，每一個請求 URL 都會映射到我們應用中的一個期望狀態。因為沒有用戶交互和 DOM 更新，所以響應性在服務端是不必要的。為了更好的性能，默認情況下響應性在 SSR 期間是禁用的。
+
+### 組件生命週期鉤子 {#component-lifecycle-hooks}
+
+因為沒有任何動態更新，所以像 <span class="options-api">`mounted`</span><span class="composition-api">`onMounted`</span> 或者 <span class="options-api">`updated`</span><span class="composition-api">`onUpdated`</span> 這樣的生命週期鉤子**不會**在 SSR 期間被調用，而只會在客戶端運行。<span class="options-api">只有 `beforeCreate` 和 `created` 這兩個鉤子會在 SSR 期間被調用。</span>
+
+你應該避免在 <span class="options-api">`beforeCreate` 和 `created` </span><span class="composition-api">`setup()` 或者 `<script setup>` 的根作用域</span>中使用會產生副作用且需要被清理的代碼。這類副作用的常見例子是使用 `setInterval` 設置定時器。我們可能會在客戶端特有的代碼中設置定時器，然後在 <span class="options-api">`beforeUnmount`</span><span class="composition-api">`onBeforeUnmount`</span> 或 <span class="options-api">`unmounted`</span><span class="composition-api">`onUnmounted`</span> 中清除。然而，由於 unmount 鉤子不會在 SSR 期間被調用，所以定時器會永遠存在。為了避免這種情況，請將含有副作用的代碼放到 <span class="options-api">`mounted`</span><span class="composition-api">`onMounted`</span> 中。
+
+### 訪問平台特有 API {#access-to-platform-specific-apis}
+
+通用代碼不能訪問平台特有的 API，如果你的代碼直接使用了瀏覽器特有的全局變量，例如 `window` 或 `document`，他們會在 Node.js 運行時報錯，反過來也相同。
+
+對於在服務器和客戶端之間共享，但使用了不同的平台 API 的任務，建議將平台特定的實現封裝在一個通用的 API 中，或者使用能為你做這件事的庫。例如你可以使用 [`node-fetch`](https://github.com/node-fetch/node-fetch) 在服務端和客戶端使用相同的 fetch API。
+
+對於瀏覽器特有的 API，通常的方法是在僅客戶端特有的生命週期鉤子中惰性地訪問它們，例如 <span class="options-api">`mounted`</span><span class="composition-api">`onMounted`</span>。
+
+請注意，如果一個第三方庫編寫時沒有考慮到通用性，那麼要將它集成到一個 SSR 應用中可能會很棘手。你*或許*可以通過模擬一些全局變量來讓它工作，但這只是一種 hack 手段並且可能會影響到其他庫的環境檢測代碼。
+
+### 跨請求狀態污染 {#cross-request-state-pollution}
+
+在狀態管理一章中，我們介紹了一種[使用響應式 API 的簡單狀態管理模式](state-management#simple-state-management-with-reactivity-api)。而在 SSR 環境中，這種模式需要一些額外的調整。
+
+上述模式在一個 JavaScript 模塊的根作用域中聲明共享的狀態。這是一種**單例模式**——即在應用的整個生命週期中只有一個響應式對象的實例。這在僅限於客戶端的 Vue 應用中是可以的，因為對於瀏覽器的每一個頁面訪問，應用模塊都會重新初始化。
+
+然而，在 SSR 環境下，應用模塊通常只在服務器啟動時初始化一次。同一個應用模塊會在多個服務器請求之間被複用，而我們的單例狀態對象也一樣。如果我們用單個用戶特定的數據對共享的單例狀態進行修改，那麼這個狀態可能會意外地洩露給另一個用戶的請求。我們把這種情況稱為**跨請求狀態污染**。
+
+從技術上講，我們可以在每個請求上重新初始化所有 JavaScript 模塊，就像我們在瀏覽器中所做的那樣。但是，初始化 JavaScript 模塊的成本可能很高，因此這會顯著影響服務器性能。
+
+推薦的解決方案是在每個請求中為整個應用創建一個全新的實例，包括 router 和全局 store。然後，我們使用[應用層級的 provide 方法](/guide/components/provide-inject#app-level-provide)來提供共享狀態，並將其注入到需要它的組件中，而不是直接在組件中將其導入：
+
+```js [app.js]
+// （在服務端和客戶端間共享）
+import { createSSRApp } from 'vue'
+import { createStore } from './store.js'
+
+// 每次請求時調用
+export function createApp() {
+  const app = createSSRApp(/* ... */)
+  // 對每個請求都創建新的 store 實例
+  const store = createStore(/* ... */)
+  // 提供應用級別的 store
+  app.provide('store', store)
+  // 也為激活過程暴露出 store
+  return { app, store }
+}
+```
+
+像 Pinia 這樣的狀態管理庫在設計時就考慮到了這一點。請參考 [Pinia 的 SSR 指南](https://pinia.vuejs.org/zh/ssr/)以了解更多細節。
+
+### 激活不匹配 {#hydration-mismatch}
+
+如果預渲染的 HTML 的 DOM 結構不符合客戶端應用的期望，就會出現激活不匹配。最常見的激活不匹配是以下幾種原因導致的：
+
+1. 組件模板中存在不符合規範的 HTML 結構，渲染後的 HTML 被瀏覽器原生的 HTML 解析行為糾正導致不匹配。舉例來說，一個常見的錯誤是 [`<div>` 不能被放在 `<p>` 中](https://stackoverflow.com/questions/8397852/why-cant-the-p-tag-contain-a-div-tag-inside-it)：
+
+   ```html
+   <p><div>hi</div></p>
+   ```
+
+   如果我們在服務器渲染的 HTML 中出現這樣的代碼，當遇到 `<div>` 時，瀏覽器會結束第一個 `<p>`，並解析為以下 DOM 結構：
+
+   ```html
+   <p></p>
+   <div>hi</div>
+   <p></p>
+   ```
+
+2. 渲染所用的數據中包含隨機生成的值。由於同一個應用會在服務端和客戶端執行兩次，每次執行生成的隨機數都不能保證相同。避免隨機數不匹配有兩種選擇：
+
+   1. 利用 `v-if` + `onMounted` 讓需要用到隨機數的模板只在客戶端渲染。你所用的上層框架可能也會提供簡化這個用例的內置 API，例如 VitePress 的 `<ClientOnly>` 組件。

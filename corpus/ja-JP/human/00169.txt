@@ -1,0 +1,184 @@
+// SomeElement がディスパッチするイベントの種類を定義します。
+export type SomeElementEvents = {
+  'apple-fell': AppleFellEvent
+}
+
+export class AppleFellEvent extends Event {
+  /* ... 詳細は省略 ... */
+}
+```
+
+実装の詳細は省略しますが、重要な部分は、プロパティの型とイベントの型という 2 つの型定義があることです。
+
+Vue でカスタム要素の型定義を簡単に登録するための型ヘルパーを作成してみましょう
+
+```ts [some-lib/src/DefineCustomElement.ts]
+// 定義する必要のある各要素にこの型ヘルパーを再利用できます。
+type DefineCustomElement<
+  ElementType extends HTMLElement,
+  Events extends EventMap = {},
+  SelectedAttributes extends keyof ElementType = keyof ElementType
+> = new () => ElementType & {
+  // テンプレート型のチェックに公開されるプロパティを定義するには、$props を使用します。
+  // Vue は、特に `$props` 型から props 定義を読み取ります。要素の props を
+  // グローバルな HTML props と Vue の特別な props と組み合わせることに
+  // 注意してください。
+  /** @deprecated カスタム要素参照では、$props プロパティを使用しないでください。
+    これはテンプレート props 型専用です。 */
+  $props: HTMLAttributes &
+    Partial<Pick<ElementType, SelectedAttributes>> &
+    PublicProps
+
+  // イベントタイプを明示的に定義するには、$emit を使用します。
+  // Vue は、イベントタイプを`$emit`タイプから読み取ります。
+  // `$emit` は、`Events` にマッピングする特定のフォーマットを必要とします。
+  /** @deprecated カスタム要素参照では $emit プロパティを使用しないでください。
+    これはテンプレート props 型専用です。 */
+  $emit: VueEmit<Events>
+}
+
+type EventMap = {
+  [event: string]: Event
+}
+
+// これは、Vue の $emit 型が期待する形式に EventMap をマッピングします。
+type VueEmit<T extends EventMap> = EmitFn<{
+  [K in keyof T]: (event: T[K]) => void
+}>
+```
+
+:::tip Note
+私たちは `$props` と `$emit` を非推奨としました。カスタム要素の `ref` を取得した際に、これらのプロパティを使用したくなる誘惑にかられないようにするためです。これらのプロパティはカスタム要素に関しては型チェックのみに使用されるためです。これらのプロパティは実際にはカスタム要素のインスタンスには存在しません。
+:::
+
+型ヘルパーを使用して、Vue テンプレートで型チェックのために公開すべき JS プロパティを選択できます:
+
+```ts [some-lib/src/SomeElement.vue.ts]
+import {
+  SomeElement,
+  SomeElementAttributes,
+  SomeElementEvents
+} from './SomeElement.js'
+import type { Component } from 'vue'
+import type { DefineCustomElement } from './DefineCustomElement'
+
+// Vue の GlobalComponents タイプに新しい要素タイプを追加します。
+declare module 'vue' {
+  interface GlobalComponents {
+    'some-element': DefineCustomElement<
+      SomeElement,
+      SomeElementAttributes,
+      SomeElementEvents
+    >
+  }
+}
+```
+
+`some-lib` が TypeScript のソースファイルを `dist/` フォルダにビルドするとします。 `some-lib` のユーザーは、`SomeElement` をインポートし、Vue SFC で次のように使用できます:
+
+```vue
+<script setup lang="ts">
+// これにより、要素が作成され、ブラウザーに登録されます。
+import 'some-lib/dist/SomeElement.js'
+
+// TypeScript と Vue を使用しているユーザーは、さらに Vue 固有の型定義を
+// インポートする必要があります（他のフレームワークを使用しているユーザーは、
+// 他のフレームワーク固有の型定義をインポートする場合があります）。
+import type {} from 'some-lib/dist/SomeElement.vue.js'
+
+import { useTemplateRef, onMounted } from 'vue'
+
+const el = useTemplateRef('el')
+
+onMounted(() => {
+  console.log(
+    el.value!.foo,
+    el.value!.bar,
+    el.value!.lorem,
+    el.value!.someMethod()
+  )
+
+  // これらの props は使用しないでください。これらは `undefined` です
+  // IDE では取り消し線が表示されます:
+  el.$props
+  el.$emit
+})
+</script>
+
+<template>
+  <!-- これで型チェックを行いながら要素を使用できます: -->
+  <some-element
+    ref="el"
+    :foo="456"
+    :blah="'hello'"
+    @apple-fell="
+      (event) => {
+        // ここで、`event` の型は `AppleFellEvent` であると推論されます
+      }
+    "
+  ></some-element>
+</template>
+```
+
+要素に型定義がない場合、プロパティとイベントの型はより手動で定義することができます:
+
+```vue [SomeElementImpl.vue]
+<script setup lang="ts">
+// `some-lib` が型定義のないプレーンな JavaScript で、TypeScript が型を
+// 推論できないと仮定します:
+import { SomeElement } from 'some-lib'
+
+// 前回と同じ型ヘルパーを使用します。
+import { DefineCustomElement } from './DefineCustomElement'
+
+type SomeElementProps = { foo?: number; bar?: string }
+type SomeElementEvents = { 'apple-fell': AppleFellEvent }
+interface AppleFellEvent extends Event {
+  /* ... */
+}
+
+// Vue の GlobalComponents 型に新しい要素タイプを追加します。
+declare module 'vue' {
+  interface GlobalComponents {
+    'some-element': DefineCustomElement<
+      SomeElementProps,
+      SomeElementEvents
+    >
+  }
+}
+
+// ... 以前と同じように、要素への参照を使用します ...
+</script>
+
+<template>
+  <!-- ... 以前と同じように、テンプレート内の要素を使用します ... -->
+</template>
+```
+
+カスタム要素の作成者は、ライブラリーからフレームワーク固有のカスタム要素の型定義を自動的にエクスポートすべきではありません。例えば、ライブラリーの残りの部分もエクスポートする `index.ts` ファイルからエクスポートすべきではありません。そうしないと、ユーザーに予期しないモジュール拡張エラーが発生します。ユーザーは、必要なフレームワーク固有の型定義ファイルをインポートする必要があります。
+
+## Web コンポーネント と Vue コンポーネントの比較 {#web-components-vs-vue-components}
+
+開発者の中には、フレームワークに依存した独自のコンポーネントモデルは避けるべきであり、カスタム要素のみを使用することでアプリケーションの「将来性」を確保できると考える人もいます。ここでは、この考え方が問題を単純化しすぎていると思われる理由を説明します。
+
+カスタム要素と Vue コンポーネントの間には、確かにある程度の機能の重複があります: どちらも、データの受け渡し、イベントの発行、ライフサイクルの管理を備えた再利用可能なコンポーネントを定義することができます。しかし、Web コンポーネントの API は比較的低レベルで素っ気ないものです。実際のアプリケーションを構築するには、このプラットフォームがカバーしていない、かなりの数の追加機能が必要です:
+
+- 宣言的で効率的なテンプレートシステム
+
+- コンポーネント間でのロジックの抽出と再利用を容易にする、リアクティブな状態管理システム
+
+- SEO や [LCP などの Web Vitals の指標](https://web.dev/vitals/)で重要な、サーバー上でコンポーネントをレンダリングし、クライアント上でハイドレートするパフォーマンスの高い方法（SSR）。ネイティブのカスタム要素の SSR では、一般的に Node.js で DOM をシミュレートし、変異された DOM をシリアライズしますが、Vue の SSR では可能な限り文字列の連結にコンパイルされるため、より効率的です。
+
+Vue のコンポーネントモデルは、これらのニーズを考慮して、一貫したシステムとして設計されています。
+
+有能なエンジニアリングチームであれば、ネイティブのカスタム要素上に同等のものを構築することができるでしょう。しかし、これは、Vue のような成熟したフレームワークのエコシステムやコミュニティーの恩恵を受けられない一方で、自社フレームワークの長期的なメンテナンスの負担を負うことを意味します。
+
+カスタム要素をコンポーネントモデルの基礎として使用しているフレームワークもありますが、いずれも上記のような問題に対して独自の解決策を導入しなければなりません。これらのフレームワークを使用することは、これらの問題を解決する方法に関する彼らの技術的な決定を受け入れることを意味します。これは、宣伝されているかもしれませんが、潜在的な将来の解約から自動的に保護されるものではありません。
+
+また、カスタム要素では限界があると感じる部分もあります:
+
+- スロットの評価時間が長いと、コンポーネントの構成を妨げます。Vue の[スコープ付きスロット](/guide/components/slots#scoped-slots)は、コンポーネント構成における強力なメカニズムですが、ネイティブスロットの先行性質のため、カスタム要素はサポートされません。先行スロットは、受信側のコンポーネントがスロットコンテンツの一部をレンダリングするタイミングやその有無を制御できないことを意味します。
+
+- 現在、shadow DOM にスコープされた CSS を持つカスタム要素を配布するには、実行時に shadow root に注入できるように、JavaScript 内に CSS を埋め込む必要があります。また、SSR のシナリオでは、マークアップに重複したスタイルが発生します。この分野は、[プラットフォーム機能](https://github.com/whatwg/html/pull/4898/)としての開発が進められていますが、現時点ではまだ一般的にサポートされているわけではなく、パフォーマンスや SSR の面でも解決すべき問題があります。一方で、Vue の SFC は、スタイルをプレーンな CSS ファイルに抽出することをサポートする [CSS スコープ化するメカニズム](/api/sfc-css-features)を提供しています。
+
+Vue は常に Web プラットフォームの最新の規格に対応しており、みなさんが開発しやすくなるのであれば、プラットフォームが提供するものを喜んで活用していきます。しかしながら、私たちの目標は今日でも十分に機能するソリューションを提供することです。つまり、批判的な考え方で新しいプラットフォームの機能を取り入れなければなりません。そのためには、今のうちに規格では不十分な部分を埋めておく必要があります。

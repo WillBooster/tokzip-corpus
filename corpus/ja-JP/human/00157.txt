@@ -1,0 +1,302 @@
+function ref(value) {
+  const refObject = {
+    get value() {
+      track(refObject, 'value')
+      return value
+    },
+    set value(newValue) {
+      value = newValue
+      trigger(refObject, 'value')
+    }
+  }
+  return refObject
+}
+```
+
+:::tip
+ここと以下のコードスニペットは、核となるコンセプトをできるだけシンプルに説明することを目的としているため、多くの詳細は省略され、エッジケースも無視されています。
+:::
+
+これは基礎のセクションで説明したいくつかの[リアクティブオブジェクトの制限](/guide/essentials/reactivity-fundamentals#limitations-of-reactive)を説明するものです:
+
+- リアクティブオブジェクトのプロパティをローカル変数に割り当てたり分割代入した場合、その変数へのアクセスや代入は、ソースオブジェクトの get / set プロキシートラップをトリガーしなくなるため、非リアクティブになります。この「切断」は変数バインディングにのみ影響することに注意してください。変数がオブジェクトのような非プリミティブな値を指している場合、オブジェクトの変更は依然としてリアクティブです。
+
+- `reactive()` から返されたプロキシーはオリジナルと同じように動作しますが、`===` 演算子を用いてオリジナルと比較すると、異なる固有性を持つことになります。
+
+`track()` の内部では、現在実行中のエフェクトがあるかどうかをチェックします。ある場合は、追跡されているプロパティの購読者であるエフェクト（Set に格納）を検索し、実行中のエフェクトを Set に追加します:
+
+```js
+// これは、エフェクトの実行直前に設定されます。
+// これについては後ほど扱います。
+let activeEffect
+
+function track(target, key) {
+  if (activeEffect) {
+    const effects = getSubscribersForProperty(target, key)
+    effects.add(activeEffect)
+  }
+}
+```
+
+エフェクトの購読は、グローバルなデータストラクチャ `WeakMap<target, Map<key, Set<effect>>` に格納されます。もし、あるプロパティに対して購読するエフェクトの Set が見つからなかった場合（初めて追跡された場合）、Set が作成されます。要するに、これが `getSubscribersForProperty()` 関数が行うことです。説明の簡略化のため、詳細は割愛します。
+
+`trigger()` 内部では再びプロパティの購読者であるエフェクトを検索しています。ですが、今回は探す代わりにエフェクトを呼び出しています:
+
+```js
+function trigger(target, key) {
+  const effects = getSubscribersForProperty(target, key)
+  effects.forEach((effect) => effect())
+}
+```
+
+では、`whenDepsChange()` 関数に話を戻しましょう:
+
+```js
+function whenDepsChange(update) {
+  const effect = () => {
+    activeEffect = effect
+    update()
+    activeEffect = null
+  }
+  effect()
+}
+```
+
+ここでは実際のアップデートを実行する前に、エフェクト自身に現在のアクティブなエフェクトをセットするために素の `update` 関数をラップしています。これにより、アップデート中に `track()` を呼び出し、現在のアクティブなエフェクトを特定することができます。
+
+この時点で、依存関係を自動的に追跡し、依存関係が変更されるたびに再実行するエフェクトを作成しました。これを **リアクティブエフェクト（Reactive Effect）** と呼びます。
+
+Vue はリアクティブエフェクトを作成するための API を提供しています: [`watchEffect()`](/api/reactivity-core#watcheffect)。実際、この例にある魔法のような `whenDepsChange()` とかなり似た動きをすることに気づくかもしれません。これで、実際の Vue の API を使って最初のサンプルを作り直すことができます:
+
+```js
+import { ref, watchEffect } from 'vue'
+
+const A0 = ref(0)
+const A1 = ref(1)
+const A2 = ref()
+
+watchEffect(() => {
+  // A0 と A1 を追跡
+  A2.value = A0.value + A1.value
+})
+
+// エフェクトをトリガー
+A0.value = 2
+```
+
+ref の変更のためにリアクティブエフェクトを使用するのはあまり気持ちのいい使い方ではありません。実際、算出プロパティを使う方がより宣言的です:
+
+```js
+import { ref, computed } from 'vue'
+
+const A0 = ref(0)
+const A1 = ref(1)
+const A2 = computed(() => A0.value + A1.value)
+
+A0.value = 2
+```
+
+内部的には、`computed` がリアクティブエフェクトを使って無効化や再計算を管理しています。
+
+では、一般的で便利なリアクティブエフェクトの例とは何でしょうか？そう、DOM の更新です！単純な"リアクティブレンダリング"を実装するには、次のようにします:
+
+```js
+import { ref, watchEffect } from 'vue'
+
+const count = ref(0)
+
+watchEffect(() => {
+  document.body.innerHTML = `Count is: ${count.value}`
+})
+
+// DOM を更新
+count.value++
+```
+
+実際、これは Vue のコンポーネントが状態と DOM を同期させる方法にかなり近いです。各コンポーネントのインスタンスは、DOM をレンダリングして更新するためのリアクティブエフェクトを作成します。もちろん、Vue コンポーネントは `innerHTML` よりもずっと効率的な方法で DOM を更新しています。これについては[レンダリングメカニズム](./rendering-mechanism)で説明されています。
+
+<div class="options-api">
+
+`ref()`、`computed()` と `watchEffect()` API はすべて Composition API の一部です。これまで Vue で Options API だけを使用していた方は、Composition API が Vue のリアクティブシステムの仕組みに近いことに気がつくでしょう。実際、Vue 3 では、Options API は Composition API の上に実装されています。コンポーネントインスタンス（`this`）のすべてのプロパティへのアクセスは、リアクティビティー追跡のための getter / setter をトリガーし、`watch` や `computed` などのオプションは、内部的に Composition API と同等のものを呼び出します。
+
+</div>
+
+## ランタイムとコンパイルタイムのリアクティビティーの比較 {#runtime-vs-compile-time-reactivity}
+
+Vue のリアクティビティーシステムは、主にランタイムベースです:追跡とトリガーは、すべてコードがブラウザーで直接実行されている間に行われます。ランタイム中のリアクティビティーの長所は、ビルドステップなしで動作すること、そしてエッジケースが少ないことです。一方で、JavaScript の構文の制限に制約されることになり、Vue の ref のような値コンテナーの必要性につながります。
+
+[Svelte](https://svelte.dev/) のような一部のフレームワークは、コンパイル時のリアクティビティーを実装することで、そのような制限を克服することを選択しています。リアクティビティーをシミュレートするためにコードを分析および変換します。コンパイルステップにより、フレームワークは JavaScript 自体のセマンティクスを変更できます。例えば、依存関係の解析やローカル定義された変数へのアクセスに関するエフェクトトリガーを実行するコードを暗黙のうちに注入できます。欠点は、このような変換にはビルドステップが必要であり、また JavaScript のセマンティクスを変更するということは、本質的には「JavaScript のように見えるが別のものにコンパイルされる言語を作成すること」になります。
+
+Vue チームは、[Reactivity Transform](/guide/extras/reactivity-transform) という実験的な機能を通じてこの方向性を模索しましたが、最終的には[こういった理由](https://github.com/vuejs/rfcs/discussions/369#discussioncomment-5059028)で、このプロジェクトには適していないだろうと判断しました。
+
+## リアクティビティーのデバッグ {#reactivity-debugging}
+
+Vue のリアクティビティーシステムが依存関係を自動的に追跡するのは素晴らしいことですが、場合によっては、何が追跡されているのか、あるいは何がコンポーネントの再レンダリングを引き起こしているのかを正確に把握したいと時があるかもしれません。
+
+### コンポーネントデバッグフック {#component-debugging-hooks}
+
+コンポーネントのレンダリング時にどの依存関係が使われているか、どの依存関係が更新のトリガーになっているかは、<span class="options-api">`renderTracked`</span><span class="composition-api">`onRenderTracked`</span> と <span class="options-api">`renderTriggered`</span><span class="composition-api">`onRenderTriggered`</span> ライフサイクルフックを使ってデバッグすることができます。どちらのフックも、調べたい依存関係の情報を含むデバッガーイベントを受け取ります。依存関係を対話的に調査するために、コールバックの中に `debugger` ステートメントを置くことをお勧めします:
+
+<div class="composition-api">
+
+```vue
+<script setup>
+import { onRenderTracked, onRenderTriggered } from 'vue'
+
+onRenderTracked((event) => {
+  debugger
+})
+
+onRenderTriggered((event) => {
+  debugger
+})
+</script>
+```
+
+</div>
+<div class="options-api">
+
+```js
+export default {
+  renderTracked(event) {
+    debugger
+  },
+  renderTriggered(event) {
+    debugger
+  }
+}
+```
+
+</div>
+
+:::tip
+コンポーネントデバッグフックは開発モードでのみ動作します。
+:::
+
+デバッグイベントオブジェクトの型は下記の通りです:
+
+<span id="debugger-event"></span>
+
+```ts
+type DebuggerEvent = {
+  effect: ReactiveEffect
+  target: object
+  type:
+    | TrackOpTypes /* 'get' | 'has' | 'iterate' */
+    | TriggerOpTypes /* 'set' | 'add' | 'delete' | 'clear' */
+  key: any
+  newValue?: any
+  oldValue?: any
+  oldTarget?: Map<any, any> | Set<any>
+}
+```
+
+### 算出プロパティのデバッグ {#computed-debugging}
+
+<div class="composition-api">
+
+`computed()` の第 2 引数に `onTrack` と `onTrigger` のコールバック関数オブジェクトを渡すことで、算出プロパティをデバッグすることができます:
+
+- `onTrack` はリアクティブなプロパティや ref が依存関係として追跡されるときに呼ばれます。
+- `onTrigger` は依存関係の変更によってウォッチャーのコールバック関数がトリガーされたときに呼ばれます。
+
+どちらのコールバックも、コンポーネントデバッグフックと[同じフォーマット](#debugger-event)でデバッガーイベントを受信します:
+
+```js
+const plusOne = computed(() => count.value + 1, {
+  onTrack(e) {
+    // count.value が依存関係として追跡されたときにトリガーされます
+    debugger
+  },
+  onTrigger(e) {
+    // count.value が変更されたときにトリガーされます
+    debugger
+  }
+})
+
+// plusOne にアクセスすると、onTrack がトリガーされる
+console.log(plusOne.value)
+
+// count.value を変更すると、onTrigger がトリガーされる
+count.value++
+```
+
+:::tip
+算出プロパティの `onTrack` と `onTrigger` オプションは開発モードでのみ動作します。
+:::
+
+</div>
+
+<div class="options-api">
+
+算出プロパティのデバッグオプションは、Composition API の `computed()` 関数を介してのみ利用できます。
+
+</div>
+
+### ウォッチャーのデバッグ {#watcher-debugging}
+
+<div class="composition-api">
+
+`computed()` と同様にウォッチャーも `onTrack` と `onTrigger` オプションをサポートしています:
+
+```js
+watch(source, callback, {
+  onTrack(e) {
+    debugger
+  },
+  onTrigger(e) {
+    debugger
+  }
+})
+
+watchEffect(callback, {
+  onTrack(e) {
+    debugger
+  },
+  onTrigger(e) {
+    debugger
+  }
+})
+```
+
+:::tip
+ウォッチャーの `onTrack` と `onTrigger` オプションは開発モードでのみ動作します。
+:::
+
+</div>
+
+<div class="options-api">
+
+オブジェクト構文で宣言されたウォッチャーも `onTrack` と `onTrigger` オプションをサポートしています:
+
+```js
+export default {
+  watch: {
+    source: {
+      handler() {
+        // ...
+      },
+      onTrack(e) {
+        debugger
+      },
+      onTrigger(e) {
+        debugger
+      }
+    }
+  }
+}
+```
+
+</div>
+
+## 外部の状態システムとの統合 {#integration-with-external-state-systems}
+
+Vue のリアクティビティーシステムは、プレーンな JavaScript オブジェクトをリアクティブなプロキシーに綿密に変換することで機能します。外部の状態管理システムと統合する場合（例えば、外部のソリューションもプロキシーを使用する場合）、この変換は不要になることがあり、時には望ましくないことになります。
+
+Vue のリアクティビティーシステムを外部の状態管理ソリューションと統合する一般的な方法は、外部の状態を [`shallowRef`](/api/reactivity-advanced#shallowref) で保持することです。shallow ref は `.value` プロパティにアクセスしたときのみリアクティブになり、内部の値はそのまま残されます。外部の状態が変化したら、更新をトリガーするために ref の値を置き換えます。
+
+### イミュータブルなデータ {#immutable-data}
+
+undo/redo 機能（元に戻す/やり直す機能）を実装する場合、ユーザーが編集するたびにアプリケーションの状態のスナップショットを取得したいと思うかもしれません。ですが、ステートツリーが大きい場合、こういった機能に対しては Vue のミュータブル（変更可能）なリアクティビティーシステムは適していません。更新があるたびにステートオブジェクト全体をシリアライズすると、CPU とメモリー両方のコストがかかる可能性があるためです。
+
+[イミュータブルなデータ構造](https://en.wikipedia.org/wiki/Persistent_data_structure)は、ステートオブジェクトを決して変更させないことでこれを解決します。変更の代わりに、古いオブジェクトと同じ、変化のない部分を共有する新しいオブジェクトを作成するのです。JavaScript でイミュータブルなデータを使用する方法はさまざまありますが、Vue で [Immer](https://immerjs.github.io/immer/) を使用すると、ミュータブルな構文を維持しつつ、より人に分かりやすい状態でイミュータブルなデータを使用できるため、おすすめです。

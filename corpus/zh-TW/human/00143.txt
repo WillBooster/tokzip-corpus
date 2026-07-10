@@ -1,0 +1,108 @@
+`foo` 和 `bar` 這兩個 div 是完全靜態的，沒有必要在重新渲染時再次創建和比對它們。渲染器在初始渲染時創建這些 vnode，緩存它們，並在每次後續重新渲染時重用相同的 vnode。當它注意到舊的 vnode 和新的 vnode 是相同的時候，渲染器還能夠完全跳過對它們的差異比對。
+
+此外，當有足夠多連續的靜態元素時，它們還會再被壓縮為一個“靜態 vnode”，其中包含的是這些節點相應的純 HTML 字符串。([示例](https://template-explorer.vuejs.org/#eyJzcmMiOiI8ZGl2PlxuICA8ZGl2IGNsYXNzPVwiZm9vXCI+Zm9vPC9kaXY+XG4gIDxkaXYgY2xhc3M9XCJmb29cIj5mb288L2Rpdj5cbiAgPGRpdiBjbGFzcz1cImZvb1wiPmZvbzwvZGl2PlxuICA8ZGl2IGNsYXNzPVwiZm9vXCI+Zm9vPC9kaXY+XG4gIDxkaXYgY2xhc3M9XCJmb29cIj5mb288L2Rpdj5cbiAgPGRpdj57eyBkeW5hbWljIH19PC9kaXY+XG48L2Rpdj4iLCJzc3IiOmZhbHNlLCJvcHRpb25zIjp7ImhvaXN0U3RhdGljIjp0cnVlfX0=))。這些靜態節點會直接通過 `innerHTML` 來掛載。
+
+### 更新類型標記 {#patch-flags}
+
+對於單個有動態綁定的元素來說，我們可以在編譯時推斷出大量信息：
+
+```vue-html
+<!-- 僅含 class 綁定 -->
+<div :class="{ active }"></div>
+
+<!-- 僅含 id 和 value 綁定 -->
+<input :id="id" :value="value">
+
+<!-- 僅含文本子節點 -->
+<div>{{ dynamic }}</div>
+```
+
+[在模板編譯預覽中查看](https://template-explorer.vuejs.org/#eyJzcmMiOiI8ZGl2IDpjbGFzcz1cInsgYWN0aXZlIH1cIj48L2Rpdj5cblxuPGlucHV0IDppZD1cImlkXCIgOnZhbHVlPVwidmFsdWVcIj5cblxuPGRpdj57eyBkeW5hbWljIH19PC9kaXY+Iiwib3B0aW9ucyI6e319)
+
+在為這些元素生成渲染函數時，Vue 在 vnode 創建調用中直接編碼了每個元素所需的更新類型：
+
+```js{3}
+createElementVNode("div", {
+  class: _normalizeClass({ active: _ctx.active })
+}, null, 2 /* CLASS */)
+```
+
+最後這個參數 `2` 就是一個[更新類型標記 (patch flag)](https://github.com/vuejs/core/blob/main/packages/shared/src/patchFlags.ts)。一個元素可以有多個更新類型標記，會被合併成一個數字。運行時渲染器也將會使用[位運算](https://en.wikipedia.org/wiki/Bitwise_operation)來檢查這些標記，確定相應的更新操作：
+
+```js
+if (vnode.patchFlag & PatchFlags.CLASS /* 2 */) {
+  // 更新節點的 CSS class
+}
+```
+
+位運算檢查是非常快的。通過這樣的更新類型標記，Vue 能夠在更新帶有動態綁定的元素時做最少的操作。
+
+Vue 也為 vnode 的子節點標記了類型。舉例來說，包含多個根節點的模板被表示為一個片段 (fragment)，大多數情況下，我們可以確定其順序是永遠不變的，所以這部分信息就可以提供給運行時作為一個更新類型標記。
+
+```js{4}
+export function render() {
+  return (_openBlock(), _createElementBlock(_Fragment, null, [
+    /* children */
+  ], 64 /* STABLE_FRAGMENT */))
+}
+```
+
+運行時會完全跳過對這個根片段中子元素順序的重新協調過程。
+
+### 樹結構打平 {#tree-flattening}
+
+再來看看上面這個例子中生成的代碼，你會發現所返回的虛擬 DOM 樹是經一個特殊的 `createElementBlock()` 調用創建的：
+
+```js{2}
+export function render() {
+  return (_openBlock(), _createElementBlock(_Fragment, null, [
+    /* children */
+  ], 64 /* STABLE_FRAGMENT */))
+}
+```
+
+這裡我們引入一個概念“區塊”，內部結構是穩定的一個部分可被稱之為一個區塊。在這個用例中，整個模板只有一個區塊，因為這裡沒有用到任何結構性指令 (例如 `v-if` 或者 `v-for`)。
+
+每一個塊都會追蹤其所有帶更新類型標記的後代節點 (不只是直接子節點)，舉例來說：
+
+```vue-html{3,5}
+<div> <!-- root block -->
+  <div>...</div>         <!-- 不會追蹤 -->
+  <div :id="id"></div>   <!-- 要追蹤 -->
+  <div>                  <!-- 不會追蹤 -->
+    <div>{{ bar }}</div> <!-- 要追蹤 -->
+  </div>
+</div>
+```
+
+編譯的結果會被打平為一個數組，僅包含所有動態的後代節點：
+
+```
+div (block root)
+- div 帶有 :id 綁定
+- div 帶有 {{ bar }} 綁定
+```
+
+當這個組件需要重新渲染時，只需要遍歷這個打平的樹而非整棵樹。這也就是我們所說的**樹結構打平**，這大大減少了我們在虛擬 DOM 協調時需要遍歷的節點數量。模板中任何的靜態部分都會被高效地略過。
+
+`v-if` 和 `v-for` 指令會創建新的區塊節點：
+
+```vue-html
+<div> <!-- 根區塊 -->
+  <div>
+    <div v-if> <!-- if 區塊 -->
+      ...
+    </div>
+  </div>
+</div>
+```
+
+一個子區塊會在父區塊的動態子節點數組中被追蹤，這為他們的父區塊保留了一個穩定的結構。
+
+### 對 SSR 激活的影響 {#impact-on-ssr-hydration}
+
+更新類型標記和樹結構打平都大大提升了 Vue [SSR 激活](/guide/scaling-up/ssr#client-hydration)的性能表現：
+
+- 單個元素的激活可以基於相應 vnode 的更新類型標記走更快的捷徑。
+
+- 在激活時只有區塊節點和其動態子節點需要被遍歷，這在模板層面上實現更高效的部分激活。
