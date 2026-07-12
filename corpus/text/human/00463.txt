@@ -1,214 +1,107 @@
-<!--
-    tagline: Modify the way certain types of packages are installed
--->
+**Solution:** Write custom Gson [`TypeAdapter`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/TypeAdapter.html) implementations for the affected classes or change the type of your data.
+If you already wrote a custom adapter, but it is not used, see [this troubleshooting point](#custom-adapter-not-used).\
+If this occurs for a field in one of your classes which you did not actually want to serialize or deserialize in the first place, you can exclude that field, see the [user guide](UserGuide.md#excluding-fields-from-serialization-and-deserialization).
 
-# Setting up and using custom installers
+**Explanation:**
 
-## Synopsis
+When no built-in adapter for a type exists and no custom adapter has been registered, Gson falls back to using reflection to access the fields of a class (including `private` ones). Most likely you are seeing this error because you (by accident) rely on the reflection-based adapter for third-party classes. That should be avoided because you make yourself dependent on the implementation details of these classes which could change at any point. For the JDK it is also not possible anymore to access internal fields using reflection starting with JDK 17, see [JEP 403](https://openjdk.org/jeps/403).
 
-At times, it may be necessary for a package to require additional actions during
-installation, such as installing packages outside of the default `vendor`
-library.
+If you want to prevent using reflection on third-party classes in the future you can write your own [`ReflectionAccessFilter`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/ReflectionAccessFilter.html) or use one of the predefined ones, such as `ReflectionAccessFilter.BLOCK_ALL_PLATFORM`.
 
-In these cases you could consider creating a Custom Installer to handle your
-specific logic.
+## <a id="reflection-inaccessible-to-module-gson"></a> `InaccessibleObjectException`: 'module ... does not "opens ..." to module com.google.gson'
 
-## Alternative to custom installers with Composer 2.1+
+**Symptom:** An exception with a message in the form 'module ... does not "opens ..." to module com.google.gson' is thrown
 
-As of Composer 2.1, the `Composer\InstalledVersions` class has a
-[`getInstalledPackagesByType`](https://getcomposer.org/doc/07-runtime.md#knowing-which-packages-of-a-given-type-are-installed)
-method which can let you figure out at runtime which plugins/modules/extensions are installed.
+**Reason:**
 
-It is highly recommended to use that instead of building new custom
-installers if you are building a new application. This has the advantage of leaving
-all vendor code in the vendor directory, and not requiring custom installer code.
+- If the reported package is your own package then you have not configured the module declaration of your project to allow Gson to use reflection on your classes.
+- If the reported package is from a third party library or the JDK see [this troubleshooting point](#inaccessibleobjectexception-module--does-not-opens--to-unnamed-module).
 
-## Calling a Custom Installer
+**Solution:** Make sure the `module-info.java` file of your project allows Gson to use reflection on your classes, for example:
 
-Suppose that your project already has a Custom Installer for specific modules
-then invoking that installer is a matter of defining the correct [type][1] in
-your package file.
+```java
+module mymodule {
+    requires com.google.gson;
 
-> _See the next chapter for an instruction how to create Custom Installers._
+    opens mypackage to com.google.gson;
+}
+```
 
-Every Custom Installer defines which [type][1] string it will recognize. Once
-recognized it will completely override the default installer and only apply its
-own logic.
+Or in case this occurs for a field in one of your classes which you did not actually want to serialize or deserialize in the first place, you can exclude that field, see the [user guide](UserGuide.md#excluding-fields-from-serialization-and-deserialization).
 
-An example use-case would be:
+## <a id="android-app-random-names"></a> Android app not working in Release mode; random property names
 
-> phpDocumentor features Templates that need to be installed outside of the
-> default /vendor folder structure. As such they have chosen to adopt the
-> `phpdocumentor-template` [type][1] and create a plugin providing the Custom
-> Installer to send these templates to the correct folder.
+**Symptom:** Your Android app is working fine in Debug mode but fails in Release mode and the JSON properties have seemingly random names such as `a`, `b`, ...
 
-An example composer.json of such a template package would be:
+**Reason:** You probably have not configured ProGuard / R8 correctly
+
+**Solution:** Make sure you have configured ProGuard / R8 correctly to preserve the names of your fields. See the [Android example](examples/android-proguard-example/README.md) for more information.
+
+## <a id="android-app-broken-after-app-update"></a> Android app unable to parse JSON after app update
+
+**Symptom:** You released a new version of your Android app and it fails to parse JSON data created by the previous version of your app
+
+**Reason:** You probably have not configured ProGuard / R8 correctly; probably the field names are being obfuscated and their naming changed between the versions of your app
+
+**Solution:** Make sure you have configured ProGuard / R8 correctly to preserve the names of your fields. See the [Android example](examples/android-proguard-example/README.md) for more information.
+
+If you want to preserve backward compatibility for you app you can use [`@SerializedName`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/annotations/SerializedName.html) on the fields to specify the obfuscated name as alternate, for example: `@SerializedName(value = "myprop", alternate = "a")`
+
+Normally ProGuard and R8 produce a mapping file, this makes it easier to find out the obfuscated field names instead of having to find them out through trial and error or other means. See the [Android Studio user guide](https://developer.android.com/studio/build/shrink-code.html#retracing) for more information.
+
+## <a id="default-field-values-missing"></a> Default field values not present after deserialization
+
+**Symptom:** You have assign default values to fields but after deserialization the fields have their standard value (such as `null` or `0`)
+
+**Reason:** Gson cannot invoke the constructor of your class and falls back to JDK `Unsafe` (or similar means)
+
+**Solution:** Make sure that the class:
+
+- is `static` (explicitly or implicitly when it is a top-level class)
+- has a no-args constructor
+
+Otherwise Gson will by default try to use JDK `Unsafe` or similar means to create an instance of your class without invoking the constructor and without running any initializers. You can also disable that behavior through [`GsonBuilder.disableJdkUnsafe()`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/GsonBuilder.html#disableJdkUnsafe()) to notice such issues early on.
+
+## <a id="anonymous-local-null"></a> `null` values for anonymous and local classes
+
+**Symptom:** Objects of a class are always serialized as JSON `null` / always deserialized as Java `null`
+
+**Reason:** The class you are serializing or deserializing is an anonymous or a local class (or you have specified a custom `ExclusionStrategy`)
+
+**Solution:** Convert the class to a `static` nested class. If the class is already `static` make sure you have not specified a Gson `ExclusionStrategy` which might exclude the class.
+
+Notes:
+
+- "double brace-initialization" also creates anonymous classes
+- Local record classes (feature added in Java 16) are supported by Gson and are not affected by this
+
+## <a id="map-key-wrong-json"></a> Map keys having unexpected format in JSON
+
+**Symptom:** JSON output for `Map` keys is unexpected / cannot be deserialized again
+
+**Reason:** The `Map` key type is 'complex' and you have not configured the `GsonBuilder` properly
+
+**Solution:** Use [`GsonBuilder.enableComplexMapKeySerialization()`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/GsonBuilder.html#enableComplexMapKeySerialization()). See also the [user guide](UserGuide.md#maps-examples) for more information.
+
+## <a id="malformed-json"></a> Parsing JSON fails with `MalformedJsonException`
+
+**Symptom:** JSON parsing fails with `MalformedJsonException`
+
+**Reason:** The JSON data is actually malformed
+
+**Solution:** During debugging, log the JSON data right before calling Gson methods or set a breakpoint to inspect the data and make sure it has the expected format. Sometimes APIs might return HTML error pages (instead of JSON data) when reaching rate limits or when other errors occur. Also read the location information of the `MalformedJsonException` exception message, it indicates where exactly in the document the malformed data was detected, including the [JSONPath](https://goessner.net/articles/JsonPath/).
+
+For example, let's assume you want to deserialize the following JSON data:
 
 ```json
 {
-    "name": "phpdocumentor/template-responsive",
-    "type": "phpdocumentor-template",
-    "require": {
-        "phpdocumentor/template-installer-plugin": "*"
-    }
+  "languages": [
+    "English",
+    "French",
+  ]
 }
 ```
 
-> **IMPORTANT**: to make sure that the template installer is present at the
-> time the template package is installed, template packages should require
-> the plugin package.
-
-## Creating an Installer
-
-A Custom Installer is defined as a class that implements the
-[`Composer\Installer\InstallerInterface`][4] and is usually distributed in a
-Composer Plugin.
-
-A basic Installer Plugin would thus compose of three files:
-
-1. the package file: composer.json
-2. The Plugin class, e.g.: `My\Project\Composer\Plugin.php`, containing a class that implements `Composer\Plugin\PluginInterface`.
-3. The Installer class, e.g.: `My\Project\Composer\Installer.php`, containing a class that implements `Composer\Installer\InstallerInterface`.
-
-### composer.json
-
-The package file is the same as any other package file but with the following
-requirements:
-
-1. the [type][1] attribute must be `composer-plugin`.
-2. the [extra][2] attribute must contain an element `class` defining the
-   class name of the plugin (including namespace). If a package contains
-   multiple plugins, this can be an array of class names.
-
-Example:
-
-```json
-{
-    "name": "phpdocumentor/template-installer-plugin",
-    "type": "composer-plugin",
-    "license": "MIT",
-    "autoload": {
-        "psr-0": {"phpDocumentor\\Composer": "src/"}
-    },
-    "extra": {
-        "class": "phpDocumentor\\Composer\\TemplateInstallerPlugin"
-    },
-    "require": {
-        "composer-plugin-api": "^1.0"
-    },
-    "require-dev": {
-        "composer/composer": "^1.3"
-    }
-}
-```
-
-The example above has Composer itself in its require-dev, which allows you to use
-the Composer classes in your test suite for example.
-
-### The Plugin class
-
-The class defining the Composer plugin must implement the
-[`Composer\Plugin\PluginInterface`][3]. It can then register the Custom
-Installer in its `activate()` method.
-
-The class may be placed in any location and have any name, as long as it is
-autoloadable and matches the `extra.class` element in the package definition.
-
-Example:
-
-```php
-<?php
-
-namespace phpDocumentor\Composer;
-
-use Composer\Composer;
-use Composer\IO\IOInterface;
-use Composer\Plugin\PluginInterface;
-
-class TemplateInstallerPlugin implements PluginInterface
-{
-    public function activate(Composer $composer, IOInterface $io)
-    {
-        $installer = new TemplateInstaller($io, $composer);
-        $composer->getInstallationManager()->addInstaller($installer);
-    }
-}
-```
-
-### The Custom Installer class
-
-The class that executes the custom installation should implement the
-[`Composer\Installer\InstallerInterface`][4] (or extend another installer that
-implements that interface). It defines the [type][1] string as it will be
-recognized by packages that will use this installer in the `supports()` method.
-
-> **NOTE**: _choose your [type][1] name carefully, it is recommended to follow
-> the format: `vendor-type`_. For example: `phpdocumentor-template`.
-
-The InstallerInterface class defines the following methods (please see the
-source for the exact signature):
-
-* **supports()**, here you test whether the passed [type][1] matches the name
-  that you declared for this installer (see the example).
-* **isInstalled()**, determines whether a supported package is installed or not.
-* **install()**, here you can determine the actions that need to be executed
-  upon installation.
-* **update()**, here you define the behavior that is required when Composer is
-  invoked with the update argument.
-* **uninstall()**, here you can determine the actions that need to be executed
-  when the package needs to be removed.
-* **getInstallPath()**, this method should return the absolute path where the
-  package is to be installed. The path _must not end with a slash._
-
-Example:
-
-```php
-<?php
-
-namespace phpDocumentor\Composer;
-
-use Composer\Package\PackageInterface;
-use Composer\Installer\LibraryInstaller;
-
-class TemplateInstaller extends LibraryInstaller
-{
-    /**
-     * @inheritDoc
-     */
-    public function getInstallPath(PackageInterface $package)
-    {
-        $prefix = substr($package->getPrettyName(), 0, 23);
-        if ('phpdocumentor/template-' !== $prefix) {
-            throw new \InvalidArgumentException(
-                'Unable to install template, phpdocumentor templates '
-                .'should always start their package name with '
-                .'"phpdocumentor/template-"'
-            );
-        }
-
-        return 'data/templates/'.substr($package->getPrettyName(), 23);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function supports($packageType)
-    {
-        return 'phpdocumentor-template' === $packageType;
-    }
-}
-```
-
-The example demonstrates that it is possible to extend the
-[`Composer\Installer\LibraryInstaller`][5] class to strip a prefix
-(`phpdocumentor/template-`) and use the remaining part to assemble a completely
-different installation path.
-
-> _Instead of being installed in `/vendor` any package installed using this
-> Installer will be put in the `/data/templates/<stripped name>` folder._
-
-[1]: ../04-schema.md#type
-[2]: ../04-schema.md#extra
-[3]: https://github.com/composer/composer/blob/main/src/Composer/Plugin/PluginInterface.php
-[4]: https://github.com/composer/composer/blob/main/src/Composer/Installer/InstallerInterface.php
-[5]: https://github.com/composer/composer/blob/main/src/Composer/Installer/LibraryInstaller.php
+This will fail with an exception similar to this one: `MalformedJsonException: Use JsonReader.setStrictness(Strictness.LENIENT) to accept malformed JSON at line 5 column 4 path $.languages[2]`\
+The problem here is the trailing comma (`,`) after `"French"`, trailing commas are not allowed by the JSON specification. The location information "line 5 column 4" points to the `]` in the JSON data (with some slight inaccuracies) because Gson expected another value after `,` instead of the closing `]`. The JSONPath `$.languages[2]` in the exception message also points there: `$.` refers to the root object, `languages` refers to its member of that name and `[2]` refers to the (missing) third value in the JSON array value of that member (numbering starts at 0, so it is `[2]` instead of `[3]`).\
+The proper solution here is to fix the malformed JSON data.

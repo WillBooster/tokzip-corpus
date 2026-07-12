@@ -1,650 +1,805 @@
-# API Reference
+### Updating an Object
 
-The {fmt} library API consists of the following components:
+Update callbacks are triggered whenever an **existing** record is persisted
+(i.e. "saved") to the underlying database. They are called before, after and
+around the object is updated.
 
-- [`fmt/base.h`](#base-api): the base API providing main formatting functions
-  for `char`/UTF-8 with C++20 compile-time checks and minimal dependencies
-- [`fmt/format.h`](#format-api): `fmt::format` and other formatting functions
-  as well as locale support
-- [`fmt/ranges.h`](#ranges-api): formatting of ranges and tuples
-- [`fmt/chrono.h`](#chrono-api): date and time formatting
-- [`fmt/std.h`](#std-api): formatters for standard library types
-- [`fmt/compile.h`](#compile-api): format string compilation
-- [`fmt/color.h`](#color-api): terminal colors and text styles
-- [`fmt/os.h`](#os-api): system APIs
-- [`fmt/ostream.h`](#ostream-api): `std::ostream` support
-- [`fmt/args.h`](#args-api): dynamic argument lists
-- [`fmt/printf.h`](#printf-api): safe `printf`
-- [`fmt/xchar.h`](#xchar-api): optional `wchar_t` support
+* [`before_validation`][]
+* [`after_validation`][]
+* [`before_save`][]
+* [`around_save`][]
+* [`before_update`][]
+* [`around_update`][]
+* [`after_update`][]
+* [`after_save`][]
+* [`after_commit`][] / [`after_rollback`][]
 
-All functions and types provided by the library reside in namespace `fmt`
-and macros have prefix `FMT_`.
+[`after_update`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_update
+[`around_update`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-around_update
+[`before_update`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-before_update
 
-## Base API
+WARNING: The `after_save` callback is triggered on both create and update
+operations. However, it consistently executes after the more specific callbacks
+`after_create` and `after_update`, regardless of the sequence in which the macro
+calls were made. Similarly, before and around save callbacks follow the same
+rule: `before_save` runs before create/update, and `around_save` runs around
+create/update operations. It's important to note that save callbacks will always
+run before/around/after the more specific create/update callbacks.
 
-`fmt/base.h` defines the base API which provides main formatting functions
-for `char`/UTF-8 with C++20 compile-time checks. It has minimal include
-dependencies for better compile times. This header is only beneficial when
-using {fmt} as a library (the default) and not in the header-only mode.
-It also provides `formatter` specializations for the following types:
+We've already covered [validation](#validation-callbacks) and
+[save](#save-callbacks) callbacks. See the [`after_commit` /
+`after_rollback` section](#after-commit-and-after-rollback) for examples using
+these two callbacks.
 
-- `int`, `long long`,
-- `unsigned`, `unsigned long long`
-- `float`, `double`, `long double`
-- `bool`
-- `char`
-- `const char*`, [`fmt::string_view`](#basic_string_view)
-- `const void*`
+#### Update Callbacks
 
-The following functions use [format string syntax](syntax.md) similar to that
-of [str.format](https://docs.python.org/3/library/stdtypes.html#str.format)
-in Python. They take *fmt* and *args* as arguments.
+```ruby
+class User < ApplicationRecord
+  before_update :check_role_change
+  around_update :log_updating
+  after_update :send_update_email
 
-*fmt* is a format string that contains literal text and replacement fields
-surrounded by braces `{}`. The fields are replaced with formatted arguments
-in the resulting string. [`fmt::format_string`](#format_string) is a format
-string which can be implicitly constructed from a string literal or a
-`constexpr` string and is checked at compile time in C++20. To pass a runtime
-format string wrap it in [`fmt::runtime`](#runtime).
+  private
+    def check_role_change
+      if role_changed?
+        Rails.logger.info("User role changed to #{role}")
+      end
+    end
 
-*args* is an argument list representing objects to be formatted.
+    def log_updating
+      Rails.logger.info("Updating user with email: #{email}")
+      yield
+      Rails.logger.info("User updated with email: #{email}")
+    end
 
-I/O errors are reported as [`std::system_error`](
-https://en.cppreference.com/w/cpp/error/system_error) exceptions unless
-specified otherwise.
-
-::: print(format_string<T...>, T&&...)
-
-::: print(FILE*, format_string<T...>, T&&...)
-
-::: println(format_string<T...>, T&&...)
-
-::: println(FILE*, format_string<T...>, T&&...)
-
-::: format_to(OutputIt&&, format_string<T...>, T&&...)
-
-::: format_to_n(OutputIt, size_t, format_string<T...>, T&&...)
-
-::: format_to_n_result
-
-::: formatted_size(format_string<T...>, T&&...)
-
-<a id="udt"></a>
-### Formatting User-Defined Types
-
-The {fmt} library provides formatters for many standard C++ types.
-See [`fmt/ranges.h`](#ranges-api) for ranges and tuples including standard
-containers such as `std::vector`, [`fmt/chrono.h`](#chrono-api) for date and
-time formatting and [`fmt/std.h`](#std-api) for other standard library types.
-
-There are two ways to make a user-defined type formattable: providing a
-`format_as` function or specializing the `formatter` struct template.
-
-Use `format_as` if you want to make your type formattable as some other
-type with the same format specifiers. The `format_as` function should
-take an object of your type and return an object of a formattable type.
-It should be defined in the same namespace as your type.
-
-Example ([run](https://godbolt.org/z/nvME4arz8)):
-
-    #include <fmt/format.h>
-
-    namespace kevin_namespacy {
-
-    enum class film {
-      house_of_cards, american_beauty, se7en = 7
-    };
-
-    auto format_as(film f) { return fmt::underlying(f); }
-
-    }
-
-    int main() {
-      fmt::print("{}\n", kevin_namespacy::film::se7en); // Output: 7
-    }
-
-Using specialization is more complex but gives you full control over
-parsing and formatting. To use this method specialize the `formatter`
-struct template for your type and implement `parse` and `format`
-methods.
-
-The recommended way of defining a formatter is by reusing an existing
-one via inheritance or composition. This way you can support standard
-format specifiers without implementing them yourself. For example:
-
-```c++
-// color.h:
-#include <fmt/base.h>
-
-enum class color {red, green, blue};
-
-template <> struct fmt::formatter<color>: formatter<string_view> {
-  // parse is inherited from formatter<string_view>.
-
-  auto format(color c, format_context& ctx) const
-    -> format_context::iterator;
-};
+    def send_update_email
+      UserMailer.update_email(self).deliver_later
+      Rails.logger.info("Update email sent to: #{email}")
+    end
+end
 ```
 
-```c++
-// color.cc:
-#include "color.h"
-#include <fmt/format.h>
+```irb
+irb> user = User.find(1)
+=> #<User id: 1, email: "john.doe@example.com", created_at: "2024-03-20 16:19:52.405195000 +0000", updated_at: "2024-03-20 16:19:52.405195000 +0000", name: "John Doe", role: "user" >
 
-auto fmt::formatter<color>::format(color c, format_context& ctx) const
-    -> format_context::iterator {
-  string_view name = "unknown";
-  switch (c) {
-  case color::red:   name = "red"; break;
-  case color::green: name = "green"; break;
-  case color::blue:  name = "blue"; break;
-  }
-  return formatter<string_view>::format(name, ctx);
-}
+irb> user.update(role: "admin")
+User role changed to admin
+Updating user with email: john.doe@example.com
+User updated with email: john.doe@example.com
+Update email sent to: john.doe@example.com
 ```
 
-Note that `formatter<string_view>::format` is defined in `fmt/format.h`
-so it has to be included in the source file. Since `parse` is inherited
-from `formatter<string_view>` it will recognize all string format
-specifications, for example
+#### Using a Combination of Callbacks
 
-```c++
-fmt::format("{:>10}", color::blue)
+Often, you will need to use a combination of callbacks to achieve the desired
+behavior. For example, you may want to send a confirmation email after a user is
+created, but only if the user is new and not being updated. When a user is
+updated, you may want to notify an admin if critical information is changed. In
+this case, you can use `after_create` and `after_update` callbacks together.
+
+```ruby
+class User < ApplicationRecord
+  after_create :send_confirmation_email
+  after_update :notify_admin_if_critical_info_updated
+
+  private
+    def send_confirmation_email
+      UserMailer.confirmation_email(self).deliver_later
+      Rails.logger.info("Confirmation email sent to: #{email}")
+    end
+
+    def notify_admin_if_critical_info_updated
+      if saved_change_to_email? || saved_change_to_phone_number?
+        AdminMailer.user_critical_info_updated(self).deliver_later
+        Rails.logger.info("Notification sent to admin about critical info update for: #{email}")
+      end
+    end
+end
 ```
 
-will return `"      blue"`.
+```irb
+irb> user = User.create(name: "John Doe", email: "john.doe@example.com")
+Confirmation email sent to: john.doe@example.com
+=> #<User id: 1, email: "john.doe@example.com", ...>
 
-<!-- The experimental `nested_formatter` provides an easy way of applying a
-formatter to one or more subobjects.
-
-For example:
-
-    #include <fmt/format.h>
-
-    struct point {
-      double x, y;
-    };
-
-    template <>
-    struct fmt::formatter<point> : nested_formatter<double> {
-      auto format(point p, format_context& ctx) const {
-        return write_padded(ctx, [=](auto out) {
-          return format_to(out, "({}, {})", this->nested(p.x),
-                           this->nested(p.y));
-        });
-      }
-    };
-
-    int main() {
-      fmt::print("[{:>20.2f}]", point{1, 2});
-    }
-
-prints:
-
-    [          (1.00, 2.00)]
-
-Notice that fill, align and width are applied to the whole object which
-is the recommended behavior while the remaining specifiers apply to
-elements. -->
-
-In general the formatter has the following form:
-
-    template <> struct fmt::formatter<T> {
-      // Parses format specifiers and stores them in the formatter.
-      //
-      // [ctx.begin(), ctx.end()) is a, possibly empty, character range that
-      // contains a part of the format string starting from the format
-      // specifications to be parsed, e.g. in
-      //
-      //   fmt::format("{:f} continued", ...);
-      //
-      // the range will contain "f} continued". The formatter should parse
-      // specifiers until '}' or the end of the range. In this example the
-      // formatter should parse the 'f' specifier and return an iterator
-      // pointing to '}'.
-      constexpr auto parse(format_parse_context& ctx)
-        -> format_parse_context::iterator;
-
-      // Formats value using the parsed format specification stored in this
-      // formatter and writes the output to ctx.out().
-      auto format(const T& value, format_context& ctx) const
-        -> format_context::iterator;
-    };
-
-It is recommended to at least support fill, align and width that apply
-to the whole object and have the same semantics as in standard
-formatters.
-
-You can also write a formatter for a hierarchy of classes:
-
-```c++
-// demo.h:
-#include <type_traits>
-#include <fmt/core.h>
-
-struct A {
-  virtual ~A() {}
-  virtual std::string name() const { return "A"; }
-};
-
-struct B : A {
-  virtual std::string name() const { return "B"; }
-};
-
-template <typename T>
-struct fmt::formatter<T, std::enable_if_t<std::is_base_of_v<A, T>, char>> :
-    fmt::formatter<std::string> {
-  auto format(const A& a, format_context& ctx) const {
-    return formatter<std::string>::format(a.name(), ctx);
-  }
-};
+irb> user.update(email: "john.doe.new@example.com")
+Notification sent to admin about critical info update for: john.doe.new@example.com
+=> true
 ```
 
-```c++
-// demo.cc:
-#include "demo.h"
-#include <fmt/format.h>
+### Destroying an Object
 
-int main() {
-  B b;
-  A& a = b;
-  fmt::print("{}", a); // Output: B
-}
+Destroy callbacks are triggered whenever a record is destroyed, but ignored when
+a record is deleted. They are called before, after and around the object is
+destroyed.
+
+* [`before_destroy`][]
+* [`around_destroy`][]
+* [`after_destroy`][]
+* [`after_commit`][] / [`after_rollback`][]
+
+[`after_destroy`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_destroy
+[`around_destroy`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-around_destroy
+[`before_destroy`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-before_destroy
+
+Find [examples for using `after_commit` /
+`after_rollback`](#after-commit-and-after-rollback).
+
+#### Destroy Callbacks
+
+```ruby
+class User < ApplicationRecord
+  before_destroy :check_admin_count
+  around_destroy :log_destroy_operation
+  after_destroy :notify_users
+
+  private
+    def check_admin_count
+      if admin? && User.where(role: "admin").count == 1
+        throw :abort
+      end
+      Rails.logger.info("Checked the admin count")
+    end
+
+    def log_destroy_operation
+      Rails.logger.info("About to destroy user with ID #{id}")
+      yield
+      Rails.logger.info("User with ID #{id} destroyed successfully")
+    end
+
+    def notify_users
+      UserMailer.deletion_email(self).deliver_later
+      Rails.logger.info("Notification sent to other users about user deletion")
+    end
+end
 ```
 
-Providing both a `formatter` specialization and a `format_as` overload is
-disallowed.
+```irb
+irb> user = User.find(1)
+=> #<User id: 1, email: "john.doe@example.com", created_at: "2024-03-20 16:19:52.405195000 +0000", updated_at: "2024-03-20 16:19:52.405195000 +0000", name: "John Doe", role: "admin">
 
-::: basic_format_parse_context
-
-::: context
-
-::: format_context
-
-### Compile-Time Checks
-
-Compile-time format string checks are enabled by default on compilers
-that support C++20 `consteval`. On older compilers you can use the
-[FMT_STRING](#legacy-checks) macro defined in `fmt/format.h` instead.
-
-Unused arguments are allowed as in Python's `str.format` and ordinary functions.
-
-::: basic_format_string
-
-::: format_string
-
-::: runtime(string_view)
-
-### Named Arguments
-
-::: arg(const Char*, const T&)
-
-Named arguments are not supported in compile-time checks at the moment.
-
-### Type Erasure
-
-You can create your own formatting function with compile-time checks and
-small binary footprint, for example ([run](https://godbolt.org/z/b9Pbasvzc)):
-
-```c++
-#include <fmt/format.h>
-
-void vlog(const char* file, int line,
-          fmt::string_view fmt, fmt::format_args args) {
-  fmt::print("{}: {}: {}", file, line, fmt::vformat(fmt, args));
-}
-
-template <typename... T>
-void log(const char* file, int line,
-         fmt::format_string<T...> fmt, T&&... args) {
-  vlog(file, line, fmt, fmt::make_format_args(args...));
-}
-
-#define MY_LOG(fmt, ...) log(__FILE__, __LINE__, fmt, __VA_ARGS__)
-
-MY_LOG("invalid squishiness: {}", 42);
+irb> user.destroy
+Checked the admin count
+About to destroy user with ID 1
+User with ID 1 destroyed successfully
+Notification sent to other users about user deletion
 ```
 
-Note that `vlog` is not parameterized on argument types which improves
-compile times and reduces binary code size compared to a fully
-parameterized version.
-
-::: make_format_args(T&...)
-
-::: basic_format_args
-
-::: format_args
-
-::: basic_format_arg
-
-### Compatibility
-
-::: basic_string_view
-
-::: string_view
-
-## Format API
-
-`fmt/format.h` defines the full format API providing additional
-formatting functions and locale support.
-
-<a id="format"></a>
-::: format(format_string<T...>, T&&...)
-
-::: vformat(string_view, format_args)
-
-::: operator""_a()
-
-### Utilities
-
-::: ptr(T)
-
-::: underlying(Enum)
-
-::: to_string(const T&)
-
-::: group_digits(T)
-
-::: detail::buffer
-
-::: basic_memory_buffer
-
-### System Errors
-
-{fmt} does not use `errno` to communicate errors to the user, but it may
-call system functions which set `errno`. Users should not make any
-assumptions about the value of `errno` being preserved by library
-functions.
-
-::: system_error
-
-::: format_system_error
-
-### Custom Allocators
-
-The {fmt} library supports custom dynamic memory allocators. A custom
-allocator class can be specified as a template argument to
-[`fmt::basic_memory_buffer`](#basic_memory_buffer):
-
-    using custom_memory_buffer = 
-      fmt::basic_memory_buffer<char, fmt::inline_buffer_size, custom_allocator>;
-
-It is also possible to write a formatting function that uses a custom
-allocator:
-
-    using custom_string =
-      std::basic_string<char, std::char_traits<char>, custom_allocator>;
-
-    custom_string vformat(custom_allocator alloc, fmt::string_view format_str,
-                          fmt::format_args args) {
-      auto buf = custom_memory_buffer(alloc);
-      fmt::vformat_to(std::back_inserter(buf), format_str, args);
-      return custom_string(buf.data(), buf.size(), alloc);
-    }
-
-    template <typename ...Args>
-    inline custom_string format(custom_allocator alloc,
-                                fmt::string_view format_str,
-                                const Args& ... args) {
-      return vformat(alloc, format_str, fmt::make_format_args(args...));
-    }
-
-The allocator will be used for the output container only. Formatting
-functions normally don't do any allocations for built-in and string
-types except for non-default floating-point formatting that occasionally
-falls back on `sprintf`.
-
-### Locale
-
-All formatting is locale-independent by default. Use the `'L'` format
-specifier to insert the appropriate number separator characters from the
-locale:
-
-    #include <fmt/core.h>
-    #include <locale>
-
-    std::locale::global(std::locale("en_US.UTF-8"));
-    auto s = fmt::format("{:L}", 1000000);  // s == "1,000,000"
-
-`fmt/format.h` provides the following overloads of formatting functions
-that take `std::locale` as a parameter. The locale type is a template
-parameter to avoid the expensive `<locale>` include.
-
-::: format(const Locale&, format_string<T...>, T&&...)
-
-::: format_to(OutputIt, const Locale&, format_string<T...>, T&&...)
-
-::: formatted_size(const Locale&, format_string<T...>, T&&...)
-
-<a id="legacy-checks"></a>
-### Legacy Compile-Time Checks
-
-`FMT_STRING` enables compile-time checks on older compilers. It requires
-C++14 or later and is a no-op in C++11.
-
-::: FMT_STRING
-
-To force the use of legacy compile-time checks, define the preprocessor
-variable `FMT_ENFORCE_COMPILE_STRING`. When set, functions accepting
-`FMT_STRING` will fail to compile with regular strings.
-
-<a id="ranges-api"></a>
-## Range and Tuple Formatting
-
-`fmt/ranges.h` provides formatting support for ranges and tuples:
-
-    #include <fmt/ranges.h>
-
-    fmt::print("{}", std::tuple<char, int>{'a', 42});
-    // Output: ('a', 42)
-
-Using `fmt::join`, you can separate tuple elements with a custom separator:
-
-    #include <fmt/ranges.h>
-
-    auto t = std::tuple<int, char>{1, 'a'};
-    fmt::print("{}", fmt::join(t, ", "));
-    // Output: 1, a
-
-::: join(Range&&, string_view)
-
-::: join(It, Sentinel, string_view)
-
-::: join(std::initializer_list<T>, string_view)
-
-<a id="chrono-api"></a>
-## Date and Time Formatting
-
-`fmt/chrono.h` provides formatters for
-
-- [`std::chrono::duration`](https://en.cppreference.com/w/cpp/chrono/duration)
-- [`std::chrono::time_point`](
-  https://en.cppreference.com/w/cpp/chrono/time_point)
-- [`std::tm`](https://en.cppreference.com/w/cpp/chrono/c/tm)
-
-The format syntax is described in [Chrono Format Specifications](syntax.md#
-chrono-format-specifications).
-
-**Example**:
-
-    #include <fmt/chrono.h>
-
-    int main() {
-      std::time_t t = std::time(nullptr);
-
-      fmt::print("The date is {:%Y-%m-%d}.", fmt::localtime(t));
-      // Output: The date is 2020-11-07.
-      // (with 2020-11-07 replaced by the current date)
-
-      using namespace std::literals::chrono_literals;
-
-      fmt::print("Default format: {} {}\n", 42s, 100ms);
-      // Output: Default format: 42s 100ms
-
-      fmt::print("strftime-like format: {:%H:%M:%S}\n", 3h + 15min + 30s);
-      // Output: strftime-like format: 03:15:30
-    }
-
-::: localtime(std::time_t)
-
-::: gmtime(std::time_t)
-
-<a id="std-api"></a>
-## Standard Library Types Formatting
-
-`fmt/std.h` provides formatters for:
-
-- [`std::atomic`](https://en.cppreference.com/w/cpp/atomic/atomic)
-- [`std::atomic_flag`](https://en.cppreference.com/w/cpp/atomic/atomic_flag)
-- [`std::bitset`](https://en.cppreference.com/w/cpp/utility/bitset)
-- [`std::error_code`](https://en.cppreference.com/w/cpp/error/error_code)
-- [`std::filesystem::path`](https://en.cppreference.com/w/cpp/filesystem/path)
-- [`std::monostate`](https://en.cppreference.com/w/cpp/utility/variant/monostate)
-- [`std::optional`](https://en.cppreference.com/w/cpp/utility/optional)
-- [`std::source_location`](https://en.cppreference.com/w/cpp/utility/source_location)
-- [`std::thread::id`](https://en.cppreference.com/w/cpp/thread/thread/id)
-- [`std::variant`](https://en.cppreference.com/w/cpp/utility/variant/variant)
-
-::: ptr(const std::unique_ptr<T, Deleter>&)
-
-::: ptr(const std::shared_ptr<T>&)
-
-### Formatting Variants
-
-A `std::variant` is only formattable if every variant alternative is
-formattable, and requires the `__cpp_lib_variant` [library
-feature](https://en.cppreference.com/w/cpp/feature_test).
-
-**Example**:
-
-    #include <fmt/std.h>
-
-    fmt::print("{}", std::variant<char, float>('x'));
-    // Output: variant('x')
-
-    fmt::print("{}", std::variant<std::monostate, char>());
-    // Output: variant(monostate)
-
-<a id="compile-api"></a>
-## Format String Compilation
-
-`fmt/compile.h` provides format string compilation enabled via the
-`FMT_COMPILE` macro or the `_cf` user-defined literal defined in
-namespace `fmt::literals`. Format strings marked with `FMT_COMPILE`
-or `_cf` are parsed, checked and converted into efficient formatting
-code at compile-time. This supports arguments of built-in and string
-types as well as user-defined types with `format` functions taking
-the format context type as a template parameter in their `formatter`
-specializations. For example:
-
-    template <> struct fmt::formatter<point> {
-      constexpr auto parse(format_parse_context& ctx);
-
-      template <typename FormatContext>
-      auto format(const point& p, FormatContext& ctx) const;
-    };
-
-Format string compilation can generate more binary code compared to the
-default API and is only recommended in places where formatting is a
-performance bottleneck.
-
-::: FMT_COMPILE
-
-::: operator""_cf
-
-<a id="color-api"></a>
-## Terminal Colors and Text Styles
-
-`fmt/color.h` provides support for terminal color and text style output.
-
-::: print(const text_style&, format_string<T...>, T&&...)
-
-::: fg(detail::color_type)
-
-::: bg(detail::color_type)
-
-::: styled(const T&, text_style)
-
-<a id="os-api"></a>
-## System APIs
-
-::: ostream
-
-::: windows_error
-
-<a id="ostream-api"></a>
-## `std::ostream` Support
-
-`fmt/ostream.h` provides `std::ostream` support including formatting of
-user-defined types that have an overloaded insertion operator
-(`operator<<`). In order to make a type formattable via `std::ostream`
-you should provide a `formatter` specialization inherited from
-`ostream_formatter`:
-
-    #include <fmt/ostream.h>
-
-    struct date {
-      int year, month, day;
-
-      friend std::ostream& operator<<(std::ostream& os, const date& d) {
-        return os << d.year << '-' << d.month << '-' << d.day;
-      }
-    };
-
-    template <> struct fmt::formatter<date> : ostream_formatter {};
-
-    std::string s = fmt::format("The date is {}", date{2012, 12, 9});
-    // s == "The date is 2012-12-9"
-
-::: streamed(const T&)
-
-::: print(std::ostream&, format_string<T...>, T&&...)
-
-<a id="args-api"></a>
-## Dynamic Argument Lists
-
-The header `fmt/args.h` provides `dynamic_format_arg_store`, a builder-like API
-that can be used to construct format argument lists dynamically.
-
-::: dynamic_format_arg_store
-
-<a id="printf-api"></a>
-## Safe `printf`
-
-The header `fmt/printf.h` provides `printf`-like formatting
-functionality. The following functions use [printf format string
-syntax](https://pubs.opengroup.org/onlinepubs/009695399/functions/fprintf.html)
-with the POSIX extension for positional arguments. Unlike their standard
-counterparts, the `fmt` functions are type-safe and throw an exception
-if an argument type doesn't match its format specification.
-
-::: printf(string_view, const T&...)
-
-::: fprintf(std::FILE*, const S&, const T&...)
-
-::: sprintf(const S&, const T&...)
-
-<a id="xchar-api"></a>
-## Wide Strings
-
-The optional header `fmt/xchar.h` provides support for `wchar_t` and
-exotic character types.
-
-::: is_char
-
-::: wstring_view
-
-::: wformat_context
-
-::: to_wstring(const T&)
-
-## Compatibility with C++20 `std::format`
-
-{fmt} implements nearly all of the [C++20 formatting
-library](https://en.cppreference.com/w/cpp/utility/format) with the
-following differences:
-
-- Names are defined in the `fmt` namespace instead of `std` to avoid
-  collisions with standard library implementations.
-- Width calculation doesn't use grapheme clusterization. The latter has
-  been implemented in a separate branch but hasn't been integrated yet.
+### `after_initialize` and `after_find`
+
+Whenever an Active Record object is instantiated, either by directly using `new`
+or when a record is loaded from the database, the [`after_initialize`][]
+callback will be called. It can be useful to avoid the need to directly override
+your Active Record `initialize` method.
+
+When loading a record from the database the [`after_find`][] callback will be
+called. `after_find` is called before `after_initialize` if both are defined.
+
+NOTE: The `after_initialize` and `after_find` callbacks have no `before_*`
+counterparts.
+
+They can be registered just like the other Active Record callbacks.
+
+```ruby
+class User < ApplicationRecord
+  after_initialize do |user|
+    Rails.logger.info("You have initialized an object!")
+  end
+
+  after_find do |user|
+    Rails.logger.info("You have found an object!")
+  end
+end
+```
+
+```irb
+irb> User.new
+You have initialized an object!
+=> #<User id: nil>
+
+irb> User.first
+You have found an object!
+You have initialized an object!
+=> #<User id: 1>
+```
+
+[`after_find`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_find
+[`after_initialize`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_initialize
+
+### `after_touch`
+
+The [`after_touch`][] callback will be called whenever an Active Record object
+is touched. You can [read more about `touch` in the API
+docs](https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-touch).
+
+```ruby
+class User < ApplicationRecord
+  after_touch do |user|
+    Rails.logger.info("You have touched an object")
+  end
+end
+```
+
+```irb
+irb> user = User.create(name: "Kuldeep")
+=> #<User id: 1, name: "Kuldeep", created_at: "2013-11-25 12:17:49", updated_at: "2013-11-25 12:17:49">
+
+irb> user.touch
+You have touched an object
+=> true
+```
+
+It can be used along with `belongs_to`:
+
+```ruby
+class Book < ApplicationRecord
+  belongs_to :library, touch: true
+  after_touch do
+    Rails.logger.info("A Book was touched")
+  end
+end
+
+class Library < ApplicationRecord
+  has_many :books
+  after_touch :log_when_books_or_library_touched
+
+  private
+    def log_when_books_or_library_touched
+      Rails.logger.info("Book/Library was touched")
+    end
+end
+```
+
+```irb
+irb> book = Book.last
+=> #<Book id: 1, library_id: 1, created_at: "2013-11-25 17:04:22", updated_at: "2013-11-25 17:05:05">
+
+irb> book.touch # triggers book.library.touch
+A Book was touched
+Book/Library was touched
+=> true
+```
+
+[`after_touch`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_touch
+
+Running Callbacks
+-----------------
+
+The following methods trigger callbacks:
+
+* `create`
+* `create!`
+* `destroy`
+* `destroy!`
+* `destroy_all`
+* `destroy_by`
+* `save`
+* `save!`
+* `save(validate: false)`
+* `save!(validate: false)`
+* `toggle!`
+* `touch`
+* `update_attribute`
+* `update_attribute!`
+* `update`
+* `update!`
+* `valid?`
+* `validate`
+
+Additionally, the `after_find` callback is triggered by the following finder
+methods:
+
+* `all`
+* `first`
+* `find`
+* `find_by`
+* `find_by!`
+* `find_by_*`
+* `find_by_*!`
+* `find_by_sql`
+* `last`
+* `sole`
+* `take`
+
+The `after_initialize` callback is triggered every time a new object of the
+class is initialized.
+
+NOTE: The `find_by_*` and `find_by_*!` methods are dynamic finders generated
+automatically for every attribute. Learn more about them in the [Dynamic finders
+section](active_record_querying.html#dynamic-finders).
+
+Conditional Callbacks
+---------------------
+
+As with [validations](active_record_validations.html), we can also make the
+calling of a callback method conditional on the satisfaction of a given
+predicate. We can do this using the `:if` and `:unless` options, which can take
+a symbol, a `Proc` or an `Array`.
+
+You may use the `:if` option when you want to specify under which conditions the
+callback **should** be called. If you want to specify the conditions under which
+the callback **should not** be called, then you may use the `:unless` option.
+
+### Using `:if` and `:unless` with a `Symbol`
+
+You can associate the `:if` and `:unless` options with a symbol corresponding to
+the name of a predicate method that will get called right before the callback.
+
+When using the `:if` option, the callback **won't** be executed if the predicate
+method returns **false**; when using the `:unless` option, the callback
+**won't** be executed if the predicate method returns **true**. This is the most
+common option.
+
+```ruby
+class Order < ApplicationRecord
+  before_save :normalize_card_number, if: :paid_with_card?
+end
+```
+
+Using this form of registration it is also possible to register several
+different predicates that should be called to check if the callback should be
+executed. We will cover this in the [Multiple Callback Conditions
+section](#multiple-callback-conditions).
+
+### Using `:if` and `:unless` with a `Proc`
+
+It is possible to associate `:if` and `:unless` with a `Proc` object. This
+option is best suited when writing short validation methods, usually one-liners:
+
+```ruby
+class Order < ApplicationRecord
+  before_save :normalize_card_number,
+    if: ->(order) { order.paid_with_card? }
+end
+```
+
+Since the proc is evaluated in the context of the object, it is also possible to
+write this as:
+
+```ruby
+class Order < ApplicationRecord
+  before_save :normalize_card_number, if: -> { paid_with_card? }
+end
+```
+
+### Multiple Callback Conditions
+
+The `:if` and `:unless` options also accept an array of procs or method names as
+symbols:
+
+```ruby
+class Comment < ApplicationRecord
+  before_save :filter_content,
+    if: [:subject_to_parental_control?, :untrusted_author?]
+end
+```
+
+You can easily include a proc in the list of conditions:
+
+```ruby
+class Comment < ApplicationRecord
+  before_save :filter_content,
+    if: [:subject_to_parental_control?, -> { untrusted_author? }]
+end
+```
+
+### Using Both `:if` and `:unless`
+
+Callbacks can mix both `:if` and `:unless` in the same declaration:
+
+```ruby
+class Comment < ApplicationRecord
+  before_save :filter_content,
+    if: -> { forum.parental_control? },
+    unless: -> { author.trusted? }
+end
+```
+
+The callback only runs when all the `:if` conditions and none of the `:unless`
+conditions are evaluated to `true`.
+
+Skipping Callbacks
+------------------
+
+Just as with [validations](active_record_validations.html), it is also possible
+to skip callbacks by using the following methods:
+
+* [`decrement!`][]
+* [`decrement_counter`][]
+* [`delete`][]
+* [`delete_all`][]
+* [`delete_by`][]
+* [`increment!`][]
+* [`increment_counter`][]
+* [`insert`][]
+* [`insert!`][]
+* [`insert_all`][]
+* [`insert_all!`][]
+* [`touch_all`][]
+* [`update_column`][]
+* [`update_columns`][]
+* [`update_all`][]
+* [`update_counters`][]
+* [`upsert`][]
+* [`upsert_all`][]
+
+Let's consider a `User` model where the `before_save` callback logs any changes
+to the user's email address:
+
+```ruby
+class User < ApplicationRecord
+  before_save :log_email_change
+
+  private
+    def log_email_change
+      if email_changed?
+        Rails.logger.info("Email changed from #{email_was} to #{email}")
+      end
+    end
+end
+```
+
+Now, suppose there's a scenario where you want to update the user's email
+address without triggering the `before_save` callback to log the email change.
+You can use the `update_columns` method for this purpose:
+
+```irb
+irb> user = User.find(1)
+irb> user.update_columns(email: 'new_email@example.com')
+```
+
+The above will update the user's email address without triggering the
+`before_save` callback.
+
+WARNING. These methods should be used with caution because there may be
+important business rules and application logic in callbacks that you do not want
+to bypass. Bypassing them without understanding the potential implications may
+lead to invalid data.
+
+[`decrement!`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-decrement-21
+[`decrement_counter`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/CounterCache/ClassMethods.html#method-i-decrement_counter
+[`delete`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-delete
+[`delete_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-delete_all
+[`delete_by`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-delete_by
+[`increment!`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-increment-21
+[`increment_counter`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/CounterCache/ClassMethods.html#method-i-increment_counter
+[`insert`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-insert
+[`insert!`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-insert-21
+[`insert_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-insert_all
+[`insert_all!`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-insert_all-21
+[`touch_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-touch_all
+[`update_column`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-update_column
+[`update_columns`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-update_columns
+[`update_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-update_all
+[`update_counters`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-update_counters
+[`upsert`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-upsert
+[`upsert_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-upsert_all
+
+Suppressing Callbacks
+---------------------
+
+In certain scenarios, you may need to temporarily prevent certain callbacks from
+being executed within your Rails application. This can be useful when you want
+to skip specific actions during certain operations without permanently disabling
+the callbacks.
+
+Rails provides a mechanism for suppressing callbacks using the
+[`ActiveRecord::Suppressor`
+module](https://api.rubyonrails.org/classes/ActiveRecord/Suppressor.html). By
+using this module, you can wrap a block of code where you want to suppress
+callbacks, ensuring that they are not executed during that specific operation.
+
+Let's consider a scenario where we have a `User` model with a callback that
+sends a welcome email to new users after they sign up. However, there might be
+cases where we want to create a user without sending the welcome email, such as
+during seeding the database with test data.
+
+```ruby
+class User < ApplicationRecord
+  after_create :send_welcome_email
+
+  def send_welcome_email
+    puts "Welcome email sent to #{self.email}"
+  end
+end
+```
+
+In this example, the `after_create` callback triggers the `send_welcome_email`
+method every time a new user is created.
+
+To create a user without sending the welcome email, we can use the
+`ActiveRecord::Suppressor` module as follows:
+
+```ruby
+User.suppress do
+  User.create(name: "Jane", email: "jane@example.com")
+end
+```
+
+In the above code, the `User.suppress` block ensures that the
+`send_welcome_email` callback is not executed during the creation of the "Jane"
+user, allowing us to create the user without sending the welcome email.
+
+WARNING: Using the Active Record Suppressor, while potentially beneficial for
+selectively controlling callback execution, can introduce complexity and
+unexpected behavior. Suppressing callbacks can obscure the intended flow of your
+application, leading to difficulties in understanding and maintaining the
+codebase over time. Carefully consider the implications of suppressing
+callbacks, ensuring thorough documentation and thoughtful testing to mitigate
+risks of unintended side effects, performance issues, and test failures.
+
+Halting Execution
+-----------------
+
+As you start registering new callbacks for your models, they will be queued for
+execution. This queue will include all of your model's validations, the
+registered callbacks, and the database operation to be executed.
+
+The whole callback chain is wrapped in a transaction. If any callback raises an
+exception, the execution chain gets halted and a **rollback** is issued, and the
+error will be re-raised.
+
+```ruby
+class Product < ActiveRecord::Base
+  before_validation do
+    raise "Price can't be negative" if total_price < 0
+  end
+end
+
+Product.create # raises "Price can't be negative"
+```
+
+This unexpectedly breaks code that does not expect methods like `create` and
+`save` to raise exceptions.
+
+NOTE: If an exception occurs during the callback chain, Rails will re-raise it
+unless it is an `ActiveRecord::Rollback` or `ActiveRecord::RecordInvalid`
+exception. Instead, you should use `throw :abort` to intentionally halt the
+chain. If any callback throws `:abort`, the process will be aborted and `create`
+will return false.
+
+```ruby
+class Product < ActiveRecord::Base
+  before_validation do
+    throw :abort if total_price < 0
+  end
+end
+
+Product.create # => false
+```
+
+However, it will raise an `ActiveRecord::RecordNotSaved` when calling `create!`.
+This exception indicates that the record was not saved due to the callback's
+interruption.
+
+```ruby
+User.create! # => raises an ActiveRecord::RecordNotSaved
+```
+
+
+When `throw :abort` is called in any destroy callback, `destroy` will return
+false:
+
+```ruby
+class User < ActiveRecord::Base
+  before_destroy do
+    throw :abort if still_active?
+  end
+end
+
+User.first.destroy # => false
+```
+
+However, it will raise an `ActiveRecord::RecordNotDestroyed` when calling
+`destroy!`.
+
+```ruby
+User.first.destroy! # => raises an ActiveRecord::RecordNotDestroyed
+```
+
+Association Callbacks
+---------------------
+
+Association callbacks are similar to normal callbacks, but they are triggered by
+events in the life cycle of the associated collection. There are four available
+association callbacks:
+
+* `before_add`
+* `after_add`
+* `before_remove`
+* `after_remove`
+
+You can define association callbacks by adding options to the association.
+
+Suppose you have an example where an author can have many books. However, before
+adding a book to the authors collection, you want to ensure that the author has
+not reached their book limit. You can do this by adding a `before_add` callback
+to check the limit.
+
+```ruby
+class Author < ApplicationRecord
+  has_many :books, before_add: :check_limit
+
+  private
+    def check_limit
+      if books.count >= 5
+        errors.add(:base, "Cannot add more than 5 books for this author")
+        throw(:abort)
+      end
+    end
+end
+```
+
+If a `before_add` callback throws `:abort`, the object does not get added to the
+collection.
+
+At times you may want to perform multiple actions on the associated object. In
+this case, you can stack callbacks on a single event by passing them as an
+array. Additionally, Rails passes the object being added or removed to the
+callback for you to use.
+
+```ruby
+class Author < ApplicationRecord
+  has_many :books, before_add: [:check_limit, :calculate_shipping_charges]
+
+  def check_limit
+    if books.count >= 5
+      errors.add(:base, "Cannot add more than 5 books for this author")
+      throw(:abort)
+    end
+  end
+
+  def calculate_shipping_charges(book)
+    weight_in_pounds = book.weight_in_pounds || 1
+    shipping_charges = weight_in_pounds * 2
+
+    shipping_charges
+  end
+end
+```
+
+Similarly, if a `before_remove` callback throws `:abort`, the object does not
+get removed from the collection.
+
+NOTE: These callbacks are called only when the associated objects are added or
+removed through the association collection.
+
+```ruby
+# Triggers `before_add` callback
+author.books << book
+author.books = [book, book2]
+
+# Does not trigger the `before_add` callback
+book.update(author_id: 1)
+```
+
+Cascading Association Callbacks
+-------------------------------
+
+Callbacks can be performed when associated objects are changed. They work
+through the model associations whereby life cycle events can cascade on
+associations and fire callbacks.
+
+Suppose an example where a user has many articles. A user's articles should be
+destroyed if the user is destroyed. Let's add an `after_destroy` callback to the
+`User` model by way of its association to the `Article` model:
+
+```ruby
+class User < ApplicationRecord
+  has_many :articles, dependent: :destroy
+end
+
+class Article < ApplicationRecord
+  after_destroy :log_destroy_action
+
+  def log_destroy_action
+    Rails.logger.info("Article destroyed")
+  end
+end
+```
+
+```irb
+irb> user = User.first
+=> #<User id: 1>
+irb> user.articles.create!
+=> #<Article id: 1, user_id: 1>
+irb> user.destroy
+Article destroyed
+=> #<User id: 1>
+```
+
+WARNING: When using a `before_destroy` callback, it should be placed before
+`dependent: :destroy` associations (or use the `prepend: true` option), to
+ensure they execute before the records are deleted by `dependent: :destroy`.
+
+Transaction Callbacks
+---------------------
+
+### `after_commit` and `after_rollback`
+
+Two additional callbacks are triggered by the completion of a database
+transaction: [`after_commit`][] and [`after_rollback`][]. These callbacks are
+very similar to the `after_save` callback except that they don't execute until
+after database changes have either been committed or rolled back. They are most
+useful when your Active Record models need to interact with external systems
+that are not part of the database transaction.
+
+Consider a `PictureFile` model that needs to delete a file after the
+corresponding record is destroyed.
+
+```ruby
+class PictureFile < ApplicationRecord
+  after_destroy :delete_picture_file_from_disk
+
+  def delete_picture_file_from_disk
+    if File.exist?(filepath)
+      File.delete(filepath)
+    end
+  end
+end
+```
+
+If anything raises an exception after the `after_destroy` callback is called and
+the transaction rolls back, then the file will have been deleted and the model
+will be left in an inconsistent state. For example, suppose that
+`picture_file_2` in the code below is not valid and the `save!` method raises an
+error.
+
+```ruby
+PictureFile.transaction do
+  picture_file_1.destroy
+  picture_file_2.save!
+end
+```
+
+By using the `after_commit` callback we can account for this case.
+
+```ruby
+class PictureFile < ApplicationRecord
+  after_commit :delete_picture_file_from_disk, on: :destroy
+
+  def delete_picture_file_from_disk
+    if File.exist?(filepath)
+      File.delete(filepath)
+    end
+  end
+end
+```
+
+NOTE: The `:on` option specifies when a callback will be fired. If you don't
+supply the `:on` option the callback will fire for every life cycle event. [Read
+more about `:on`](#registering-callbacks-to-fire-on-life-cycle-events).
+
+When a transaction completes, the `after_commit` or `after_rollback` callbacks
+are called for all models created, updated, or destroyed within that
+transaction. However, if an exception is raised within one of these callbacks,
+the exception will bubble up and any remaining `after_commit` or
+`after_rollback` methods will _not_ be executed.

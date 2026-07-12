@@ -1,228 +1,210 @@
-parseData("sup", z.string());
-// => string
+HTTPS
+=====
+
+OkHttp attempts to balance two competing concerns:
+
+ * **Connectivity** to as many hosts as possible. That includes advanced hosts that run the latest versions of [boringssl](https://boringssl.googlesource.com/boringssl/) and less out of date hosts running older versions of [OpenSSL](https://www.openssl.org/).
+ * **Security** of the connection. This includes verification of the remote webserver with certificates and the privacy of data exchanged with strong ciphers.
+
+When negotiating a connection to an HTTPS server, OkHttp needs to know which [TLS versions](http://square.github.io/okhttp/4.x/okhttp/okhttp3/-tls-version/) and [cipher suites](http://square.github.io/okhttp/4.x/okhttp/okhttp3/-cipher-suite/) to offer. A client that wants to maximize connectivity would include obsolete TLS versions and weak-by-design cipher suites. A strict client that wants to maximize security would be limited to only the latest TLS version and strongest cipher suites.
+
+Specific security vs. connectivity decisions are implemented by [ConnectionSpec](http://square.github.io/okhttp/4.x/okhttp/okhttp3/-connection-spec/). OkHttp includes four built-in connection specs:
+
+ * `RESTRICTED_TLS` is a secure configuration, intended to meet stricter compliance requirements.
+ * `MODERN_TLS` is a secure configuration that connects to modern HTTPS servers.
+ * `COMPATIBLE_TLS` is a secure configuration that connects to secure–but not current–HTTPS servers.
+ * `CLEARTEXT` is an insecure configuration that is used for `http://` URLs.
+
+These loosely follow the model set in [Google Cloud Policies](https://cloud.google.com/load-balancing/docs/ssl-policies-concepts). We [track changes](tls_configuration_history.md) to this policy.
+
+By default, OkHttp will attempt a `MODERN_TLS` connection.  However by configuring the client connectionSpecs you can allow a fall back to `COMPATIBLE_TLS` connection if the modern configuration fails.
+
+```java
+OkHttpClient client = new OkHttpClient.Builder()
+    .connectionSpecs(Arrays.asList(ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS))
+    .build();
 ```
 
-#### Constraining allowable inputs
+The TLS versions and cipher suites in each spec can change with each release. For example, in OkHttp 2.2 we dropped support for SSL 3.0 in response to the [POODLE](http://googleonlinesecurity.blogspot.ca/2014/10/this-poodle-bites-exploiting-ssl-30.html) attack. And in OkHttp 2.3 we dropped support for [RC4](http://en.wikipedia.org/wiki/RC4#Security). As with your desktop web browser, staying up-to-date with OkHttp is the best way to stay secure.
 
-The `ZodType` class has three generic parameters.
+You can build your own connection spec with a custom set of TLS versions and cipher suites. For example, this configuration is limited to three highly-regarded cipher suites. Its drawback is that it requires Android 5.0+ and a similarly current webserver.
 
-```ts
-class ZodType<
-  Output = any,
-  Def extends ZodTypeDef = ZodTypeDef,
-  Input = Output
-> { ... }
+```java
+ConnectionSpec spec = new ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+    .tlsVersions(TlsVersion.TLS_1_2)
+    .cipherSuites(
+          CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+          CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+          CipherSuite.TLS_DHE_RSA_WITH_AES_128_GCM_SHA256)
+    .build();
+
+OkHttpClient client = new OkHttpClient.Builder()
+    .connectionSpecs(Collections.singletonList(spec))
+    .build();
 ```
 
-By constraining these in your generic input, you can limit what schemas are allowable as inputs to your function:
+### Debugging TLS Handshake Failures
 
-```ts
-function makeSchemaOptional<T extends z.ZodType<string>>(schema: T) {
-  return schema.optional();
-}
+The TLS handshake requires clients and servers to share a common TLS version and cipher suite. This
+depends on the JVM or Android version, OkHttp version, and web server configuration. If there is no
+common cipher suite and TLS version, your call will fail like this:
 
-makeSchemaOptional(z.string());
-// works fine
-
-makeSchemaOptional(z.number());
-// Error: 'ZodNumber' is not assignable to parameter of type 'ZodType<string, ZodTypeDef, string>'
+```
+Caused by: javax.net.ssl.SSLProtocolException: SSL handshake aborted: ssl=0x7f2719a89e80:
+    Failure in SSL library, usually a protocol error
+        error:14077410:SSL routines:SSL23_GET_SERVER_HELLO:sslv3 alert handshake 
+        failure (external/openssl/ssl/s23_clnt.c:770 0x7f2728a53ea0:0x00000000)
+    at com.android.org.conscrypt.NativeCrypto.SSL_do_handshake(Native Method)
 ```
 
-### Error handling
+You can check a web server's configuration using [Qualys SSL Labs][qualys]. OkHttp's TLS
+configuration history is [tracked here](tls_configuration_history.md).
 
-Zod provides a subclass of Error called `ZodError`. ZodErrors contain an `issues` array containing detailed information about the validation problems.
+Applications expected to be installed on older Android devices should consider adopting the
+[Google Play Services’ ProviderInstaller][provider_installer]. This will increase security for users
+and increase connectivity with web servers.
 
-```ts
-const result = z
-  .object({
-    name: z.string(),
-  })
-  .safeParse({ name: 12 });
+### Certificate Pinning ([.kt][CertificatePinningKotlin], [.java][CertificatePinningJava]) 
 
-if (!result.success) {
-  result.error.issues;
-  /* [
-      {
-        "code": "invalid_type",
-        "expected": "string",
-        "received": "number",
-        "path": [ "name" ],
-        "message": "Expected string, received number"
+By default, OkHttp trusts the certificate authorities of the host platform. This strategy maximizes connectivity, but it is subject to certificate authority attacks such as the [2011 DigiNotar attack](http://www.computerworld.com/article/2510951/cybercrime-hacking/hackers-spied-on-300-000-iranians-using-fake-google-certificate.html). It also assumes your HTTPS servers’ certificates are signed by a certificate authority.
+
+Use [CertificatePinner](http://square.github.io/okhttp/4.x/okhttp/okhttp3/-certificate-pinner/) to restrict which certificates and certificate authorities are trusted. Certificate pinning increases security, but limits your server team’s abilities to update their TLS certificates. **Do not use certificate pinning without the blessing of your server’s TLS administrator!**
+
+```Kotlin tab=
+  private val client = OkHttpClient.Builder()
+      .certificatePinner(
+          CertificatePinner.Builder()
+              .add("publicobject.com", "sha256/afwiKY3RxoMmLkuRW1l7QsPZTJPwDS2pdDROQjXw8ig=")
+              .build())
+      .build()
+
+  fun run() {
+    val request = Request.Builder()
+        .url("https://publicobject.com/robots.txt")
+        .build()
+
+    client.newCall(request).execute().use { response ->
+      if (!response.isSuccessful) throw IOException("Unexpected code $response")
+
+      for (certificate in response.handshake!!.peerCertificates) {
+        println(CertificatePinner.pin(certificate))
       }
-  ] */
-}
+    }
+  }
 ```
 
-> For detailed information about the possible error codes and how to customize error messages, check out the dedicated error handling guide: [ERROR_HANDLING.md](ERROR_HANDLING.md)
+```Java tab=
+  private final OkHttpClient client = new OkHttpClient.Builder()
+      .certificatePinner(
+          new CertificatePinner.Builder()
+              .add("publicobject.com", "sha256/afwiKY3RxoMmLkuRW1l7QsPZTJPwDS2pdDROQjXw8ig=")
+              .build())
+      .build();
 
-Zod's error reporting emphasizes _completeness_ and _correctness_. If you are looking to present a useful error message to the end user, you should either override Zod's error messages using an error map (described in detail in the Error Handling guide) or use a third-party library like [`zod-validation-error`](https://github.com/causaly/zod-validation-error)
+  public void run() throws Exception {
+    Request request = new Request.Builder()
+        .url("https://publicobject.com/robots.txt")
+        .build();
 
-### Error formatting
+    try (Response response = client.newCall(request).execute()) {
+      if (!response.isSuccessful()) throw new IOException("Unexpected code " + response);
 
-You can use the `.format()` method to convert this error into a nested object.
-
-```ts
-const result = z
-  .object({
-    name: z.string(),
-  })
-  .safeParse({ name: 12 });
-
-if (!result.success) {
-  const formatted = result.error.format();
-  /* {
-    name: { _errors: [ 'Expected string, received number' ] }
-  } */
-
-  formatted.name?._errors;
-  // => ["Expected string, received number"]
-}
+      for (Certificate certificate : response.handshake().peerCertificates()) {
+        System.out.println(CertificatePinner.pin(certificate));
+      }
+    }
+  }
 ```
 
-## Comparison
+### Customizing Trusted Certificates ([.kt][CustomTrustKotlin], [.java][CustomTrustJava])
 
-There are a handful of other widely-used validation libraries, but all of them have certain design limitations that make for a non-ideal developer experience.
+The full code sample shows how to replace the host platform’s certificate authorities with your own set. As above, **do not use custom certificates without the blessing of your server’s TLS administrator!**
 
-<!-- The table below summarizes the feature differences. Below the table there are more involved discussions of certain alternatives, where necessary. -->
+```Kotlin tab=
+  private val client: OkHttpClient
 
-<!-- | Feature                                                                                                                | [Zod](https://github.com/colinhacks) | [Joi](https://github.com/hapijs/joi) | [Yup](https://github.com/jquense/yup) | [io-ts](https://github.com/gcanti/io-ts) | [Runtypes](https://github.com/pelotom/runtypes) | [ow](https://github.com/sindresorhus/ow) | [class-validator](https://github.com/typestack/class-validator) |
-| ---------------------------------------------------------------------------------------------------------------------- | :-----------------------------: | :----------------------------------: | :-----------------------------------: | :--------------------------------------: | :---------------------------------------------: | :--------------------------------------: | :-------------------------------------------------------------: |
-| <abbr title='Any ability to extract a TypeScript type from a validator instance counts.'>Type inference</abbr>         |               🟢                |                  🔴                  |                  🟢                   |                    🟢                    |                       🟢                        |                    🟢                    |                               🟢                                |
-| <abbr title="Yup's inferred types are incorrect in certain cases, see discussion below.">Correct type inference</abbr> |               🟢                |                  🔴                  |                  🔴                   |                    🟢                    |                       🟢                        |                    🟢                    |                               🟢                                |
+  init {
+    val trustManager = trustManagerForCertificates(trustedCertificatesInputStream())
+    val sslContext = SSLContext.getInstance("TLS")
+    sslContext.init(null, arrayOf<TrustManager>(trustManager), null)
+    val sslSocketFactory = sslContext.socketFactory
 
-<abbr title="number, string, boolean, null, undefined">Primitive Types</abbr>
-<abbr title="Includes any checks beyond 'Is this a string?', e.g. min/max length, isEmail, isURL, case checking, etc.">String Validation</abbr>
-<abbr title="Includes any checks beyond 'Is this a number?', e.g. min/max, isPositive, integer vs float, etc.">Number Validation</abbr>
-Dates
+    client = OkHttpClient.Builder()
+        .sslSocketFactory(sslSocketFactory, trustManager)
+        .build()
+  }
 
-Primitive Literals
-Object Literals
-Tuple Literals
-Objects
-Arrays
-Non-empty arrays
-Unions
-Optionals
-Nullable
-Enums
-Enum Autocomplete
-Intersections
-Object Merging
-Tuples
-Recursive Types
-Function Schemas
+  fun run() {
+    val request = Request.Builder()
+        .url("https://publicobject.com/helloworld.txt")
+        .build()
 
-<abbr title="For instance, Yup allows custom error messages with the syntax yup.number().min(5, 'Number must be more than 5!')">Validation Messages</abbr>
-Immutable instances
-Type Guards
-Validity Checking
-Casting
-Default Values
-Rich Errors
-Branded -->
+    client.newCall(request).execute().use { response ->
+      if (!response.isSuccessful) throw IOException("Unexpected code $response")
 
-<!-- - Missing object methods: (pick, omit, partial, deepPartial, merge, extend)
+      for ((name, value) in response.headers) {
+        println("$name: $value")
+      }
 
-* Missing nonempty arrays with proper typing (`[T, ...T[]]`)
-* Missing lazy/recursive types
-* Missing promise schemas
-* Missing function schemas
-* Missing union & intersection schemas
-* Missing support for parsing cyclical data (maybe)
-* Missing error customization -->
+      println(response.body!!.string())
+    }
+  }
 
-### Joi
+  /**
+   * Returns an input stream containing one or more certificate PEM files. This implementation just
+   * embeds the PEM files in Java strings; most applications will instead read this from a resource
+   * file that gets bundled with the application.
+   */
+  private fun trustedCertificatesInputStream(): InputStream {
+    ... // Full source omitted. See sample.
+  }
 
-[https://github.com/hapijs/joi](https://github.com/hapijs/joi)
-
-Doesn't support static type inference 😕
-
-### Yup
-
-[https://github.com/jquense/yup](https://github.com/jquense/yup)
-
-Yup is a full-featured library that was implemented first in vanilla JS, and later rewritten in TypeScript.
-
-- Supports casting and transforms
-- All object fields are optional by default
-<!-- - Missing nonempty arrays with proper typing (`[T, ...T[]]`) -->
-- Missing promise schemas
-- Missing function schemas
-- Missing union & intersection schemas
-
-<!-- ¹Yup has a strange interpretation of the word `required`. Instead of meaning "not undefined", Yup uses it to mean "not empty". So `yup.string().required()` will not accept an empty string, and `yup.array(yup.string()).required()` will not accept an empty array. Instead, Yup us Zod arrays there is a dedicated `.nonempty()` method to indicate this, or you can implement it with a custom refinement. -->
-
-### io-ts
-
-[https://github.com/gcanti/io-ts](https://github.com/gcanti/io-ts)
-
-io-ts is an excellent library by gcanti. The API of io-ts heavily inspired the design of Zod.
-
-In our experience, io-ts prioritizes functional programming purity over developer experience in many cases. This is a valid and admirable design goal, but it makes io-ts particularly hard to integrate into an existing codebase with a more procedural or object-oriented bias. For instance, consider how to define an object with optional properties in io-ts:
-
-```ts
-import * as t from "io-ts";
-
-const A = t.type({
-  foo: t.string,
-});
-
-const B = t.partial({
-  bar: t.number,
-});
-
-const C = t.intersection([A, B]);
-
-type C = t.TypeOf<typeof C>;
-// returns { foo: string; bar?: number | undefined }
+  private fun trustManagerForCertificates(inputStream: InputStream): X509TrustManager {
+    ... // Full source omitted. See sample.
+  }
 ```
 
-You must define the required and optional props in separate object validators, pass the optionals through `t.partial` (which marks all properties as optional), then combine them with `t.intersection` .
+```Java tab=
+  private final OkHttpClient client;
 
-Consider the equivalent in Zod:
+  public CustomTrust() {
+    X509TrustManager trustManager;
+    SSLSocketFactory sslSocketFactory;
+    try {
+      trustManager = trustManagerForCertificates(trustedCertificatesInputStream());
+      SSLContext sslContext = SSLContext.getInstance("TLS");
+      sslContext.init(null, new TrustManager[] { trustManager }, null);
+      sslSocketFactory = sslContext.getSocketFactory();
+    } catch (GeneralSecurityException e) {
+      throw new RuntimeException(e);
+    }
 
-```ts
-const C = z.object({
-  foo: z.string(),
-  bar: z.number().optional(),
-});
+    client = new OkHttpClient.Builder()
+        .sslSocketFactory(sslSocketFactory, trustManager)
+        .build();
+  }
 
-type C = z.infer<typeof C>;
-// returns { foo: string; bar?: number | undefined }
+  public void run() throws Exception {
+    Request request = new Request.Builder()
+        .url("https://publicobject.com/helloworld.txt")
+        .build();
+
+    Response response = client.newCall(request).execute();
+    System.out.println(response.body().string());
+  }
+
+  private InputStream trustedCertificatesInputStream() {
+    ... // Full source omitted. See sample.
+  }
+
+  public SSLContext sslContextForTrustedCertificates(InputStream in) {
+    ... // Full source omitted. See sample.
+  }
 ```
 
-This more declarative API makes schema definitions vastly more concise.
-
-`io-ts` also requires the use of gcanti's functional programming library `fp-ts` to parse results and handle errors. This is another fantastic resource for developers looking to keep their codebase strictly functional. But depending on `fp-ts` necessarily comes with a lot of intellectual overhead; a developer has to be familiar with functional programming concepts and the `fp-ts` nomenclature to use the library.
-
-- Supports codecs with serialization & deserialization transforms
-- Supports branded types
-- Supports advanced functional programming, higher-kinded types, `fp-ts` compatibility
-- Missing object methods: (pick, omit, partial, deepPartial, merge, extend)
-- Missing nonempty arrays with proper typing (`[T, ...T[]]`)
-- Missing promise schemas
-- Missing function schemas
-
-### Runtypes
-
-[https://github.com/pelotom/runtypes](https://github.com/pelotom/runtypes)
-
-Good type inference support.
-
-- Supports "pattern matching": computed properties that distribute over unions
-- Missing object methods: (deepPartial, merge)
-- Missing nonempty arrays with proper typing (`[T, ...T[]]`)
-- Missing promise schemas
-- Missing error customization
-
-### Ow
-
-[https://github.com/sindresorhus/ow](https://github.com/sindresorhus/ow)
-
-Ow is focused on function input validation. It's a library that makes it easy to express complicated assert statements, but it doesn't let you parse untyped data. They support a much wider variety of types; Zod has a nearly one-to-one mapping with TypeScript's type system, whereas ow lets you validate several highly-specific types out of the box (e.g. `int32Array` , see full list in their README).
-
-If you want to validate function inputs, use function schemas in Zod! It's a much simpler approach that lets you reuse a function type declaration without repeating yourself (namely, copy-pasting a bunch of ow assertions at the beginning of every function). Also Zod lets you validate your return types as well, so you can be sure there won't be any unexpected data passed downstream.
-
-## Changelog
-
-View the changelog at [CHANGELOG.md](CHANGELOG.md)
+ [CustomTrustJava]: https://github.com/square/okhttp/blob/master/samples/guide/src/main/java/okhttp3/recipes/CustomTrust.java
+ [CustomTrustKotlin]: https://github.com/square/okhttp/blob/master/samples/guide/src/main/java/okhttp3/recipes/kt/CustomTrust.kt
+ [CertificatePinningJava]: https://github.com/square/okhttp/blob/master/samples/guide/src/main/java/okhttp3/recipes/CertificatePinning.java
+ [CertificatePinningKotlin]: https://github.com/square/okhttp/blob/master/samples/guide/src/main/java/okhttp3/recipes/kt/CertificatePinning.kt
+ [provider_installer]: https://developer.android.com/training/articles/security-gms-provider
+ [qualys]: https://www.ssllabs.com/ssltest/

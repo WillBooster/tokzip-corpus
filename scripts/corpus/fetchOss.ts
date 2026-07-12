@@ -52,6 +52,9 @@ const EXTENSIONS: Record<string, string[]> = {
  * full of them — but a test tree's prose is machine output (compiler baselines, parser dumps,
  * dependency pins), not documentation.
  */
+/** `.txt` files that are configuration or tool input, not documentation. Text corpus only. */
+const NON_PROSE_TXT =
+  /^(cmakelists|conanfile|robots|requirements(-[\w.]+)?|constraints|\.?[\w.-]*supp(ressions)?|package-list|\.?gitattributes)\.txt$/i;
 const PROSE_EXCLUDED_DIRS = new Set([
   "test",
   "tests",
@@ -360,8 +363,13 @@ function sampleFiles(
       if (entry.name.includes(".min.")) continue;
       if (isNoticeFile(entry.name)) continue;
       // A `.txt` is prose only where documentation lives; elsewhere it is data (fixtures, pins).
-      if (proseOnly && entry.name.endsWith(".txt") && prefix !== "" && !relative.startsWith("docs/"))
-        continue;
+      if (proseOnly && entry.name.endsWith(".txt")) {
+        if (prefix !== "" && !relative.startsWith("docs/")) continue;
+        // Even at the root or under docs/, some .txt files are build or tool configuration
+        // (CMakeLists.txt, requirements.txt, robots.txt) rather than documentation. Prose files
+        // that happen to live beside them (BUILDING.txt, RUNNING.txt) are kept.
+        if (NON_PROSE_TXT.test(entry.name)) continue;
+      }
       // Dirents never report symlinks as directories, so a link to a directory would reach
       // readFileSync and crash with EISDIR; a link out of the checkout would read a host file.
       if (!isContainedFile(root, path)) continue;

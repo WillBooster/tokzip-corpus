@@ -1,55 +1,185 @@
----
-sidebar_position: 7
----
+# Expression Translation (UseAsDataSource)
 
-# Cloud
+Automapper supports translating Expressions from one object to another in a separate [package](https://www.nuget.org/packages/AutoMapper.Extensions.ExpressionMapping/).
+This is done by substituting the properties from the source class to what they map to in the destination class.
 
-Tigerbeetle is [optimized for performance](../performance.md), exploiting "close to the metal"
-technologies such as **Direct I/O** and **io_uring**.
+Given the example classes:
 
-This raises the question of whether or not these benefits are realised in a cloud environment where
-the kernel is available to the app but where the network and the storage is virtualised.
+```c#
+public class OrderLine
+{
+  public int Id { get; set; }
+  public int OrderId { get; set; }
+  public Item Item { get; set; }
+  public decimal Quantity { get; set; }
+}
 
-## Direct I/O
+public class Item
+{
+  public int Id { get; set; }
+  public string Name { get; set; }
+}
 
-Direct I/O eliminates memory copies between user space and the kernel within the OS, so whether the
-OS is virtualized or not beyond that, Direct I/O would still be of benefit, and perhaps even more so
-in a cloud environment by virtue of reducing memory pressure and freeing up the more limited
-per-core memory bandwidth, especially with noisy neighbors.
+public class OrderLineDTO
+{
+  public int Id { get; set; }
+  public int OrderId { get; set; }
+  public string Item { get; set; }
+  public decimal Quantity { get; set; }
+}
 
-A quick example, tested with Ubuntu in a VM on a Mac, we still see a 7% relative throughput
-improvement for Direct I/O, regardless of whether Parallels is propagating O_DIRECT to the physical
-disk, it’s still saving the cost of the memcpy to Ubuntu’s page cache (and beyond that appears to
-also avoid polluting the CPU’s L1-3 cache by memcpy’ing through it - hard to be certain given all
-the various memcpy() implementations).
+var configuration = new MapperConfiguration(cfg =>
+{
+  cfg.AddExpressionMapping();
+  
+  cfg.CreateMap<OrderLine, OrderLineDTO>()
+    .ForMember(dto => dto.Item, conf => conf.MapFrom(ol => ol.Item.Name));
+  cfg.CreateMap<OrderLineDTO, OrderLine>()
+    .ForMember(ol => ol.Item, conf => conf.MapFrom(dto => dto));
+  cfg.CreateMap<OrderLineDTO, Item>()
+    .ForMember(i => i.Name, conf => conf.MapFrom(dto => dto.Item));
+});
+```
+When mapping from DTO Expression
 
-At the same time, where cloud environments support locally attached high-performance block devices
-(NVMe SSD), running local storage (as opposed to something like EBS) would definitely be preferable
-if only from a performance point of view.
+```c#
+Expression<Func<OrderLineDTO, bool>> dtoExpression = dto=> dto.Item.StartsWith("A");
+var expression = mapper.Map<Expression<Func<OrderLine, bool>>>(dtoExpression);
+```
 
-From a safety point of view, we haven’t yet tested whether any VMs would disregard O_DIRECT for an
-NVMe device, or interpolate their own block device caching layer and mark dirty pages as clean
-despite an EIO disk fault, but after a physical system reboot our hash-chaining and ongoing disk
-scrubbing would at least be able to detect any issues related to this.
+Expression will be translated to `ol => ol.Item.Name.StartsWith("A")`
 
-We are intentionally designing TigerBeetle to repair these local storage failures automatically on a
-fine-grained basis using cluster redundancy.
+Automapper knows `dto.Item` is mapped to `ol.Item.Name` so it substituted it for the expression.
 
-## io_uring
+Expression translation can work on expressions of collections as well.
 
-In a similar way, io_uring removes (or amortizes by orders of magnitude) the cost of syscalls
-between user space and the kernel, regardless of whether those are both within a virtualized
-environment or not. io_uring is being developed by Jens Axboe specifically to reduce the cost of
-large scale server fleets, which are typically cloud native, and there’s already been
-[work done](https://www.phoronix.com/scan.php?page=news_item&px=KVM-IO-uring-Passthrough-LF2020) to
-share the host’s io_uring queues with virtualized guests.
+```c#
+Expression<Func<IQueryable<OrderLineDTO>,IQueryable<OrderLineDTO>>> dtoExpression = dtos => dtos.Where(dto => dto.Quantity > 5).OrderBy(dto => dto.Quantity);
+var expression = mapper.Map<Expression<Func<IQueryable<OrderLine>,IQueryable<OrderLine>>>(dtoExpression);
+```
 
-Our testing is only getting started though, we’re still building out the system end to end, so it
-will be great to benchmark more performance numbers in various environments (and across cloud
-providers) and share these as we go.
+Resulting in `ols => ols.Where(ol => ol.Quantity > 5).OrderBy(ol => ol.Quantity)`
 
-Credit to @tdaly61 from the Mojaloop community for prompting us with some great questions about
-Tigerbeetle in the cloud.
+### Mapping Flattened Properties to Navigation Properties
 
-You can read more about how we use io_uring in
-[A Programmer-Friendly I/O Abstraction Over io_uring and kqueue](https://tigerbeetle.com/blog/a-friendly-abstraction-over-iouring-and-kqueue).
+AutoMapper also supports mapping flattened (TModel or DTO) properties in expressions to their corresponding (TData) navigation properties (when the navigation property has been removed from the view model or DTO) e.g. CourseModel.DepartmentName from the model expression becomes Course.Department in the data expression.
+
+Take the following set of classes:
+
+```c#
+public class CourseModel
+{
+    public int CourseID { get; set; }
+
+    public int DepartmentID { get; set; }
+    public string DepartmentName { get; set; }
+}
+public class Course
+{
+    public int CourseID { get; set; }
+
+    public int DepartmentID { get; set; }
+    public Department Department { get; set; }
+}
+
+public class Department
+{
+    public int DepartmentID { get; set; }
+    public string Name { get; set; }
+}
+```
+
+Then map exp below to expMapped.
+
+```c#
+Expression<Func<IQueryable<CourseModel>, IIncludableQueryable<CourseModel, object>>> exp = i => i.Include(s => s.DepartmentName);
+Expression<Func<IQueryable<Course>, IIncludableQueryable<Course, object>>> expMapped = mapper.MapExpressionAsInclude<Expression<Func<IQueryable<Course>, IIncludableQueryable<Course, object>>>>(exp);
+```
+
+The resulting mapped expression (expMapped.ToString()) is then ``` i => i.Include(s => s.Department);  ``` . This feature allows navigation properties for the query to be defined based on the view model alone.
+
+### Supported Mapping options
+
+Much like how Queryable Extensions can only support certain things that the LINQ providers support, expression translation follows the same rules as what it can and can't support.
+
+## UseAsDataSource
+
+Mapping expressions to one another is a tedious and produces long ugly code.
+
+`UseAsDataSource().For<DTO>()` makes this translation clean by not having to explicitly map expressions.
+It also calls `ProjectTo<TDO>()` for you as well, where applicable.
+
+Using EntityFramework as an example
+
+`dataContext.OrderLines.UseAsDataSource().For<OrderLineDTO>().Where(dto => dto.Name.StartsWith("A"))`
+
+Does the equivalent of
+
+`dataContext.OrderLines.Where(ol => ol.Item.Name.StartsWith("A")).ProjectTo<OrderLineDTO>()`
+
+### When ProjectTo() is not called
+
+Expression Translation works for all kinds of functions, including `Select` calls.  If `Select` is used after `UseAsDataSource()` and changes the return type, then `ProjectTo<>()` won't be called and `mapper.Map` will be used instead.
+
+Example:
+
+`dataContext.OrderLines.UseAsDataSource().For<OrderLineDTO>().Select(dto => dto.Name)`
+
+Does the equivalent of
+
+`dataContext.OrderLines.Select(ol => ol.Item.Name)`
+
+### Register a callback, for when an UseAsDataSource() query is enumerated
+
+Sometimes, you may want to edit the collection, that is returned from a mapped query before forwarding it to the next application layer.
+With `.ProjectTo<TDto>` this is quite simple, as there is no sense in directly returning the resulting `IQueryable<TDto>` because you cannot edit it anymore anyways. So you will most likely do this:
+
+```c#
+var configuration = new MapperConfiguration(cfg =>
+    cfg.CreateMap<OrderLine, OrderLineDTO>()
+    .ForMember(dto => dto.Item, conf => conf.MapFrom(ol => ol.Item.Name)));
+
+public List<OrderLineDTO> GetLinesForOrder(int orderId)
+{
+  using (var context = new orderEntities())
+  {
+    var dtos = context.OrderLines.Where(ol => ol.OrderId == orderId)
+             .ProjectTo<OrderLineDTO>().ToList();
+    foreach(var dto in dtos)
+    {
+        // edit some property, or load additional data from the database and augment the dtos
+    }
+    return dtos;
+  }
+}
+```
+
+However, if you did this with the `.UseAsDataSource()` approach, you would lose all of its power - namely its ability to modify the internal expression until it is enumerated.
+To solve that problem, we introduced the `.OnEnumerated` callback.
+Using it, you can do the following:
+
+```c#
+var configuration = new MapperConfiguration(cfg =>
+    cfg.CreateMap<OrderLine, OrderLineDTO>()
+    .ForMember(dto => dto.Item, conf => conf.MapFrom(ol => ol.Item.Name)));
+
+public IQueryable<OrderLineDTO> GetLinesForOrder(int orderId)
+{
+  using (var context = new orderEntities())
+  {
+    return context.OrderLines.Where(ol => ol.OrderId == orderId)
+             .UseAsDataSource()
+             .For<OrderLineDTO>()
+             .OnEnumerated((dtos) =>
+             {
+                foreach(var dto in dtosCast<OrderLineDTO>())
+                {
+                     // edit some property, or load additional data from the database and augment the dtos
+                }
+             }
+   }
+}
+```
+
+this `OnEnumerated(IEnumerable)`callback is executed, when the `IQueryable<OrderLineDTO>` itself is enumerated.
+So this also works with the OData samples mentioned above: The OData $filter and $orderby expressions are still converted into SQL, and the `OnEnumerated()`callback is provided with the filtered, ordered resultset from the database.

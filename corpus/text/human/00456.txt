@@ -1,185 +1,74 @@
-# Expression Translation (UseAsDataSource)
-
-Automapper supports translating Expressions from one object to another in a separate [package](https://www.nuget.org/packages/AutoMapper.Extensions.ExpressionMapping/).
-This is done by substituting the properties from the source class to what they map to in the destination class.
-
-Given the example classes:
-
-```c#
-public class OrderLine
-{
-  public int Id { get; set; }
-  public int OrderId { get; set; }
-  public Item Item { get; set; }
-  public decimal Quantity { get; set; }
-}
-
-public class Item
-{
-  public int Id { get; set; }
-  public string Name { get; set; }
-}
-
-public class OrderLineDTO
-{
-  public int Id { get; set; }
-  public int OrderId { get; set; }
-  public string Item { get; set; }
-  public decimal Quantity { get; set; }
-}
-
-var configuration = new MapperConfiguration(cfg =>
-{
-  cfg.AddExpressionMapping();
-  
-  cfg.CreateMap<OrderLine, OrderLineDTO>()
-    .ForMember(dto => dto.Item, conf => conf.MapFrom(ol => ol.Item.Name));
-  cfg.CreateMap<OrderLineDTO, OrderLine>()
-    .ForMember(ol => ol.Item, conf => conf.MapFrom(dto => dto));
-  cfg.CreateMap<OrderLineDTO, Item>()
-    .ForMember(i => i.Name, conf => conf.MapFrom(dto => dto.Item));
-});
-```
-When mapping from DTO Expression
-
-```c#
-Expression<Func<OrderLineDTO, bool>> dtoExpression = dto=> dto.Item.StartsWith("A");
-var expression = mapper.Map<Expression<Func<OrderLine, bool>>>(dtoExpression);
-```
-
-Expression will be translated to `ol => ol.Item.Name.StartsWith("A")`
-
-Automapper knows `dto.Item` is mapped to `ol.Item.Name` so it substituted it for the expression.
-
-Expression translation can work on expressions of collections as well.
-
-```c#
-Expression<Func<IQueryable<OrderLineDTO>,IQueryable<OrderLineDTO>>> dtoExpression = dtos => dtos.Where(dto => dto.Quantity > 5).OrderBy(dto => dto.Quantity);
-var expression = mapper.Map<Expression<Func<IQueryable<OrderLine>,IQueryable<OrderLine>>>(dtoExpression);
-```
-
-Resulting in `ols => ols.Where(ol => ol.Quantity > 5).OrderBy(ol => ol.Quantity)`
-
-### Mapping Flattened Properties to Navigation Properties
-
-AutoMapper also supports mapping flattened (TModel or DTO) properties in expressions to their corresponding (TData) navigation properties (when the navigation property has been removed from the view model or DTO) e.g. CourseModel.DepartmentName from the model expression becomes Course.Department in the data expression.
-
-Take the following set of classes:
-
-```c#
-public class CourseModel
-{
-    public int CourseID { get; set; }
-
-    public int DepartmentID { get; set; }
-    public string DepartmentName { get; set; }
-}
-public class Course
-{
-    public int CourseID { get; set; }
-
-    public int DepartmentID { get; set; }
-    public Department Department { get; set; }
-}
-
-public class Department
-{
-    public int DepartmentID { get; set; }
-    public string Name { get; set; }
-}
-```
-
-Then map exp below to expMapped.
-
-```c#
-Expression<Func<IQueryable<CourseModel>, IIncludableQueryable<CourseModel, object>>> exp = i => i.Include(s => s.DepartmentName);
-Expression<Func<IQueryable<Course>, IIncludableQueryable<Course, object>>> expMapped = mapper.MapExpressionAsInclude<Expression<Func<IQueryable<Course>, IIncludableQueryable<Course, object>>>>(exp);
-```
-
-The resulting mapped expression (expMapped.ToString()) is then ``` i => i.Include(s => s.Department);  ``` . This feature allows navigation properties for the query to be defined based on the view model alone.
-
-### Supported Mapping options
-
-Much like how Queryable Extensions can only support certain things that the LINQ providers support, expression translation follows the same rules as what it can and can't support.
-
-## UseAsDataSource
-
-Mapping expressions to one another is a tedious and produces long ugly code.
-
-`UseAsDataSource().For<DTO>()` makes this translation clean by not having to explicitly map expressions.
-It also calls `ProjectTo<TDO>()` for you as well, where applicable.
-
-Using EntityFramework as an example
-
-`dataContext.OrderLines.UseAsDataSource().For<OrderLineDTO>().Where(dto => dto.Name.StartsWith("A"))`
-
-Does the equivalent of
-
-`dataContext.OrderLines.Where(ol => ol.Item.Name.StartsWith("A")).ProjectTo<OrderLineDTO>()`
-
-### When ProjectTo() is not called
-
-Expression Translation works for all kinds of functions, including `Select` calls.  If `Select` is used after `UseAsDataSource()` and changes the return type, then `ProjectTo<>()` won't be called and `mapper.Map` will be used instead.
-
-Example:
-
-`dataContext.OrderLines.UseAsDataSource().For<OrderLineDTO>().Select(dto => dto.Name)`
-
-Does the equivalent of
-
-`dataContext.OrderLines.Select(ol => ol.Item.Name)`
-
-### Register a callback, for when an UseAsDataSource() query is enumerated
-
-Sometimes, you may want to edit the collection, that is returned from a mapped query before forwarding it to the next application layer.
-With `.ProjectTo<TDto>` this is quite simple, as there is no sense in directly returning the resulting `IQueryable<TDto>` because you cannot edit it anymore anyways. So you will most likely do this:
-
-```c#
-var configuration = new MapperConfiguration(cfg =>
-    cfg.CreateMap<OrderLine, OrderLineDTO>()
-    .ForMember(dto => dto.Item, conf => conf.MapFrom(ol => ol.Item.Name)));
-
-public List<OrderLineDTO> GetLinesForOrder(int orderId)
-{
-  using (var context = new orderEntities())
-  {
-    var dtos = context.OrderLines.Where(ol => ol.OrderId == orderId)
-             .ProjectTo<OrderLineDTO>().ToList();
-    foreach(var dto in dtos)
-    {
-        // edit some property, or load additional data from the database and augment the dtos
-    }
-    return dtos;
-  }
-}
-```
-
-However, if you did this with the `.UseAsDataSource()` approach, you would lose all of its power - namely its ability to modify the internal expression until it is enumerated.
-To solve that problem, we introduced the `.OnEnumerated` callback.
-Using it, you can do the following:
-
-```c#
-var configuration = new MapperConfiguration(cfg =>
-    cfg.CreateMap<OrderLine, OrderLineDTO>()
-    .ForMember(dto => dto.Item, conf => conf.MapFrom(ol => ol.Item.Name)));
-
-public IQueryable<OrderLineDTO> GetLinesForOrder(int orderId)
-{
-  using (var context = new orderEntities())
-  {
-    return context.OrderLines.Where(ol => ol.OrderId == orderId)
-             .UseAsDataSource()
-             .For<OrderLineDTO>()
-             .OnEnumerated((dtos) =>
-             {
-                foreach(var dto in dtosCast<OrderLineDTO>())
-                {
-                     // edit some property, or load additional data from the database and augment the dtos
-                }
-             }
-   }
-}
-```
-
-this `OnEnumerated(IEnumerable)`callback is executed, when the `IQueryable<OrderLineDTO>` itself is enumerated.
-So this also works with the OData samples mentioned above: The OData $filter and $orderby expressions are still converted into SQL, and the `OnEnumerated()`callback is provided with the filtered, ordered resultset from the database.
+..v4.0.15
+[4.0.14]: https://github.com/clap-rs/clap/compare/v4.0.13...v4.0.14
+[4.0.13]: https://github.com/clap-rs/clap/compare/v4.0.12...v4.0.13
+[4.0.12]: https://github.com/clap-rs/clap/compare/v4.0.11...v4.0.12
+[4.0.11]: https://github.com/clap-rs/clap/compare/v4.0.10...v4.0.11
+[4.0.10]: https://github.com/clap-rs/clap/compare/v4.0.9...v4.0.10
+[4.0.9]: https://github.com/clap-rs/clap/compare/v4.0.8...v4.0.9
+[4.0.8]: https://github.com/clap-rs/clap/compare/v4.0.7...v4.0.8
+[4.0.7]: https://github.com/clap-rs/clap/compare/v4.0.6...v4.0.7
+[4.0.6]: https://github.com/clap-rs/clap/compare/v4.0.5...v4.0.6
+[4.0.5]: https://github.com/clap-rs/clap/compare/v4.0.4...v4.0.5
+[4.0.4]: https://github.com/clap-rs/clap/compare/v4.0.3...v4.0.4
+[4.0.3]: https://github.com/clap-rs/clap/compare/v4.0.2...v4.0.3
+[4.0.2]: https://github.com/clap-rs/clap/compare/v4.0.1...v4.0.2
+[4.0.1]: https://github.com/clap-rs/clap/compare/v4.0.0...v4.0.1
+[4.0.0]: https://github.com/clap-rs/clap/compare/v3.2.18...v4.0.0
+[3.2.18]: https://github.com/clap-rs/clap/compare/v3.2.17...v3.2.18
+[3.2.17]: https://github.com/clap-rs/clap/compare/v3.2.16...v3.2.17
+[3.2.16]: https://github.com/clap-rs/clap/compare/v3.2.15...v3.2.16
+[3.2.15]: https://github.com/clap-rs/clap/compare/v3.2.14...v3.2.15
+[3.2.14]: https://github.com/clap-rs/clap/compare/v3.2.13...v3.2.14
+[3.2.13]: https://github.com/clap-rs/clap/compare/v3.2.12...v3.2.13
+[3.2.12]: https://github.com/clap-rs/clap/compare/v3.2.11...v3.2.12
+[3.2.11]: https://github.com/clap-rs/clap/compare/v3.2.10...v3.2.11
+[3.2.10]: https://github.com/clap-rs/clap/compare/v3.2.8...v3.2.10
+[3.2.8]: https://github.com/clap-rs/clap/compare/v3.2.7...v3.2.8
+[3.2.7]: https://github.com/clap-rs/clap/compare/v3.2.6...v3.2.7
+[3.2.6]: https://github.com/clap-rs/clap/compare/v3.2.5...v3.2.6
+[3.2.5]: https://github.com/clap-rs/clap/compare/v3.2.4...v3.2.5
+[3.2.4]: https://github.com/clap-rs/clap/compare/v3.2.3...v3.2.4
+[3.2.3]: https://github.com/clap-rs/clap/compare/v3.2.2...v3.2.3
+[3.2.2]: https://github.com/clap-rs/clap/compare/v3.2.1...v3.2.2
+[3.2.1]: https://github.com/clap-rs/clap/compare/v3.2.0...v3.2.1
+[3.2.0]: https://github.com/clap-rs/clap/compare/v3.1.18...v3.2.0
+[3.1.18]: https://github.com/clap-rs/clap/compare/v3.1.17...v3.1.18
+[3.1.17]: https://github.com/clap-rs/clap/compare/v3.1.16...v3.1.17
+[3.1.16]: https://github.com/clap-rs/clap/compare/v3.1.15...v3.1.16
+[3.1.15]: https://github.com/clap-rs/clap/compare/v3.1.14...v3.1.15
+[3.1.14]: https://github.com/clap-rs/clap/compare/v3.1.13...v3.1.14
+[3.1.13]: https://github.com/clap-rs/clap/compare/v3.1.12...v3.1.13
+[3.1.12]: https://github.com/clap-rs/clap/compare/v3.1.11...v3.1.12
+[3.1.11]: https://github.com/clap-rs/clap/compare/v3.1.10...v3.1.11
+[3.1.10]: https://github.com/clap-rs/clap/compare/v3.1.9...v3.1.10
+[3.1.9]: https://github.com/clap-rs/clap/compare/v3.1.8...v3.1.9
+[3.1.8]: https://github.com/clap-rs/clap/compare/v3.1.7...v3.1.8
+[3.1.7]: https://github.com/clap-rs/clap/compare/v3.1.6...v3.1.7
+[3.1.6]: https://github.com/clap-rs/clap/compare/v3.1.5...v3.1.6
+[3.1.5]: https://github.com/clap-rs/clap/compare/v3.1.4...v3.1.5
+[3.1.4]: https://github.com/clap-rs/clap/compare/v3.1.3...v3.1.4
+[3.1.3]: https://github.com/clap-rs/clap/compare/v3.1.2...v3.1.3
+[3.1.2]: https://github.com/clap-rs/clap/compare/v3.1.1...v3.1.2
+[3.1.1]: https://github.com/clap-rs/clap/compare/v3.1.0...v3.1.1
+[3.1.0]: https://github.com/clap-rs/clap/compare/v3.0.14...v3.1.0
+[3.0.14]: https://github.com/clap-rs/clap/compare/v3.0.13...v3.0.14
+[3.0.13]: https://github.com/clap-rs/clap/compare/v3.0.12...v3.0.13
+[3.0.12]: https://github.com/clap-rs/clap/compare/v3.0.11...v3.0.12
+[3.0.11]: https://github.com/clap-rs/clap/compare/v3.0.10...v3.0.11
+[3.0.10]: https://github.com/clap-rs/clap/compare/v3.0.9...v3.0.10
+[3.0.9]: https://github.com/clap-rs/clap/compare/v3.0.8...v3.0.9
+[3.0.8]: https://github.com/clap-rs/clap/compare/v3.0.7...v3.0.8
+[3.0.7]: https://github.com/clap-rs/clap/compare/v3.0.6...v3.0.7
+[3.0.6]: https://github.com/clap-rs/clap/compare/v3.0.5...v3.0.6
+[3.0.5]: https://github.com/clap-rs/clap/compare/v3.0.4...v3.0.5
+[3.0.4]: https://github.com/clap-rs/clap/compare/v3.0.3...v3.0.4
+[3.0.3]: https://github.com/clap-rs/clap/compare/v3.0.2...v3.0.3
+[3.0.2]: https://github.com/clap-rs/clap/compare/v3.0.1...v3.0.2
+[3.0.1]: https://github.com/clap-rs/clap/compare/v3.0.0...v3.0.1
+[3.0.0]: https://github.com/clap-rs/clap/compare/v2.34.0...v3.0.0
+[2.34.0]: https://github.com/clap-rs/clap/compare/v2.33.4...v2.34.0
+[2.33.4]: https://github.com/clap-rs/clap/compare/v2.33.3...v2.33.4
+[2.33.3]: https://github.com/clap-rs/clap/compare/v2.33.2...v2.33.3
+[2.33.2]: https://github.com/clap-rs/clap/compare/v2.33.1...v2.33.2
+[2.33.1]: https://github.com/clap-rs/clap/compare/v2.33.0...v2.33.1
+[2.33.0]: https://github.com/clap-rs/clap/compare/v2.32.0...v2.33.0

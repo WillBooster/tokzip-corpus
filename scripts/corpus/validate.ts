@@ -1,7 +1,7 @@
 /** Fails when committed corpus bytes lack approved provenance or redistribution notices. */
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import nlSources from "./nl-sources.json";
 import ossSources from "./oss-sources.json";
 import {
@@ -180,7 +180,7 @@ function validateEntry(dir: string, label: string, entry: ManifestEntry, errors:
  */
 function isContainedFile(dir: string, path: string): boolean {
   const resolvedPath = resolve(path);
-  if (!resolvedPath.startsWith(`${resolve(dir)}/`)) return false;
+  if (!resolvedPath.startsWith(`${resolve(dir)}${sep}`)) return false;
   try {
     return lstatSync(resolvedPath).isFile();
   } catch {

@@ -1,683 +1,301 @@
-In this guide, we'll discuss the bare minimum necessary to understand how to
-modify a `package.yaml` file. You can see a full list of the available options
-at the [Hpack documentation](https://github.com/sol/hpack#quick-reference). The
-Cabal User Guide is the definitive reference for the
-[Cabal file format](https://cabal.readthedocs.io/en/stable/cabal-package.html).
+---
+sidebar_position: 1
+---
+
+# VSR
+
+Documentation for (roughly) code in the `src/vsr` directory.
+
+## Glossary
+
+Consensus:
 
-### The location of GHC
+- _checkpoint_: Ensure that all updates from the past wrap of the WAL are durable in the _grid_, then advance the replica's recovery point by updating the superblock. After a checkpoint, the checkpointed WAL entries are safe to be overwritten by the next wrap. (Sidenote: in consensus literature this is sometimes called snapshotting. But we use that term to mean something else.)
+- _header_: Identifier for many kinds of messages, including each entry in the VSR log. Passed around instead of the entry when the full entry is not needed (such as view change).
+- _journal_: The in-memory data structure that manages the WAL.
+- _nack_: Short for negative acknowledgement. Used to determine (during a view change) which entries can be truncated from the log. See [Protocol Aware Recovery](https://www.usenix.org/system/files/conference/fast18/fast18-alagappan.pdf).
+- _op_: Short for op-number. An op is assigned to each request that is submitted by the user before being stored in the log. An op is a monotonically increasing integer identifying each message to be handled by consensus. When messages with the same op in different views conflict, view change picks one version to commit. Each user batch (which may contain many batch entries) corresponds to one op. Each op is identified (once inside the VSR log) by a _header_.
+- _superblock_: All local state for the replica that cannot be replicated remotely. Loss is protected against by storing `config.superblock_copies` copies of the superblock.
+- _view_: A replica is _primary_ for one view. Views are monotonically increasing integers that are incremented each time a new primary is selected.
+
+Storage:
+
+- _zone_: The TigerBeetle data file is made up of zones. The superblock is one zone.
+- _grid_: The zone on disk where LSM trees and metadata for them reside.
+- _WAL_: Write-ahead log. It is implemented as two on-disk ring buffers. Entries are only overwritten after they have been checkpointed.
+- _state sync_: The process of syncing checkpointed data (LSM root information, the _grid_, and the superblock freeset). When a replica lags behind the cluster far enough that their WALs no longer intersect, the lagging replica must state sync to catch up.
 
-As we saw above, the `build` command installed GHC for us. You can use the
-`stack path` command for quite a bit of path information (which we'll play with
-more later). We'll look at where GHC is installed:
+## Protocols
 
-=== "Unix-like"
+### Commands
 
-    Command:
+|      `vsr.Header.Command` |  Source |       Target | Protocols                                                                                                                                  |
+| ------------------------: | ------: | -----------: | ------------------------------------------------------------------------------------------------------------------------------------------ |
+|                    `ping` | replica |      replica | [Ping (Replica-Replica)](#protocol-ping-replica-replica)                                                                                   |
+|                    `pong` | replica |      replica | [Ping (Replica-Replica)](#protocol-ping-replica-replica)                                                                                   |
+|             `ping_client` |  client |      replica | [Ping (Replica-Client)](#protocol-ping-replica-client)                                                                                     |
+|             `pong_client` | replica |       client | [Ping (Replica-Client)](#protocol-ping-replica-client)                                                                                     |
+|                 `request` |  client |      primary | [Normal](#protocol-normal)                                                                                                                 |
+|                 `prepare` | replica |       backup | [Normal](#protocol-normal), [Repair WAL](#protocol-repair-wal)                                                                             |
+|              `prepare_ok` | replica |      primary | [Normal](#protocol-normal), [Repair WAL](#protocol-repair-wal)                                                                             |
+|                   `reply` | primary |       client | [Normal](#protocol-normal), [Repair Client Replies](#protocol-repair-client-replies), [Sync Client Replies](#protocol-sync-client-replies) |
+|                  `commit` | primary |       backup | [Normal](#protocol-normal)                                                                                                                 |
+|       `start_view_change` | replica | all replicas | [Start-View-Change](#protocol-start-view-change)                                                                                           |
+|          `do_view_change` | replica | all replicas | [View-Change](#protocol-view-change)                                                                                                       |
+|              `start_view` | primary |       backup | [Request/Start View](#protocol-requeststart-view), [State Sync](./sync.md)                                                                 |
+|      `request_start_view` |  backup |      primary | [Request/Start View](#protocol-requeststart-view)                                                                                          |
+|         `request_headers` | replica |      replica | [Repair Journal](#protocol-repair-journal)                                                                                                 |
+|         `request_prepare` | replica |      replica | [Repair WAL](#protocol-repair-wal)                                                                                                         |
+|           `request_reply` | replica |      replica | [Repair Client Replies](#protocol-repair-client-replies), [Sync Client Replies](#protocol-sync-client-replies)                             |
+|                 `headers` | replica |      replica | [Repair Journal](#protocol-repair-journal)                                                                                                 |
+|                `eviction` | primary |       client | [Client](#protocol-client)                                                                                                                 |
+|          `request_blocks` | replica |      replica | [Sync Forest](#protocol-sync-forest), [Repair Grid](#protocol-repair-grid)                                                                 |
+|                   `block` | replica |      replica | [Sync Forest](#protocol-sync-forest), [Repair Grid](#protocol-repair-grid)                                                                 |
 
-    ~~~text
-    stack exec -- which ghc
-    /home/<user_name>/.stack/programs/x86_64-linux/ghc-9.0.2/bin/ghc
-    ~~~
+### Recovery
 
-=== "Windows (with PowerShell)"
+Unlike [VRR](https://pmg.csail.mit.edu/papers/vr-revisited.pdf), TigerBeetle does not implement Recovery Protocol (see §4.3).
+Instead, replicas persist their VSR state to the superblock.
+This ensures that a recovering replica never backtracks to an older view (from the point of view of the cluster).
 
-    Command:
+### Protocol: Ping (Replica-Replica)
 
-    ~~~text
-    stack exec -- where.exe ghc
-    C:\Users\<user_name>\AppData\Local\Programs\stack\x86_64-windows\ghc-9.0.2\bin\ghc.exe
-    ~~~
+Replicas send `command=ping`/`command=pong` messages to one another to synchronize clocks.
 
-As you can see from that path (and as emphasized earlier), the installation is
-placed to not interfere with any other GHC installation, whether system-wide or
-even different GHC versions installed by Stack.
+### Protocol: Ping (Replica-Client)
 
-## Cleaning your project
+Clients send `command=ping_client` (and receive `command=pong_client`) messages to (from) replicas to learn the cluster's current view.
 
-You can clean up build artifacts for your project using the `stack clean` and
-`stack purge` commands.
+### Protocol: Normal
 
-### The `stack clean` command
+Normal protocol prepares and commits requests (from clients) and sends replies (to clients).
 
-`stack clean` deletes the local working directories containing compiler output.
-By default, that means the contents of directories in `.stack-work/dist`, for
-all the `.stack-work` directories within a project.
+1. The client sends a `command=request` message to the primary. (If the client's view is outdated, the receiver will forward the message on to the actual primary).
+2. The primary converts the `command=request` to a `command=prepare` (assigning it an `op` and `timestamp`).
+3. Each replica (in a chain beginning with the primary) performs the following steps concurrently:
+   - Write the prepare to the WAL.
+   - Forward the prepare to the next replica in the chain.
+4. Each replica sends a `command=prepare_ok` message to the primary once it has written the prepare to the WAL.
+5. When a primary collects a [replication quorum](#quorums) of `prepare_ok`s _and_ it has committed all preceding prepares, it commits the prepare.
+6. The primary replies to the client.
+7. The backups are informed that the prepare was committed by either:
+   - a subsequent prepare, or
+   - a periodic `command=commit` heartbeat message.
 
-Use `stack clean <specific-package>` to delete the output for the package
-_specific-package_ only.
+```mermaid
+sequenceDiagram
+    participant C0 as Client
+    participant R0 as Replica 0 (primary)
+    participant R1 as Replica 1 (backup)
+    participant R2 as Replica 2 (backup)
 
-### The `stack purge` command
+    C0->>R0: Request A
 
-`stack purge` deletes the local stack working directories, including extra-deps,
-git dependencies and the compiler output (including logs). It does not delete
-any snapshot packages, compilers or programs installed using `stack install`.
-This essentially reverts the project to a completely fresh state, as if it had
-never been built. `stack purge` is just a shortcut for `stack clean --full`
+    R0->>+R0: Prepare A
+    R0->>+R1: Prepare A
+    R1->>+R2: Prepare A
 
-### The `stack build` command
+    R0->>-R0: Prepare-Ok A
+    R1->>-R0: Prepare-Ok A
+    R0->>C0: Reply A
+    R2->>-R0: Prepare-Ok A
+```
 
-The `build` command is the heart and soul of Stack. It is the engine that powers
-building your code, testing it, getting dependencies, and more. Quite a bit of
-the remainder of this guide will cover more advanced `build` functions and
-features, such as building test and Haddocks at the same time, or constantly
-rebuilding blocking on file changes.
+See also:
 
-!!! note
+- [VRR](https://pmg.csail.mit.edu/papers/vr-revisited.pdf) §4.1
 
-    Using the `build` command twice with the same options and arguments should
-    generally do nothing (besides things like rerunning test suites), and
-    should, in general, produce a reproducible result between different runs.
+### Protocol: Start-View-Change
 
-## Adding dependencies
+Start-View-Change (SVC) protocol initiates [view-changes](#protocol-view-change) with minimal disruption.
 
-Let's say we decide to modify our `helloworld` source a bit to use a new
-library, perhaps the ubiquitous `text` package. In `src/Lib.hs`, we can, for
-example add:
+Unlike the Start-View-Change described in [VRR](https://pmg.csail.mit.edu/papers/vr-revisited.pdf) §4.2, this protocol runs in both `status=normal` and `status=view_change` (not just `status=view_change`).
 
-~~~haskell
-{-# LANGUAGE OverloadedStrings #-}
-module Lib
-    ( someFunc
-    ) where
+1. Depending on the replica's status:
+   - `status=normal` & primary: When the replica has not recently received a `prepare_ok` (and it has a prepare in flight), pause broadcasting `command=commit`.
+   - `status=normal` & backup: When the replica has not recently received a `command=commit`, broadcast `command=start_view_change` to all replicas (including self).
+   - `status=view_change`: If the replica has not completed a view-change recently, send a `command=start_view_change` to all replicas (including self).
+2. (Periodically retry sending the SVC).
+3. If the backup receives a `command=commit` or changes views (respectively), stop the `command=start_view_change` retries.
+4. If the replica collects a [view-change quorum](#quorums) of SVC messages, transition to `status=view_change` for the next view. (That is, increment the replica's view and start sending a DVC).
 
-import qualified Data.Text.IO as T
+This protocol approach enables liveness under asymmetric network partitions. For example, a replica which can send to the cluster but not receive may send SVCs, but if the remainder of the cluster is healthy, they will never achieve a quorum, so the view is stable. When the partition heals, the formerly-isolated replica may rejoin the original view (if it was isolated in `status=normal`) or a new view (if it was isolated in `status=view_change`).
 
-someFunc :: IO ()
-someFunc = T.putStrLn "someFunc"
-~~~
+See also:
 
-When we try to build this, things don't go as expected:
+- [Raft does not Guarantee Liveness in the face of Network Faults](https://decentralizedthoughts.github.io/2020-12-12-raft-liveness-full-omission/) ("PreVote and CheckQuorum")
+- ["Consensus: Bridging Theory and Practice"](https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf) §6.2 "Leaders" describes periodically committing a heartbeat to detect stale leaders.
 
-~~~text
-stack build
-# build failure output (abridged for clarity) ...
-src\Lib.hs:6:1: error:
-    Could not load module ‘Data.Text.IO’
-    It is a member of the hidden package ‘text-1.2.5.0’.
-    Perhaps you need to add ‘text’ to the build-depends in your .cabal file.
-    Use -v (or `:set -v` in ghci) to see a list of the files searched for.
-  |
-6 | import qualified Data.Text.IO as T
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-~~~
+### Protocol: View-Change
 
-This means that the package containing the module in question is not available.
-To tell Stack to use [text](https://hackage.haskell.org/package/text), you need
-to add it to your `package.yaml` file — specifically in your `dependencies`
-section, like this:
+A replica sends `command=do_view_change` to all replicas, with the `view` it is attempting to start.
 
-~~~yaml
-dependencies:
-- base >= 4.7 && < 5
-- text # added here
-~~~
-
-Now if we rerun `stack build`, we should get a successful result. Command:
+- The _primary_ of the `view` collects a [view-change quorum](#quorums) of DVCs.
+- The _backup_ of the `view` uses to `do_view_change` to update its current `view` (transitioning to `status=view_change`).
 
-~~~text
-stack build
-# build output ...
-~~~
+DVCs include headers from prepares which are:
 
-This output means that the `text` package was downloaded, configured, built, and
-locally installed. Once that was done, we moved on to building our project
-package (`helloworld`). At no point did we need to ask Stack to build
-dependencies — it does so automatically.
-
-### Listing Dependencies
-
-Let's have Stack add a few more dependencies to our project. First, we'll
-include two new packages in the `dependencies` section for our library in our
-`package.yaml`:
-
-~~~yaml
-dependencies:
-- base >= 4.7 && < 5
-- text
-- filepath
-- containers
-~~~
-
-After adding these two dependencies, we can again run `stack build` to have them
-installed. Command:
-
-~~~text
-stack build
-# build output ...
-~~~
-
-Finally, to find out which versions of these libraries Stack installed, we can
-ask Stack to `ls dependencies`. Command:
-
-~~~text
-stack ls dependencies
-# dependency output ...
-~~~
-
-### extra-deps
-
-Let's try a more off-the-beaten-track package: the joke
-[acme-missiles](http://www.stackage.org/package/acme-missiles) package. Our
-source code is simple:
-
-~~~haskell
-module Lib
-    ( someFunc
-    ) where
-
-import Acme.Missiles
-
-someFunc :: IO ()
-someFunc = launchMissiles
-~~~
-
-Again, we add this new dependency to the `package.yaml` file like this:
-
-~~~yaml
-dependencies:
-- base >= 4.7 && < 5
-- text
-- filepath
-- containers
-- acme-missiles # added
-~~~
-
-However, rerunning `stack build` shows us the following error message. Command:
-
-~~~text
-stack build
-# build failure output ...
-~~~
-
-It says that it was unable to construct the build plan.
-
-This brings us to the next major topic in using Stack.
-
-## Curated package sets
-
-Remember above when `stack new` selected some
-[LTS snapshot](https://github.com/commercialhaskell/lts-haskell#readme) for us?
-That defined our build plan and available packages. When we tried using the
-`text` package, it just worked, because it was part of the LTS *package set*.
-
-We've specified the `acme-missiles` package in the `package.yaml` file (see
-above), but `acme-missiles` is not part of that LTS package set, so building
-failed.
-
-To add `acme-missiles` to the available packages, we'll use the `extra-deps` key
-in the `stack.yaml` file. That key defines extra packages, not present in the
-snapshot, that will be needed as dependencies. You can add this like so:
-
-~~~yaml
-extra-deps:
-- acme-missiles-0.3 # not in the LTS snapshot
-~~~
-
-Now `stack build` will succeed.
-
-With that out of the way, let's dig a little bit more into these package sets,
-also known as *snapshots*. We mentioned the LTS snapshots, and you can get quite
-a bit of information about it at
-[https://www.stackage.org/lts](https://www.stackage.org/lts), including:
-
-* The appropriate value (`lts-22.13`, as is currently the latest LTS)
-* The GHC version used
-* A full list of all packages available in this snapshot
-* The ability to perform a Hoogle search on the packages in this snapshot
-* A [list of all modules](https://www.stackage.org/lts/docs) in a snapshot,
-  which can be useful when trying to determine which package to add to your
-  `package.yaml` file.
+- _present_: A valid header, corresponding to a valid prepare in the replica's WAL.
+- _missing_: A valid header, corresponding to a prepare that the replica has not prepared/acked.
+- _corrupt_: A valid header, corresponding to a corrupt prepare in the replica's WAL.
+- _blank_: A placeholder (fake) header, corresponding to a header that the replica has never seen.
+- _fault_: A placeholder (fake) header, corresponding to a header that the replica _may have_ prepared/acked.
 
-You can also see a
-[list of all available snapshots](https://www.stackage.org/snapshots). You'll
-notice two flavors: LTS (for "Long Term Support") and Nightly. You can read more
-about them on the
-[LTS Haskell GitHub page](https://github.com/commercialhaskell/lts-haskell#readme).
-If you're not sure which to use, start with LTS Haskell (which Stack will lean
-towards by default as well).
-
-## Snapshots and changing your compiler version
+If the new primary collects a _nack quorum_ of _blank_ headers for a particular possibly-uncommitted op, it truncates the log.
 
-Let's explore package sets a bit further. Instead of `lts-22.13`, let's change
-our `stack.yaml` file to use the
-[latest nightly](https://www.stackage.org/nightly). Right now, this is currently
-2024-03-20 - please see the snapshot from the link above to get the latest.
+These cases are farther distinguished during [WAL repair](#protocol-repair-wal).
 
-Then, commanding `stack build` again will produce:
-
-~~~text
-stack build
-# Downloaded nightly-2024-03-20 build plan.
-# build output ...
-~~~
+When the primary collects its DVC quorum:
 
-We can also change snapshots on the command line, which can be useful in a
-Continuous Integration (CI) setting, like on Travis. For example, command:
+1. If any DVC in the quorum is ahead of the primary by more than one checkpoint,
+   the new primary "forfeits" (that is, it immediately triggers another view change).
+2. If any DVC in the quorum is ahead of the primary by more than one checkpoint,
+   and any messages in the next checkpoint are possibly committed,
+   the new primary forfeits.
+3. The primary installs the headers to its suffix.
+4. Then the primary repairs its headers. ([Protocol: Repair Journal](#protocol-repair-journal)).
+5. Then the primary repairs its prepares. ([Protocol: Repair WAL](#protocol-repair-wal)) (and potentially truncates uncommitted ops).
+6. Then primary commits all prepares which are not known to be uncommitted.
+7. Then the primary transitions to `status=normal` and broadcasts a `command=start_view`.
 
-~~~text
-stack --snapshot lts-21.25 build
-# Downloaded lts-21.25 build plan.
-# build output ...
-~~~
+### Protocol: Request/Start View
 
-When passed on the command line, you also get some additional "short-cut"
-versions of snapshots: `--snapshot nightly` will use the newest Nightly snapshot
-available, `--snapshot lts` will use the newest LTS, and `--snapshot lts-22`
-will use the newest LTS in the 22.x series. The reason these are only available
-on the command line and not in your `stack.yaml` file is that using them:
+#### `request_start_view`
 
-1. Will slow down your build (since Stack then needs to download information on
-   the latest available LTS each time it builds)
-2. Produces unreliable results (since a build run today may proceed differently
-   tomorrow because of changes outside of your control)
+A backup sends a `command=request_start_view` to the primary of a view when any of the following occur:
 
-### Changing GHC versions
+- the backup learns about a newer view via a `command=commit` message, or
+- the backup learns about a newer view via a `command=prepare` message, or
+- the backup discovers `commit_max` exceeds `min(op_head, op_checkpoint_next_trigger)` (during repair),
+- the backup can't make progress committing and needs to state sync, or
+- a replica recovers to `status=recovering_head`
 
-Finally, let's try using an older LTS snapshot. We'll use the newest 21.x
-snapshot with the command:
+#### `start_view`
 
-~~~text
-stack --snapshot lts-21 build
-# build output ...
-~~~
+When a `status=normal` primary receives `command=request_start_view`, it replies with a `command=start_view`.
+`command=start_view` includes:
+- The view's current suffix — the headers of the latest messages in the view.
+- The current checkpoint (see [State Sync](./sync.md)).
 
-This succeeds, automatically installing the necessary GHC along the way. So, we
-see that different LTS versions use different GHC versions and Stack can handle
-that.
+Together, the checkpoint and the view headers fully specify the logical and physical state of the view.
 
-### Other snapshot values
+Upon receiving a `start_view` for the new view, the backup installs the checkpoint if needed, installs the suffix, transitions to `status=normal`, and begins repair.
 
-We've mentioned `nightly-YYYY-MM-DD` and `lts-X.Y` values for the snapshot.
-There are actually other options available, and the list will grow over time.
-At the time of writing:
+A `start_view` contains the following headers (which may overlap):
 
-* `ghc-X.Y.Z`, for requiring a specific GHC version but no additional packages
-* Experimental custom snapshot support
+- The suffix: `pipeline_prepare_queue_max` headers from the head op down.
+- The "hooks": the header of any previous checkpoint triggers within our repairable range.
+  This helps a lagging replica catch up. (There are at most 2).
 
-The most up-to-date information can always be found in the
-[stack.yaml documentation](yaml_configuration.md#snapshot).
+### Protocol: Repair Journal
 
-## Existing projects
+`request_headers` and `headers` repair gaps or breaks in a replica's journal headers.
+Repaired headers are a prerequisite for [repairing prepares](#protocol-repair-wal).
 
-Alright, enough playing around with simple projects. Let's take an open source
-package and try to build it. We'll be ambitious and use
-[yackage](https://hackage.haskell.org/package/yackage), a local package server
-using [Yesod](http://www.yesodweb.com/). To get the code, we'll use the
-`stack unpack` command from the root directory for all our Haskell projects:
+Because the headers are repaired backwards (from the head) by hash-chaining, it is safe for both backups and transitioning primaries.
 
-~~~text
-stack unpack yackage
-Unpacked yackage-0.8.1 to <root_directory>/yackage-0.8.1/
-~~~
+Gaps/breaks in a replica's journal headers may occur:
 
-You can also unpack to the directory of your liking instead of the current one
-by issuing the command:
+- On a backup, receiving nonconsecutive ops, leaving a gap in its headers.
+- On a backup, which has not finished repair.
+- On a new primary during a view-change, which has not finished repair.
 
-~~~text
-stack unpack yackage --to <desired_directory>
-~~~
+### Protocol: Repair WAL
 
-This will create a `yackage-0.8.1` directory inside `<desired_directory>`.
+The replica's journal tracks which prepares the WAL requires — i.e. headers for which either:
 
-We will change to that directory, with the command:
+- no prepare was ever received, or
+- the prepare was received and written, but was since discovered to be corrupt
 
-~~~text
-cd yackage-0.8.1
-~~~
+During repair, missing/damaged prepares are requested & repaired chronologically, which:
 
-### The `stack init` command
+- improves the chances that older entries will be available, i.e. not yet overwritten
+- enables better pipelining of repair and commit.
 
-This new directory does not have a `stack.yaml` file, so we need to make one
-first. We could do it by hand, but let's be lazy instead with the `stack init`
-command:
+In response to a `request_prepare`:
 
-~~~text
-stack init
-# init output ...
-~~~
+- Reply the `command=prepare` with the requested prepare, if available and valid.
+- Otherwise do not reply. (e.g. the corresponding slot in the WAL is corrupt)
 
-`stack init` does quite a few things for you behind the scenes:
+Per [PAR's CTRL Protocol](https://www.usenix.org/system/files/conference/fast18/fast18-alagappan.pdf), we do not nack corrupt entries, since they _might_ be the prepare being requested.
 
-* Finds all of the Cabal files in your current directory and subdirectories
-  (unless you use `--ignore-subdirs`) and determines the packages and versions
-  they require
-* Finds the best combination of snapshot and package flags that allows
-  everything to compile with minimum external dependencies
-* It tries to look for the best matching snapshot from latest LTS, latest
-  nightly, other LTS versions in that order
+See also [State Sync](./sync.md) protocol — the extent of WAL that the replica can/should repair
+depends on the checkpoint.
 
-Assuming it finds a match, it will write your `stack.yaml` file, and everything
-will work.
+### Protocol: Repair Client Replies
 
-!!! note
+The replica stores the latest reply to each active client.
 
-    The `yackage` package does not currently support Hpack, but you can also use
-    `hpack-convert` should you need to generate a `package.yaml` file.
+During repair, corrupt client replies are requested & repaired.
 
-#### Excluded Packages
+In response to a `request_reply`:
 
-Sometimes multiple packages in your project may have conflicting requirements.
-In that case `stack init` will fail, so what do you do?
+- Respond with the `command=reply` (the requested reply), if available and valid.
+- Otherwise do not reply.
 
-You could manually create `stack.yaml` by omitting some packages to resolve the
-conflict. Alternatively you can ask `stack init` to do that for you by
-specifying `--omit-packages` flag on the command line. Let's see how that
-works.
+### Protocol: Client
 
-To simulate a conflict we will use `acme-missiles-0.3` in `yackage` and we will
-also copy `yackage.cabal` to another directory and change the name of the file
-and package to `yackage-test`. In this new package we will use
-`acme-missiles-0.2` instead. Let's see what happens when we command `stack init`
-again:
-
-~~~text
-stack init --force --omit-packages
-# init failure output ...
-~~~
-
-Looking at `stack.yaml`, you will see that the excluded packages have been
-commented out under the `packages` field. In case wrong packages are excluded
-you can uncomment the right one and comment the other one.
-
-Packages may get excluded due to conflicting requirements among user packages or
-due to conflicting requirements between a user package and the snapshot
-compiler. If all of the packages have a conflict with the compiler then all of
-them may get commented out.
-
-When packages are commented out you will see a warning every time you run a
-command which needs the configuration file. The warning can be disabled by
-editing the configuration file and removing it.
-
-#### Using a specific snapshot
-
-Sometimes you may want to use a specific snapshot for your project instead of
-`stack init` picking one for you. You can do that by using
-`stack init --snapshot <snapshot>`.
-
-You can also init with a compiler snapshot if you do not want to use a
-Stackage snapshot. That will result in all of your project's dependencies being
-put under the `extra-deps` section.
-
-#### Installing the compiler
-
-Stack will automatically install the compiler when you run `stack build` but you
-can manually specify the compiler by running `stack setup <GHC-VERSION>`.
-
-#### Miscellaneous and diagnostics
-
-_Add selected packages_: If you want to use only selected packages from your
-project directory you can do so by explicitly specifying the package directories
-on the command line.
-
-_Duplicate package names_: If multiple packages under the directory tree have
-same name, `stack init` will report those and automatically ignore one of them.
-
-_Ignore subdirectories_: By default `stack init` searches all the subdirectories
-for Cabal files. If you do not want that then you can use `--ignore-subdirs`
-command line switch.
-
-_Cabal warnings_: `stack init` will show warnings if there were issues in
-reading a Cabal file. You may want to pay attention to the warnings as sometimes
-they may result in incomprehensible errors later on during dependency solving.
-
-_Package naming_: If the `Name` field defined in a Cabal file does not match
-with the Cabal file name then `stack init` will refuse to continue.
-
-_User warnings_: When packages are excluded or external dependencies added Stack
-will show warnings every time the configuration file is loaded. You can suppress
-the warnings by editing the configuration file and removing the warnings from
-it. You may see something like this:
-
-~~~text
-stack build
-Warning: Some packages were found to be incompatible with the resolver and have been left commented out in the packages section.
-Warning: Specified resolver could not satisfy all dependencies. Some external packages have been added as dependencies.
-You can suppress this message by removing it from stack.yaml
-~~~
-
-## Different databases
-
-Time to take a short break from hands-on examples and discuss a little
-architecture. Stack has the concept of multiple *databases*.
-
-A database consists of a GHC package database (which contains the compiled
-version of a library), executables, and a few other things as well. To give you
-an idea, the contents of the parent directory of the `stack path --local-pkg-db`
-directory are the directories:
-
-~~~text
-bin
-doc
-lib
-pkgdb
-~~~
-
-Databases in Stack are *layered*. For example, the database listing we just gave
-is called a *local* database (also known as a *mutable* database). That is
-layered on top of a *snapshot* database (also known as a *write-only* database).
-The snapshot database contains the libraries and executables that are considered
-to be *immutable*. Finally, GHC itself ships with a number of libraries and
-executables, also considered to be immutable, which forms the *global* database.
-
-To get a quick idea of this, we can look at the output of the
-`stack exec -- ghc-pkg list` command in our `helloworld` project:
-
-~~~text
-<stack path --global-pkg-db directory>
-    Cabal-3.6.3.0
-    Win32-2.12.0.1
-    array-0.5.4.0
-    base-4.16.2.0
-    binary-0.8.9.0
-    bytestring-0.11.3.1
-    containers-0.6.5.1
-    deepseq-1.4.6.1
-    directory-1.3.6.2
-    exceptions-0.10.4
-    filepath-1.4.2.2
-    (ghc-9.2.3)
-    ghc-bignum-1.2
-    ghc-boot-9.2.3
-    ghc-boot-th-9.2.3
-    ghc-compact-0.1.0.0
-    ghc-heap-9.2.3
-    ghc-prim-0.8.0
-    ghci-9.2.3
-    haskeline-0.8.2
-    hpc-0.6.1.0
-    integer-gmp-1.1
-    libiserv-9.2.3
-    mtl-2.2.2
-    parsec-3.1.15.0
-    pretty-1.1.3.6
-    process-1.6.13.2
-    rts-1.0.2
-    stm-2.5.0.2
-    template-haskell-2.18.0.0
-    text-1.2.5.0
-    time-1.11.1.1
-    transformers-0.5.6.2
-    xhtml-3000.2.2.1
-
-<stack path --snapshot-pkg-db directory>
-    acme-missiles-0.3
-
-<stack path --local-pkg-db directory>
-    helloworld-0.1.0.0
-~~~
-
-where `<stack path --global-pkg-db directory>` refers to the directory output by
-the command `stack path --global-pkg-db`, and so on.
-
-Notice that `acme-missiles` ends up in the *snapshot* database. Any package
-which comes from Hackage, an archive, or a repository is considered to be an
-*immutable* package.
-
-Anything which is considered *mutable*, or depends on something mutable, ends up
-in the *local* database. This includes your own code and any other packages
-located on a local file path.
-
-The reason we have this structure is that:
-
-* it lets multiple projects reuse the same binary builds of immutable packages,
-* but doesn't allow different projects to "contaminate" each other by putting
-  non-standard content into the shared snapshot database.
-
-As you probably guessed, there can be multiple snapshot databases available. See
-the contents of the `snapshots` directory in the [Stack root](stack_root.md).
-
-* On Unix-like operating systems, each snapshot is in the last of a sequence of
-  three subdirectories named after the platform, a 256-bit hash of the source
-  map (how the package should be built -- including the compiler, options, and
-  immutable dependencies), and the GHC version.
-
-* On Windows, each snapshot is in a subdirectory that is a shorter hash (eight
-  characters) of the sequence of three directories used on Unix-like operating
-  systems. This is done to avoid problems created by default limits on file
-  path lengths on Windows systems.
-
-These snapshot databases don't get layered on top of each other; they are each
-used separately.
-
-In reality, you'll rarely — if ever — interact directly with these databases,
-but it's good to have a basic understanding of how they work so you can
-understand why rebuilding may occur at different points.
-
-## The build synonyms
-
-Let's look at a subset of the `stack --help` output:
-
-~~~text
-build    Build the package(s) in this directory/configuration
-install  Shortcut for 'build --copy-bins'
-test     Shortcut for 'build --test'
-bench    Shortcut for 'build --bench'
-haddock  Shortcut for 'build --haddock'
-~~~
-
-Four of these commands are just synonyms for the `build` command. They are
-provided for convenience for common cases (e.g., `stack test` instead of
-`stack build --test`) and so that commonly expected commands just work.
-
-What's so special about these commands being synonyms? It allows us to make
-much more composable command lines. For example, we can have a command that
-builds executables, generates Haddock documentation (Haskell API-level docs),
-and builds and runs your test suites, with:
-
-~~~text
-stack build --haddock --test
-~~~
-
-You can even get more inventive as you learn about other flags. For example,
-take the following command:
-
-~~~text
-stack build --pedantic --haddock --test --exec "echo Yay, it succeeded" --file-watch
-~~~
-
-This command will:
-
-* turn on all warnings and errors (the `--pedantic` flag)
-* build your library and executables
-* generate Haddocks (the `--haddock` flag)
-* build and run your test suite (the `--test` flag)
-* run the command `echo Yay, it succeeded` when that completes (the `--exec`
-  option)
-* after building, watch for changes in the files used to build the project, and
-  kick off a new build when done (the `--file-watch` flag)
-
-### The `stack install` command and `copy-bins` option
-
-It's worth calling out the behavior of the `install` command and `--copy-bins`
-option, since this has confused a number of users (especially when compared to
-behavior of other tools like Cabal (the tool)). The `install` command does
-precisely one thing in addition to the build command: it copies any generated
-executables to the local binary directory. You may recognize the default value
-for that path:
-
-On Unix-like operating systems, command:
-
-~~~text
-stack path --local-bin
-/home/<user_name>/.local/bin
-~~~
-
-On Windows, command:
-
-~~~text
-stack path --local-bin
-C:\Users\<user_name>\AppData\Roaming\local\bin
-~~~
-
-That's why the download page recommends adding that directory to your PATH. This
-feature is convenient, because now you can simply run `executable-name` in your
-shell instead of having to run `stack exec executable-name` from inside your
-project directory.
-
-Since it's such a point of confusion, let me list a number of things Stack does
-*not* do specially for the `install` command:
-
-* Stack will always build any necessary dependencies for your code. The install
-  command is not necessary to trigger this behavior. If you just want to build a
-  project, run `stack build`.
-* Stack will *not* track which files it's copied to your local binary directory
-  nor provide a way to automatically delete them. There are many great tools out
-  there for managing installation of binaries, and Stack does not attempt to
-  replace those.
-* Stack will not necessarily be creating a relocatable executable. If your
-  executables hard-codes paths, copying the executable will not change those
-  hard-coded paths.
-
-  * At the time of writing, there's no way to change those kinds of paths with
-    Stack, but see
-    [issue #848 about --prefix](https://github.com/commercialhaskell/stack/issues/848)
-    for future plans.
-
-That's really all there is to the `install` command: for the simplicity of what
-it does, it occupies a much larger mental space than is warranted.
-
-## Targets, locals, and extra-deps
-
-We haven't discussed this too much yet, but, in addition to having a number of
-synonyms *and* taking a number of options on the command line, the `build`
-command *also* takes many arguments. These are parsed in different ways, and can
-be used to achieve a high level of flexibility in telling Stack exactly what you
-want to build.
-
-We're not going to cover the full generality of these arguments here; instead,
-there's documentation covering the full
-[build command syntax](build_command.md). Here, we'll just point out a few
-different types of arguments:
-
-* You can specify a *package name*, e.g. `stack build vector`.
-    * This will attempt to build the `vector` package, whether it's a local
-      package, in your extra-deps, in your snapshot, or just available upstream.
-      If it's just available upstream but not included in your locals,
-      extra-deps, or snapshot, the newest version is automatically promoted to
-      an extra-dep.
-* You can also give a *package identifier*, which is a package name plus
-  version, e.g. `stack build yesod-bin-1.4.14`.
-    * This is almost identical to specifying a package name, except it will (1)
-      choose the given version instead of latest, and (2) error out if the given
-      version conflicts with the version of a project package.
-* The most flexibility comes from specifying individual *components*, e.g.
-  `stack build helloworld:test:helloworld-test` says "build the test suite
-  component named helloworld-test from the helloworld package."
-    * In addition to this long form, you can also shorten it by skipping what
-      type of component it is, e.g. `stack build helloworld:helloworld-test`, or
-      even skip the package name entirely, e.g. `stack build :helloworld-test`.
-* Finally, you can specify individual *directories* to build to trigger building
-  of any project packages included in those directories or subdirectories.
-
-When you give no specific arguments on the command line (e.g., `stack build`),
-it's the same as specifying the names of all of your project packages. If you
-just want to build the package for the directory you're currently in, you can
-use `stack build .`.
-
-### Components, --test, and --bench
-
-Here's one final important yet subtle point. Consider our `helloworld` package:
-it has a library component, an executable `helloworld-exe`, and a test suite
-`helloworld-test`. When you run `stack build helloworld`, how does it know which
-ones to build? By default, it will build the library (if any) and all of the
-executables but ignore the test suites and benchmarks.
+1. Client sends `command=request operation=register` to registers with the cluster by starting a new request-reply hashchain. (See also: [Protocol: Normal](#protocol-normal)).
+2. Client receives `command=reply operation=register` from the cluster. (If the cluster is at the maximum number of clients, it evicts the oldest).
+3. Repeat:
+   1. Send `command=request` to cluster.
+   2. If the client has been evicted, receive `command=eviction` from the cluster. (The client must re-register before sending more requests.)
+   3. If the client has not been evicted, receive `command=reply` from cluster.
+
+See also:
+
+- [Integration: Client Session Lifecycle](../../reference/sessions.md#lifecycle)
+- [Integration: Client Session Eviction](../../reference/sessions.md#eviction)
+
+### Protocol: Repair Grid
+
+Grid repair is triggered when a replica discovers a corrupt (or missing) grid block.
+
+1. The repairing replica sends a `command=request_blocks` to any other replica. The message body contains a list of block `address`/`checksum`s.
+2. Upon receiving a `command=request_blocks`, a replica reads its own grid to check for the requested blocks. For each matching block found, reply with the `command=block` message (the block itself).
+3. Upon receiving a `command=block`, a replica writes the block to its grid, and resolves the reads that were blocked on it.
+
+Note that _both sides_ of grid repair can run while the grid is being opened during replica startup.
+That is, a replica can help other replicas repair and repair itself simultaneously.
+
+TODO Describe state sync fallback.
+
+### Protocol: Sync Client Replies
+
+Sync missed client replies using [Protocol: Repair Grid](#protocol-repair-client-replies).
+
+See [State Sync](./sync.md) for details.
+
+### Protocol: Sync Forest
+
+Sync missed LSM manifest and table blocks using [Protocol: Repair Grid](#protocol-repair-grid).
+
+See [State Sync](./sync.md) for details.
+
+### Protocol: Reconfiguration
+
+TODO (Unimplemented)
+
+## Quorums
+
+- The _replication quorum_ is the minimum number of replicas required to complete a commit.
+- The _view-change quorum_ is the minimum number of replicas required to complete a view-change.
+- The _nack quorum_ is the minimum number of unique nacks required to truncate an uncommitted op.
+
+With the default configuration:
+
+|      **Replica Count** |   1 |     2 |   3 |   4 |   5 |   6 |
+| ---------------------: | --: | ----: | --: | --: | --: | --: |
+| **Replication Quorum** |   1 |     2 |   2 |   2 |   3 |   3 |
+| **View-Change Quorum** |   1 |     2 |   2 |   3 |   3 |   4 |
+|        **Nack Quorum** |   1 | **1** |   2 |   3 |   3 |   4 |
+
+See also:
+
+- `constants.quorum_replication_max` for configuration.
+- [Flexible Paxos](https://fpaxos.github.io/)
+
+## Further reading
+
+- [Viewstamped Replication Revisited](https://pmg.csail.mit.edu/papers/vr-revisited.pdf)
+- [Protocol Aware Recovery](https://www.usenix.org/system/files/conference/fast18/fast18-alagappan.pdf)

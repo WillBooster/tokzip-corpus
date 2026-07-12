@@ -1,196 +1,195 @@
-Similarly, [`from`][Array#from] returns the tail from the element at the passed index to the end. If the index is greater than the length of the array, it returns an empty array.
+---
+sidebar_position: 3
+---
 
-```ruby
-%w(a b c d).from(2)  # => ["c", "d"]
-%w(a b c d).from(10) # => []
-[].from(0)           # => []
-```
+# Two-Phase Transfers
 
-The method [`including`][Array#including] returns a new array that includes the passed elements:
+A two-phase transfer moves funds in stages:
 
-```ruby
-[ 1, 2, 3 ].including(4, 5)          # => [ 1, 2, 3, 4, 5 ]
-[ [ 0, 1 ] ].including([ [ 1, 0 ] ]) # => [ [ 0, 1 ], [ 1, 0 ] ]
-```
+1. Reserve funds ([pending](#reserve-funds-pending-transfer))
+2. Resolve funds ([post](#post-pending-transfer), [void](#void-pending-transfer), or
+   [expire](#expire-pending-transfer))
 
-The method [`excluding`][Array#excluding] returns a copy of the Array excluding the specified elements.
-This is an optimization of `Enumerable#excluding` that uses `Array#-`
-instead of `Array#reject` for performance reasons.
+The name "two-phase transfer" is a reference to the
+[two-phase commit protocol for distributed transactions](https://en.wikipedia.org/wiki/Two-phase_commit_protocol).
 
-```ruby
-["David", "Rafael", "Aaron", "Todd"].excluding("Aaron", "Todd") # => ["David", "Rafael"]
-[ [ 0, 1 ], [ 1, 0 ] ].excluding([ [ 1, 0 ] ])                  # => [ [ 0, 1 ] ]
-```
+## Reserve Funds (Pending Transfer)
 
-The methods [`second`][Array#second], [`third`][Array#third], [`fourth`][Array#fourth], and [`fifth`][Array#fifth] return the corresponding element, as do [`second_to_last`][Array#second_to_last] and [`third_to_last`][Array#third_to_last] (`first` and `last` are built-in). Thanks to social wisdom and positive constructiveness all around, [`forty_two`][Array#forty_two] is also available.
+A pending transfer, denoted by [`flags.pending`](../reference/transfer.md#flagspending),
+reserves its `amount` in the debit/credit accounts'
+[`debits_pending`](../reference/account.md#debits_pending)/[`credits_pending`](../reference/account.md#credits_pending)
+fields, respectively. Pending transfers leave the `debits_posted`/`credits_posted` unmodified.
 
-```ruby
-%w(a b c d).third # => "c"
-%w(a b c d).fifth # => nil
-```
+## Resolve Funds
 
-NOTE: Defined in `active_support/core_ext/array/access.rb`.
+Pending transfers can be posted, voided, or they may time out.
 
-[Array#excluding]: https://api.rubyonrails.org/classes/Array.html#method-i-excluding
-[Array#fifth]: https://api.rubyonrails.org/classes/Array.html#method-i-fifth
-[Array#forty_two]: https://api.rubyonrails.org/classes/Array.html#method-i-forty_two
-[Array#fourth]: https://api.rubyonrails.org/classes/Array.html#method-i-fourth
-[Array#from]: https://api.rubyonrails.org/classes/Array.html#method-i-from
-[Array#including]: https://api.rubyonrails.org/classes/Array.html#method-i-including
-[Array#second]: https://api.rubyonrails.org/classes/Array.html#method-i-second
-[Array#second_to_last]: https://api.rubyonrails.org/classes/Array.html#method-i-second_to_last
-[Array#third]: https://api.rubyonrails.org/classes/Array.html#method-i-third
-[Array#third_to_last]: https://api.rubyonrails.org/classes/Array.html#method-i-third_to_last
-[Array#to]: https://api.rubyonrails.org/classes/Array.html#method-i-to
+### Post-Pending Transfer
 
-### Extracting
+A post-pending transfer, denoted by
+[`flags.post_pending_transfer`](../reference/transfer.md#flagspost_pending_transfer), causes a
+pending transfer to "post", transferring some or all of the pending transfer's reserved amount to
+its destination.
 
-The method [`extract!`][Array#extract!] removes and returns the elements for which the block returns a true value.
-If no block is given, an Enumerator is returned instead.
+- If the posted [`amount`](../reference/transfer.md#amount) is less than the pending transfer's
+  amount, then only this amount is posted, and the remainder is restored to its original accounts.
+- If the posted [`amount`](../reference/transfer.md#amount) is equal to the pending transfer's
+  amount or equal to `AMOUNT_MAX` (`2^128 - 1`), the full pending transfer's amount is posted.
+- If the posted [`amount`](../reference/transfer.md#amount) is greater than the pending transfer's
+  amount (but less than `AMOUNT_MAX`),
+  [`exceeds_pending_transfer_amount`](../reference/requests/create_transfers.md#exceeds_pending_transfer_amount)
+  is returned.
 
-```ruby
-numbers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-odd_numbers = numbers.extract! { |number| number.odd? } # => [1, 3, 5, 7, 9]
-numbers # => [0, 2, 4, 6, 8]
-```
+<details>
+<summary>Client &lt; 0.16.0</summary>
 
-NOTE: Defined in `active_support/core_ext/array/extract.rb`.
+- If the posted [`amount`](../reference/transfer.md#amount) is 0, the full pending transfer's
+  amount is posted.
+- If the posted [`amount`](../reference/transfer.md#amount) is nonzero, then only this amount
+  is posted, and the remainder is restored to its original accounts. It must be less than or equal
+  to the pending transfer's amount.
 
-[Array#extract!]: https://api.rubyonrails.org/classes/Array.html#method-i-extract-21
+</details>
 
-### Options Extraction
+Additionally, when `flags.post_pending_transfer` is set:
 
-When the last argument in a method call is a hash, except perhaps for a `&block` argument, Ruby allows you to omit the brackets:
+- [`pending_id`](../reference/transfer.md#pending_id) must reference a
+  [pending transfer](#reserve-funds-pending-transfer).
+- [`flags.void_pending_transfer`](../reference/transfer.md#flagsvoid_pending_transfer) must not
+  be set.
 
-```ruby
-User.exists?(email: params[:email])
-```
+The following fields may either be zero or they must match the value of the pending transfer's
+field:
 
-That syntactic sugar is used a lot in Rails to avoid positional arguments where there would be too many, offering instead interfaces that emulate named parameters. In particular it is very idiomatic to use a trailing hash for options.
+- [`debit_account_id`](../reference/transfer.md#debit_account_id)
+- [`credit_account_id`](../reference/transfer.md#credit_account_id)
+- [`ledger`](../reference/transfer.md#ledger)
+- [`code`](../reference/transfer.md#code)
 
-If a method expects a variable number of arguments and uses `*` in its declaration, however, such an options hash ends up being an item of the array of arguments, where it loses its role.
+### Void-Pending Transfer
 
-In those cases, you may give an options hash a distinguished treatment with [`extract_options!`][Array#extract_options!]. This method checks the type of the last item of an array. If it is a hash it pops it and returns it, otherwise it returns an empty hash.
+A void-pending transfer, denoted by
+[`flags.void_pending_transfer`](../reference/transfer.md#flagsvoid_pending_transfer), restores
+the pending amount its original accounts. Additionally, when this field is set:
 
-Let's see for example the definition of the `caches_action` controller macro:
+- [`pending_id`](../reference/transfer.md#pending_id) must reference a
+  [pending transfer](#reserve-funds-pending-transfer).
+- [`flags.post_pending_transfer`](../reference/transfer.md#flagspost_pending_transfer) must not
+  be set.
 
-```ruby
-def caches_action(*actions)
-  return unless cache_configured?
-  options = actions.extract_options!
-  # ...
-end
-```
+The following fields may either be zero or they must match the value of the pending transfer's
+field:
 
-This method receives an arbitrary number of action names, and an optional hash of options as last argument. With the call to `extract_options!` you obtain the options hash and remove it from `actions` in a simple and explicit way.
+- [`debit_account_id`](../reference/transfer.md#debit_account_id)
+- [`credit_account_id`](../reference/transfer.md#credit_account_id)
+- [`ledger`](../reference/transfer.md#ledger)
+- [`code`](../reference/transfer.md#code)
 
-NOTE: Defined in `active_support/core_ext/array/extract_options.rb`.
+### Expire Pending Transfer
 
-[Array#extract_options!]: https://api.rubyonrails.org/classes/Array.html#method-i-extract_options-21
+A pending transfer may optionally be created with a
+[timeout](../reference/transfer.md#timeout). If the timeout interval passes before the transfer
+is either posted or voided, the transfer expires and the full amount is returned to the original
+account.
 
-### Conversions
+Note that `timeout`s are given as intervals, specified in seconds, rather than as absolute
+timestamps. For more details on why, read the page about [Time in TigerBeetle](./time.md).
 
-#### `to_sentence`
+### Errors
 
-The method [`to_sentence`][Array#to_sentence] turns an array into a string containing a sentence that enumerates its items:
+A pending transfer can only be posted or voided once. It cannot be posted twice or voided then
+posted, etc.
 
-```ruby
-%w().to_sentence                # => ""
-%w(Earth).to_sentence           # => "Earth"
-%w(Earth Wind).to_sentence      # => "Earth and Wind"
-%w(Earth Wind Fire).to_sentence # => "Earth, Wind, and Fire"
-```
+Attempting to resolve a pending transfer more than once will return the applicable error result:
 
-This method accepts three options:
+- [`pending_transfer_already_posted`](../reference/requests/create_transfers.md#pending_transfer_already_posted)
+- [`pending_transfer_already_voided`](../reference/requests/create_transfers.md#pending_transfer_already_voided)
+- [`pending_transfer_expired`](../reference/requests/create_transfers.md#pending_transfer_expired)
 
-* `:two_words_connector`: What is used for arrays of length 2. Default is " and ".
-* `:words_connector`: What is used to join the elements of arrays with 3 or more elements, except for the last two. Default is ", ".
-* `:last_word_connector`: What is used to join the last items of an array with 3 or more elements. Default is ", and ".
+## Interaction with Account Invariants
 
-The defaults for these options can be localized, their keys are:
+The pending transfer's amount is reserved in a way that the second step in a two-phase transfer will
+never cause the accounts' configured balance invariants
+([`credits_must_not_exceed_debits`](../reference/account.md#flagscredits_must_not_exceed_debits)
+or
+[`debits_must_not_exceed_credits`](../reference/account.md#flagsdebits_must_not_exceed_credits))
+to be broken, whether the second step is a post or void.
 
-| Option                 | I18n key                            |
-| ---------------------- | ----------------------------------- |
-| `:two_words_connector` | `support.array.two_words_connector` |
-| `:words_connector`     | `support.array.words_connector`     |
-| `:last_word_connector` | `support.array.last_word_connector` |
+### Pessimistic Pending Transfers
 
-NOTE: Defined in `active_support/core_ext/array/conversions.rb`.
+If an account with
+[`debits_must_not_exceed_credits`](../reference/account.md#flagsdebits_must_not_exceed_credits)
+has `credits_posted = 100` and `debits_posted = 70` and a pending transfer is started causing the
+account to have `debits_pending = 50`, the _pending_ transfer will fail. It will not wait to get to
+_posted_ status to fail.
 
-[Array#to_sentence]: https://api.rubyonrails.org/classes/Array.html#method-i-to_sentence
+## All Transfers Are Immutable
 
-#### `to_fs`
+To reiterate, completing a two-phase transfer (by either marking it void or posted) does not involve
+modifying the pending transfer. Instead you create a new transfer.
 
-The method [`to_fs`][Array#to_fs] acts like `to_s` by default.
+The first transfer that is marked pending will always have its pending flag set.
 
-If the array contains items that respond to `id`, however, the symbol
-`:db` may be passed as argument. That's typically used with
-collections of Active Record objects. Returned strings are:
+The second transfer will have a
+[`post_pending_transfer`](../reference/transfer.md#flagspost_pending_transfer) or
+[`void_pending_transfer`](../reference/transfer.md#flagsvoid_pending_transfer) flag set and a
+[`pending_id`](../reference/transfer.md#pending_id) field set to the
+[`id`](../reference/transfer.md#id) of the first transfer. The
+[`id`](../reference/transfer.md#id) of the second transfer will be unique, not the same
+[`id`](../reference/transfer.md#id) as the initial pending transfer.
 
-```ruby
-[].to_fs(:db)            # => "null"
-[user].to_fs(:db)        # => "8456"
-invoice.lines.to_fs(:db) # => "23,567,556,12"
-```
+## Examples
 
-Integers in the example above are supposed to come from the respective calls to `id`.
+The following examples show the state of two accounts in three steps:
 
-NOTE: Defined in `active_support/core_ext/array/conversions.rb`.
+1. Initially, before any transfers
+2. After a pending transfer
+3. And after the pending transfer is posted or voided
 
-[Array#to_fs]: https://api.rubyonrails.org/classes/Array.html#method-i-to_fs
+### Post Full Pending Amount
 
-#### `to_xml`
+| Account `A` |            | Account `B` |            | Transfers            |                       |            |                         |
+| ----------: | ---------: | ----------: | ---------: | :------------------- | :-------------------- | ---------: | :---------------------- |
+|  **debits** |            | **credits** |            |                      |                       |            |                         |
+| **pending** | **posted** | **pending** | **posted** | **debit_account_id** | **credit_account_id** | **amount** | **flags**               |
+|         `w` |        `x` |         `y` |        `z` | -                    | -                     |          - | -                       |
+|   123 + `w` |        `x` |   123 + `y` |        `z` | `A`                  | `B`                   |        123 | `pending`               |
+|         `w` |  123 + `x` |         `y` |  123 + `z` | `A`                  | `B`                   |        123 | `post_pending_transfer` |
 
-The method [`to_xml`][Array#to_xml] returns a string containing an XML representation of its receiver:
+### Post Partial Pending Amount
 
-```ruby
-Contributor.limit(2).order(:rank).to_xml
-# =>
-# <?xml version="1.0" encoding="UTF-8"?>
-# <contributors type="array">
-#   <contributor>
-#     <id type="integer">4356</id>
-#     <name>Jeremy Kemper</name>
-#     <rank type="integer">1</rank>
-#     <url-id>jeremy-kemper</url-id>
-#   </contributor>
-#   <contributor>
-#     <id type="integer">4404</id>
-#     <name>David Heinemeier Hansson</name>
-#     <rank type="integer">2</rank>
-#     <url-id>david-heinemeier-hansson</url-id>
-#   </contributor>
-# </contributors>
-```
+| Account `A` |            | Account `B` |            | Transfers            |                       |            |                         |
+| ----------: | ---------: | ----------: | ---------: | :------------------- | :-------------------- | ---------: | :---------------------- |
+|  **debits** |            | **credits** |            |                      |                       |            |                         |
+| **pending** | **posted** | **pending** | **posted** | **debit_account_id** | **credit_account_id** | **amount** | **flags**               |
+|         `w` |        `x` |         `y` |        `z` | -                    | -                     |          - | -                       |
+|   123 + `w` |        `x` |   123 + `y` |        `z` | `A`                  | `B`                   |        123 | `pending`               |
+|         `w` |  100 + `x` |         `y` |  100 + `z` | `A`                  | `B`                   |        100 | `post_pending_transfer` |
 
-To do so it sends `to_xml` to every item in turn, and collects the results under a root node. All items must respond to `to_xml`, an exception is raised otherwise.
+### Void Pending Transfer
 
-By default, the name of the root element is the underscored and dasherized plural of the name of the class of the first item, provided the rest of elements belong to that type (checked with `is_a?`) and they are not hashes. In the example above that's "contributors".
+| Account `A` |            | Account `B` |            | Transfers            |                       |            |                         |
+| ----------: | ---------: | ----------: | ---------: | :------------------- | :-------------------- | ---------: | :---------------------- |
+|  **debits** |            | **credits** |            |                      |                       |            |                         |
+| **pending** | **posted** | **pending** | **posted** | **debit_account_id** | **credit_account_id** | **amount** | **flags**               |
+|         `w` |        `x` |         `y` |        `z` | -                    | -                     |          - | -                       |
+|   123 + `w` |        `x` |   123 + `y` |        `z` | `A`                  | `B`                   |        123 | `pending`               |
+|         `w` |        `x` |         `y` |        `z` | `A`                  | `B`                   |        123 | `void_pending_transfer` |
 
-If there's any element that does not belong to the type of the first one the root node becomes "objects":
+## Client Documentation
 
-```ruby
-[Contributor.first, Commit.first].to_xml
-# =>
-# <?xml version="1.0" encoding="UTF-8"?>
-# <objects type="array">
-#   <object>
-#     <id type="integer">4583</id>
-#     <name>Aaron Batalion</name>
-#     <rank type="integer">53</rank>
-#     <url-id>aaron-batalion</url-id>
-#   </object>
-#   <object>
-#     <author>Joshua Peek</author>
-#     <authored-timestamp type="datetime">2009-09-02T16:44:36Z</authored-timestamp>
-#     <branch>origin/master</branch>
-#     <committed-timestamp type="datetime">2009-09-02T16:44:36Z</committed-timestamp>
-#     <committer>Joshua Peek</committer>
-#     <git-show nil="true"></git-show>
-#     <id type="integer">190316</id>
-#     <imported-from-svn type="boolean">false</imported-from-svn>
-#     <message>Kill AMo observing wrap_with_notifications since ARes was only using it</message>
-#     <sha1>723a47bfb3708f968821bc969a9a3fc873a3ed58</sha1>
-#   </object>
-# </objects>
-```
+Read more about how two-phase transfers work with each client.
+
+- [.NET](/src/clients/dotnet/README.md#two-phase-transfers)
+- [Go](/src/clients/go/README.md#two-phase-transfers)
+- [Java](/src/clients/java/README.md#two-phase-transfers)
+- [Node](/src/clients/node/README.md#two-phase-transfers)
+
+## Client Samples
+
+Or take a look at how it works with real code.
+
+- [.NET](/src/clients/dotnet/samples/two-phase/README.md)
+- [Go](/src/clients/go/samples/two-phase/README.md)
+- [Java](/src/clients/java/samples/two-phase/README.md)
+- [Node](/src/clients/node/samples/two-phase/README.md)

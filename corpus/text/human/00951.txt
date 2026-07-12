@@ -1,27 +1,173 @@
-# 13.0 Upgrade Guide
+Instead of using `after_commit` with the `on` option for a destroy like below:
 
-[Release notes](https://github.com/AutoMapper/AutoMapper/releases/tag/v13.0.0).
+```ruby
+class PictureFile < ApplicationRecord
+  after_commit :delete_picture_file_from_disk, on: :destroy
 
-## AutoMapper now targets .Net 6
+  def delete_picture_file_from_disk
+    if File.exist?(filepath)
+      File.delete(filepath)
+    end
+  end
+end
+```
 
-## `AddAutoMapper` is part of the core package and the DI package is discontinued
+You can instead use the `after_destroy_commit`.
 
-## `IMapper` has nullable annotations
+```ruby
+class PictureFile < ApplicationRecord
+  after_destroy_commit :delete_picture_file_from_disk
 
-Besides the build-time impact, there is also a behaviour change. Non-generic `Map` overloads require now either a destination type or a non-null destination object.
+  def delete_picture_file_from_disk
+    if File.exist?(filepath)
+      File.delete(filepath)
+    end
+  end
+end
+```
 
-## `AllowAdditiveTypeMapCreation` was removed
+The same applies for `after_create_commit` and `after_update_commit`.
 
-Be sure to call `CreateMap` once for a source type, destination type pair. If you want to reuse configuration, use mapping inheritance.
+However, if you use the `after_create_commit` and the `after_update_commit`
+callback with the same method name, it will only allow the last callback defined
+to take effect, as they both internally alias to `after_commit` which overrides
+previously defined callbacks with the same method name.
 
-## ProjectTo runtime polymorphic mapping with Include/IncludeBase
+```ruby
+class User < ApplicationRecord
+  after_create_commit :log_user_saved_to_db
+  after_update_commit :log_user_saved_to_db
 
-We consider this an off the beaten path feature and we don't expose it through `CreateProjection`. You can use [an extension method](https://github.com/AutoMapper/AutoMapper/search?l=C%23&q=Advanced) or `CreateMap`.
+  private
+    def log_user_saved_to_db
+      # This only gets called once
+      Rails.logger.info("User was saved to database")
+    end
+end
+```
 
-## `Context.State` similar to `Context.Items`
+```irb
+irb> user = User.create # prints nothing
 
-The same pattern the framework uses to pass state to delegates. Note that `State` and `Items` are mutually exclusive per `Map` call.
+irb> user.save # updating @user
+User was saved to database
+```
 
-## Custom Equals/GetHashCode for source objects
+In this case, it's better to use `after_save_commit` instead which is an alias
+for using the `after_commit` callback for both create and update:
 
-To avoid broken implementations, we no longer call those when checking for identical source objects, we hard code to checking object references.
+```ruby
+class User < ApplicationRecord
+  after_save_commit :log_user_saved_to_db
+
+  private
+    def log_user_saved_to_db
+      Rails.logger.info("User was saved to database")
+    end
+end
+```
+
+```irb
+irb> user = User.create # creating a User
+User was saved to database
+
+irb> user.save # updating user
+User was saved to database
+```
+
+### Transactional Callback Ordering
+
+By default (from Rails 7.1), transaction callbacks will run in the order they
+are defined.
+
+```ruby
+class User < ActiveRecord::Base
+  after_commit { Rails.logger.info("this gets called first") }
+  after_commit { Rails.logger.info("this gets called second") }
+end
+```
+
+However, in prior versions of Rails, when defining multiple transactional
+`after_` callbacks (`after_commit`, `after_rollback`, etc), the order in which
+the callbacks were run was reversed.
+
+If for some reason you'd still like them to run in reverse, you can set the
+following configuration to `false`. The callbacks will then run in the reverse
+order. See the [Active Record configuration
+options](configuring.html#config-active-record-run-after-transaction-callbacks-in-order-defined)
+for more details.
+
+```ruby
+config.active_record.run_after_transaction_callbacks_in_order_defined = false
+```
+
+NOTE: This applies to all `after_*_commit` variations too, such as
+`after_destroy_commit`.
+
+[`after_create_commit`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Transactions/ClassMethods.html#method-i-after_create_commit
+[`after_destroy_commit`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Transactions/ClassMethods.html#method-i-after_destroy_commit
+[`after_save_commit`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Transactions/ClassMethods.html#method-i-after_save_commit
+[`after_update_commit`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Transactions/ClassMethods.html#method-i-after_update_commit
+
+Callback Objects
+----------------
+
+Sometimes the callback methods that you'll write will be useful enough to be
+reused by other models. Active Record makes it possible to create classes that
+encapsulate the callback methods, so they can be reused.
+
+Here's an example of an `after_commit` callback  class to deal with the cleanup
+of discarded files on the filesystem. This behavior may not be unique to our
+`PictureFile` model and we may want to share it, so it's a good idea to
+encapsulate this into a separate class. This will make testing that behavior and
+changing it much easier.
+
+```ruby
+class FileDestroyerCallback
+  def after_commit(file)
+    if File.exist?(file.filepath)
+      File.delete(file.filepath)
+    end
+  end
+end
+```
+
+When declared inside a class, as above, the callback methods will receive the
+model object as a parameter. This will work on any model that uses the class
+like so:
+
+```ruby
+class PictureFile < ApplicationRecord
+  after_commit FileDestroyerCallback.new
+end
+```
+
+Note that we needed to instantiate a new `FileDestroyerCallback` object, since
+we declared our callback as an instance method. This is particularly useful if
+the callbacks make use of the state of the instantiated object. Often, however,
+it will make more sense to declare the callbacks as class methods:
+
+```ruby
+class FileDestroyerCallback
+  def self.after_commit(file)
+    if File.exist?(file.filepath)
+      File.delete(file.filepath)
+    end
+  end
+end
+```
+
+When the callback method is declared this way, it won't be necessary to
+instantiate a new `FileDestroyerCallback` object in our model.
+
+```ruby
+class PictureFile < ApplicationRecord
+  after_commit FileDestroyerCallback
+end
+```
+
+You can declare as many callbacks as you want inside your callback objects.
