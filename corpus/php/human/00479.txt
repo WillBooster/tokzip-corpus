@@ -10,277 +10,290 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\DependencyResolver;
+namespace Composer\Test\IO;
 
-use Composer\Package\AliasPackage;
-use Composer\Package\BasePackage;
-use Composer\Package\PackageInterface;
-use Composer\Semver\CompilingMatcher;
-use Composer\Semver\Constraint\Constraint;
+use Composer\IO\ConsoleIO;
+use Composer\Pcre\Preg;
+use Composer\Test\TestCase;
+use Symfony\Component\Console\Output\OutputInterface;
 
-/**
- * @author Nils Adermann <naderman@naderman.de>
- * @author Jordi Boggiano <j.boggiano@seld.be>
- */
-class DefaultPolicy implements PolicyInterface
+class ConsoleIOTest extends TestCase
 {
-    /** @var bool */
-    private $preferStable;
-    /** @var bool */
-    private $preferLowest;
-    /** @var array<string, string>|null */
-    private $preferredVersions;
-    /** @var array<int, array<string, array<int, int>>> */
-    private $preferredPackageResultCachePerPool;
-    /** @var array<int, array<string, int>> */
-    private $sortingCachePerPool;
-
-    /**
-     * @param array<string, string>|null $preferredVersions Must be an array of package name => normalized version
-     */
-    public function __construct(bool $preferStable = false, bool $preferLowest = false, ?array $preferredVersions = null)
+    public function testIsInteractive(): void
     {
-        $this->preferStable = $preferStable;
-        $this->preferLowest = $preferLowest;
-        $this->preferredVersions = $preferredVersions;
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $inputMock->expects($this->exactly(2))
+            ->method('isInteractive')
+            ->willReturnOnConsecutiveCalls(
+                true,
+                false
+            );
+
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
+
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $helperMock);
+
+        self::assertTrue($consoleIO->isInteractive());
+        self::assertFalse($consoleIO->isInteractive());
     }
 
-    /**
-     * @param string $operator One of Constraint::STR_OP_*
-     *
-     * @phpstan-param Constraint::STR_OP_* $operator
-     */
-    public function versionCompare(PackageInterface $a, PackageInterface $b, string $operator): bool
+    public function testWrite(): void
     {
-        if ($this->preferStable && ($stabA = $a->getStability()) !== ($stabB = $b->getStability())) {
-            return BasePackage::$stabilities[$stabA] < BasePackage::$stabilities[$stabB];
-        }
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $outputMock->expects($this->once())
+            ->method('getVerbosity')
+            ->willReturn(OutputInterface::VERBOSITY_NORMAL);
+        $outputMock->expects($this->once())
+            ->method('write')
+            ->with($this->equalTo('some information about something'), $this->equalTo(false));
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-        // dev versions need to be compared as branches via matchSpecific's special treatment, the rest can be optimized with compiling matcher
-        if (($a->isDev() && str_starts_with($a->getVersion(), 'dev-')) || ($b->isDev() && str_starts_with($b->getVersion(), 'dev-'))) {
-            $constraint = new Constraint($operator, $b->getVersion());
-            $version = new Constraint('==', $a->getVersion());
-
-            return $constraint->matchSpecific($version, true);
-        }
-
-        return CompilingMatcher::match(new Constraint($operator, $b->getVersion()), Constraint::OP_EQ, $a->getVersion());
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $helperMock);
+        $consoleIO->write('some information about something', false);
     }
 
-    /**
-     * @param  int[]  $literals
-     * @param  string $requiredPackage
-     * @return int[]
-     */
-    public function selectPreferredPackages(Pool $pool, array $literals, ?string $requiredPackage = null): array
+    public function testWriteError(): void
     {
-        sort($literals);
-        $resultCacheKey = implode(',', $literals).$requiredPackage;
-        $poolId = spl_object_id($pool);
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\ConsoleOutputInterface')->getMock();
+        $outputMock->expects($this->once())
+            ->method('getVerbosity')
+            ->willReturn(OutputInterface::VERBOSITY_NORMAL);
+        $outputMock->expects($this->once())
+            ->method('getErrorOutput')
+            ->willReturn($outputMock);
+        $outputMock->expects($this->once())
+            ->method('write')
+            ->with($this->equalTo('some information about something'), $this->equalTo(false));
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-        if (isset($this->preferredPackageResultCachePerPool[$poolId][$resultCacheKey])) {
-            return $this->preferredPackageResultCachePerPool[$poolId][$resultCacheKey];
-        }
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $helperMock);
+        $consoleIO->writeError('some information about something', false);
+    }
 
-        $packages = $this->groupLiteralsByName($pool, $literals);
+    public function testWriteWithMultipleLineStringWhenDebugging(): void
+    {
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $outputMock->expects($this->once())
+            ->method('getVerbosity')
+            ->willReturn(OutputInterface::VERBOSITY_NORMAL);
+        $outputMock->expects($this->once())
+            ->method('write')
+            ->with(
+                $this->callback(static function ($messages): bool {
+                    $result = Preg::isMatch("[(.*)/(.*) First line]", $messages[0]);
+                    $result = $result && Preg::isMatch("[(.*)/(.*) Second line]", $messages[1]);
 
-        foreach ($packages as &$nameLiterals) {
-            usort($nameLiterals, function ($a, $b) use ($pool, $requiredPackage, $poolId): int {
-                $cacheKey = 'i'.$a.'.'.$b.$requiredPackage; // i prefix -> ignoreReplace = true
+                    return $result;
+                }),
+                $this->equalTo(false)
+            );
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-                if (isset($this->sortingCachePerPool[$poolId][$cacheKey])) {
-                    return $this->sortingCachePerPool[$poolId][$cacheKey];
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $helperMock);
+        $startTime = microtime(true);
+        $consoleIO->enableDebugging($startTime);
+
+        $example = explode('\n', 'First line\nSecond lines');
+        $consoleIO->write($example, false);
+    }
+
+    public function testOverwrite(): void
+    {
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+
+        $outputMock->expects($this->any())
+            ->method('getVerbosity')
+            ->willReturn(OutputInterface::VERBOSITY_NORMAL);
+        $outputMock->expects($this->atLeast(7))
+            ->method('write')
+            ->willReturnCallback(function (...$args) {
+                static $series = null;
+
+                if ($series === null) {
+                    $series = [
+                        ['something (<question>strlen = 23</question>)', true],
+                        [str_repeat("\x08", 23), false],
+                        ['shorter (<comment>12</comment>)', false],
+                        [str_repeat(' ', 11), false],
+                        [str_repeat("\x08", 11), false],
+                        [str_repeat("\x08", 12), false],
+                        ['something longer than initial (<info>34</info>)', false],
+                    ];
                 }
 
-                return $this->sortingCachePerPool[$poolId][$cacheKey] = $this->compareByPriority($pool, $pool->literalToPackage($a), $pool->literalToPackage($b), $requiredPackage, true);
+                if (count($series) > 0) {
+                    self::assertSame(array_shift($series), [$args[0], $args[1]]);
+                }
             });
-        }
 
-        foreach ($packages as &$sortedLiterals) {
-            $sortedLiterals = $this->pruneToBestVersion($pool, $sortedLiterals);
-            $sortedLiterals = $this->pruneRemoteAliases($pool, $sortedLiterals);
-        }
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-        $selected = array_merge(...array_values($packages));
-
-        // now sort the result across all packages to respect replaces across packages
-        usort($selected, function ($a, $b) use ($pool, $requiredPackage, $poolId): int {
-            $cacheKey = $a.'.'.$b.$requiredPackage; // no i prefix -> ignoreReplace = false
-
-            if (isset($this->sortingCachePerPool[$poolId][$cacheKey])) {
-                return $this->sortingCachePerPool[$poolId][$cacheKey];
-            }
-
-            return $this->sortingCachePerPool[$poolId][$cacheKey] = $this->compareByPriority($pool, $pool->literalToPackage($a), $pool->literalToPackage($b), $requiredPackage);
-        });
-
-        return $this->preferredPackageResultCachePerPool[$poolId][$resultCacheKey] = $selected;
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $helperMock);
+        $consoleIO->write('something (<question>strlen = 23</question>)');
+        $consoleIO->overwrite('shorter (<comment>12</comment>)', false);
+        $consoleIO->overwrite('something longer than initial (<info>34</info>)');
     }
 
-    /**
-     * @param  int[] $literals
-     * @return array<string, int[]>
-     */
-    protected function groupLiteralsByName(Pool $pool, array $literals): array
+    public function testAsk(): void
     {
-        $packages = [];
-        foreach ($literals as $literal) {
-            $packageName = $pool->literalToPackage($literal)->getName();
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\QuestionHelper')->getMock();
+        $setMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-            if (!isset($packages[$packageName])) {
-                $packages[$packageName] = [];
-            }
-            $packages[$packageName][] = $literal;
-        }
+        $helperMock
+            ->expects($this->once())
+            ->method('ask')
+            ->with(
+                $this->isInstanceOf('Symfony\Component\Console\Input\InputInterface'),
+                $this->isInstanceOf('Symfony\Component\Console\Output\OutputInterface'),
+                $this->isInstanceOf('Symfony\Component\Console\Question\Question')
+            )
+        ;
 
-        return $packages;
+        $setMock
+            ->expects($this->once())
+            ->method('get')
+            ->with($this->equalTo('question'))
+            ->will($this->returnValue($helperMock))
+        ;
+
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $setMock);
+        $consoleIO->ask('Why?', 'default');
     }
 
-    /**
-     * @protected
-     */
-    public function compareByPriority(Pool $pool, BasePackage $a, BasePackage $b, ?string $requiredPackage = null, bool $ignoreReplace = false): int
+    public function testAskConfirmation(): void
     {
-        // prefer aliases to the original package
-        if ($a->getName() === $b->getName()) {
-            $aAliased = $a instanceof AliasPackage;
-            $bAliased = $b instanceof AliasPackage;
-            if ($aAliased && !$bAliased) {
-                return -1; // use a
-            }
-            if (!$aAliased && $bAliased) {
-                return 1; // use b
-            }
-        }
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\QuestionHelper')->getMock();
+        $setMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-        if (!$ignoreReplace) {
-            // return original, not replaced
-            if ($this->replaces($a, $b)) {
-                return 1; // use b
-            }
-            if ($this->replaces($b, $a)) {
-                return -1; // use a
-            }
+        $helperMock
+            ->expects($this->once())
+            ->method('ask')
+            ->with(
+                $this->isInstanceOf('Symfony\Component\Console\Input\InputInterface'),
+                $this->isInstanceOf('Symfony\Component\Console\Output\OutputInterface'),
+                $this->isInstanceOf('Composer\Question\StrictConfirmationQuestion')
+            )
+        ;
 
-            // for replacers not replacing each other, put a higher prio on replacing
-            // packages with the same vendor as the required package
-            if ($requiredPackage && false !== ($pos = strpos($requiredPackage, '/'))) {
-                $requiredVendor = substr($requiredPackage, 0, $pos);
+        $setMock
+            ->expects($this->once())
+            ->method('get')
+            ->with($this->equalTo('question'))
+            ->will($this->returnValue($helperMock))
+        ;
 
-                $aIsSameVendor = strpos($a->getName(), $requiredVendor) === 0;
-                $bIsSameVendor = strpos($b->getName(), $requiredVendor) === 0;
-
-                if ($bIsSameVendor !== $aIsSameVendor) {
-                    return $aIsSameVendor ? -1 : 1;
-                }
-            }
-        }
-
-        // priority equal, sort by package id to make reproducible
-        if ($a->id === $b->id) {
-            return 0;
-        }
-
-        return ($a->id < $b->id) ? -1 : 1;
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $setMock);
+        $consoleIO->askConfirmation('Why?', false);
     }
 
-    /**
-     * Checks if source replaces a package with the same name as target.
-     *
-     * Replace constraints are ignored. This method should only be used for
-     * prioritisation, not for actual constraint verification.
-     */
-    protected function replaces(BasePackage $source, BasePackage $target): bool
+    public function testAskAndValidate(): void
     {
-        foreach ($source->getReplaces() as $link) {
-            if ($link->getTarget() === $target->getName()
-//                && (null === $link->getConstraint() ||
-//                $link->getConstraint()->matches(new Constraint('==', $target->getVersion())))) {
-            ) {
-                return true;
-            }
-        }
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\QuestionHelper')->getMock();
+        $setMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-        return false;
+        $helperMock
+            ->expects($this->once())
+            ->method('ask')
+            ->with(
+                $this->isInstanceOf('Symfony\Component\Console\Input\InputInterface'),
+                $this->isInstanceOf('Symfony\Component\Console\Output\OutputInterface'),
+                $this->isInstanceOf('Symfony\Component\Console\Question\Question')
+            )
+        ;
+
+        $setMock
+            ->expects($this->once())
+            ->method('get')
+            ->with($this->equalTo('question'))
+            ->will($this->returnValue($helperMock))
+        ;
+
+        $validator = static function ($value): bool {
+            return true;
+        };
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $setMock);
+        $consoleIO->askAndValidate('Why?', $validator, 10, 'default');
     }
 
-    /**
-     * @param  int[] $literals
-     * @return int[]
-     */
-    protected function pruneToBestVersion(Pool $pool, array $literals): array
+    public function testSelect(): void
     {
-        if ($this->preferredVersions !== null) {
-            $name = $pool->literalToPackage($literals[0])->getName();
-            if (isset($this->preferredVersions[$name])) {
-                $preferredVersion = $this->preferredVersions[$name];
-                $bestLiterals = [];
-                foreach ($literals as $literal) {
-                    if ($pool->literalToPackage($literal)->getVersion() === $preferredVersion) {
-                        $bestLiterals[] = $literal;
-                    }
-                }
-                if (\count($bestLiterals) > 0) {
-                    return $bestLiterals;
-                }
-            }
-        }
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\QuestionHelper')->getMock();
+        $setMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-        $operator = $this->preferLowest ? '<' : '>';
-        $bestLiterals = [$literals[0]];
-        $bestPackage = $pool->literalToPackage($literals[0]);
-        foreach ($literals as $i => $literal) {
-            if (0 === $i) {
-                continue;
-            }
+        $helperMock
+            ->expects($this->once())
+            ->method('ask')
+            ->with(
+                $this->isInstanceOf('Symfony\Component\Console\Input\InputInterface'),
+                $this->isInstanceOf('Symfony\Component\Console\Output\OutputInterface'),
+                $this->isInstanceOf('Symfony\Component\Console\Question\Question')
+            )
+            ->will($this->returnValue(['item2']));
 
-            $package = $pool->literalToPackage($literal);
+        $setMock
+            ->expects($this->once())
+            ->method('get')
+            ->with($this->equalTo('question'))
+            ->will($this->returnValue($helperMock))
+        ;
 
-            if ($this->versionCompare($package, $bestPackage, $operator)) {
-                $bestPackage = $package;
-                $bestLiterals = [$literal];
-            } elseif ($this->versionCompare($package, $bestPackage, '==')) {
-                $bestLiterals[] = $literal;
-            }
-        }
-
-        return $bestLiterals;
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $setMock);
+        $result = $consoleIO->select('Select item', ["item1", "item2"], 'item1', false, "Error message", true);
+        self::assertEquals(['1'], $result);
     }
 
-    /**
-     * Assumes that locally aliased (in root package requires) packages take priority over branch-alias ones
-     *
-     * If no package is a local alias, nothing happens
-     *
-     * @param  int[] $literals
-     * @return int[]
-     */
-    protected function pruneRemoteAliases(Pool $pool, array $literals): array
+    public function testSetAndgetAuthentication(): void
     {
-        $hasLocalAlias = false;
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-        foreach ($literals as $literal) {
-            $package = $pool->literalToPackage($literal);
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $helperMock);
+        $consoleIO->setAuthentication('repoName', 'l3l0', 'passwd');
 
-            if ($package instanceof AliasPackage && $package->isRootPackageAlias()) {
-                $hasLocalAlias = true;
-                break;
-            }
-        }
+        self::assertEquals(
+            ['username' => 'l3l0', 'password' => 'passwd'],
+            $consoleIO->getAuthentication('repoName')
+        );
+    }
 
-        if (!$hasLocalAlias) {
-            return $literals;
-        }
+    public function testGetAuthenticationWhenDidNotSet(): void
+    {
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
 
-        $selected = [];
-        foreach ($literals as $literal) {
-            $package = $pool->literalToPackage($literal);
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $helperMock);
 
-            if ($package instanceof AliasPackage && $package->isRootPackageAlias()) {
-                $selected[] = $literal;
-            }
-        }
+        self::assertEquals(
+            ['username' => null, 'password' => null],
+            $consoleIO->getAuthentication('repoName')
+        );
+    }
 
-        return $selected;
+    public function testHasAuthentication(): void
+    {
+        $inputMock = $this->getMockBuilder('Symfony\Component\Console\Input\InputInterface')->getMock();
+        $outputMock = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')->getMock();
+        $helperMock = $this->getMockBuilder('Symfony\Component\Console\Helper\HelperSet')->getMock();
+
+        $consoleIO = new ConsoleIO($inputMock, $outputMock, $helperMock);
+        $consoleIO->setAuthentication('repoName', 'l3l0', 'passwd');
+
+        self::assertTrue($consoleIO->hasAuthentication('repoName'));
+        self::assertFalse($consoleIO->hasAuthentication('repoName2'));
     }
 }

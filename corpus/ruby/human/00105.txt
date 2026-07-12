@@ -1,150 +1,110 @@
 require_relative 'test_helper'
 
-class StreamingTest < Minitest::Test
-  Stream = Sinatra::Helpers::Stream
-
-  it 'returns the concatenated body' do
-    mock_app do
-      get('/') do
-        stream do |out|
-          out << "Hello" << " "
-          out << "World!"
-        end
+class MiddlewareTest < Minitest::Test
+  setup do
+    @app = mock_app(Sinatra::Application) do
+      get('/*')do
+        response.headers['X-Tests'] = env['test.ran'].
+          map { |n| n.split('::').last }.
+          join(', ')
+        env['PATH_INFO']
       end
     end
-
-    get('/')
-    assert_body "Hello World!"
   end
 
-  it 'always yields strings' do
-    stream = Stream.new { |out| out << :foo }
-    stream.each { |str| assert_equal 'foo', str }
-  end
-
-  it 'postpones body generation' do
-    step = 0
-
-    stream = Stream.new do |out|
-      10.times do
-        out << step
-        step += 1
-      end
-    end
-
-    stream.each do |s|
-      assert_equal s, step.to_s
-      step += 1
+  class MockMiddleware < Struct.new(:app)
+    def call(env)
+      (env['test.ran'] ||= []) << self.class.to_s
+      app.call(env)
     end
   end
 
-  it 'calls the callback after it is done' do
-    step   = 0
-    final  = 0
-    stream = Stream.new { |_| 10.times { step += 1 }}
-    stream.callback { final = step }
-    stream.each {|_|}
-    assert_equal 10, final
-  end
-
-  it 'does not trigger the callback if close is set to :keep_open' do
-    step   = 0
-    final  = 0
-    stream = Stream.new(Stream, :keep_open) { |_| 10.times { step += 1 } }
-    stream.callback { final = step }
-    stream.each {|_|}
-    assert_equal 0, final
-  end
-
-  it 'allows adding more than one callback' do
-    a = b = false
-    stream = Stream.new { }
-    stream.callback { a = true }
-    stream.callback { b = true }
-    stream.each {|_| }
-    assert a, 'should trigger first callback'
-    assert b, 'should trigger second callback'
-  end
-
-  class MockScheduler
-    def initialize(*)     @schedule, @defer = [], []                end
-    def schedule(&block)  @schedule << block                        end
-    def defer(&block)     @defer    << block                        end
-    def schedule!(*)      @schedule.pop.call until @schedule.empty? end
-    def defer!(*)         @defer.pop.call    until @defer.empty?    end
-  end
-
-  it 'allows dropping in another scheduler' do
-    scheduler  = MockScheduler.new
-    processing = sending = done = false
-
-    stream = Stream.new(scheduler) do |out|
-      processing = true
-      out << :foo
+  class UpcaseMiddleware < MockMiddleware
+    def call(env)
+      env['PATH_INFO'] = env['PATH_INFO'].upcase
+      super
     end
-
-    stream.each { sending = true}
-    stream.callback { done = true }
-
-    scheduler.schedule!
-    assert !processing
-    assert !sending
-    assert !done
-
-    scheduler.defer!
-    assert processing
-    assert !sending
-    assert !done
-
-    scheduler.schedule!
-    assert sending
-    assert done
   end
 
-  it 'schedules exceptions to be raised on the main thread/event loop/...' do
-    scheduler = MockScheduler.new
-    Stream.new(scheduler) { fail 'should be caught' }.each { }
-    scheduler.defer!
-    assert_raises(RuntimeError) { scheduler.schedule! }
+  it "is added with Sinatra::Application.use" do
+    @app.use UpcaseMiddleware
+    get '/hello-world'
+    assert ok?
+    assert_equal '/HELLO-WORLD', body
   end
 
-  it 'does not trigger an infinite loop if you call close in a callback' do
-    stream = Stream.new { |out| out.callback { out.close }}
-    stream.each { |_| }
-  end
-
-  it 'gives access to route specific params' do
-    mock_app do
-      get('/:name') do
-        stream { |o| o << params[:name] }
-      end
+  class DowncaseMiddleware < MockMiddleware
+    def call(env)
+      env['PATH_INFO'] = env['PATH_INFO'].downcase
+      super
     end
-    get '/foo'
-    assert_body 'foo'
   end
 
-  it 'sets up async.close if available' do
-    ran = false
-    mock_app do
-      get('/') do
-        close = Object.new
-        def close.callback; yield end
-        def close.errback; end
-        env['async.close'] = close
-        stream(:keep_open) do |out|
-          out.callback { ran = true }
-          out.close
-        end
-      end
+  it "runs in the order defined" do
+    @app.use UpcaseMiddleware
+    @app.use DowncaseMiddleware
+    get '/Foo'
+    assert_equal "/foo", body
+    assert_equal "UpcaseMiddleware, DowncaseMiddleware", response['X-Tests']
+  end
+
+  it "resets the prebuilt pipeline when new middleware is added" do
+    @app.use UpcaseMiddleware
+    get '/Foo'
+    assert_equal "/FOO", body
+    @app.use DowncaseMiddleware
+    get '/Foo'
+    assert_equal '/foo', body
+    assert_equal "UpcaseMiddleware, DowncaseMiddleware", response['X-Tests']
+  end
+
+  it "works when app is used as middleware" do
+    @app.use UpcaseMiddleware
+    @app = @app.new
+    get '/Foo'
+    assert_equal "/FOO", body
+    assert_equal "UpcaseMiddleware", response['X-Tests']
+  end
+
+  class FreezeMiddleware < MockMiddleware
+    def call(env)
+      req = Rack::Request.new(env)
+      req.update_param('bar', 'baz'.freeze)
+      super
     end
+  end
+
+  it "works when middleware adds a frozen param" do
+    @app.use FreezeMiddleware
+    get '/Foo'
+  end
+
+  class SpecialConstsMiddleware < MockMiddleware
+    def call(env)
+      req = Rack::Request.new(env)
+      req.update_param('s', :s)
+      req.update_param('i', 1)
+      req.update_param('c', 3.to_c)
+      req.update_param('t', true)
+      req.update_param('f', false)
+      req.update_param('n', nil)
+      super
+    end
+  end
+
+  it "handles params when the params contains true/false values" do
+    @app.use SpecialConstsMiddleware
     get '/'
-    assert ran
   end
 
-  it 'has a public interface to inspect its open/closed state' do
-    stream = Stream.new(Stream) { |out| out << :foo }
-    assert !stream.closed?
-    stream.close
-    assert stream.closed?
+  class KeywordArgumentIntializationMiddleware < MockMiddleware
+    def initialize(app, **)
+      super app
+    end
+  end
+
+  it "handles keyword arguments" do
+    @app.use KeywordArgumentIntializationMiddleware, argument: "argument"
+    get '/'
   end
 end

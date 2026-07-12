@@ -10,94 +10,302 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\EventDispatcher;
+namespace Composer\Test\Package\Archiver;
 
-/**
- * The base event class
- *
- * @author Nils Adermann <naderman@naderman.de>
- */
-class Event
+use Composer\Package\Archiver\ArchivableFilesFinder;
+use Composer\Pcre\Preg;
+use Composer\Test\TestCase;
+use Composer\Util\Filesystem;
+use Symfony\Component\Process\Process;
+
+class ArchivableFilesFinderTest extends TestCase
 {
     /**
-     * @var string This event's name
+     * @var string
      */
-    protected $name;
-
+    protected $sources;
     /**
-     * @var string[] Arguments passed by the user, these will be forwarded to CLI script handlers
+     * @var ArchivableFilesFinder
      */
-    protected $args;
-
+    protected $finder;
     /**
-     * @var mixed[] Flags usable in PHP script handlers
+     * @var Filesystem
      */
-    protected $flags;
+    protected $fs;
 
-    /**
-     * @var bool Whether the event should not be passed to more listeners
-     */
-    private $propagationStopped = false;
-
-    /**
-     * Constructor.
-     *
-     * @param string   $name  The event name
-     * @param string[] $args  Arguments passed by the user
-     * @param mixed[]  $flags Optional flags to pass data not as argument
-     */
-    public function __construct(string $name, array $args = [], array $flags = [])
+    protected function setUp(): void
     {
-        $this->name = $name;
-        $this->args = $args;
-        $this->flags = $flags;
+        $fs = new Filesystem;
+        $this->fs = $fs;
+
+        $this->sources = $fs->normalizePath(
+            self::getUniqueTmpDirectory()
+        );
+
+        $fileTree = [
+            '.foo',
+            'A/prefixA.foo',
+            'A/prefixB.foo',
+            'A/prefixC.foo',
+            'A/prefixD.foo',
+            'A/prefixE.foo',
+            'A/prefixF.foo',
+            'B/sub/prefixA.foo',
+            'B/sub/prefixB.foo',
+            'B/sub/prefixC.foo',
+            'B/sub/prefixD.foo',
+            'B/sub/prefixE.foo',
+            'B/sub/prefixF.foo',
+            'C/prefixA.foo',
+            'C/prefixB.foo',
+            'C/prefixC.foo',
+            'C/prefixD.foo',
+            'C/prefixE.foo',
+            'C/prefixF.foo',
+            'D/prefixA',
+            'D/prefixB',
+            'D/prefixC',
+            'D/prefixD',
+            'D/prefixE',
+            'D/prefixF',
+            'E/subtestA.foo',
+            'F/subtestA.foo',
+            'G/subtestA.foo',
+            'H/subtestA.foo',
+            'I/J/subtestA.foo',
+            'K/dirJ/subtestA.foo',
+            'toplevelA.foo',
+            'toplevelB.foo',
+            'prefixA.foo',
+            'prefixB.foo',
+            'prefixC.foo',
+            'prefixD.foo',
+            'prefixE.foo',
+            'prefixF.foo',
+            'parameters.yml',
+            'parameters.yml.dist',
+            '!important!.txt',
+            '!important_too!.txt',
+            '#weirdfile',
+        ];
+
+        foreach ($fileTree as $relativePath) {
+            $path = $this->sources.'/'.$relativePath;
+            $fs->ensureDirectoryExists(dirname($path));
+            file_put_contents($path, '');
+        }
+    }
+
+    protected function tearDown(): void
+    {
+        parent::tearDown();
+        $fs = new Filesystem;
+        $fs->removeDirectory($this->sources);
+    }
+
+    public function testManualExcludes(): void
+    {
+        $excludes = [
+            'prefixB.foo',
+            '!/prefixB.foo',
+            '/prefixA.foo',
+            'prefixC.*',
+            '!*/*/*/prefixC.foo',
+            '.*',
+        ];
+
+        $this->finder = new ArchivableFilesFinder($this->sources, $excludes);
+
+        self::assertArchivableFiles([
+            '/!important!.txt',
+            '/!important_too!.txt',
+            '/#weirdfile',
+            '/A/prefixA.foo',
+            '/A/prefixD.foo',
+            '/A/prefixE.foo',
+            '/A/prefixF.foo',
+            '/B/sub/prefixA.foo',
+            '/B/sub/prefixC.foo',
+            '/B/sub/prefixD.foo',
+            '/B/sub/prefixE.foo',
+            '/B/sub/prefixF.foo',
+            '/C/prefixA.foo',
+            '/C/prefixD.foo',
+            '/C/prefixE.foo',
+            '/C/prefixF.foo',
+            '/D/prefixA',
+            '/D/prefixB',
+            '/D/prefixC',
+            '/D/prefixD',
+            '/D/prefixE',
+            '/D/prefixF',
+            '/E/subtestA.foo',
+            '/F/subtestA.foo',
+            '/G/subtestA.foo',
+            '/H/subtestA.foo',
+            '/I/J/subtestA.foo',
+            '/K/dirJ/subtestA.foo',
+            '/parameters.yml',
+            '/parameters.yml.dist',
+            '/prefixB.foo',
+            '/prefixD.foo',
+            '/prefixE.foo',
+            '/prefixF.foo',
+            '/toplevelA.foo',
+            '/toplevelB.foo',
+        ]);
+    }
+
+    public function testGitExcludes(): void
+    {
+        $this->skipIfNotExecutable('git');
+
+        file_put_contents($this->sources.'/.gitattributes', implode("\n", [
+            '',
+            '# gitattributes rules with comments and blank lines',
+            'prefixB.foo export-ignore',
+            '/prefixA.foo export-ignore',
+            'prefixC.* export-ignore',
+            '',
+            'prefixE.foo export-ignore',
+            '# and more',
+            '# comments',
+            '',
+            '/prefixE.foo -export-ignore',
+            '/prefixD.foo export-ignore',
+            'prefixF.* export-ignore',
+            '/*/*/prefixF.foo -export-ignore',
+            '',
+            'refixD.foo export-ignore',
+            '/C export-ignore',
+            'D/prefixA export-ignore',
+            'E export-ignore',
+            'F/ export-ignore',
+            'G/* export-ignore',
+            'H/** export-ignore',
+            'J/ export-ignore',
+            'parameters.yml export-ignore',
+            '\!important!.txt export-ignore',
+            '\#* export-ignore',
+        ]));
+
+        $this->finder = new ArchivableFilesFinder($this->sources, []);
+
+        self::assertArchivableFiles($this->getArchivedFiles(
+            'git init && '.
+            'git config user.email "you@example.com" && '.
+            'git config user.name "Your Name" && '.
+            'git config commit.gpgsign false && '.
+            'git add .git* && '.
+            'git commit -m "ignore rules" && '.
+            'git add . && '.
+            'git commit -m "init" && '.
+            'git archive --format=zip --prefix=archive/ -o archive.zip HEAD'
+        ));
+    }
+
+    public function testSkipExcludes(): void
+    {
+        $excludes = [
+            'prefixB.foo',
+        ];
+
+        $this->finder = new ArchivableFilesFinder($this->sources, $excludes, true);
+
+        self::assertArchivableFiles([
+            '/!important!.txt',
+            '/!important_too!.txt',
+            '/#weirdfile',
+            '/.foo',
+            '/A/prefixA.foo',
+            '/A/prefixB.foo',
+            '/A/prefixC.foo',
+            '/A/prefixD.foo',
+            '/A/prefixE.foo',
+            '/A/prefixF.foo',
+            '/B/sub/prefixA.foo',
+            '/B/sub/prefixB.foo',
+            '/B/sub/prefixC.foo',
+            '/B/sub/prefixD.foo',
+            '/B/sub/prefixE.foo',
+            '/B/sub/prefixF.foo',
+            '/C/prefixA.foo',
+            '/C/prefixB.foo',
+            '/C/prefixC.foo',
+            '/C/prefixD.foo',
+            '/C/prefixE.foo',
+            '/C/prefixF.foo',
+            '/D/prefixA',
+            '/D/prefixB',
+            '/D/prefixC',
+            '/D/prefixD',
+            '/D/prefixE',
+            '/D/prefixF',
+            '/E/subtestA.foo',
+            '/F/subtestA.foo',
+            '/G/subtestA.foo',
+            '/H/subtestA.foo',
+            '/I/J/subtestA.foo',
+            '/K/dirJ/subtestA.foo',
+            '/parameters.yml',
+            '/parameters.yml.dist',
+            '/prefixA.foo',
+            '/prefixB.foo',
+            '/prefixC.foo',
+            '/prefixD.foo',
+            '/prefixE.foo',
+            '/prefixF.foo',
+            '/toplevelA.foo',
+            '/toplevelB.foo',
+        ]);
     }
 
     /**
-     * Returns the event's name.
-     *
-     * @return string The event name
+     * @return string[]
      */
-    public function getName(): string
+    protected function getArchivableFiles(): array
     {
-        return $this->name;
+        $files = [];
+        foreach ($this->finder as $file) {
+            if (!$file->isDir()) {
+                $files[] = Preg::replace('#^'.preg_quote($this->sources, '#').'#', '', $this->fs->normalizePath($file->getRealPath()));
+            }
+        }
+
+        sort($files);
+
+        return $files;
     }
 
     /**
-     * Returns the event's arguments.
-     *
-     * @return string[] The event arguments
+     * @return string[]
      */
-    public function getArguments(): array
+    protected function getArchivedFiles(string $command): array
     {
-        return $this->args;
+        $process = Process::fromShellCommandline($command, $this->sources);
+        $process->run();
+
+        $archive = new \PharData($this->sources.'/archive.zip');
+        $iterator = new \RecursiveIteratorIterator($archive);
+
+        $files = [];
+        foreach ($iterator as $file) {
+            $files[] = Preg::replace('#^phar://'.preg_quote($this->sources, '#').'/archive\.zip/archive#', '', $this->fs->normalizePath((string) $file));
+        }
+
+        unset($archive, $iterator, $file);
+        unlink($this->sources.'/archive.zip');
+
+        return $files;
     }
 
     /**
-     * Returns the event's flags.
-     *
-     * @return mixed[] The event flags
+     * @param string[] $expectedFiles
      */
-    public function getFlags(): array
+    protected function assertArchivableFiles(array $expectedFiles): void
     {
-        return $this->flags;
-    }
+        $actualFiles = $this->getArchivableFiles();
 
-    /**
-     * Checks if stopPropagation has been called
-     *
-     * @return bool Whether propagation has been stopped
-     */
-    public function isPropagationStopped(): bool
-    {
-        return $this->propagationStopped;
-    }
-
-    /**
-     * Prevents the event from being passed to further listeners
-     */
-    public function stopPropagation(): void
-    {
-        $this->propagationStopped = true;
+        self::assertEquals($expectedFiles, $actualFiles);
     }
 }

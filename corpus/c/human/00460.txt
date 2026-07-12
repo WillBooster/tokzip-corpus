@@ -1,5 +1,3 @@
-#ifndef HEADER_CURL_DYNBUF_H
-#define HEADER_CURL_DYNBUF_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -23,71 +21,112 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+#include "test.h"
 
-#include <curl/curl.h>
+#include "memdebug.h"
 
-#ifndef BUILDING_LIBCURL
-/* this renames the functions so that the tool code can use the same code
-   without getting symbol collisions */
-#define Curl_dyn_init(a,b) curlx_dyn_init(a,b)
-#define Curl_dyn_add(a,b) curlx_dyn_add(a,b)
-#define Curl_dyn_addn(a,b,c) curlx_dyn_addn(a,b,c)
-#define Curl_dyn_addf curlx_dyn_addf
-#define Curl_dyn_vaddf curlx_dyn_vaddf
-#define Curl_dyn_free(a) curlx_dyn_free(a)
-#define Curl_dyn_ptr(a) curlx_dyn_ptr(a)
-#define Curl_dyn_uptr(a) curlx_dyn_uptr(a)
-#define Curl_dyn_len(a) curlx_dyn_len(a)
-#define Curl_dyn_reset(a) curlx_dyn_reset(a)
-#define Curl_dyn_tail(a,b) curlx_dyn_tail(a,b)
-#define Curl_dyn_setlen(a,b) curlx_dyn_setlen(a,b)
-#define curlx_dynbuf dynbuf /* for the struct name */
-#endif
-
-struct dynbuf {
-  char *bufr;    /* point to a null-terminated allocated buffer */
-  size_t leng;   /* number of bytes *EXCLUDING* the null-terminator */
-  size_t allc;   /* size of the current allocation */
-  size_t toobig; /* size limit for the buffer */
-#ifdef DEBUGBUILD
-  int init;     /* detect API usage mistakes */
-#endif
+static const char *post[]={
+  "one",
+  "two",
+  "three",
+  "and a final longer crap: four",
+  NULL
 };
 
-void Curl_dyn_init(struct dynbuf *s, size_t toobig);
-void Curl_dyn_free(struct dynbuf *s);
-CURLcode Curl_dyn_addn(struct dynbuf *s, const void *mem, size_t len)
-  WARN_UNUSED_RESULT;
-CURLcode Curl_dyn_add(struct dynbuf *s, const char *str)
-  WARN_UNUSED_RESULT;
-CURLcode Curl_dyn_addf(struct dynbuf *s, const char *fmt, ...)
-  WARN_UNUSED_RESULT CURL_PRINTF(2, 3);
-CURLcode Curl_dyn_vaddf(struct dynbuf *s, const char *fmt, va_list ap)
-  WARN_UNUSED_RESULT CURL_PRINTF(2, 0);
-void Curl_dyn_reset(struct dynbuf *s);
-CURLcode Curl_dyn_tail(struct dynbuf *s, size_t trail);
-CURLcode Curl_dyn_setlen(struct dynbuf *s, size_t set);
-char *Curl_dyn_ptr(const struct dynbuf *s);
-unsigned char *Curl_dyn_uptr(const struct dynbuf *s);
-size_t Curl_dyn_len(const struct dynbuf *s);
 
-/* returns 0 on success, -1 on error */
-/* The implementation of this function exists in mprintf.c */
-int Curl_dyn_vprintf(struct dynbuf *dyn, const char *format, va_list ap_save);
+struct WriteThis {
+  int counter;
+};
 
-/* Dynamic buffer max sizes */
-#define DYN_DOH_RESPONSE    3000
-#define DYN_DOH_CNAME       256
-#define DYN_PAUSE_BUFFER    (64 * 1024 * 1024)
-#define DYN_HAXPROXY        2048
-#define DYN_HTTP_REQUEST    (1024*1024)
-#define DYN_APRINTF         8000000
-#define DYN_RTSP_REQ_HEADER (64*1024)
-#define DYN_TRAILERS        (64*1024)
-#define DYN_PROXY_CONNECT_HEADERS 16384
-#define DYN_QLOG_NAME       1024
-#define DYN_H1_TRAILER      4096
-#define DYN_PINGPPONG_CMD   (64*1024)
-#define DYN_IMAP_CMD        (64*1024)
-#define DYN_MQTT_RECV       (64*1024)
+static size_t read_callback(char *ptr, size_t size, size_t nmemb, void *userp)
+{
+  struct WriteThis *pooh = (struct WriteThis *)userp;
+  const char *data;
+
+  if(size*nmemb < 1)
+    return 0;
+
+  data = post[pooh->counter];
+
+  if(data) {
+    size_t len = strlen(data);
+    if(size*nmemb < len) {
+      fprintf(stderr, "read buffer is too small to run test\n");
+      return 0;
+    }
+    memcpy(ptr, data, len);
+    pooh->counter++; /* advance pointer */
+    return len;
+  }
+  return 0;                         /* no more data left to deliver */
+}
+
+CURLcode test(char *URL)
+{
+  CURL *curl;
+  CURLcode res = CURLE_OK;
+  struct curl_slist *slist = NULL;
+  struct WriteThis pooh;
+  pooh.counter = 0;
+
+  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+    fprintf(stderr, "curl_global_init() failed\n");
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  curl = curl_easy_init();
+  if(!curl) {
+    fprintf(stderr, "curl_easy_init() failed\n");
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  slist = curl_slist_append(slist, "Transfer-Encoding: chunked");
+  if(!slist) {
+    fprintf(stderr, "curl_slist_append() failed\n");
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  /* First set the URL that is about to receive our POST. */
+  test_setopt(curl, CURLOPT_URL, URL);
+
+  /* Now specify we want to POST data */
+  test_setopt(curl, CURLOPT_POST, 1L);
+
+  /* we want to use our own read function */
+  test_setopt(curl, CURLOPT_READFUNCTION, read_callback);
+
+  /* pointer to pass to our read function */
+  test_setopt(curl, CURLOPT_READDATA, &pooh);
+
+  /* get verbose debug output please */
+  test_setopt(curl, CURLOPT_VERBOSE, 1L);
+
+  /* include headers in the output */
+  test_setopt(curl, CURLOPT_HEADER, 1L);
+
+  /* enforce chunked transfer by setting the header */
+  test_setopt(curl, CURLOPT_HTTPHEADER, slist);
+
+#ifdef LIB565
+  test_setopt(curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_DIGEST);
+  test_setopt(curl, CURLOPT_USERPWD, "foo:bar");
 #endif
+
+  /* Perform the request, res will get the return code */
+  res = curl_easy_perform(curl);
+
+test_cleanup:
+
+  /* clean up the headers list */
+  if(slist)
+    curl_slist_free_all(slist);
+
+  /* always cleanup */
+  curl_easy_cleanup(curl);
+  curl_global_cleanup();
+
+  return res;
+}

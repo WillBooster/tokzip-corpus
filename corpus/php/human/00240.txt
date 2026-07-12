@@ -10,114 +10,261 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Util;
+namespace Composer\Test\Package;
 
-use React\Promise\CancellablePromiseInterface;
-use Symfony\Component\Console\Helper\ProgressBar;
-use React\Promise\PromiseInterface;
+use Composer\Json\JsonFile;
+use Composer\Package\Locker;
+use Composer\Plugin\PluginInterface;
+use Composer\IO\NullIO;
+use Composer\Test\TestCase;
 
-/**
- * @author Jordi Boggiano <j.boggiano@seld.be>
- */
-class Loop
+class LockerTest extends TestCase
 {
-    /** @var HttpDownloader */
-    private $httpDownloader;
-    /** @var ProcessExecutor|null */
-    private $processExecutor;
-    /** @var array<int, array<PromiseInterface<mixed>>> */
-    private $currentPromises = [];
-    /** @var int */
-    private $waitIndex = 0;
-
-    public function __construct(HttpDownloader $httpDownloader, ?ProcessExecutor $processExecutor = null)
+    public function testIsLocked(): void
     {
-        $this->httpDownloader = $httpDownloader;
-        $this->httpDownloader->enableAsync();
+        $json = $this->createJsonFileMock();
+        $locker = new Locker(
+            new NullIO,
+            $json,
+            $this->createInstallationManagerMock(),
+            $this->getJsonContent()
+        );
 
-        $this->processExecutor = $processExecutor;
-        if ($this->processExecutor) {
-            $this->processExecutor->enableAsync();
-        }
+        $json
+            ->expects($this->any())
+            ->method('exists')
+            ->will($this->returnValue(true));
+        $json
+            ->expects($this->any())
+            ->method('read')
+            ->will($this->returnValue(['packages' => []]));
+
+        self::assertTrue($locker->isLocked());
     }
 
-    public function getHttpDownloader(): HttpDownloader
+    public function testGetNotLockedPackages(): void
     {
-        return $this->httpDownloader;
+        $json = $this->createJsonFileMock();
+        $inst = $this->createInstallationManagerMock();
+
+        $locker = new Locker(new NullIO, $json, $inst, $this->getJsonContent());
+
+        $json
+            ->expects($this->once())
+            ->method('exists')
+            ->will($this->returnValue(false));
+
+        self::expectException('LogicException');
+
+        $locker->getLockedRepository();
     }
 
-    public function getProcessExecutor(): ?ProcessExecutor
+    public function testGetLockedPackages(): void
     {
-        return $this->processExecutor;
+        $json = $this->createJsonFileMock();
+        $inst = $this->createInstallationManagerMock();
+
+        $locker = new Locker(new NullIO, $json, $inst, $this->getJsonContent());
+
+        $json
+            ->expects($this->once())
+            ->method('exists')
+            ->will($this->returnValue(true));
+        $json
+            ->expects($this->once())
+            ->method('read')
+            ->will($this->returnValue([
+                'packages' => [
+                    ['name' => 'pkg1', 'version' => '1.0.0-beta'],
+                    ['name' => 'pkg2', 'version' => '0.1.10'],
+                ],
+            ]));
+
+        $repo = $locker->getLockedRepository();
+        self::assertNotNull($repo->findPackage('pkg1', '1.0.0-beta'));
+        self::assertNotNull($repo->findPackage('pkg2', '0.1.10'));
+    }
+
+    public function testSetLockData(): void
+    {
+        $json = $this->createJsonFileMock();
+        $inst = $this->createInstallationManagerMock();
+
+        $jsonContent = $this->getJsonContent() . '  ';
+        $locker = new Locker(new NullIO, $json, $inst, $jsonContent);
+
+        $package1 = self::getPackage('pkg1', '1.0.0-beta');
+        $package2 = self::getPackage('pkg2', '0.1.10');
+
+        $contentHash = md5(trim($jsonContent));
+
+        $json
+            ->expects($this->once())
+            ->method('write')
+            ->with([
+                '_readme' => ['This file locks the dependencies of your project to a known state',
+                                   'Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies',
+                                   'This file is @gener'.'ated automatically', ],
+                'content-hash' => $contentHash,
+                'packages' => [
+                    ['name' => 'pkg1', 'version' => '1.0.0-beta', 'type' => 'library'],
+                    ['name' => 'pkg2', 'version' => '0.1.10', 'type' => 'library'],
+                ],
+                'packages-dev' => [],
+                'aliases' => [],
+                'minimum-stability' => 'dev',
+                'stability-flags' => [],
+                'platform' => [],
+                'platform-dev' => [],
+                'platform-overrides' => ['foo/bar' => '1.0'],
+                'prefer-stable' => false,
+                'prefer-lowest' => false,
+                'plugin-api-version' => PluginInterface::PLUGIN_API_VERSION,
+            ]);
+
+        $locker->setLockData([$package1, $package2], [], [], [], [], 'dev', [], false, false, ['foo/bar' => '1.0']);
+    }
+
+    public function testLockBadPackages(): void
+    {
+        $json = $this->createJsonFileMock();
+        $inst = $this->createInstallationManagerMock();
+
+        $locker = new Locker(new NullIO, $json, $inst, $this->getJsonContent());
+
+        $package1 = $this->createPackageMock();
+        $package1
+            ->expects($this->once())
+            ->method('getPrettyName')
+            ->will($this->returnValue('pkg1'));
+
+        self::expectException('LogicException');
+
+        $locker->setLockData([$package1], [], [], [], [], 'dev', [], false, false, []);
+    }
+
+    public function testIsFresh(): void
+    {
+        $json = $this->createJsonFileMock();
+        $inst = $this->createInstallationManagerMock();
+
+        $jsonContent = $this->getJsonContent();
+        $locker = new Locker(new NullIO, $json, $inst, $jsonContent);
+
+        $json
+            ->expects($this->once())
+            ->method('read')
+            ->will($this->returnValue(['hash' => md5($jsonContent)]));
+
+        self::assertTrue($locker->isFresh());
+    }
+
+    public function testIsFreshFalse(): void
+    {
+        $json = $this->createJsonFileMock();
+        $inst = $this->createInstallationManagerMock();
+
+        $locker = new Locker(new NullIO, $json, $inst, $this->getJsonContent());
+
+        $json
+            ->expects($this->once())
+            ->method('read')
+            ->will($this->returnValue(['hash' => $this->getJsonContent(['name' => 'test2'])]));
+
+        self::assertFalse($locker->isFresh());
+    }
+
+    public function testIsFreshWithContentHash(): void
+    {
+        $json = $this->createJsonFileMock();
+        $inst = $this->createInstallationManagerMock();
+
+        $jsonContent = $this->getJsonContent();
+        $locker = new Locker(new NullIO, $json, $inst, $jsonContent);
+
+        $json
+            ->expects($this->once())
+            ->method('read')
+            ->will($this->returnValue(['hash' => md5($jsonContent . '  '), 'content-hash' => md5($jsonContent)]));
+
+        self::assertTrue($locker->isFresh());
+    }
+
+    public function testIsFreshWithContentHashAndNoHash(): void
+    {
+        $json = $this->createJsonFileMock();
+        $inst = $this->createInstallationManagerMock();
+
+        $jsonContent = $this->getJsonContent();
+        $locker = new Locker(new NullIO, $json, $inst, $jsonContent);
+
+        $json
+            ->expects($this->once())
+            ->method('read')
+            ->will($this->returnValue(['content-hash' => md5($jsonContent)]));
+
+        self::assertTrue($locker->isFresh());
+    }
+
+    public function testIsFreshFalseWithContentHash(): void
+    {
+        $json = $this->createJsonFileMock();
+        $inst = $this->createInstallationManagerMock();
+
+        $locker = new Locker(new NullIO, $json, $inst, $this->getJsonContent());
+
+        $differentHash = md5($this->getJsonContent(['name' => 'test2']));
+
+        $json
+            ->expects($this->once())
+            ->method('read')
+            ->will($this->returnValue(['hash' => $differentHash, 'content-hash' => $differentHash]));
+
+        self::assertFalse($locker->isFresh());
     }
 
     /**
-     * @param array<PromiseInterface<mixed>> $promises
-     * @param ProgressBar|null              $progress
+     * @return \PHPUnit\Framework\MockObject\MockObject&\Composer\Json\JsonFile
      */
-    public function wait(array $promises, ?ProgressBar $progress = null): void
+    private function createJsonFileMock()
     {
-        $uncaught = null;
-
-        \React\Promise\all($promises)->then(
-            static function (): void {
-            },
-            static function (\Throwable $e) use (&$uncaught): void {
-                $uncaught = $e;
-            }
-        );
-
-        // keep track of every group of promises that is waited on, so abortJobs can
-        // cancel them all, even if wait() was called within a wait()
-        $waitIndex = $this->waitIndex++;
-        $this->currentPromises[$waitIndex] = $promises;
-
-        if ($progress) {
-            $totalJobs = 0;
-            $totalJobs += $this->httpDownloader->countActiveJobs();
-            if ($this->processExecutor) {
-                $totalJobs += $this->processExecutor->countActiveJobs();
-            }
-            $progress->start($totalJobs);
-        }
-
-        $lastUpdate = 0;
-        while (true) {
-            $activeJobs = 0;
-
-            $activeJobs += $this->httpDownloader->countActiveJobs();
-            if ($this->processExecutor) {
-                $activeJobs += $this->processExecutor->countActiveJobs();
-            }
-
-            if ($progress && microtime(true) - $lastUpdate > 0.1) {
-                $lastUpdate = microtime(true);
-                $progress->setProgress($progress->getMaxSteps() - $activeJobs);
-            }
-
-            if (!$activeJobs) {
-                break;
-            }
-        }
-
-        // as we skip progress updates if they are too quick, make sure we do one last one here at 100%
-        if ($progress) {
-            $progress->finish();
-        }
-
-        unset($this->currentPromises[$waitIndex]);
-        if (null !== $uncaught) {
-            throw $uncaught;
-        }
+        return $this->getMockBuilder('Composer\Json\JsonFile')
+            ->disableOriginalConstructor()
+            ->getMock();
     }
 
-    public function abortJobs(): void
+    /**
+     * @return \PHPUnit\Framework\MockObject\MockObject&\Composer\Installer\InstallationManager
+     */
+    private function createInstallationManagerMock()
     {
-        foreach ($this->currentPromises as $promiseGroup) {
-            foreach ($promiseGroup as $promise) {
-                // to support react/promise 2.x we wrap the promise in a resolve() call for safety
-                \React\Promise\resolve($promise)->cancel();
-            }
-        }
+        $mock = $this->getMockBuilder('Composer\Installer\InstallationManager')
+            ->disableOriginalConstructor()
+            ->getMock();
+
+        return $mock;
+    }
+
+    /**
+     * @return \PHPUnit\Framework\MockObject\MockObject&\Composer\Package\PackageInterface
+     */
+    private function createPackageMock()
+    {
+        return $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
+    }
+
+    /**
+     * @param array<string, string> $customData
+     */
+    private function getJsonContent(array $customData = []): string
+    {
+        $data = array_merge([
+            'minimum-stability' => 'beta',
+            'name' => 'test',
+        ], $customData);
+
+        ksort($data);
+
+        return JsonFile::encode($data, 0);
     }
 }

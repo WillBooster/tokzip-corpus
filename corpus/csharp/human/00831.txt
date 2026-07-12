@@ -1,82 +1,94 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using NUnit.Framework.Interfaces;
-using NUnit.Framework.Internal;
 
-namespace NUnit.Framework.Tests.Internal.Results
+namespace NUnit.Framework.Tests.Attributes
 {
-    public class TestResultMixedResultTests : TestResultTests
+    public sealed class TestAction
     {
-        [SetUp]
-        public void SimulateTestRun()
+        public string Name { get; }
+        public Action Action { get; }
+        public Action<ITestResult> Assertion { get; }
+
+        public TestAction(Action action, Action<ITestResult> assertion, string name)
         {
-            TestResult.SetResult(ResultState.Success);
-            TestResult.AssertCount = 2;
-            SuiteResult.AddResult(TestResult);
-
-            TestResult.SetResult(ResultState.Failure, "message", "stack trace");
-            TestResult.AssertCount = 1;
-            SuiteResult.AddResult(TestResult);
-
-            TestResult.SetResult(ResultState.Success);
-            TestResult.AssertCount = 3;
-            SuiteResult.AddResult(TestResult);
-
-            TestResult.SetResult(ResultState.Inconclusive, "inconclusive reason", "stacktrace");
-            TestResult.AssertCount = 0;
-            SuiteResult.AddResult(TestResult);
-
-            TestResult.SetResult(ResultState.Warning, "message", "warning");
-            TestResult.AssertCount = 0;
-            SuiteResult.AddResult(TestResult);
+            Action = action;
+            Assertion = assertion;
+            Name = name;
         }
 
-        [Test]
-        public void SuiteResultIsFailure()
+        public override string ToString()
         {
-            Assert.Multiple(() =>
+            return Name;
+        }
+
+        private const string FailureMessage = "The test has failed";
+        private const string IgnoreMessage = "The test was ignored";
+        private const string InconclusiveMessage = "The test was inconclusive";
+
+        internal static IEnumerable<TestAction> PossibleTestOutcomes
+        {
+            get
             {
-                Assert.That(SuiteResult.ResultState, Is.EqualTo(ResultState.ChildFailure));
-                Assert.That(SuiteResult.ResultState.Status, Is.EqualTo(TestStatus.Failed));
-                Assert.That(SuiteResult.Message, Is.EqualTo(TestResult.CHILD_ERRORS_MESSAGE));
-                Assert.That(SuiteResult.ResultState.Site, Is.EqualTo(FailureSite.Child));
-                Assert.That(SuiteResult.StackTrace, Is.Null, "There should be no stacktrace");
-                Assert.That(SuiteResult.TotalCount, Is.EqualTo(5));
-                Assert.That(SuiteResult.PassCount, Is.EqualTo(2));
-                Assert.That(SuiteResult.FailCount, Is.EqualTo(1));
-                Assert.That(SuiteResult.WarningCount, Is.EqualTo(1));
-                Assert.That(SuiteResult.SkipCount, Is.EqualTo(0));
-                Assert.That(SuiteResult.InconclusiveCount, Is.EqualTo(1));
-                Assert.That(SuiteResult.AssertCount, Is.EqualTo(6));
+                yield return new TestAction(Assert.Pass, AssertPassedResult, "Pass");
+                yield return new TestAction(() => throw new Exception(), AssertExceptionResult, "Exception");
+                yield return new TestAction(() => Assert.Fail(FailureMessage), AssertFailResult, "Fail");
+                yield return new TestAction(() => Assert.Ignore(IgnoreMessage), AssertIgnoreResult, "Ignore");
+                yield return new TestAction(() => Assert.Inconclusive(InconclusiveMessage), AssertInconclusiveResult, "Inconclusive");
+                yield return new TestAction(MultipleFail, AssertFailResult, "Multiple > Fail");
+                yield return new TestAction(AsynchronousMultipleFail, AssertFailResult, "Multiple > Async Fail");
+            }
+        }
+
+        private static void MultipleFail()
+        {
+            Assert.Multiple(() => Assert.Fail(FailureMessage));
+        }
+
+        private static void AsynchronousMultipleFail()
+        {
+            Assert.Multiple(async () =>
+            {
+                await Task.Yield();
+                Assert.Fail(FailureMessage);
             });
         }
 
-        [Test]
-        public void SuiteResultXmlNodeIsFailure()
+        private static void AssertPassedResult(ITestResult result)
         {
-            TNode suiteNode = SuiteResult.ToXml(true);
+            Assert.That(result.ResultState, Is.EqualTo(ResultState.Success));
+        }
 
-            Assert.That(suiteNode.Attributes["result"], Is.EqualTo("Failed"));
-            TNode? failureNode = suiteNode.SelectSingleNode("failure");
-            Assert.That(failureNode, Is.Not.Null, "No failure element found");
+        private static void AssertExceptionResult(ITestResult result)
+        {
+            Assert.That(result.ResultState.Status, Is.EqualTo(TestStatus.Failed));
+            Assert.That(result.ResultState.Site, Is.EqualTo(FailureSite.Test));
+            Assert.That(result.ResultState.Label, Is.EqualTo(ResultState.Error.Label));
+        }
 
-            TNode? messageNode = failureNode.SelectSingleNode("message");
-            Assert.That(messageNode, Is.Not.Null, "No message element found");
-            Assert.That(messageNode.Value, Is.EqualTo(TestResult.CHILD_ERRORS_MESSAGE));
+        private static void AssertFailResult(ITestResult result)
+        {
+            AssertOutcome(result, TestStatus.Failed, FailureMessage);
+        }
 
-            TNode? stacktraceNode = failureNode.SelectSingleNode("stacktrace");
-            Assert.That(stacktraceNode, Is.Null, "There should be no stacktrace");
+        private static void AssertIgnoreResult(ITestResult result)
+        {
+            AssertOutcome(result, TestStatus.Skipped, IgnoreMessage);
+        }
 
-            Assert.Multiple(() =>
-            {
-                Assert.That(suiteNode.Attributes["total"], Is.EqualTo("5"));
-                Assert.That(suiteNode.Attributes["passed"], Is.EqualTo("2"));
-                Assert.That(suiteNode.Attributes["failed"], Is.EqualTo("1"));
-                Assert.That(suiteNode.Attributes["warnings"], Is.EqualTo("1"));
-                Assert.That(suiteNode.Attributes["skipped"], Is.EqualTo("0"));
-                Assert.That(suiteNode.Attributes["inconclusive"], Is.EqualTo("1"));
-                Assert.That(suiteNode.Attributes["asserts"], Is.EqualTo("6"));
-            });
+        private static void AssertInconclusiveResult(ITestResult result)
+        {
+            AssertOutcome(result, TestStatus.Inconclusive, InconclusiveMessage);
+        }
+
+        private static void AssertOutcome(ITestResult result, TestStatus status, string message)
+        {
+            Assert.That(result.ResultState.Status, Is.EqualTo(status));
+            Assert.That(result.ResultState.Site, Is.EqualTo(FailureSite.Test));
+            Assert.That(result.Message, Is.EqualTo(message));
         }
     }
 }

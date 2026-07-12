@@ -14,11 +14,17 @@ import sources from "./oss-sources.json";
 import {
   appendManifest,
   CACHE_DIR,
+  chunkDocument,
   cloneAtRef,
+  hasIncompatibleSpdx,
+  isContainedFile,
+  isNoticeFile,
+  MAX_SAMPLE_BYTES,
   noticePathFor,
   resetOrigin,
   resolvedSha,
   sizeBucketOf,
+  syncNoticeFiles,
   writeSample,
 } from "./shared.ts";
 
@@ -50,6 +56,7 @@ const EXCLUDED_DIRS = new Set([
   "out",
   "third_party",
   "third-party",
+  "thirdparty",
   "deps",
   "external",
   "extern",
@@ -57,12 +64,10 @@ const EXCLUDED_DIRS = new Set([
   "generated",
   "__generated__",
 ]);
-const MAX_FILE_BYTES = 128 * 1024;
 const MAX_AVG_LINE_LENGTH = 200;
-/** Cap any single repo at this share of a language's corpus volume. */
-const SINGLE_REPO_SHARE = 0.2;
 const LANG_BUDGET_BYTES = 8 * 1024 * 1024;
 const QUICK_LANG_BUDGET_BYTES = 4 * 1024 * 1024;
+const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 interface SourceEntry {
   repo: string;
@@ -70,6 +75,8 @@ interface SourceEntry {
   license: string;
   trainable: boolean;
   quick?: boolean;
+  requiredNoticeFiles?: string[];
+  excludePrefixes?: string[];
 }
 
 main();
@@ -97,16 +104,17 @@ function fetchLanguage(language: string, quick: boolean): void {
   resetOrigin(language, "human"); // Re-runs must not duplicate manifest rows over stale samples.
   const selected = quick ? entries.filter((e) => e.quick) : entries;
   const budget = quick ? QUICK_LANG_BUDGET_BYTES : LANG_BUDGET_BYTES;
-  const repoCap = selected.length > 1 ? budget * SINGLE_REPO_SHARE : budget;
+  const repoCap = budget / selected.length;
   let total = 0;
   let index = 0;
   for (const entry of selected) {
     if (total >= budget) break;
     const checkout = cloneAtRef(entry.repo, entry.ref);
     if (!checkout) continue;
+    syncNoticeFiles(checkout, entry.repo);
     const sha = resolvedSha(checkout);
     let repoBytes = 0;
-    for (const file of sampleFiles(checkout, extensions)) {
+    for (const file of sampleFiles(checkout, extensions, entry.license, entry.excludePrefixes)) {
       if (total >= budget || repoBytes >= repoCap) break;
       const content = readFileSync(file.path, "utf8");
       const name = `${String(index++).padStart(5, "0")}.txt`;
@@ -133,34 +141,75 @@ function fetchLanguage(language: string, quick: boolean): void {
  * into `.corpus/.cache` (all oss-sources languages + fetchNl's gitDocs repos). Harvested text
  * must inherit the source repo's flags, or copyleft prose could leak into shipped dictionaries.
  */
-function repoFlagsByCacheDir(): Map<string, { license: string; trainable: boolean }> {
-  const flags = new Map<string, { license: string; trainable: boolean }>();
-  const register = (repo: string, license: string, trainable: boolean): void => {
-    flags.set(repo.split("/").slice(-2).join("__"), { license, trainable });
+function repoFlagsByCacheDir(): Map<
+  string,
+  { excludePrefixes?: string[]; license: string; quick: boolean; trainable: boolean }
+> {
+  const flags = new Map<
+    string,
+    { excludePrefixes?: string[]; license: string; quick: boolean; trainable: boolean }
+  >();
+  const register = (
+    repo: string,
+    license: string,
+    trainable: boolean,
+    quick: boolean,
+    excludePrefixes?: string[],
+  ): void => {
+    flags.set(repo.split("/").slice(-2).join("__"), {
+      excludePrefixes,
+      license,
+      quick,
+      trainable,
+    });
   };
   for (const entries of Object.values(sources.languages as Record<string, SourceEntry[]>)) {
     for (const entry of entries)
-      if (entry.repo.startsWith("http")) register(entry.repo, entry.license, entry.trainable);
+      if (entry.repo.startsWith("http"))
+        register(
+          entry.repo,
+          entry.license,
+          entry.trainable,
+          entry.quick === true,
+          entry.excludePrefixes,
+        );
   }
   const locales = nlSources.locales as Record<
     string,
-    { gitDocs?: { repo: string; license: string; trainable: boolean }[] }
+    {
+      gitDocs?: {
+        excludePrefixes?: string[];
+        license: string;
+        repo: string;
+        trainable: boolean;
+      }[];
+    }
   >;
   for (const locale of Object.values(locales)) {
-    for (const entry of locale.gitDocs ?? []) register(entry.repo, entry.license, entry.trainable);
+    for (const entry of locale.gitDocs ?? [])
+      register(entry.repo, entry.license, entry.trainable, true, entry.excludePrefixes);
   }
   return flags;
 }
 
 /** The `text` corpus harvests README/CHANGELOG/docs prose from every cloned repo. */
 function harvestText(quick: boolean): void {
+  prepareTextSources(quick);
   if (!existsSync(CACHE_DIR)) return;
   resetOrigin("text", "human");
   const flags = repoFlagsByCacheDir();
   const budget = quick ? QUICK_LANG_BUDGET_BYTES : LANG_BUDGET_BYTES;
   let total = 0;
   let index = 0;
-  for (const repoDir of readdirSync(CACHE_DIR)) {
+  const repos: {
+    dir: string;
+    files: SampledFile[];
+    flags: { excludePrefixes?: string[]; license: string; quick: boolean; trainable: boolean };
+    next: number;
+    repoDir: string;
+    sha: string;
+  }[] = [];
+  for (const repoDir of readdirSync(CACHE_DIR).toSorted()) {
     const dir = join(CACHE_DIR, repoDir);
     if (!statSync(dir).isDirectory()) continue;
     const repoFlags = flags.get(repoDir);
@@ -168,25 +217,61 @@ function harvestText(quick: boolean): void {
       console.error(`text: skipping unmapped cache dir ${repoDir} (no license metadata)`);
       continue;
     }
-    for (const file of sampleFiles(dir, EXTENSIONS.text!)) {
-      if (total >= budget) return;
-      const content = readFileSync(file.path, "utf8");
+    if (quick && !repoFlags.quick) continue;
+    repos.push({
+      dir,
+      files: sampleFiles(dir, EXTENSIONS.text!, repoFlags.license, repoFlags.excludePrefixes, true),
+      flags: repoFlags,
+      next: 0,
+      repoDir,
+      sha: resolvedSha(dir),
+    });
+  }
+  while (total < budget) {
+    let progressed = false;
+    for (const repo of repos) {
+      const file = repo.files[repo.next++];
+      if (!file) continue;
+      progressed = true;
+      const content = file.content ?? readFileSync(file.path, "utf8");
       const name = `${String(index++).padStart(5, "0")}.txt`;
       writeSample("text", "human", name, content);
       appendManifest("text", {
         file: `human/${name}`,
         lang: "text",
         origin: "human",
-        source: `${repoDir}@${resolvedSha(dir)}:${file.relative}`,
-        license: repoFlags.license,
-        notice: `THIRD_PARTY_NOTICES/${repoDir}`,
+        source: `${repo.repoDir}@${repo.sha}:${file.relative}`,
+        license: repo.flags.license,
+        notice: `THIRD_PARTY_NOTICES/${repo.repoDir}`,
         sizeBucket: sizeBucketOf(file.bytes),
-        trainable: repoFlags.trainable,
+        trainable: repo.flags.trainable,
       });
       total += file.bytes;
+      if (total >= budget) break;
+    }
+    if (!progressed) break;
+  }
+  // The README promises documentation from every pinned repository in the shared text corpus.
+  for (const repo of repos) {
+    if (repo.files.length === 0 || repo.next === 0) {
+      console.error(`error: text harvested no documentation from ${repo.repoDir}`);
+      process.exitCode = 1;
     }
   }
   console.log(`text: harvested ${total} B of docs/prose`);
+}
+
+/** Text-only fetching must populate its own cache instead of depending on prior language runs. */
+function prepareTextSources(quick: boolean): void {
+  const ossEntries = Object.values(sources.languages as Record<string, SourceEntry[]>).flat();
+  const localeEntries = Object.values(
+    nlSources.locales as Record<string, { gitDocs?: SourceEntry[] }>,
+  ).flatMap((locale) => (locale.gitDocs ?? []).map((entry) => ({ ...entry, quick: true })));
+  for (const entry of [...ossEntries, ...localeEntries]) {
+    if (!entry.repo.startsWith("http") || (quick && entry.quick !== true)) continue;
+    const dir = cloneAtRef(entry.repo, entry.ref);
+    if (dir) syncNoticeFiles(dir, entry.repo);
+  }
 }
 
 function hashOf(text: string): number {
@@ -201,10 +286,18 @@ interface SampledFile {
   path: string;
   relative: string;
   bytes: number;
+  /** Chunked slice of an oversized document; whole-file samples re-read from `path`. */
+  content?: string;
 }
 
 /** Sampling rules: language extensions only; skip vendored/generated/minified; keep tests; whole files. */
-function sampleFiles(root: string, extensions: string[]): SampledFile[] {
+function sampleFiles(
+  root: string,
+  extensions: string[],
+  license: string,
+  excludedPrefixes: string[] = [],
+  chunkOversized = false,
+): SampledFile[] {
   const files: SampledFile[] = [];
   const walk = (dir: string, prefix: string): void => {
     let entries;
@@ -217,32 +310,79 @@ function sampleFiles(root: string, extensions: string[]): SampledFile[] {
       if (entry.name.startsWith(".")) continue;
       const path = join(dir, entry.name);
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (
+        excludedPrefixes.some(
+          (excluded) => relative === excluded || relative.startsWith(`${excluded}/`),
+        )
+      ) {
+        continue;
+      }
       if (entry.isDirectory()) {
-        if (!EXCLUDED_DIRS.has(entry.name.toLowerCase())) walk(path, relative);
+        if (!EXCLUDED_DIRS.has(entry.name.toLowerCase()) && !isNoticeFile(entry.name))
+          walk(path, relative);
         continue;
       }
       if (!extensions.some((ext) => entry.name.endsWith(ext))) continue;
       if (entry.name.includes(".min.")) continue;
+      if (isNoticeFile(entry.name)) continue;
+      // Dirents never report symlinks as directories, so a link to a directory would reach
+      // readFileSync and crash with EISDIR; a link out of the checkout would read a host file.
+      if (!isContainedFile(root, path)) continue;
       let stat;
       try {
         stat = statSync(path);
       } catch {
         continue;
       }
-      if (stat.size === 0 || stat.size > MAX_FILE_BYTES) continue;
-      const content = readFileSync(path, "utf8");
+      if (stat.size === 0 || (stat.size > MAX_SAMPLE_BYTES && !chunkOversized)) continue;
+      const buffer = readFileSync(path);
+      let content: string;
+      try {
+        content = fatalUtf8Decoder.decode(buffer);
+      } catch {
+        continue; // The corpus API consumes Unicode text, so non-UTF-8 fixtures are not samples.
+      }
       if (content.includes("\u0000")) continue;
+      if (hasIncompatibleSpdx(content, license)) continue;
       const lines = content.split("\n");
       if (content.length / Math.max(lines.length, 1) > MAX_AVG_LINE_LENGTH) continue; // Minified/generated.
-      files.push({ path, relative, bytes: Buffer.byteLength(content) });
+      if (buffer.byteLength > MAX_SAMPLE_BYTES) {
+        // Oversized documentation still represents its repo: sample it as bounded chunks.
+        for (const { chunk, chunkIndex } of chunkDocument(content)) {
+          files.push({
+            path,
+            relative: `${relative}#chunk${chunkIndex}`,
+            bytes: Buffer.byteLength(chunk),
+            content: chunk,
+          });
+        }
+        continue;
+      }
+      files.push({ path, relative, bytes: buffer.byteLength });
     }
   };
   walk(root, "");
-  // Deterministic pseudo-random order (stable per-path hash): when a budget cap cuts the
-  // list short, samples spread across the whole tree instead of clustering on
-  // alphabetically-first directories.
-  files.sort(
-    (a, b) => hashOf(a.relative) - hashOf(b.relative) || (a.relative < b.relative ? -1 : 1),
-  );
-  return files;
+  // Stable pseudo-random order within each size bucket spreads samples across the tree.
+  // Round-robin interleaving then prevents a repo's dominant file size from crowding the
+  // other benchmark sizes out before the byte cap is reached.
+  const buckets = new Map<string, SampledFile[]>();
+  for (const file of files) {
+    const bucket = sizeBucketOf(file.bytes);
+    const values = buckets.get(bucket) ?? [];
+    values.push(file);
+    buckets.set(bucket, values);
+  }
+  for (const values of buckets.values())
+    values.sort(
+      (a, b) => hashOf(a.relative) - hashOf(b.relative) || (a.relative < b.relative ? -1 : 1),
+    );
+  const balanced: SampledFile[] = [];
+  const bucketOrder = ["0.5k", "2k", "8k", "24k"];
+  for (let index = 0; bucketOrder.some((bucket) => index < (buckets.get(bucket)?.length ?? 0)); index++) {
+    for (const bucket of bucketOrder) {
+      const file = buckets.get(bucket)?.[index];
+      if (file) balanced.push(file);
+    }
+  }
+  return balanced;
 }

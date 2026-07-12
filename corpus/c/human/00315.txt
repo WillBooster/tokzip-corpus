@@ -1,100 +1,161 @@
-/* File: report_openssl_version.c
+/***************************************************************************
+ *                                  _   _ ____  _
+ *  Project                     ___| | | |  _ \| |
+ *                             / __| | | | |_) | |
+ *                            | (__| |_| |  _ <| |___
+ *                             \___|\___/|_| \_\_____|
  *
- * This file dynamically loads the OpenSSL shared image to report the
- * version string.
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
  *
- * It will optionally place that version string in a DCL symbol.
+ * This software is licensed as described in the file COPYING, which
+ * you should have received as part of this distribution. The terms
+ * are also available at https://curl.se/docs/copyright.html.
  *
- * Usage:  report_openssl_version <shared_image> [<dcl_symbol>]
+ * You may opt to use, copy, modify, merge, publish, distribute and/or sell
+ * copies of the Software, and permit persons to whom the Software is
+ * furnished to do so, under the terms of the COPYING file.
  *
- * Copyright (C) John Malmberg
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
  *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
+ * SPDX-License-Identifier: curl
  *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- *
- * SPDX-License-Identifier: ISC
- *
+ ***************************************************************************/
+/* <DESC>
+ * multi interface and debug callback
+ * </DESC>
  */
 
-#include <dlfcn.h>
-#include <openssl/opensslv.h>
-#include <openssl/crypto.h>
-
+#include <stdio.h>
 #include <string.h>
-#include <descrip.h>
-#include <libclidef.h>
-#include <stsdef.h>
-#include <errno.h>
 
-unsigned long LIB$SET_SYMBOL(
-    const struct dsc$descriptor_s * symbol,
-    const struct dsc$descriptor_s * value,
-    const unsigned long * table_type);
+/* curl stuff */
+#include <curl/curl.h>
 
-int main(int argc, char ** argv) {
+#define TRUE 1
 
+static void dump(const char *text, FILE *stream, unsigned char *ptr,
+                 size_t size, char nohex)
+{
+  size_t i;
+  size_t c;
 
-void * libptr;
-const char * (*ssl_version)(int t);
-const char * version;
+  unsigned int width = 0x10;
 
-   if(argc < 1) {
-       puts("report_openssl_version filename");
-       exit(1);
-   }
+  if(nohex)
+    /* without the hex output, we can fit more on screen */
+    width = 0x40;
 
-   libptr = dlopen(argv[1], 0);
+  fprintf(stream, "%s, %10.10lu bytes (0x%8.8lx)\n",
+          text, (unsigned long)size, (unsigned long)size);
 
-   ssl_version = (const char * (*)(int))dlsym(libptr, "SSLeay_version");
-   if(ssl_version == NULL) {
-      ssl_version = (const char * (*)(int))dlsym(libptr, "ssleay_version");
-      if(ssl_version == NULL) {
-         ssl_version = (const char * (*)(int))dlsym(libptr, "SSLEAY_VERSION");
+  for(i = 0; i<size; i += width) {
+
+    fprintf(stream, "%4.4lx: ", (unsigned long)i);
+
+    if(!nohex) {
+      /* hex not disabled, show it */
+      for(c = 0; c < width; c++)
+        if(i + c < size)
+          fprintf(stream, "%02x ", ptr[i + c]);
+        else
+          fputs("   ", stream);
+    }
+
+    for(c = 0; (c < width) && (i + c < size); c++) {
+      /* check for 0D0A; if found, skip past and start a new line of output */
+      if(nohex && (i + c + 1 < size) && ptr[i + c] == 0x0D &&
+         ptr[i + c + 1] == 0x0A) {
+        i += (c + 2 - width);
+        break;
       }
-   }
-
-   dlclose(libptr);
-
-   if(ssl_version == NULL) {
-      puts("Unable to lookup version of OpenSSL");
-      exit(1);
-   }
-
-   version = ssl_version(SSLEAY_VERSION);
-
-   puts(version);
-
-   /* Was a symbol argument given? */
-   if(argc > 1) {
-      int status;
-      struct dsc$descriptor_s symbol_dsc;
-      struct dsc$descriptor_s value_dsc;
-      const unsigned long table_type = LIB$K_CLI_LOCAL_SYM;
-
-      symbol_dsc.dsc$a_pointer = argv[2];
-      symbol_dsc.dsc$w_length = strlen(argv[2]);
-      symbol_dsc.dsc$b_dtype = DSC$K_DTYPE_T;
-      symbol_dsc.dsc$b_class = DSC$K_CLASS_S;
-
-      value_dsc.dsc$a_pointer = (char *)version; /* Cast ok */
-      value_dsc.dsc$w_length = strlen(version);
-      value_dsc.dsc$b_dtype = DSC$K_DTYPE_T;
-      value_dsc.dsc$b_class = DSC$K_CLASS_S;
-
-      status = LIB$SET_SYMBOL(&symbol_dsc, &value_dsc, &table_type);
-      if(!$VMS_STATUS_SUCCESS(status)) {
-         exit(status);
+      fprintf(stream, "%c",
+              (ptr[i + c] >= 0x20) && (ptr[i + c]<0x80)?ptr[i + c]:'.');
+      /* check again for 0D0A, to avoid an extra \n if it's at width */
+      if(nohex && (i + c + 2 < size) && ptr[i + c + 1] == 0x0D &&
+         ptr[i + c + 2] == 0x0A) {
+        i += (c + 3 - width);
+        break;
       }
-   }
+    }
+    fputc('\n', stream); /* newline */
+  }
+  fflush(stream);
+}
 
-   exit(0);
+static
+int my_trace(CURL *handle, curl_infotype type,
+             unsigned char *data, size_t size,
+             void *userp)
+{
+  const char *text;
+
+  (void)userp;
+  (void)handle; /* prevent compiler warning */
+
+  switch(type) {
+  case CURLINFO_TEXT:
+    fprintf(stderr, "== Info: %s", data);
+    return 0;
+  case CURLINFO_HEADER_OUT:
+    text = "=> Send header";
+    break;
+  case CURLINFO_DATA_OUT:
+    text = "=> Send data";
+    break;
+  case CURLINFO_HEADER_IN:
+    text = "<= Recv header";
+    break;
+  case CURLINFO_DATA_IN:
+    text = "<= Recv data";
+    break;
+  default: /* in case a new one is introduced to shock us */
+    return 0;
+  }
+
+  dump(text, stderr, data, size, TRUE);
+  return 0;
+}
+
+/*
+ * Simply download an HTTP file.
+ */
+int main(void)
+{
+  CURL *http_handle;
+  CURLM *multi_handle;
+
+  int still_running = 0; /* keep number of running handles */
+
+  http_handle = curl_easy_init();
+
+  /* set the options (I left out a few, you get the point anyway) */
+  curl_easy_setopt(http_handle, CURLOPT_URL, "https://www.example.com/");
+
+  curl_easy_setopt(http_handle, CURLOPT_DEBUGFUNCTION, my_trace);
+  curl_easy_setopt(http_handle, CURLOPT_VERBOSE, 1L);
+
+  /* init a multi stack */
+  multi_handle = curl_multi_init();
+
+  /* add the individual transfers */
+  curl_multi_add_handle(multi_handle, http_handle);
+
+  do {
+    CURLMcode mc = curl_multi_perform(multi_handle, &still_running);
+
+    if(still_running)
+      /* wait for activity, timeout or "nothing" */
+      mc = curl_multi_poll(multi_handle, NULL, 0, 1000, NULL);
+
+    if(mc)
+      break;
+
+  } while(still_running);
+
+  curl_multi_cleanup(multi_handle);
+
+  curl_easy_cleanup(http_handle);
+
+  return 0;
 }

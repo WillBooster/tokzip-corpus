@@ -10,214 +10,546 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Command;
+namespace Composer\Util;
 
-use Composer\Factory;
 use Composer\IO\IOInterface;
-use Composer\Package\Loader\ValidatingArrayLoader;
-use Composer\Plugin\CommandEvent;
-use Composer\Plugin\PluginEvents;
-use Composer\Repository\InstalledRepository;
-use Composer\Repository\PlatformRepository;
-use Composer\Util\ConfigValidator;
-use Composer\Util\Filesystem;
-use Symfony\Component\Console\Input\InputArgument;
-use Symfony\Component\Console\Input\InputInterface;
-use Symfony\Component\Console\Input\InputOption;
-use Symfony\Component\Console\Output\OutputInterface;
+use Composer\Pcre\Preg;
+use Seld\Signal\SignalHandler;
+use Symfony\Component\Process\Exception\ProcessSignaledException;
+use Symfony\Component\Process\Process;
+use Symfony\Component\Process\Exception\RuntimeException;
+use React\Promise\Promise;
+use React\Promise\PromiseInterface;
 
 /**
- * ValidateCommand
- *
  * @author Robert Schönthal <seroscho@googlemail.com>
  * @author Jordi Boggiano <j.boggiano@seld.be>
  */
-class ValidateCommand extends BaseCommand
+class ProcessExecutor
 {
+    private const STATUS_QUEUED = 1;
+    private const STATUS_STARTED = 2;
+    private const STATUS_COMPLETED = 3;
+    private const STATUS_FAILED = 4;
+    private const STATUS_ABORTED = 5;
+
+    private const GIT_CMDS_NEED_GIT_DIR = [
+        ['show'],
+        ['log'],
+        ['branch'],
+        ['remote', 'set-url']
+    ];
+
+    /** @var int */
+    protected static $timeout = 300;
+
+    /** @var bool */
+    protected $captureOutput = false;
+    /** @var string */
+    protected $errorOutput = '';
+    /** @var ?IOInterface */
+    protected $io;
+
     /**
-     * configure
+     * @phpstan-var array<int, array<string, mixed>>
      */
-    protected function configure(): void
+    private $jobs = [];
+    /** @var int */
+    private $runningJobs = 0;
+    /** @var int */
+    private $maxJobs = 10;
+    /** @var int */
+    private $idGen = 0;
+    /** @var bool */
+    private $allowAsync = false;
+
+    public function __construct(?IOInterface $io = null)
     {
-        $this
-            ->setName('validate')
-            ->setDescription('Validates a composer.json and composer.lock')
-            ->setDefinition([
-                new InputOption('no-check-all', null, InputOption::VALUE_NONE, 'Do not validate requires for overly strict/loose constraints'),
-                new InputOption('check-lock', null, InputOption::VALUE_NONE, 'Check if lock file is up to date (even when config.lock is false)'),
-                new InputOption('no-check-lock', null, InputOption::VALUE_NONE, 'Do not check if lock file is up to date'),
-                new InputOption('no-check-publish', null, InputOption::VALUE_NONE, 'Do not check for publish errors'),
-                new InputOption('no-check-version', null, InputOption::VALUE_NONE, 'Do not report a warning if the version field is present'),
-                new InputOption('with-dependencies', 'A', InputOption::VALUE_NONE, 'Also validate the composer.json of all installed dependencies'),
-                new InputOption('strict', null, InputOption::VALUE_NONE, 'Return a non-zero exit code for warnings as well as errors'),
-                new InputArgument('file', InputArgument::OPTIONAL, 'path to composer.json file'),
-            ])
-            ->setHelp(
-                <<<EOT
-The validate command validates a given composer.json and composer.lock
-
-Exit codes in case of errors are:
-1 validation warning(s), only when --strict is given
-2 validation error(s)
-3 file unreadable or missing
-
-Read more at https://getcomposer.org/doc/03-cli.md#validate
-EOT
-            );
-    }
-
-    protected function execute(InputInterface $input, OutputInterface $output): int
-    {
-        $file = $input->getArgument('file') ?: Factory::getComposerFile();
-        $io = $this->getIO();
-
-        if (!file_exists($file)) {
-            $io->writeError('<error>' . $file . ' not found.</error>');
-
-            return 3;
-        }
-        if (!Filesystem::isReadable($file)) {
-            $io->writeError('<error>' . $file . ' is not readable.</error>');
-
-            return 3;
-        }
-
-        $validator = new ConfigValidator($io);
-        $checkAll = $input->getOption('no-check-all') ? 0 : ValidatingArrayLoader::CHECK_ALL;
-        $checkPublish = !$input->getOption('no-check-publish');
-        $checkLock = !$input->getOption('no-check-lock');
-        $checkVersion = $input->getOption('no-check-version') ? 0 : ConfigValidator::CHECK_VERSION;
-        $isStrict = $input->getOption('strict');
-        [$errors, $publishErrors, $warnings] = $validator->validate($file, $checkAll, $checkVersion);
-
-        $lockErrors = [];
-        $composer = $this->createComposerInstance($input, $io, $file);
-        // config.lock = false ~= implicit --no-check-lock; --check-lock overrides
-        $checkLock = ($checkLock && $composer->getConfig()->get('lock')) || $input->getOption('check-lock');
-        $locker = $composer->getLocker();
-        if ($locker->isLocked() && !$locker->isFresh()) {
-            $lockErrors[] = '- The lock file is not up to date with the latest changes in composer.json, it is recommended that you run `composer update` or `composer update <package name>`.';
-        }
-
-        if ($locker->isLocked()) {
-            $lockErrors = array_merge($lockErrors, $locker->getMissingRequirementInfo($composer->getPackage(), true));
-        }
-
-        $this->outputResult($io, $file, $errors, $warnings, $checkPublish, $publishErrors, $checkLock, $lockErrors, true);
-
-        // $errors include publish and lock errors when exists
-        $exitCode = count($errors) > 0 ? 2 : (($isStrict && count($warnings) > 0) ? 1 : 0);
-
-        if ($input->getOption('with-dependencies')) {
-            $localRepo = $composer->getRepositoryManager()->getLocalRepository();
-            foreach ($localRepo->getPackages() as $package) {
-                $path = $composer->getInstallationManager()->getInstallPath($package);
-                if (null === $path) {
-                    continue;
-                }
-                $file = $path . '/composer.json';
-                if (is_dir($path) && file_exists($file)) {
-                    [$errors, $publishErrors, $warnings] = $validator->validate($file, $checkAll, $checkVersion);
-
-                    $this->outputResult($io, $package->getPrettyName(), $errors, $warnings, $checkPublish, $publishErrors);
-
-                    // $errors include publish errors when exists
-                    $depCode = count($errors) > 0 ? 2 : (($isStrict && count($warnings) > 0) ? 1 : 0);
-                    $exitCode = max($depCode, $exitCode);
-                }
-            }
-        }
-
-        $commandEvent = new CommandEvent(PluginEvents::COMMAND, 'validate', $input, $output);
-        $eventCode = $composer->getEventDispatcher()->dispatch($commandEvent->getName(), $commandEvent);
-
-        return max($eventCode, $exitCode);
+        $this->io = $io;
     }
 
     /**
-     * @param string[] $errors
-     * @param string[] $warnings
-     * @param string[] $publishErrors
-     * @param string[] $lockErrors
+     * runs a process on the commandline
+     *
+     * @param  string|list<string> $command the command to execute
+     * @param  mixed   $output  the output will be written into this var if passed by ref
+     *                          if a callable is passed it will be used as output handler
+     * @param  null|string $cwd     the working directory
+     * @return int     statuscode
      */
-    private function outputResult(IOInterface $io, string $name, array &$errors, array &$warnings, bool $checkPublish = false, array $publishErrors = [], bool $checkLock = false, array $lockErrors = [], bool $printSchemaUrl = false): void
+    public function execute($command, &$output = null, ?string $cwd = null): int
     {
-        $doPrintSchemaUrl = false;
+        if (func_num_args() > 1) {
+            return $this->doExecute($command, $cwd, false, $output);
+        }
 
-        if ($errors) {
-            $io->writeError('<error>' . $name . ' is invalid, the following errors/warnings were found:</error>');
-        } elseif ($publishErrors) {
-            $io->writeError('<info>' . $name . ' is valid for simple usage with Composer but has</info>');
-            $io->writeError('<info>strict errors that make it unable to be published as a package</info>');
-            $doPrintSchemaUrl = $printSchemaUrl;
-        } elseif ($warnings) {
-            $io->writeError('<info>' . $name . ' is valid, but with a few warnings</info>');
-            $doPrintSchemaUrl = $printSchemaUrl;
-        } elseif ($lockErrors) {
-            $io->write('<info>' . $name . ' is valid but your composer.lock has some '.($checkLock ? 'errors' : 'warnings').'</info>');
+        return $this->doExecute($command, $cwd, false);
+    }
+
+    /**
+     * runs a process on the commandline in TTY mode
+     *
+     * @param  string|list<string>  $command the command to execute
+     * @param  null|string $cwd     the working directory
+     * @return int     statuscode
+     */
+    public function executeTty($command, ?string $cwd = null): int
+    {
+        if (Platform::isTty()) {
+            return $this->doExecute($command, $cwd, true);
+        }
+
+        return $this->doExecute($command, $cwd, false);
+    }
+
+    /**
+     * @param  string|list<string> $command
+     * @param  array<string, string>|null $env
+     * @param  mixed   $output
+     */
+    private function runProcess($command, ?string $cwd, ?array $env, bool $tty, &$output = null): ?int
+    {
+        if (is_string($command)) {
+            $process = Process::fromShellCommandline($command, $cwd, $env, null, static::getTimeout());
         } else {
-            $io->write('<info>' . $name . ' is valid</info>');
+            $process = new Process($command, $cwd, $env, null, static::getTimeout());
         }
 
-        if ($doPrintSchemaUrl) {
-            $io->writeError('<warning>See https://getcomposer.org/doc/04-schema.md for details on the schema</warning>');
-        }
-
-        if ($errors) {
-            $errors = array_map(static function ($err): string {
-                return '- ' . $err;
-            }, $errors);
-            array_unshift($errors, '# General errors');
-        }
-        if ($warnings) {
-            $warnings = array_map(static function ($err): string {
-                return '- ' . $err;
-            }, $warnings);
-            array_unshift($warnings, '# General warnings');
-        }
-
-        // Avoid setting the exit code to 1 in case --strict and --no-check-publish/--no-check-lock are combined
-        $extraWarnings = [];
-
-        // If checking publish errors, display them as errors, otherwise just show them as warnings
-        if ($publishErrors) {
-            $publishErrors = array_map(static function ($err): string {
-                return '- ' . $err;
-            }, $publishErrors);
-
-            if ($checkPublish) {
-                array_unshift($publishErrors, '# Publish errors');
-                $errors = array_merge($errors, $publishErrors);
-            } else {
-                array_unshift($publishErrors, '# Publish warnings');
-                $extraWarnings = array_merge($extraWarnings, $publishErrors);
+        if (! Platform::isWindows() && $tty) {
+            try {
+                $process->setTty(true);
+            } catch (RuntimeException $e) {
+                // ignore TTY enabling errors
             }
         }
 
-        // If checking lock errors, display them as errors, otherwise just show them as warnings
-        if ($lockErrors) {
-            if ($checkLock) {
-                array_unshift($lockErrors, '# Lock file errors');
-                $errors = array_merge($errors, $lockErrors);
-            } else {
-                array_unshift($lockErrors, '# Lock file warnings');
-                $extraWarnings = array_merge($extraWarnings, $lockErrors);
+        $callback = is_callable($output) ? $output : function (string $type, string $buffer): void {
+            $this->outputHandler($type, $buffer);
+        };
+
+        $signalHandler = SignalHandler::create(
+            [SignalHandler::SIGINT, SignalHandler::SIGTERM, SignalHandler::SIGHUP],
+            function (string $signal) {
+                if ($this->io !== null) {
+                    $this->io->writeError(
+                        'Received '.$signal.', aborting when child process is done',
+                        true,
+                        IOInterface::DEBUG
+                    );
+                }
+            }
+        );
+
+        try {
+            $process->run($callback);
+
+            if ($this->captureOutput && !is_callable($output)) {
+                $output = $process->getOutput();
+            }
+
+            $this->errorOutput = $process->getErrorOutput();
+        } catch (ProcessSignaledException $e) {
+            if ($signalHandler->isTriggered()) {
+                // exiting as we were signaled and the child process exited too due to the signal
+                $signalHandler->exitWithLastSignal();
+            }
+        } finally {
+            $signalHandler->unregister();
+        }
+
+        return $process->getExitCode();
+    }
+
+    /**
+     * @param  string|list<string> $command
+     * @param  mixed   $output
+     */
+    private function doExecute($command, ?string $cwd, bool $tty, &$output = null): int
+    {
+        $this->outputCommandRun($command, $cwd, false);
+
+        $this->captureOutput = func_num_args() > 3;
+        $this->errorOutput = '';
+
+        $env = null;
+
+        $requiresGitDirEnv = $this->requiresGitDirEnv($command);
+        if ($cwd !== null && $requiresGitDirEnv) {
+            $isBareRepository = !is_dir(sprintf('%s/.git', rtrim($cwd, '/')));
+            if ($isBareRepository) {
+                $configValue = '';
+                $this->runProcess('git config safe.bareRepository', $cwd, ['GIT_DIR' => $cwd], $tty, $configValue);
+                $configValue = trim($configValue);
+                if ($configValue === 'explicit') {
+                    $env = ['GIT_DIR' => $cwd];
+                }
             }
         }
 
-        $messages = [
-            'error' => $errors,
-            'warning' => array_merge($warnings, $extraWarnings),
+        return $this->runProcess($command, $cwd, $env, $tty, $output);
+    }
+
+    /**
+     * starts a process on the commandline in async mode
+     *
+     * @param  string|list<string> $command the command to execute
+     * @param  string              $cwd     the working directory
+     * @phpstan-return PromiseInterface<Process>
+     */
+    public function executeAsync($command, ?string $cwd = null): PromiseInterface
+    {
+        if (!$this->allowAsync) {
+            throw new \LogicException('You must use the ProcessExecutor instance which is part of a Composer\Loop instance to be able to run async processes');
+        }
+
+        $job = [
+            'id' => $this->idGen++,
+            'status' => self::STATUS_QUEUED,
+            'command' => $command,
+            'cwd' => $cwd,
         ];
 
-        foreach ($messages as $style => $msgs) {
-            foreach ($msgs as $msg) {
-                if (strpos($msg, '#') === 0) {
-                    $io->writeError('<' . $style . '>' . $msg . '</' . $style . '>');
-                } else {
-                    $io->writeError($msg);
+        $resolver = static function ($resolve, $reject) use (&$job): void {
+            $job['status'] = ProcessExecutor::STATUS_QUEUED;
+            $job['resolve'] = $resolve;
+            $job['reject'] = $reject;
+        };
+
+        $canceler = static function () use (&$job): void {
+            if ($job['status'] === ProcessExecutor::STATUS_QUEUED) {
+                $job['status'] = ProcessExecutor::STATUS_ABORTED;
+            }
+            if ($job['status'] !== ProcessExecutor::STATUS_STARTED) {
+                return;
+            }
+            $job['status'] = ProcessExecutor::STATUS_ABORTED;
+            try {
+                if (defined('SIGINT')) {
+                    $job['process']->signal(SIGINT);
+                }
+            } catch (\Exception $e) {
+                // signal can throw in various conditions, but we don't care if it fails
+            }
+            $job['process']->stop(1);
+
+            throw new \RuntimeException('Aborted process');
+        };
+
+        $promise = new Promise($resolver, $canceler);
+        $promise = $promise->then(function () use (&$job) {
+            if ($job['process']->isSuccessful()) {
+                $job['status'] = ProcessExecutor::STATUS_COMPLETED;
+            } else {
+                $job['status'] = ProcessExecutor::STATUS_FAILED;
+            }
+
+            $this->markJobDone();
+
+            return $job['process'];
+        }, function ($e) use (&$job): void {
+            $job['status'] = ProcessExecutor::STATUS_FAILED;
+
+            $this->markJobDone();
+
+            throw $e;
+        });
+        $this->jobs[$job['id']] = &$job;
+
+        if ($this->runningJobs < $this->maxJobs) {
+            $this->startJob($job['id']);
+        }
+
+        return $promise;
+    }
+
+    protected function outputHandler(string $type, string $buffer): void
+    {
+        if ($this->captureOutput) {
+            return;
+        }
+
+        if (null === $this->io) {
+            echo $buffer;
+
+            return;
+        }
+
+        if (Process::ERR === $type) {
+            $this->io->writeErrorRaw($buffer, false);
+        } else {
+            $this->io->writeRaw($buffer, false);
+        }
+    }
+
+    private function startJob(int $id): void
+    {
+        $job = &$this->jobs[$id];
+        if ($job['status'] !== self::STATUS_QUEUED) {
+            return;
+        }
+
+        // start job
+        $job['status'] = self::STATUS_STARTED;
+        $this->runningJobs++;
+
+        $command = $job['command'];
+        $cwd = $job['cwd'];
+
+        $this->outputCommandRun($command, $cwd, true);
+
+        try {
+            if (is_string($command)) {
+                $process = Process::fromShellCommandline($command, $cwd, null, null, static::getTimeout());
+            } else {
+                $process = new Process($command, $cwd, null, null, static::getTimeout());
+            }
+        } catch (\Throwable $e) {
+            $job['reject']($e);
+
+            return;
+        }
+
+        $job['process'] = $process;
+
+        try {
+            $process->start();
+        } catch (\Throwable $e) {
+            $job['reject']($e);
+
+            return;
+        }
+    }
+
+    public function setMaxJobs(int $maxJobs): void
+    {
+        $this->maxJobs = $maxJobs;
+    }
+
+    public function resetMaxJobs(): void
+    {
+        $this->maxJobs = 10;
+    }
+
+    /**
+     * @param  ?int $index job id
+     */
+    public function wait($index = null): void
+    {
+        while (true) {
+            if (0 === $this->countActiveJobs($index)) {
+                return;
+            }
+
+            usleep(1000);
+        }
+    }
+
+    /**
+     * @internal
+     */
+    public function enableAsync(): void
+    {
+        $this->allowAsync = true;
+    }
+
+    /**
+     * @internal
+     *
+     * @param  ?int $index job id
+     * @return int         number of active (queued or started) jobs
+     */
+    public function countActiveJobs($index = null): int
+    {
+        // tick
+        foreach ($this->jobs as $job) {
+            if ($job['status'] === self::STATUS_STARTED) {
+                if (!$job['process']->isRunning()) {
+                    call_user_func($job['resolve'], $job['process']);
+                }
+
+                $job['process']->checkTimeout();
+            }
+
+            if ($this->runningJobs < $this->maxJobs) {
+                if ($job['status'] === self::STATUS_QUEUED) {
+                    $this->startJob($job['id']);
                 }
             }
         }
+
+        if (null !== $index) {
+            return $this->jobs[$index]['status'] < self::STATUS_COMPLETED ? 1 : 0;
+        }
+
+        $active = 0;
+        foreach ($this->jobs as $job) {
+            if ($job['status'] < self::STATUS_COMPLETED) {
+                $active++;
+            } else {
+                unset($this->jobs[$job['id']]);
+            }
+        }
+
+        return $active;
+    }
+
+    private function markJobDone(): void
+    {
+        $this->runningJobs--;
+    }
+
+    /**
+     * @return string[]
+     */
+    public function splitLines(?string $output): array
+    {
+        $output = trim((string) $output);
+
+        return $output === '' ? [] : Preg::split('{\r?\n}', $output);
+    }
+
+    /**
+     * Get any error output from the last command
+     */
+    public function getErrorOutput(): string
+    {
+        return $this->errorOutput;
+    }
+
+    /**
+     * @return int the timeout in seconds
+     */
+    public static function getTimeout(): int
+    {
+        return static::$timeout;
+    }
+
+    /**
+     * @param  int  $timeout the timeout in seconds
+     */
+    public static function setTimeout(int $timeout): void
+    {
+        static::$timeout = $timeout;
+    }
+
+    /**
+     * Escapes a string to be used as a shell argument.
+     *
+     * @param string|false|null $argument The argument that will be escaped
+     *
+     * @return string The escaped argument
+     */
+    public static function escape($argument): string
+    {
+        return self::escapeArgument($argument);
+    }
+
+    /**
+     * @param string|list<string> $command
+     */
+    private function outputCommandRun($command, ?string $cwd, bool $async): void
+    {
+        if (null === $this->io || !$this->io->isDebug()) {
+            return;
+        }
+
+        $commandString = is_string($command) ? $command : implode(' ', array_map(self::class.'::escape', $command));
+        $safeCommand = Preg::replaceCallback('{://(?P<user>[^:/\s]+):(?P<password>[^@\s/]+)@}i', static function ($m): string {
+            assert(is_string($m['user']));
+
+            // if the username looks like a long (12char+) hex string, or a modern github token (e.g. ghp_xxx) we obfuscate that
+            if (Preg::isMatch('{^([a-f0-9]{12,}|gh[a-z]_[a-zA-Z0-9_]+)$}', $m['user'])) {
+                return '://***:***@';
+            }
+            if (Preg::isMatch('{^[a-f0-9]{12,}$}', $m['user'])) {
+                return '://***:***@';
+            }
+
+            return '://'.$m['user'].':***@';
+        }, $commandString);
+        $safeCommand = Preg::replace("{--password (.*[^\\\\]\') }", '--password \'***\' ', $safeCommand);
+        $this->io->writeError('Executing'.($async ? ' async' : '').' command ('.($cwd ?: 'CWD').'): '.$safeCommand);
+    }
+
+    /**
+     * Escapes a string to be used as a shell argument for Symfony Process.
+     *
+     * This method expects cmd.exe to be started with the /V:ON option, which
+     * enables delayed environment variable expansion using ! as the delimiter.
+     * If this is not the case, any escaped ^^!var^^! will be transformed to
+     * ^!var^! and introduce two unintended carets.
+     *
+     * Modified from https://github.com/johnstevenson/winbox-args
+     * MIT Licensed (c) John Stevenson <john-stevenson@blueyonder.co.uk>
+     *
+     * @param string|false|null $argument
+     */
+    private static function escapeArgument($argument): string
+    {
+        if ('' === ($argument = (string) $argument)) {
+            return escapeshellarg($argument);
+        }
+
+        if (!Platform::isWindows()) {
+            return "'".str_replace("'", "'\\''", $argument)."'";
+        }
+
+        // New lines break cmd.exe command parsing
+        // and special chars like the fullwidth quote can be used to break out
+        // of parameter encoding via "Best Fit" encoding conversion
+        $argument = strtr($argument, [
+            "\n" => ' ',
+            "\u{ff02}" => '"',
+            "\u{02ba}" => '"',
+            "\u{301d}" => '"',
+            "\u{301e}" => '"',
+            "\u{030e}" => '"',
+            "\u{ff1a}" => ':',
+            "\u{0589}" => ':',
+            "\u{2236}" => ':',
+            "\u{ff0f}" => '/',
+            "\u{2044}" => '/',
+            "\u{2215}" => '/',
+            "\u{00b4}" => '/',
+        ]);
+
+        // In addition to whitespace, commas need quoting to preserve paths
+        $quote = strpbrk($argument, " \t,") !== false;
+        $argument = Preg::replace('/(\\\\*)"/', '$1$1\\"', $argument, -1, $dquotes);
+        $meta = $dquotes > 0 || Preg::isMatch('/%[^%]+%|![^!]+!/', $argument);
+
+        if (!$meta && !$quote) {
+            $quote = strpbrk($argument, '^&|<>()') !== false;
+        }
+
+        if ($quote) {
+            $argument = '"'.Preg::replace('/(\\\\*)$/', '$1$1', $argument).'"';
+        }
+
+        if ($meta) {
+            $argument = Preg::replace('/(["^&|<>()%])/', '^$1', $argument);
+            $argument = Preg::replace('/(!)/', '^^$1', $argument);
+        }
+
+        return $argument;
+    }
+
+    /**
+     * @param string[]|string $command
+     */
+    public function requiresGitDirEnv($command): bool
+    {
+        $cmd = !is_array($command) ? explode(' ', $command) : $command;
+        if ($cmd[0] !== 'git') {
+            return false;
+        }
+
+        foreach (self::GIT_CMDS_NEED_GIT_DIR as $gitCmd) {
+            if (array_intersect($cmd, $gitCmd) === $gitCmd) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

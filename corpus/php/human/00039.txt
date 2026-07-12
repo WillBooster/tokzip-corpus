@@ -10,115 +10,454 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Util;
+namespace Composer\DependencyResolver;
 
-use Composer\Config;
-use Composer\Pcre\Preg;
+use Composer\Package\AliasPackage;
+use Composer\Package\BasePackage;
+use Composer\Package\Link;
+use Composer\Repository\PlatformRepository;
+use Composer\Repository\RepositorySet;
+use Composer\Package\Version\VersionParser;
+use Composer\Semver\Constraint\Constraint;
+use Composer\Semver\Constraint\ConstraintInterface;
 
 /**
- * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @author Nils Adermann <naderman@naderman.de>
+ * @author Ruben Gonzalez <rubenrua@gmail.com>
+ * @phpstan-type ReasonData Link|BasePackage|string|int|array{packageName: string, constraint: ConstraintInterface}|array{package: BasePackage}
  */
-class Url
+abstract class Rule
 {
+    // reason constants and // their reason data contents
+    public const RULE_ROOT_REQUIRE = 2; // array{packageName: string, constraint: ConstraintInterface}
+    public const RULE_FIXED = 3; // array{package: BasePackage}
+    public const RULE_PACKAGE_CONFLICT = 6; // Link
+    public const RULE_PACKAGE_REQUIRES = 7; // Link
+    public const RULE_PACKAGE_SAME_NAME = 10; // string (package name)
+    public const RULE_LEARNED = 12; // int (rule id)
+    public const RULE_PACKAGE_ALIAS = 13; // BasePackage
+    public const RULE_PACKAGE_INVERSE_ALIAS = 14; // BasePackage
+
+    // bitfield defs
+    private const BITFIELD_TYPE = 0;
+    private const BITFIELD_REASON = 8;
+    private const BITFIELD_DISABLED = 16;
+
+    /** @var int */
+    protected $bitfield;
+    /** @var Request */
+    protected $request;
     /**
-     * @param non-empty-string $url
-     * @return non-empty-string the updated URL
+     * @var Link|BasePackage|ConstraintInterface|string
+     * @phpstan-var ReasonData
      */
-    public static function updateDistReference(Config $config, string $url, string $ref): string
+    protected $reasonData;
+
+    /**
+     * @param self::RULE_* $reason     A RULE_* constant describing the reason for generating this rule
+     * @param mixed        $reasonData
+     *
+     * @phpstan-param ReasonData $reasonData
+     */
+    public function __construct($reason, $reasonData)
     {
-        $host = parse_url($url, PHP_URL_HOST);
+        $this->reasonData = $reasonData;
 
-        if ($host === 'api.github.com' || $host === 'github.com' || $host === 'www.github.com') {
-            if (Preg::isMatch('{^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/(zip|tar)ball/(.+)$}i', $url, $match)) {
-                // update legacy github archives to API calls with the proper reference
-                $url = 'https://api.github.com/repos/' . $match[1] . '/'. $match[2] . '/' . $match[3] . 'ball/' . $ref;
-            } elseif (Preg::isMatch('{^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/archive/.+\.(zip|tar)(?:\.gz)?$}i', $url, $match)) {
-                // update current github web archives to API calls with the proper reference
-                $url = 'https://api.github.com/repos/' . $match[1] . '/'. $match[2] . '/' . $match[3] . 'ball/' . $ref;
-            } elseif (Preg::isMatch('{^https?://api\.github\.com/repos/([^/]+)/([^/]+)/(zip|tar)ball(?:/.+)?$}i', $url, $match)) {
-                // update api archives to the proper reference
-                $url = 'https://api.github.com/repos/' . $match[1] . '/'. $match[2] . '/' . $match[3] . 'ball/' . $ref;
-            }
-        } elseif ($host === 'bitbucket.org' || $host === 'www.bitbucket.org') {
-            if (Preg::isMatch('{^https?://(?:www\.)?bitbucket\.org/([^/]+)/([^/]+)/get/(.+)\.(zip|tar\.gz|tar\.bz2)$}i', $url, $match)) {
-                // update Bitbucket archives to the proper reference
-                $url = 'https://bitbucket.org/' . $match[1] . '/'. $match[2] . '/get/' . $ref . '.' . $match[4];
-            }
-        } elseif ($host === 'gitlab.com' || $host === 'www.gitlab.com') {
-            if (Preg::isMatch('{^https?://(?:www\.)?gitlab\.com/api/v[34]/projects/([^/]+)/repository/archive\.(zip|tar\.gz|tar\.bz2|tar)\?sha=.+$}i', $url, $match)) {
-                // update Gitlab archives to the proper reference
-                $url = 'https://gitlab.com/api/v4/projects/' . $match[1] . '/repository/archive.' . $match[2] . '?sha=' . $ref;
-            }
-        } elseif (in_array($host, $config->get('github-domains'), true)) {
-            $url = Preg::replace('{(/repos/[^/]+/[^/]+/(zip|tar)ball)(?:/.+)?$}i', '$1/'.$ref, $url);
-        } elseif (in_array($host, $config->get('gitlab-domains'), true)) {
-            $url = Preg::replace('{(/api/v[34]/projects/[^/]+/repository/archive\.(?:zip|tar\.gz|tar\.bz2|tar)\?sha=).+$}i', '${1}'.$ref, $url);
-        }
-
-        assert($url !== '');
-
-        return $url;
+        $this->bitfield = (0 << self::BITFIELD_DISABLED) |
+            ($reason << self::BITFIELD_REASON) |
+            (255 << self::BITFIELD_TYPE);
     }
 
     /**
-     * @param non-empty-string $url
-     * @return non-empty-string
+     * @return list<int>
      */
-    public static function getOrigin(Config $config, string $url): string
+    abstract public function getLiterals(): array;
+
+    /**
+     * @return int|string
+     */
+    abstract public function getHash();
+
+    abstract public function __toString(): string;
+
+    abstract public function equals(Rule $rule): bool;
+
+    /**
+     * @return self::RULE_*
+     */
+    public function getReason(): int
     {
-        if (0 === strpos($url, 'file://')) {
-            return $url;
+        return ($this->bitfield & (255 << self::BITFIELD_REASON)) >> self::BITFIELD_REASON;
+    }
+
+    /**
+     * @phpstan-return ReasonData
+     */
+    public function getReasonData()
+    {
+        return $this->reasonData;
+    }
+
+    public function getRequiredPackage(): ?string
+    {
+        switch ($this->getReason()) {
+            case self::RULE_ROOT_REQUIRE:
+                return $this->getReasonData()['packageName'];
+            case self::RULE_FIXED:
+                return $this->getReasonData()['package']->getName();
+            case self::RULE_PACKAGE_REQUIRES:
+                return $this->getReasonData()->getTarget();
         }
 
-        $origin = (string) parse_url($url, PHP_URL_HOST);
-        if ($port = parse_url($url, PHP_URL_PORT)) {
-            $origin .= ':'.$port;
-        }
+        return null;
+    }
 
-        if (strpos($origin, '.github.com') === (strlen($origin) - 11)) {
-            return 'github.com';
-        }
+    /**
+     * @param RuleSet::TYPE_* $type
+     */
+    public function setType($type): void
+    {
+        $this->bitfield = ($this->bitfield & ~(255 << self::BITFIELD_TYPE)) | ((255 & $type) << self::BITFIELD_TYPE);
+    }
 
-        if ($origin === 'repo.packagist.org') {
-            return 'packagist.org';
-        }
+    public function getType(): int
+    {
+        return ($this->bitfield & (255 << self::BITFIELD_TYPE)) >> self::BITFIELD_TYPE;
+    }
 
-        if ($origin === '') {
-            $origin = $url;
-        }
+    public function disable(): void
+    {
+        $this->bitfield = ($this->bitfield & ~(255 << self::BITFIELD_DISABLED)) | (1 << self::BITFIELD_DISABLED);
+    }
 
-        // Gitlab can be installed in a non-root context (i.e. gitlab.com/foo). When downloading archives the originUrl
-        // is the host without the path, so we look for the registered gitlab-domains matching the host here
-        if (
-            false === strpos($origin, '/')
-            && !in_array($origin, $config->get('gitlab-domains'), true)
-        ) {
-            foreach ($config->get('gitlab-domains') as $gitlabDomain) {
-                if ($gitlabDomain !== '' && str_starts_with($gitlabDomain, $origin)) {
-                    return $gitlabDomain;
+    public function enable(): void
+    {
+        $this->bitfield &= ~(255 << self::BITFIELD_DISABLED);
+    }
+
+    public function isDisabled(): bool
+    {
+        return (bool) (($this->bitfield & (255 << self::BITFIELD_DISABLED)) >> self::BITFIELD_DISABLED);
+    }
+
+    public function isEnabled(): bool
+    {
+        return !(($this->bitfield & (255 << self::BITFIELD_DISABLED)) >> self::BITFIELD_DISABLED);
+    }
+
+    abstract public function isAssertion(): bool;
+
+    public function isCausedByLock(RepositorySet $repositorySet, Request $request, Pool $pool): bool
+    {
+        if ($this->getReason() === self::RULE_PACKAGE_REQUIRES) {
+            if (PlatformRepository::isPlatformPackage($this->getReasonData()->getTarget())) {
+                return false;
+            }
+            if ($request->getLockedRepository()) {
+                foreach ($request->getLockedRepository()->getPackages() as $package) {
+                    if ($package->getName() === $this->getReasonData()->getTarget()) {
+                        if ($pool->isUnacceptableFixedOrLockedPackage($package)) {
+                            return true;
+                        }
+                        if (!$this->getReasonData()->getConstraint()->matches(new Constraint('=', $package->getVersion()))) {
+                            return true;
+                        }
+                        // required package was locked but has been unlocked and still matches
+                        if (!$request->isLockedPackage($package)) {
+                            return true;
+                        }
+                        break;
+                    }
                 }
             }
         }
 
-        return $origin;
+        if ($this->getReason() === self::RULE_ROOT_REQUIRE) {
+            if (PlatformRepository::isPlatformPackage($this->getReasonData()['packageName'])) {
+                return false;
+            }
+            if ($request->getLockedRepository()) {
+                foreach ($request->getLockedRepository()->getPackages() as $package) {
+                    if ($package->getName() === $this->getReasonData()['packageName']) {
+                        if ($pool->isUnacceptableFixedOrLockedPackage($package)) {
+                            return true;
+                        }
+                        if (!$this->getReasonData()['constraint']->matches(new Constraint('=', $package->getVersion()))) {
+                            return true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        return false;
     }
 
-    public static function sanitize(string $url): string
+    /**
+     * @internal
+     */
+    public function getSourcePackage(Pool $pool): BasePackage
     {
-        // GitHub repository rename result in redirect locations containing the access_token as GET parameter
-        // e.g. https://api.github.com/repositories/9999999999?access_token=github_token
-        $url = Preg::replace('{([&?]access_token=)[^&]+}', '$1***', $url);
+        $literals = $this->getLiterals();
 
-        $url = Preg::replaceCallback('{^(?P<prefix>[a-z0-9]+://)?(?P<user>[^:/\s@]+):(?P<password>[^@\s/]+)@}i', static function ($m): string {
-            assert(is_string($m['user']));
-            // if the username looks like a long (12char+) hex string, or a modern github token (e.g. ghp_xxx) we obfuscate that
-            if (Preg::isMatch('{^([a-f0-9]{12,}|gh[a-z]_[a-zA-Z0-9_]+|github_pat_[a-zA-Z0-9_]+)$}', $m['user'])) {
-                return $m['prefix'].'***:***@';
+        switch ($this->getReason()) {
+            case self::RULE_PACKAGE_CONFLICT:
+                $package1 = $this->deduplicateDefaultBranchAlias($pool->literalToPackage($literals[0]));
+                $package2 = $this->deduplicateDefaultBranchAlias($pool->literalToPackage($literals[1]));
+
+                $reasonData = $this->getReasonData();
+                // swap literals if they are not in the right order with package2 being the conflicter
+                if ($reasonData->getSource() === $package1->getName()) {
+                    [$package2, $package1] = [$package1, $package2];
+                }
+
+                return $package2;
+
+            case self::RULE_PACKAGE_REQUIRES:
+                $sourceLiteral = array_shift($literals);
+                $sourcePackage = $this->deduplicateDefaultBranchAlias($pool->literalToPackage($sourceLiteral));
+
+                return $sourcePackage;
+
+            default:
+                throw new \LogicException('Not implemented');
+        }
+    }
+
+    /**
+     * @param BasePackage[] $installedMap
+     * @param array<Rule[]> $learnedPool
+     */
+    public function getPrettyString(RepositorySet $repositorySet, Request $request, Pool $pool, bool $isVerbose, array $installedMap = [], array $learnedPool = []): string
+    {
+        $literals = $this->getLiterals();
+
+        switch ($this->getReason()) {
+            case self::RULE_ROOT_REQUIRE:
+                $reasonData = $this->getReasonData();
+                $packageName = $reasonData['packageName'];
+                $constraint = $reasonData['constraint'];
+
+                $packages = $pool->whatProvides($packageName, $constraint);
+                if (!$packages) {
+                    return 'No package found to satisfy root composer.json require '.$packageName.' '.$constraint->getPrettyString();
+                }
+
+                $packagesNonAlias = array_values(array_filter($packages, static function ($p): bool {
+                    return !($p instanceof AliasPackage);
+                }));
+                if (count($packagesNonAlias) === 1) {
+                    $package = $packagesNonAlias[0];
+                    if ($request->isLockedPackage($package)) {
+                        return $package->getPrettyName().' is locked to version '.$package->getPrettyVersion()." and an update of this package was not requested.";
+                    }
+                }
+
+                return 'Root composer.json requires '.$packageName.' '.$constraint->getPrettyString().' -> satisfiable by '.$this->formatPackagesUnique($pool, $packages, $isVerbose, $constraint).'.';
+
+            case self::RULE_FIXED:
+                $package = $this->deduplicateDefaultBranchAlias($this->getReasonData()['package']);
+
+                if ($request->isLockedPackage($package)) {
+                    return $package->getPrettyName().' is locked to version '.$package->getPrettyVersion().' and an update of this package was not requested.';
+                }
+
+                return $package->getPrettyName().' is present at version '.$package->getPrettyVersion() . ' and cannot be modified by Composer';
+
+            case self::RULE_PACKAGE_CONFLICT:
+                $package1 = $this->deduplicateDefaultBranchAlias($pool->literalToPackage($literals[0]));
+                $package2 = $this->deduplicateDefaultBranchAlias($pool->literalToPackage($literals[1]));
+
+                $conflictTarget = $package1->getPrettyString();
+                $reasonData = $this->getReasonData();
+
+                // swap literals if they are not in the right order with package2 being the conflicter
+                if ($reasonData->getSource() === $package1->getName()) {
+                    [$package2, $package1] = [$package1, $package2];
+                    $conflictTarget = $package1->getPrettyName().' '.$reasonData->getPrettyConstraint();
+                }
+
+                // if the conflict is not directly against the package but something it provides/replaces,
+                // we try to find that link to display a better message
+                if ($reasonData->getTarget() !== $package1->getName()) {
+                    $provideType = null;
+                    $provided = null;
+                    foreach ($package1->getProvides() as $provide) {
+                        if ($provide->getTarget() === $reasonData->getTarget()) {
+                            $provideType = 'provides';
+                            $provided = $provide->getPrettyConstraint();
+                            break;
+                        }
+                    }
+                    foreach ($package1->getReplaces() as $replace) {
+                        if ($replace->getTarget() === $reasonData->getTarget()) {
+                            $provideType = 'replaces';
+                            $provided = $replace->getPrettyConstraint();
+                            break;
+                        }
+                    }
+                    if (null !== $provideType) {
+                        $conflictTarget = $reasonData->getTarget().' '.$reasonData->getPrettyConstraint().' ('.$package1->getPrettyString().' '.$provideType.' '.$reasonData->getTarget().' '.$provided.')';
+                    }
+                }
+
+                return $package2->getPrettyString().' conflicts with '.$conflictTarget.'.';
+
+            case self::RULE_PACKAGE_REQUIRES:
+                $sourceLiteral = array_shift($literals);
+                $sourcePackage = $this->deduplicateDefaultBranchAlias($pool->literalToPackage($sourceLiteral));
+                $reasonData = $this->getReasonData();
+
+                $requires = [];
+                foreach ($literals as $literal) {
+                    $requires[] = $pool->literalToPackage($literal);
+                }
+
+                $text = $reasonData->getPrettyString($sourcePackage);
+                if ($requires) {
+                    $text .= ' -> satisfiable by ' . $this->formatPackagesUnique($pool, $requires, $isVerbose, $reasonData->getConstraint()) . '.';
+                } else {
+                    $targetName = $reasonData->getTarget();
+
+                    $reason = Problem::getMissingPackageReason($repositorySet, $request, $pool, $isVerbose, $targetName, $reasonData->getConstraint());
+
+                    return $text . ' -> ' . $reason[1];
+                }
+
+                return $text;
+
+            case self::RULE_PACKAGE_SAME_NAME:
+                $packageNames = [];
+                foreach ($literals as $literal) {
+                    $package = $pool->literalToPackage($literal);
+                    $packageNames[$package->getName()] = true;
+                }
+                $replacedName = $this->getReasonData();
+
+                if (count($packageNames) > 1) {
+                    $reason = null;
+
+                    if (!isset($packageNames[$replacedName])) {
+                        $reason = 'They '.(count($literals) === 2 ? 'both' : 'all').' replace '.$replacedName.' and thus cannot coexist.';
+                    } else {
+                        $replacerNames = $packageNames;
+                        unset($replacerNames[$replacedName]);
+                        $replacerNames = array_keys($replacerNames);
+
+                        if (count($replacerNames) === 1) {
+                            $reason = $replacerNames[0] . ' replaces ';
+                        } else {
+                            $reason = '['.implode(', ', $replacerNames).'] replace ';
+                        }
+                        $reason .= $replacedName.' and thus cannot coexist with it.';
+                    }
+
+                    $installedPackages = [];
+                    $removablePackages = [];
+                    foreach ($literals as $literal) {
+                        if (isset($installedMap[abs($literal)])) {
+                            $installedPackages[] = $pool->literalToPackage($literal);
+                        } else {
+                            $removablePackages[] = $pool->literalToPackage($literal);
+                        }
+                    }
+
+                    if ($installedPackages && $removablePackages) {
+                        return $this->formatPackagesUnique($pool, $removablePackages, $isVerbose, null, true).' cannot be installed as that would require removing '.$this->formatPackagesUnique($pool, $installedPackages, $isVerbose, null, true).'. '.$reason;
+                    }
+
+                    return 'Only one of these can be installed: '.$this->formatPackagesUnique($pool, $literals, $isVerbose, null, true).'. '.$reason;
+                }
+
+                return 'You can only install one version of a package, so only one of these can be installed: ' . $this->formatPackagesUnique($pool, $literals, $isVerbose, null, true) . '.';
+            case self::RULE_LEARNED:
+                /** @TODO currently still generates way too much output to be helpful, and in some cases can even lead to endless recursion */
+                // if (isset($learnedPool[$this->getReasonData()])) {
+                //     echo $this->getReasonData()."\n";
+                //     $learnedString = ', learned rules:' . Problem::formatDeduplicatedRules($learnedPool[$this->getReasonData()], '        ', $repositorySet, $request, $pool, $isVerbose, $installedMap, $learnedPool);
+                // } else {
+                //     $learnedString = ' (reasoning unavailable)';
+                // }
+                $learnedString = ' (conflict analysis result)';
+
+                if (count($literals) === 1) {
+                    $ruleText = $pool->literalToPrettyString($literals[0], $installedMap);
+                } else {
+                    $groups = [];
+                    foreach ($literals as $literal) {
+                        $package = $pool->literalToPackage($literal);
+                        if (isset($installedMap[$package->id])) {
+                            $group = $literal > 0 ? 'keep' : 'remove';
+                        } else {
+                            $group = $literal > 0 ? 'install' : 'don\'t install';
+                        }
+
+                        $groups[$group][] = $this->deduplicateDefaultBranchAlias($package);
+                    }
+                    $ruleTexts = [];
+                    foreach ($groups as $group => $packages) {
+                        $ruleTexts[] = $group . (count($packages) > 1 ? ' one of' : '').' ' . $this->formatPackagesUnique($pool, $packages, $isVerbose);
+                    }
+
+                    $ruleText = implode(' | ', $ruleTexts);
+                }
+
+                return 'Conclusion: '.$ruleText.$learnedString;
+            case self::RULE_PACKAGE_ALIAS:
+                $aliasPackage = $pool->literalToPackage($literals[0]);
+
+                // avoid returning content like "9999999-dev is an alias of dev-master" as it is useless
+                if ($aliasPackage->getVersion() === VersionParser::DEFAULT_BRANCH_ALIAS) {
+                    return '';
+                }
+                $package = $this->deduplicateDefaultBranchAlias($pool->literalToPackage($literals[1]));
+
+                return $aliasPackage->getPrettyString() .' is an alias of '.$package->getPrettyString().' and thus requires it to be installed too.';
+            case self::RULE_PACKAGE_INVERSE_ALIAS:
+                // inverse alias rules work the other way around than above
+                $aliasPackage = $pool->literalToPackage($literals[1]);
+
+                // avoid returning content like "9999999-dev is an alias of dev-master" as it is useless
+                if ($aliasPackage->getVersion() === VersionParser::DEFAULT_BRANCH_ALIAS) {
+                    return '';
+                }
+                $package = $this->deduplicateDefaultBranchAlias($pool->literalToPackage($literals[0]));
+
+                return $aliasPackage->getPrettyString() .' is an alias of '.$package->getPrettyString().' and must be installed with it.';
+            default:
+                $ruleText = '';
+                foreach ($literals as $i => $literal) {
+                    if ($i !== 0) {
+                        $ruleText .= '|';
+                    }
+                    $ruleText .= $pool->literalToPrettyString($literal, $installedMap);
+                }
+
+                return '('.$ruleText.')';
+        }
+    }
+
+    /**
+     * @param array<int|BasePackage> $packages An array containing packages or literals
+     */
+    protected function formatPackagesUnique(Pool $pool, array $packages, bool $isVerbose, ?ConstraintInterface $constraint = null, bool $useRemovedVersionGroup = false): string
+    {
+        foreach ($packages as $index => $package) {
+            if (!\is_object($package)) {
+                $packages[$index] = $pool->literalToPackage($package);
             }
+        }
 
-            return $m['prefix'].$m['user'].':***@';
-        }, $url);
+        return Problem::getPackageList($packages, $isVerbose, $pool, $constraint, $useRemovedVersionGroup);
+    }
 
-        return $url;
+    private function deduplicateDefaultBranchAlias(BasePackage $package): BasePackage
+    {
+        if ($package instanceof AliasPackage && $package->getPrettyVersion() === VersionParser::DEFAULT_BRANCH_ALIAS) {
+            $package = $package->getAliasOf();
+        }
+
+        return $package;
     }
 }

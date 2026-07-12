@@ -1,504 +1,253 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const zls = @import("zls");
+const tracy = @import("tracy");
+const known_folders = @import("known-folders");
 
-const offsets = zls.offsets;
+const Config = @import("Config.zig");
+const offsets = @import("offsets.zig");
 
-const ErrorBuilder = @This();
+const logger = std.log.scoped(.zls_config);
 
-allocator: std.mem.Allocator,
-files: std.StringArrayHashMapUnmanaged(File) = .{},
-message_count: usize = 0,
-/// similar to `git diff --unified`
-/// show error messages with n lines of context.
-/// null will show the whole file
-unified: ?usize = 3,
-file_name_visibility: enum {
-    never,
-    multi_file,
-    always,
-} = .multi_file,
-
-pub fn init(allocator: std.mem.Allocator) ErrorBuilder {
-    return ErrorBuilder{ .allocator = allocator };
+pub fn getLocalConfigPath(allocator: std.mem.Allocator) known_folders.Error!?[]const u8 {
+    const folder_path = try known_folders.getPath(allocator, .local_configuration) orelse return null;
+    defer allocator.free(folder_path);
+    return try std.fs.path.join(allocator, &.{ folder_path, "zls.json" });
 }
 
-pub fn deinit(builder: *ErrorBuilder) void {
-    for (builder.files.values()) |*file| {
-        for (file.messages.items) |item| {
-            builder.allocator.free(item.message);
-        }
-        file.messages.deinit(builder.allocator);
-    }
-    builder.files.deinit(builder.allocator);
-    builder.* = undefined;
+pub fn getGlobalConfigPath(allocator: std.mem.Allocator) known_folders.Error!?[]const u8 {
+    const folder_path = try known_folders.getPath(allocator, .global_configuration) orelse return null;
+    defer allocator.free(folder_path);
+    return try std.fs.path.join(allocator, &.{ folder_path, "zls.json" });
 }
 
-/// assumes `name` and `source` outlives the `ErrorBuilder`
-pub fn addFile(builder: *ErrorBuilder, name: []const u8, source: []const u8) error{OutOfMemory}!void {
-    const gop = try builder.files.getOrPutValue(builder.allocator, name, .{ .source = source });
-    assertFmt(!gop.found_existing, "file '{s}' already exists", .{name});
-}
+pub fn load(allocator: std.mem.Allocator) error{OutOfMemory}!LoadConfigResult {
+    const local_config_path = getLocalConfigPath(allocator) catch |err| blk: {
+        logger.warn("failed to resolve local configuration path: {}", .{err});
+        break :blk null;
+    };
+    defer if (local_config_path) |path| allocator.free(path);
 
-/// preserves insertion order
-pub fn removeFile(builder: *ErrorBuilder, name: []const u8) void {
-    const found = builder.files.fetchOrderedRemove(name);
-    assertFmt(found != null, "file '{s}' doesn't exist", .{name});
-    builder.message_count -= found.?.value.messages.items.len;
-}
+    const global_config_path = getGlobalConfigPath(allocator) catch |err| blk: {
+        logger.warn("failed to resolve global configuration path: {}", .{err});
+        break :blk null;
+    };
+    defer if (global_config_path) |path| allocator.free(path);
 
-pub fn msgAtLoc(
-    builder: *ErrorBuilder,
-    comptime fmt: []const u8,
-    file_name: []const u8,
-    loc: offsets.Loc,
-    level: std.log.Level,
-    args: anytype,
-) error{OutOfMemory}!void {
-    const message = try std.fmt.allocPrint(builder.allocator, fmt, args);
-    errdefer builder.allocator.free(message);
-    try builder.appendMessage(message, file_name, loc, level);
-}
-
-pub fn msgAtIndex(
-    builder: *ErrorBuilder,
-    comptime fmt: []const u8,
-    file_name: []const u8,
-    source_index: usize,
-    level: std.log.Level,
-    args: anytype,
-) error{OutOfMemory}!void {
-    return msgAtLoc(builder, fmt, file_name, .{ .start = source_index, .end = source_index }, level, args);
-}
-
-pub fn hasMessages(builder: ErrorBuilder) bool {
-    return builder.message_count != 0;
-}
-
-/// remove every message from all files
-pub fn clearMessages(builder: *ErrorBuilder) void {
-    for (builder.files.values()) |*file| {
-        for (file.messages.items) |item| {
-            builder.allocator.free(item.message);
-        }
-        file.messages.clearAndFree(builder.allocator);
-    }
-    builder.message_count = 0;
-}
-
-/// remove all files that contain no messages
-pub fn removeUnusedFiles(builder: *ErrorBuilder) void {
-    var i: usize = 0;
-    while (i < builder.files.count()) : (i += 1) {
-        const file: *File = &builder.files.values()[i];
-        if (file.messages.items.len == 0) {
-            file.messages.deinit(builder.allocator); // there may still be capacity remaining
-            builder.files.swapRemoveAt(i);
-        } else {
-            i += 1;
+    for ([_]?[]const u8{ local_config_path, global_config_path }) |config_path| {
+        const result = try loadFromFile(allocator, config_path orelse continue);
+        switch (result) {
+            .success, .failure => return result,
+            .not_found => {},
         }
     }
+
+    return .not_found;
 }
 
-pub const FormatContext = struct {
-    builder: *const ErrorBuilder,
-    tty_config: ?std.io.tty.Config = null,
+pub const LoadConfigResult = union(enum) {
+    success: struct {
+        config: std.json.Parsed(Config),
+        /// file path of the config.json
+        path: []const u8,
+    },
+    failure: struct {
+        /// `null` indicates that the error has already been logged
+        error_bundle: ?std.zig.ErrorBundle,
+
+        pub fn toMessage(self: @This(), allocator: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
+            const error_bundle = self.error_bundle orelse return null;
+            var msg: std.ArrayListUnmanaged(u8) = .{};
+            errdefer msg.deinit(allocator);
+            error_bundle.renderToWriter(.{ .ttyconf = .no_color }, msg.writer(allocator)) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => unreachable, // why does renderToWriter return `anyerror!void`?
+            };
+            return try msg.toOwnedSlice(allocator);
+        }
+    },
+    not_found,
+
+    pub fn deinit(self: *LoadConfigResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .success => |*config_with_path| {
+                config_with_path.config.deinit();
+                allocator.free(config_with_path.path);
+            },
+            .failure => |*payload| {
+                if (payload.error_bundle) |*error_bundle| error_bundle.deinit(allocator);
+            },
+            .not_found => {},
+        }
+    }
 };
 
-pub fn format(
-    builder: *const ErrorBuilder,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
-    _ = options;
-    if (fmt.len != 0) std.fmt.invalidFmtError(fmt, builder.*);
-    try write(.{ .builder = builder }, writer);
-}
+pub fn loadFromFile(allocator: std.mem.Allocator, file_path: []const u8) error{OutOfMemory}!LoadConfigResult {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
 
-pub fn formatContext(
-    context: FormatContext,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
-    _ = options;
-    if (fmt.len != 0) std.fmt.invalidFmtError(fmt, context.builder.*);
-    try write(context, writer);
-}
+    const file_buf = std.fs.cwd().readFileAlloc(allocator, file_path, std.math.maxInt(u32)) catch |err| switch (err) {
+        error.FileNotFound => return .not_found,
+        error.OutOfMemory => |e| return e,
+        else => {
+            logger.warn("Error while reading configuration file: {}", .{err});
+            return .{ .failure = .{ .error_bundle = null } };
+        },
+    };
+    defer allocator.free(file_buf);
 
-pub fn fmtContext(builder: *const ErrorBuilder, tty_config: std.io.tty.Config) std.fmt.Formatter(formatContext) {
-    return .{ .data = .{
-        .builder = builder,
-        .tty_config = tty_config,
+    const parse_options = std.json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    };
+    var parse_diagnostics: std.json.Diagnostics = .{};
+
+    var scanner = std.json.Scanner.initCompleteInput(allocator, file_buf);
+    defer scanner.deinit();
+    scanner.enableDiagnostics(&parse_diagnostics);
+
+    @setEvalBranchQuota(10000);
+    const config = std.json.parseFromTokenSource(
+        Config,
+        allocator,
+        &scanner,
+        parse_options,
+    ) catch |err| {
+        var eb: std.zig.ErrorBundle.Wip = undefined;
+        try eb.init(allocator);
+        errdefer eb.deinit();
+
+        const src_path = try eb.addString(file_path);
+        const msg = try eb.addString(@errorName(err));
+
+        const src_loc = try eb.addSourceLocation(.{
+            .src_path = src_path,
+            .line = @intCast(parse_diagnostics.getLine()),
+            .column = @intCast(parse_diagnostics.getColumn()),
+            .span_start = @intCast(parse_diagnostics.getByteOffset()),
+            .span_main = @intCast(parse_diagnostics.getByteOffset()),
+            .span_end = @intCast(parse_diagnostics.getByteOffset()),
+        });
+        try eb.addRootErrorMessage(.{
+            .msg = msg,
+            .src_loc = src_loc,
+        });
+
+        return .{ .failure = .{ .error_bundle = try eb.toOwnedBundle("") } };
+    };
+
+    return .{ .success = .{
+        .config = config,
+        .path = try allocator.dupe(u8, file_path),
     } };
 }
 
-pub fn writeDebug(builder: *const ErrorBuilder) void {
-    const stderr = std.io.getStdErr();
-    const tty_config = std.io.tty.detectConfig(stderr);
-    // does zig trim the output or why is this needed?
-    stderr.writeAll(" ") catch return;
-    std.debug.print("\n{}\n", .{builder.fmtContext(tty_config)});
-}
+pub const Env = struct {
+    zig_exe: []const u8,
+    lib_dir: ?[]const u8,
+    std_dir: []const u8,
+    global_cache_dir: []const u8,
+    version: []const u8,
+    target: ?[]const u8 = null,
+};
 
-//
-//
-//
+pub fn getZigEnv(allocator: std.mem.Allocator, zig_exe_path: []const u8) ?std.json.Parsed(Env) {
+    const zig_env_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ zig_exe_path, "env" },
+    }) catch {
+        logger.err("Failed to execute zig env", .{});
+        return null;
+    };
 
-fn assertFmt(ok: bool, comptime fmt: []const u8, args: anytype) void {
-    if (builtin.mode == .Debug or builtin.is_test) {
-        if (!ok) std.debug.panic(fmt, args);
-    } else {
-        std.debug.assert(ok);
+    defer {
+        allocator.free(zig_env_result.stdout);
+        allocator.free(zig_env_result.stderr);
     }
+
+    switch (zig_env_result.term) {
+        .Exited => |code| {
+            if (code != 0) {
+                logger.err("zig env failed with error_code: {}", .{code});
+                return null;
+            }
+        },
+        else => logger.err("zig env invocation failed", .{}),
+    }
+
+    return std.json.parseFromSlice(
+        Env,
+        allocator,
+        zig_env_result.stdout,
+        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+    ) catch {
+        logger.err("Failed to parse zig env JSON result", .{});
+        return null;
+    };
 }
 
-fn appendMessage(
-    builder: *ErrorBuilder,
-    message: []const u8,
-    file_name: []const u8,
-    loc: offsets.Loc,
-    level: std.log.Level,
-) error{OutOfMemory}!void {
-    assertFmt(loc.start <= loc.end, "invalid source location [{d}..{d}]", .{ loc.start, loc.end });
-    const file: *File = blk: {
-        const file = builder.files.getPtr(file_name);
-        assertFmt(file != null, "file '{s}' doesn't exist", .{file_name});
-        break :blk file.?;
-    };
-    assertFmt(
-        loc.end <= file.source.len,
-        "source location [{d}..{d}] is outside file source (len: {d})",
-        .{ loc.start, loc.end, file.source.len },
-    );
-    assertFmt(
-        std.mem.count(u8, offsets.locToSlice(file.source, loc), "\n") == 0,
-        "source location [{d}..{d}] must span a single line",
-        .{ loc.start, loc.end },
-    );
+/// the same struct as Config but every field is optional
+pub const Configuration = getConfigurationType();
 
-    const Context = struct {
-        items: []MsgItem,
-        source: []const u8,
-
-        pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-            return MsgItem.lessThan(ctx.source, ctx.items[a], ctx.items[b]);
+// returns a Struct which is the same as `Config` except that every field is optional.
+fn getConfigurationType() type {
+    var config_info: std.builtin.Type = @typeInfo(Config);
+    var fields: [config_info.Struct.fields.len]std.builtin.Type.StructField = undefined;
+    for (config_info.Struct.fields, &fields) |field, *new_field| {
+        new_field.* = field;
+        if (@typeInfo(field.type) != .Optional) {
+            new_field.type = @Type(std.builtin.Type{
+                .Optional = .{ .child = field.type },
+            });
         }
-
-        pub fn swap(ctx: @This(), a: usize, b: usize) void {
-            return std.mem.swap(MsgItem, &ctx.items[a], &ctx.items[b]);
-        }
-    };
-
-    try file.messages.append(builder.allocator, .{
-        .loc = loc,
-        .level = level,
-        .message = message,
-    });
-    // the `a` parameter of this function makes no sense.
-    std.sort.insertionContext(
-        0,
-        file.messages.items.len,
-        Context{ .items = file.messages.items, .source = file.source },
-    );
-    builder.message_count += 1;
+        new_field.default_value = &@as(new_field.type, null);
+    }
+    config_info.Struct.fields = fields[0..];
+    config_info.Struct.decls = &.{};
+    return @Type(config_info);
 }
 
-fn write(context: FormatContext, writer: anytype) @TypeOf(writer).Error!void {
-    const builder = context.builder;
-    for (builder.files.keys(), builder.files.values()) |file_name, file| {
-        if (file.messages.items.len == 0) continue;
+pub fn findZig(allocator: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+    const env_path = std.process.getEnvVarOwned(allocator, "PATH") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        error.OutOfMemory => |e| return e,
+        error.InvalidWtf8 => |e| {
+            logger.err("failed to load 'PATH' enviorment variable: {}", .{e});
+            return null;
+        },
+    };
+    defer allocator.free(env_path);
 
-        std.debug.assert(std.sort.isSorted(MsgItem, file.messages.items, file.source, MsgItem.lessThan));
+    const zig_exe = "zig" ++ comptime builtin.target.exeFileExt();
 
-        if (builder.file_name_visibility == .always or
-            builder.file_name_visibility == .multi_file and builder.files.count() > 1)
-        {
-            try writer.print("{s}:\n", .{file_name});
+    var it = std.mem.tokenizeScalar(u8, env_path, std.fs.path.delimiter);
+    while (it.next()) |path| {
+        var full_path = try std.fs.path.join(allocator, &[_][]const u8{ path, zig_exe });
+        defer allocator.free(full_path);
+
+        if (!std.fs.path.isAbsolute(full_path)) {
+            logger.warn("ignoring entry in PATH '{s}' because it is not an absolute file path", .{full_path});
+            continue;
         }
 
-        var it = MsgItemIterator{
-            .source = file.source,
-            .messages = file.messages.items,
+        const file = std.fs.openFileAbsolute(full_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => |e| {
+                logger.warn("failed to open entry in PATH '{s}': {}", .{ full_path, e });
+                continue;
+            },
         };
+        defer file.close();
 
-        var last_line_end: usize = 0;
-        var last_line_end_with_unified: usize = 0;
-
-        while (it.next()) |line_messages| {
-            std.debug.assert(line_messages.len > 0);
-
-            const some_line_source_index = line_messages[0].loc.start;
-            const line_loc = offsets.lineLocAtIndex(file.source, some_line_source_index);
-            defer last_line_end = line_loc.end;
-
-            const unified_loc = if (builder.unified) |n|
-                offsets.multilineLocAtIndex(file.source, some_line_source_index, n)
-            else
-                offsets.Loc{
-                    .start = 0,
-                    .end = file.source.len,
-                };
-            defer last_line_end_with_unified = unified_loc.end;
-
-            if (last_line_end_with_unified == 0) { // start
-                try writer.writeAll(file.source[unified_loc.start..line_loc.end]);
-            } else if (last_line_end_with_unified < unified_loc.start) { // no intersection
-                try writer.writeAll(file.source[last_line_end..@min(last_line_end_with_unified + 1, file.source.len)]);
-                try writer.writeAll(file.source[unified_loc.start..line_loc.end]);
-            } else { // intersection (we can merge)
-                try writer.writeAll(file.source[last_line_end..line_loc.end]);
-            }
-
-            for (line_messages) |item| {
-                try writer.writeByte('\n');
-                for (line_loc.start..item.loc.start) |_| try writer.writeByte(' ');
-                for (item.loc.start..item.loc.end) |_| try writer.writeByte('^');
-                if (item.loc.start == item.loc.end) try writer.writeByte('^');
-
-                const level_txt: []const u8 = switch (item.level) {
-                    .err => "error",
-                    .warn => "warning",
-                    .info => "info",
-                    .debug => "debug",
-                };
-                const color: std.io.tty.Color = switch (item.level) {
-                    .err => .red,
-                    .warn => .yellow,
-                    .info => .white,
-                    .debug => .white,
-                };
-                if (context.tty_config) |tty| tty.setColor(writer, color) catch {};
-                try writer.print(" {s}: ", .{level_txt});
-                if (context.tty_config) |tty| tty.setColor(writer, .reset) catch {};
-                try writer.writeAll(item.message);
+        stat_failed: {
+            const stat = file.stat() catch break :stat_failed;
+            if (stat.kind == .directory) {
+                logger.warn("ignoring entry in PATH '{s}' because it is a directory", .{full_path});
             }
         }
 
-        try writer.writeAll(file.source[last_line_end..last_line_end_with_unified]);
+        defer full_path = "";
+        return full_path;
     }
-}
-
-const File = struct {
-    source: []const u8,
-    messages: std.ArrayListUnmanaged(MsgItem) = .{},
-};
-
-const MsgItem = struct {
-    loc: offsets.Loc,
-    level: std.log.Level,
-    message: []const u8,
-
-    fn lessThan(source: []const u8, lhs: MsgItem, rhs: MsgItem) bool {
-        const is_less = lhs.loc.start < rhs.loc.start;
-        const text = if (is_less) source[lhs.loc.start..rhs.loc.start] else source[rhs.loc.start..lhs.loc.start];
-
-        // report messages on the same line in reverse order
-        if (std.mem.indexOfScalar(u8, text, '\n') == null) {
-            return lhs.loc.start > rhs.loc.start;
-        }
-
-        return is_less;
-    }
-};
-
-/// iterates through MsgItem's grouped by lines
-/// assumes that `messages` is sorted
-const MsgItemIterator = struct {
-    source: []const u8,
-    messages: []const MsgItem,
-    msg_index: usize = 0,
-
-    fn next(it: *MsgItemIterator) ?[]const MsgItem {
-        std.debug.assert(it.msg_index <= it.messages.len);
-        if (it.msg_index == it.messages.len) return null;
-
-        const msg = it.messages[it.msg_index];
-        const line_loc = offsets.lineLocAtIndex(it.source, msg.loc.start);
-
-        const start = it.msg_index;
-        const end = while (it.msg_index < it.messages.len) : (it.msg_index += 1) {
-            const loc = it.messages[it.msg_index].loc;
-            if (line_loc.start <= loc.start and loc.end <= line_loc.end) continue;
-            break it.msg_index;
-        } else it.messages.len;
-
-        it.msg_index = end;
-        return it.messages[start..end];
-    }
-};
-
-//
-//
-//
-
-test ErrorBuilder {
-    var eb = ErrorBuilder.init(std.testing.allocator);
-    defer eb.deinit();
-    try std.testing.expect(!eb.hasMessages());
-
-    try eb.addFile("example.zig", "");
-    try eb.msgAtIndex("", "example.zig", 0, .info, .{});
-    try std.testing.expect(eb.hasMessages());
-
-    eb.clearMessages();
-    try std.testing.expect(!eb.hasMessages());
-    eb.removeUnusedFiles();
-    try std.testing.expectEqual(@as(usize, 0), eb.files.count());
-}
-
-test "ErrorBuilder - write" {
-    var eb = ErrorBuilder.init(std.testing.allocator);
-    defer eb.deinit();
-
-    try std.testing.expectFmt("", "{}", .{eb});
-
-    try eb.addFile("",
-        \\The missile knows where it is at all times.
-        \\It knows this because it knows where it isn't.
-        \\By subtracting where it is from where it isn't, or where it isn't from where it is
-        \\(whichever is greater), it obtains a difference, or deviation.
-        \\The guidance subsystem uses deviations to generate corrective commands to drive
-        \\the missile from a position where it is to a position where it isn't, and
-        \\arriving at a position where it wasn't, it now is.
-        \\Consequently, the position where it is, is now the position that it wasn't, and it
-        \\follows that the position that it was, is now the position that it isn't.
-        \\In the event that the position that it is in is not the position that it wasn't,
-        \\the system has acquired a variation, the variation being the difference between where
-        \\the missile is, and where it wasn't.
-        \\If variation is considered to be a significant factor, it too may be correcte by the GEA.
-        \\However, the missile must also know where it was.
-        \\The missile guidance computer scenario works as follows.
-        \\Because a variation has modified some of the information the missile has obtained,
-        \\it is not sure just where it is.
-        \\However, it is sure where it isn't, within reason, and it knows where it was.
-        \\It now subtracts where it should be from where it wasn't, or vice-versa, and by
-        \\differentiating this from the algebraic sum of where it shouldn't be, and where
-        \\it was, it is able to obtain the deviation and its variation, which is called error.
-    );
-
-    try std.testing.expectFmt("", "{}", .{eb});
-
-    {
-        eb.clearMessages();
-        eb.unified = 0;
-        try eb.msgAtLoc("what about equallity?", "", .{ .start = 175, .end = 195 }, .warn, .{});
-
-        try std.testing.expectFmt(
-            \\(whichever is greater), it obtains a difference, or deviation.
-            \\ ^^^^^^^^^^^^^^^^^^^^ warning: what about equallity?
-        , "{}", .{eb});
-    }
-
-    {
-        eb.clearMessages();
-        eb.unified = 1;
-        try eb.msgAtLoc("are safety checks enabled?", "", .{ .start = 94, .end = 105 }, .info, .{});
-
-        try std.testing.expectFmt(
-            \\It knows this because it knows where it isn't.
-            \\By subtracting where it is from where it isn't, or where it isn't from where it is
-            \\   ^^^^^^^^^^^ info: are safety checks enabled?
-            \\(whichever is greater), it obtains a difference, or deviation.
-        , "{}", .{eb});
-    }
-
-    {
-        eb.clearMessages();
-        eb.unified = 1;
-        try eb.msgAtLoc("AAM or ASM?", "", .{ .start = 4, .end = 11 }, .info, .{});
-
-        try std.testing.expectFmt(
-            \\The missile knows where it is at all times.
-            \\    ^^^^^^^ info: AAM or ASM?
-            \\It knows this because it knows where it isn't.
-        , "{}", .{eb});
-    }
-
-    {
-        eb.clearMessages();
-        eb.unified = 2;
-        try eb.msgAtLoc("reserved keyword!", "", .{ .start = 1432, .end = 1437 }, .err, .{});
-
-        try std.testing.expectFmt(
-            \\It now subtracts where it should be from where it wasn't, or vice-versa, and by
-            \\differentiating this from the algebraic sum of where it shouldn't be, and where
-            \\it was, it is able to obtain the deviation and its variation, which is called error.
-            \\                                                                              ^^^^^ error: reserved keyword!
-        , "{}", .{eb});
-    }
-
-    {
-        eb.clearMessages();
-        try eb.msgAtLoc("redeclaration of work 'knows'", "", .{ .start = 69, .end = 74 }, .err, .{});
-        try eb.msgAtLoc("declared here", "", .{ .start = 12, .end = 17 }, .info, .{});
-
-        eb.unified = 0;
-        try std.testing.expectFmt(
-            \\The missile knows where it is at all times.
-            \\            ^^^^^ info: declared here
-            \\It knows this because it knows where it isn't.
-            \\                         ^^^^^ error: redeclaration of work 'knows'
-        , "{}", .{eb});
-
-        eb.unified = 1;
-        try std.testing.expectFmt(
-            \\The missile knows where it is at all times.
-            \\            ^^^^^ info: declared here
-            \\It knows this because it knows where it isn't.
-            \\                         ^^^^^ error: redeclaration of work 'knows'
-            \\By subtracting where it is from where it isn't, or where it isn't from where it is
-        , "{}", .{eb});
-    }
-
-    {
-        eb.clearMessages();
-        try eb.msgAtLoc("redeclaration of work 'knows'", "", .{ .start = 69, .end = 74 }, .err, .{});
-        try eb.msgAtLoc("declared here", "", .{ .start = 12, .end = 17 }, .info, .{});
-
-        eb.unified = 0;
-        try std.testing.expectFmt(
-            \\The missile knows where it is at all times.
-            \\            ^^^^^ info: declared here
-            \\It knows this because it knows where it isn't.
-            \\                         ^^^^^ error: redeclaration of work 'knows'
-        , "{}", .{eb});
-
-        eb.unified = 1;
-        try std.testing.expectFmt(
-            \\The missile knows where it is at all times.
-            \\            ^^^^^ info: declared here
-            \\It knows this because it knows where it isn't.
-            \\                         ^^^^^ error: redeclaration of work 'knows'
-            \\By subtracting where it is from where it isn't, or where it isn't from where it is
-        , "{}", .{eb});
-    }
-}
-
-test "ErrorBuilder - write on empty file" {
-    var eb = ErrorBuilder.init(std.testing.allocator);
-    defer eb.deinit();
-
-    try eb.addFile("empty.zig", "");
-    try eb.msgAtIndex("why is this empty?", "empty.zig", 0, .warn, .{});
-
-    eb.unified = null;
-    try std.testing.expectFmt(
-        \\
-        \\^ warning: why is this empty?
-    , "{}", .{eb});
-
-    eb.unified = 0;
-    try std.testing.expectFmt(
-        \\
-        \\^ warning: why is this empty?
-    , "{}", .{eb});
-
-    eb.unified = 2;
-    try std.testing.expectFmt(
-        \\
-        \\^ warning: why is this empty?
-    , "{}", .{eb});
+    return null;
 }

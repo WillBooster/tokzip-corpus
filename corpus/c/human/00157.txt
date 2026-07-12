@@ -5,7 +5,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) Steve Holme, <steve_holme@hotmail.com>.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -21,95 +21,266 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-/* <DESC>
- * A basic application source code using the multi interface doing two
- * transfers in parallel.
- * </DESC>
- */
 
-#include <stdio.h>
-#include <string.h>
+#include "curl_setup.h"
 
-/* curl stuff */
+#if defined(_WIN32)
+
 #include <curl/curl.h>
+#include "system_win32.h"
+#include "version_win32.h"
+#include "curl_sspi.h"
+#include "warnless.h"
+
+/* The last #include files should be: */
+#include "curl_memory.h"
+#include "memdebug.h"
+
+LARGE_INTEGER Curl_freq;
+bool Curl_isVistaOrGreater;
+bool Curl_isWindows8OrGreater;
+
+/* Handle of iphlpapp.dll */
+static HMODULE s_hIpHlpApiDll = NULL;
+
+/* Function pointers */
+IF_NAMETOINDEX_FN Curl_if_nametoindex = NULL;
+FREEADDRINFOEXW_FN Curl_FreeAddrInfoExW = NULL;
+GETADDRINFOEXCANCEL_FN Curl_GetAddrInfoExCancel = NULL;
+GETADDRINFOEXW_FN Curl_GetAddrInfoExW = NULL;
+
+/* Curl_win32_init() performs win32 global initialization */
+CURLcode Curl_win32_init(long flags)
+{
+#ifdef USE_WINSOCK
+  HMODULE ws2_32Dll;
+#endif
+  /* CURL_GLOBAL_WIN32 controls the *optional* part of the initialization which
+     is just for Winsock at the moment. Any required win32 initialization
+     should take place after this block. */
+  if(flags & CURL_GLOBAL_WIN32) {
+#ifdef USE_WINSOCK
+    WORD wVersionRequested;
+    WSADATA wsaData;
+    int res;
+
+    wVersionRequested = MAKEWORD(2, 2);
+    res = WSAStartup(wVersionRequested, &wsaData);
+
+    if(res)
+      /* Tell the user that we could not find a usable */
+      /* winsock.dll.     */
+      return CURLE_FAILED_INIT;
+
+    /* Confirm that the Windows Sockets DLL supports what we need.*/
+    /* Note that if the DLL supports versions greater */
+    /* than wVersionRequested, it will still return */
+    /* wVersionRequested in wVersion. wHighVersion contains the */
+    /* highest supported version. */
+
+    if(LOBYTE(wsaData.wVersion) != LOBYTE(wVersionRequested) ||
+       HIBYTE(wsaData.wVersion) != HIBYTE(wVersionRequested) ) {
+      /* Tell the user that we could not find a usable */
+
+      /* winsock.dll. */
+      WSACleanup();
+      return CURLE_FAILED_INIT;
+    }
+    /* The Windows Sockets DLL is acceptable. Proceed. */
+#elif defined(USE_LWIPSOCK)
+    lwip_init();
+#endif
+  } /* CURL_GLOBAL_WIN32 */
+
+#ifdef USE_WINDOWS_SSPI
+  {
+    CURLcode result = Curl_sspi_global_init();
+    if(result)
+      return result;
+  }
+#endif
+
+  s_hIpHlpApiDll = Curl_load_library(TEXT("iphlpapi.dll"));
+  if(s_hIpHlpApiDll) {
+    /* Get the address of the if_nametoindex function */
+    IF_NAMETOINDEX_FN pIfNameToIndex =
+      CURLX_FUNCTION_CAST(IF_NAMETOINDEX_FN,
+                          (GetProcAddress(s_hIpHlpApiDll, "if_nametoindex")));
+
+    if(pIfNameToIndex)
+      Curl_if_nametoindex = pIfNameToIndex;
+  }
+
+#ifdef USE_WINSOCK
+#ifdef CURL_WINDOWS_APP
+  ws2_32Dll = Curl_load_library(TEXT("ws2_32.dll"));
+#else
+  ws2_32Dll = GetModuleHandleA("ws2_32");
+#endif
+  if(ws2_32Dll) {
+    Curl_FreeAddrInfoExW = CURLX_FUNCTION_CAST(FREEADDRINFOEXW_FN,
+      GetProcAddress(ws2_32Dll, "FreeAddrInfoExW"));
+    Curl_GetAddrInfoExCancel = CURLX_FUNCTION_CAST(GETADDRINFOEXCANCEL_FN,
+      GetProcAddress(ws2_32Dll, "GetAddrInfoExCancel"));
+    Curl_GetAddrInfoExW = CURLX_FUNCTION_CAST(GETADDRINFOEXW_FN,
+      GetProcAddress(ws2_32Dll, "GetAddrInfoExW"));
+  }
+#endif
+
+  /* curlx_verify_windows_version must be called during init at least once
+     because it has its own initialization routine. */
+  if(curlx_verify_windows_version(6, 0, 0, PLATFORM_WINNT,
+                                  VERSION_GREATER_THAN_EQUAL)) {
+    Curl_isVistaOrGreater = TRUE;
+  }
+  else
+    Curl_isVistaOrGreater = FALSE;
+
+  if(curlx_verify_windows_version(6, 2, 0, PLATFORM_WINNT,
+                                  VERSION_GREATER_THAN_EQUAL)) {
+    Curl_isWindows8OrGreater = TRUE;
+  }
+  else
+    Curl_isWindows8OrGreater = FALSE;
+
+  QueryPerformanceFrequency(&Curl_freq);
+  return CURLE_OK;
+}
+
+/* Curl_win32_cleanup() is the opposite of Curl_win32_init() */
+void Curl_win32_cleanup(long init_flags)
+{
+  Curl_FreeAddrInfoExW = NULL;
+  Curl_GetAddrInfoExCancel = NULL;
+  Curl_GetAddrInfoExW = NULL;
+  if(s_hIpHlpApiDll) {
+    FreeLibrary(s_hIpHlpApiDll);
+    s_hIpHlpApiDll = NULL;
+    Curl_if_nametoindex = NULL;
+  }
+
+#ifdef USE_WINDOWS_SSPI
+  Curl_sspi_global_cleanup();
+#endif
+
+  if(init_flags & CURL_GLOBAL_WIN32) {
+#ifdef USE_WINSOCK
+    WSACleanup();
+#endif
+  }
+}
+
+#if !defined(LOAD_WITH_ALTERED_SEARCH_PATH)
+#define LOAD_WITH_ALTERED_SEARCH_PATH  0x00000008
+#endif
+
+#if !defined(LOAD_LIBRARY_SEARCH_SYSTEM32)
+#define LOAD_LIBRARY_SEARCH_SYSTEM32   0x00000800
+#endif
+
+/* We use our own typedef here since some headers might lack these */
+typedef HMODULE (APIENTRY *LOADLIBRARYEX_FN)(LPCTSTR, HANDLE, DWORD);
+
+/* See function definitions in winbase.h */
+#ifdef UNICODE
+#  ifdef _WIN32_WCE
+#    define LOADLIBARYEX  L"LoadLibraryExW"
+#  else
+#    define LOADLIBARYEX  "LoadLibraryExW"
+#  endif
+#else
+#  define LOADLIBARYEX    "LoadLibraryExA"
+#endif
 
 /*
- * Download an HTTP file and upload an FTP file simultaneously.
+ * Curl_load_library()
+ *
+ * This is used to dynamically load DLLs using the most secure method available
+ * for the version of Windows that we are running on.
+ *
+ * Parameters:
+ *
+ * filename  [in] - The filename or full path of the DLL to load. If only the
+ *                  filename is passed then the DLL will be loaded from the
+ *                  Windows system directory.
+ *
+ * Returns the handle of the module on success; otherwise NULL.
  */
-
-#define HANDLECOUNT 2   /* Number of simultaneous transfers */
-#define HTTP_HANDLE 0   /* Index for the HTTP transfer */
-#define FTP_HANDLE 1    /* Index for the FTP transfer */
-
-int main(void)
+HMODULE Curl_load_library(LPCTSTR filename)
 {
-  CURL *handles[HANDLECOUNT];
-  CURLM *multi_handle;
+#ifndef CURL_WINDOWS_APP
+  HMODULE hModule = NULL;
+  LOADLIBRARYEX_FN pLoadLibraryEx = NULL;
 
-  int still_running = 1; /* keep number of running handles */
-  int i;
+  /* Get a handle to kernel32 so we can access it is functions at runtime */
+  HMODULE hKernel32 = GetModuleHandle(TEXT("kernel32"));
+  if(!hKernel32)
+    return NULL;
 
-  CURLMsg *msg; /* for picking up messages with the transfer status */
-  int msgs_left; /* how many messages are left */
+  /* Attempt to find LoadLibraryEx() which is only available on Windows 2000
+     and above */
+  pLoadLibraryEx =
+    CURLX_FUNCTION_CAST(LOADLIBRARYEX_FN,
+                        (GetProcAddress(hKernel32, LOADLIBARYEX)));
 
-  /* Allocate one CURL handle per transfer */
-  for(i = 0; i<HANDLECOUNT; i++)
-    handles[i] = curl_easy_init();
-
-  /* set the options (I left out a few, you get the point anyway) */
-  curl_easy_setopt(handles[HTTP_HANDLE], CURLOPT_URL, "https://example.com");
-
-  curl_easy_setopt(handles[FTP_HANDLE], CURLOPT_URL, "ftp://example.com");
-  curl_easy_setopt(handles[FTP_HANDLE], CURLOPT_UPLOAD, 1L);
-
-  /* init a multi stack */
-  multi_handle = curl_multi_init();
-
-  /* add the individual transfers */
-  for(i = 0; i<HANDLECOUNT; i++)
-    curl_multi_add_handle(multi_handle, handles[i]);
-
-  while(still_running) {
-    CURLMcode mc = curl_multi_perform(multi_handle, &still_running);
-
-    if(still_running)
-      /* wait for activity, timeout or "nothing" */
-      mc = curl_multi_poll(multi_handle, NULL, 0, 1000, NULL);
-
-    if(mc)
-      break;
+  /* Detect if there is already a path in the filename and load the library if
+     there is. Note: Both back slashes and forward slashes have been supported
+     since the earlier days of DOS at an API level although they are not
+     supported by command prompt */
+  if(_tcspbrk(filename, TEXT("\\/"))) {
+    /** !checksrc! disable BANNEDFUNC 1 **/
+    hModule = pLoadLibraryEx ?
+      pLoadLibraryEx(filename, NULL, LOAD_WITH_ALTERED_SEARCH_PATH) :
+      LoadLibrary(filename);
   }
-  /* See how the transfers went */
-  /* !checksrc! disable EQUALSNULL 1 */
-  while((msg = curl_multi_info_read(multi_handle, &msgs_left)) != NULL) {
-    if(msg->msg == CURLMSG_DONE) {
-      int idx;
+  /* Detect if KB2533623 is installed, as LOAD_LIBRARY_SEARCH_SYSTEM32 is only
+     supported on Windows Vista, Windows Server 2008, Windows 7 and Windows
+     Server 2008 R2 with this patch or natively on Windows 8 and above */
+  else if(pLoadLibraryEx && GetProcAddress(hKernel32, "AddDllDirectory")) {
+    /* Load the DLL from the Windows system directory */
+    hModule = pLoadLibraryEx(filename, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  }
+  else {
+    /* Attempt to get the Windows system path */
+    UINT systemdirlen = GetSystemDirectory(NULL, 0);
+    if(systemdirlen) {
+      /* Allocate space for the full DLL path (Room for the null terminator
+         is included in systemdirlen) */
+      size_t filenamelen = _tcslen(filename);
+      TCHAR *path = malloc(sizeof(TCHAR) * (systemdirlen + 1 + filenamelen));
+      if(path && GetSystemDirectory(path, systemdirlen)) {
+        /* Calculate the full DLL path */
+        _tcscpy(path + _tcslen(path), TEXT("\\"));
+        _tcscpy(path + _tcslen(path), filename);
 
-      /* Find out which handle this message is about */
-      for(idx = 0; idx<HANDLECOUNT; idx++) {
-        int found = (msg->easy_handle == handles[idx]);
-        if(found)
-          break;
-      }
+        /* Load the DLL from the Windows system directory */
+        /** !checksrc! disable BANNEDFUNC 1 **/
+        hModule = pLoadLibraryEx ?
+          pLoadLibraryEx(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH) :
+          LoadLibrary(path);
 
-      switch(idx) {
-      case HTTP_HANDLE:
-        printf("HTTP transfer completed with status %d\n", msg->data.result);
-        break;
-      case FTP_HANDLE:
-        printf("FTP transfer completed with status %d\n", msg->data.result);
-        break;
       }
+      free(path);
     }
   }
-
-  /* remove the transfers and cleanup the handles */
-  for(i = 0; i<HANDLECOUNT; i++) {
-    curl_multi_remove_handle(multi_handle, handles[i]);
-    curl_easy_cleanup(handles[i]);
-  }
-
-  curl_multi_cleanup(multi_handle);
-
-  return 0;
+  return hModule;
+#else
+  /* the Universal Windows Platform (UWP) cannot do this */
+  (void)filename;
+  return NULL;
+#endif
 }
+
+bool Curl_win32_impersonating(void)
+{
+#ifndef CURL_WINDOWS_APP
+  HANDLE token = NULL;
+  if(OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
+    CloseHandle(token);
+    return TRUE;
+  }
+#endif
+  return FALSE;
+}
+
+#endif /* _WIN32 */

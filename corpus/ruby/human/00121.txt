@@ -1,115 +1,106 @@
-require_relative 'test_helper'
+# frozen_string_literal: true
 
-class ERBTest < Minitest::Test
-  def engine
-    Tilt::ERBTemplate
+RSpec.describe Rack::Protection::AuthenticityToken do
+  let(:token) { described_class.random_token }
+  let(:masked_token) { described_class.token(session) }
+  let(:bad_token) { Base64.strict_encode64('badtoken') }
+  let(:session) { { csrf: token } }
+
+  it_behaves_like 'any rack application'
+
+  it 'denies post requests without any token' do
+    expect(post('/')).not_to be_ok
   end
 
-  def setup
-    Tilt.prefer engine, :erb
-    super
+  it 'accepts post requests with correct X-CSRF-Token header' do
+    post('/', {}, 'rack.session' => session, 'HTTP_X_CSRF_TOKEN' => token)
+    expect(last_response).to be_ok
   end
 
-  def erb_app(&block)
+  it 'accepts post requests with masked X-CSRF-Token header' do
+    post('/', {}, 'rack.session' => session, 'HTTP_X_CSRF_TOKEN' => masked_token)
+    expect(last_response).to be_ok
+  end
+
+  it 'denies post requests with wrong X-CSRF-Token header' do
+    post('/', {}, 'rack.session' => session, 'HTTP_X_CSRF_TOKEN' => bad_token)
+    expect(last_response).not_to be_ok
+  end
+
+  it 'accepts post form requests with correct authenticity_token field' do
+    post('/', { 'authenticity_token' => token }, 'rack.session' => session)
+    expect(last_response).to be_ok
+  end
+
+  it 'accepts post form requests with masked authenticity_token field' do
+    post('/', { 'authenticity_token' => masked_token }, 'rack.session' => session)
+    expect(last_response).to be_ok
+  end
+
+  it 'denies post form requests with wrong authenticity_token field' do
+    post('/', { 'authenticity_token' => bad_token }, 'rack.session' => session)
+    expect(last_response).not_to be_ok
+  end
+
+  it 'accepts post form requests with a valid per form token' do
+    token = Rack::Protection::AuthenticityToken.token(session, path: '/foo')
+    post('/foo', { 'authenticity_token' => token }, 'rack.session' => session)
+    expect(last_response).to be_ok
+  end
+
+  it 'denies post form requests with an invalid per form token' do
+    token = Rack::Protection::AuthenticityToken.token(session, path: '/foo')
+    post('/bar', { 'authenticity_token' => token }, 'rack.session' => session)
+    expect(last_response).not_to be_ok
+  end
+
+  it 'prevents ajax requests without a valid token' do
+    expect(post('/', {}, 'HTTP_X_REQUESTED_WITH' => 'XMLHttpRequest')).not_to be_ok
+  end
+
+  it 'allows for a custom authenticity token param' do
     mock_app do
-      set :views, __dir__ + '/views'
-      get('/', &block)
+      use Rack::Protection::AuthenticityToken, authenticity_param: 'csrf_param'
+      run proc { |_e| [200, { 'content-type' => 'text/plain' }, ['hi']] }
     end
-    get '/'
+
+    post('/', { 'csrf_param' => token }, 'rack.session' => { csrf: token })
+    expect(last_response).to be_ok
   end
 
-  it 'uses the correct engine' do
-    assert_equal engine, Tilt[:erb]
+  it "sets a new csrf token for the session in env, even after a 'safe' request" do
+    get('/', {}, {})
+    expect(env['rack.session'][:csrf]).not_to be_nil
   end
 
-  it 'renders inline ERB strings' do
-    erb_app { erb '<%= 1 + 1 %>' }
-    assert ok?
-    assert_equal '2', body
-  end
-
-  it 'renders .erb files in views path' do
-    erb_app { erb :hello }
-    assert ok?
-    assert_equal "Hello World\n", body
-  end
-
-  it 'takes a :locals option' do
-    erb_app do
-      locals = {:foo => 'Bar'}
-      erb '<%= foo %>', :locals => locals
-    end
-    assert ok?
-    assert_equal 'Bar', body
-  end
-
-  it "renders with inline layouts" do
+  it 'allows for a custom token session key' do
     mock_app do
-      layout { 'THIS. IS. <%= yield.upcase %>!' }
-      get('/') { erb 'Sparta' }
-    end
-    get '/'
-    assert ok?
-    assert_equal 'THIS. IS. SPARTA!', body
-  end
-
-  it "renders with file layouts" do
-    erb_app { erb 'Hello World', :layout => :layout2 }
-    assert ok?
-    assert_body "ERB Layout!\nHello World"
-  end
-
-  it "renders erb with blocks" do
-    mock_app do
-      def container
-        @_out_buf << "THIS."
-        yield
-        @_out_buf << "SPARTA!"
-      end
-      def is; "IS." end
-      get('/') { erb '<% container do %> <%= is %> <% end %>' }
-    end
-    get '/'
-    assert ok?
-    assert_equal 'THIS. IS. SPARTA!', body
-  end
-
-  it "can be used in a nested fashion for partials and whatnot" do
-    mock_app do
-      template(:inner) { "<inner><%= 'hi' %></inner>" }
-      template(:outer) { "<outer><%= erb :inner %></outer>" }
-      get('/') { erb :outer }
+      use(Rack::Config) { |e| e['rack.session'] ||= {} }
+      use Rack::Protection::AuthenticityToken, key: :_csrf
+      run DummyApp
     end
 
     get '/'
-    assert ok?
-    assert_equal '<outer><inner>hi</inner></outer>', body
+    expect(env['rack.session'][:_csrf]).not_to be_nil
   end
 
-  it "can render truly nested layouts by accepting a layout and a block with the contents" do
-    mock_app do
-      template(:main_outer_layout) { "<h1>Title</h1>\n<%= yield %>" }
-      template(:an_inner_layout) { "<h2>Subtitle</h2>\n<%= yield %>" }
-      template(:a_page) { "<p>Contents.</p>\n" }
-      get('/') do
-        erb :main_outer_layout, :layout => false do
-          erb :an_inner_layout do
-            erb :a_page
-          end
-        end
-      end
+  describe '.token' do
+    it 'returns a unique masked version of the authenticity token' do
+      expect(Rack::Protection::AuthenticityToken.token(session)).not_to eq(masked_token)
     end
-    get '/'
-    assert ok?
-    assert_body "<h1>Title</h1>\n<h2>Subtitle</h2>\n<p>Contents.</p>\n"
-  end
-end
 
-begin
-  require 'erubi'
-  class ErubiTest < ERBTest
-    def engine; Tilt::ErubiTemplate end
+    it 'sets a session authenticity token if one does not exist' do
+      session = {}
+      allow(Rack::Protection::AuthenticityToken).to receive(:random_token).and_return(token)
+      allow_any_instance_of(Rack::Protection::AuthenticityToken).to receive(:mask_token).and_return(masked_token)
+      Rack::Protection::AuthenticityToken.token(session)
+      expect(session[:csrf]).to eq(token)
+    end
   end
-rescue LoadError
-  warn "#{$!}: skipping erubi tests"
+
+  describe '.random_token' do
+    it 'generates a base64 encoded 32 character string' do
+      expect(Base64.urlsafe_decode64(token).length).to eq(32)
+    end
+  end
 end

@@ -1,3 +1,5 @@
+#ifndef HEADER_CURL_CONNECT_H
+#define HEADER_CURL_CONNECT_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -5,7 +7,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) Steve Holme, <steve_holme@hotmail.com>.
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -21,143 +23,131 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-
 #include "curl_setup.h"
 
-#include <curl/curl.h>
+#include "nonblock.h" /* for curlx_nonblock(), formerly Curl_nonblock() */
+#include "sockaddr.h"
+#include "timeval.h"
 
-#include "vauth.h"
-#include "urldata.h"
-#include "strcase.h"
-#include "curl_multibyte.h"
-#include "curl_printf.h"
+struct Curl_dns_entry;
+struct ip_quadruple;
 
-/* The last #include files should be: */
-#include "curl_memory.h"
-#include "memdebug.h"
+/* generic function that returns how much time there is left to run, according
+   to the timeouts set */
+timediff_t Curl_timeleft(struct Curl_easy *data,
+                         struct curltime *nowp,
+                         bool duringconnect);
 
-/*
- * Curl_auth_build_spn()
- *
- * This is used to build a SPN string in the following formats:
- *
- * service/host@realm (Not currently used)
- * service/host       (Not used by GSS-API)
- * service@realm      (Not used by Windows SSPI)
- *
- * Parameters:
- *
- * service  [in] - The service type such as http, smtp, pop or imap.
- * host     [in] - The hostname.
- * realm    [in] - The realm.
- *
- * Returns a pointer to the newly allocated SPN.
- */
-#if !defined(USE_WINDOWS_SSPI)
-char *Curl_auth_build_spn(const char *service, const char *host,
-                          const char *realm)
-{
-  char *spn = NULL;
+#define DEFAULT_CONNECT_TIMEOUT 300000 /* milliseconds == five minutes */
 
-  /* Generate our SPN */
-  if(host && realm)
-    spn = aprintf("%s/%s@%s", service, host, realm);
-  else if(host)
-    spn = aprintf("%s/%s", service, host);
-  else if(realm)
-    spn = aprintf("%s@%s", service, realm);
+#define DEFAULT_SHUTDOWN_TIMEOUT_MS   (2 * 1000)
 
-  /* Return our newly allocated SPN */
-  return spn;
-}
-#else
-TCHAR *Curl_auth_build_spn(const char *service, const char *host,
-                           const char *realm)
-{
-  char *utf8_spn = NULL;
-  TCHAR *tchar_spn = NULL;
-  TCHAR *dupe_tchar_spn = NULL;
+void Curl_shutdown_start(struct Curl_easy *data, int sockindex,
+                         struct curltime *nowp);
 
-  (void) realm;
+/* return how much time there is left to shutdown the connection at
+ * sockindex. Returns 0 if there is no limit or shutdown has not started. */
+timediff_t Curl_shutdown_timeleft(struct connectdata *conn, int sockindex,
+                                  struct curltime *nowp);
 
-  /* Note: We could use DsMakeSPN() or DsClientMakeSpnForTargetServer() rather
-     than doing this ourselves but the first is only available in Windows XP
-     and Windows Server 2003 and the latter is only available in Windows 2000
-     but not Windows95/98/ME or Windows NT4.0 unless the Active Directory
-     Client Extensions are installed. As such it is far simpler for us to
-     formulate the SPN instead. */
+/* return how much time there is left to shutdown the connection.
+ * Returns 0 if there is no limit or shutdown has not started. */
+timediff_t Curl_conn_shutdown_timeleft(struct connectdata *conn,
+                                       struct curltime *nowp);
 
-  /* Generate our UTF8 based SPN */
-  utf8_spn = aprintf("%s/%s", service, host);
-  if(!utf8_spn)
-    return NULL;
+void Curl_shutdown_clear(struct Curl_easy *data, int sockindex);
 
-  /* Allocate and return a TCHAR based SPN. Since curlx_convert_UTF8_to_tchar
-     must be freed by curlx_unicodefree we will dupe the result so that the
-     pointer this function returns can be normally free'd. */
-  tchar_spn = curlx_convert_UTF8_to_tchar(utf8_spn);
-  free(utf8_spn);
-  if(!tchar_spn)
-    return NULL;
-  dupe_tchar_spn = _tcsdup(tchar_spn);
-  curlx_unicodefree(tchar_spn);
-  return dupe_tchar_spn;
-}
-#endif /* USE_WINDOWS_SSPI */
+/* TRUE iff shutdown has been started */
+bool Curl_shutdown_started(struct Curl_easy *data, int sockindex);
 
 /*
- * Curl_auth_user_contains_domain()
+ * Used to extract socket and connectdata struct for the most recent
+ * transfer on the given Curl_easy.
  *
- * This is used to test if the specified user contains a Windows domain name as
- * follows:
- *
- * Domain\User (Down-level Logon Name)
- * Domain/User (curl Down-level format - for compatibility with existing code)
- * User@Domain (User Principal Name)
- *
- * Note: The username may be empty when using a GSS-API library or Windows
- * SSPI as the user and domain are either obtained from the credentials cache
- * when using GSS-API or via the currently logged in user's credentials when
- * using Windows SSPI.
- *
- * Parameters:
- *
- * user  [in] - The username.
- *
- * Returns TRUE on success; otherwise FALSE.
+ * The returned socket will be CURL_SOCKET_BAD in case of failure!
  */
-bool Curl_auth_user_contains_domain(const char *user)
-{
-  bool valid = FALSE;
+curl_socket_t Curl_getconnectinfo(struct Curl_easy *data,
+                                  struct connectdata **connp);
 
-  if(user && *user) {
-    /* Check we have a domain name or UPN present */
-    char *p = strpbrk(user, "\\/@");
+bool Curl_addr2string(struct sockaddr *sa, curl_socklen_t salen,
+                      char *addr, int *port);
 
-    valid = (p != NULL && p > user && p < user + strlen(user) - 1 ? TRUE :
-                                                                    FALSE);
-  }
-#if defined(HAVE_GSSAPI) || defined(USE_WINDOWS_SSPI)
-  else
-    /* User and domain are obtained from the GSS-API credentials cache or the
-       currently logged in user from Windows */
-    valid = TRUE;
+void Curl_persistconninfo(struct Curl_easy *data, struct connectdata *conn,
+                          struct ip_quadruple *ip);
+
+/*
+ * Curl_conncontrol() marks the end of a connection/stream. The 'closeit'
+ * argument specifies if it is the end of a connection or a stream.
+ *
+ * For stream-based protocols (such as HTTP/2), a stream close will not cause
+ * a connection close. Other protocols will close the connection for both
+ * cases.
+ *
+ * It sets the bit.close bit to TRUE (with an explanation for debug builds),
+ * when the connection will close.
+ */
+
+#define CONNCTRL_KEEP 0 /* undo a marked closure */
+#define CONNCTRL_CONNECTION 1
+#define CONNCTRL_STREAM 2
+
+void Curl_conncontrol(struct connectdata *conn,
+                      int closeit
+#if defined(DEBUGBUILD) && !defined(CURL_DISABLE_VERBOSE_STRINGS)
+                      , const char *reason
+#endif
+  );
+
+#if defined(DEBUGBUILD) && !defined(CURL_DISABLE_VERBOSE_STRINGS)
+#define streamclose(x,y) Curl_conncontrol(x, CONNCTRL_STREAM, y)
+#define connclose(x,y) Curl_conncontrol(x, CONNCTRL_CONNECTION, y)
+#define connkeep(x,y) Curl_conncontrol(x, CONNCTRL_KEEP, y)
+#else /* if !DEBUGBUILD || CURL_DISABLE_VERBOSE_STRINGS */
+#define streamclose(x,y) Curl_conncontrol(x, CONNCTRL_STREAM)
+#define connclose(x,y) Curl_conncontrol(x, CONNCTRL_CONNECTION)
+#define connkeep(x,y) Curl_conncontrol(x, CONNCTRL_KEEP)
 #endif
 
-  return valid;
-}
-
-/*
- * Curl_auth_ollowed_to_host() tells if authentication, cookies or other
- * "sensitive data" can (still) be sent to this host.
+/**
+ * Create a cfilter for making an "ip" connection to the
+ * given address, using parameters from `conn`. The "ip" connection
+ * can be a TCP socket, a UDP socket or even a QUIC connection.
+ *
+ * It MUST use only the supplied `ai` for its connection attempt.
+ *
+ * Such a filter may be used in "happy eyeball" scenarios, and its
+ * `connect` implementation needs to support non-blocking. Once connected,
+ * it MAY be installed in the connection filter chain to serve transfers.
  */
-bool Curl_auth_allowed_to_host(struct Curl_easy *data)
-{
-  struct connectdata *conn = data->conn;
-  return (!data->state.this_is_a_follow ||
-          data->set.allow_auth_to_other_hosts ||
-          (data->state.first_host &&
-           strcasecompare(data->state.first_host, conn->host.name) &&
-           (data->state.first_remote_port == conn->remote_port) &&
-           (data->state.first_remote_protocol == conn->handler->protocol)));
-}
+typedef CURLcode cf_ip_connect_create(struct Curl_cfilter **pcf,
+                                      struct Curl_easy *data,
+                                      struct connectdata *conn,
+                                      const struct Curl_addrinfo *ai,
+                                      int transport);
+
+CURLcode Curl_cf_setup_insert_after(struct Curl_cfilter *cf_at,
+                                    struct Curl_easy *data,
+                                    const struct Curl_dns_entry *remotehost,
+                                    int transport,
+                                    int ssl_mode);
+
+/**
+ * Setup the cfilters at `sockindex` in connection `conn`.
+ * If no filter chain is installed yet, inspects the configuration
+ * in `data` and `conn? to install a suitable filter chain.
+ */
+CURLcode Curl_conn_setup(struct Curl_easy *data,
+                         struct connectdata *conn,
+                         int sockindex,
+                         const struct Curl_dns_entry *remotehost,
+                         int ssl_mode);
+
+extern struct Curl_cftype Curl_cft_happy_eyeballs;
+extern struct Curl_cftype Curl_cft_setup;
+
+#ifdef UNITTESTS
+void Curl_debug_set_transport_provider(int transport,
+                                       cf_ip_connect_create *cf_create);
+#endif
+
+#endif /* HEADER_CURL_CONNECT_H */

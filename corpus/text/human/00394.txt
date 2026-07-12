@@ -1,123 +1,148 @@
----
-c: Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
-SPDX-License-Identifier: curl
-Title: curl_ws_send
-Section: 3
-Source: libcurl
-See-also:
-  - curl_easy_getinfo (3)
-  - curl_easy_perform (3)
-  - curl_easy_setopt (3)
-  - curl_ws_recv (3)
-  - libcurl-ws (3)
-Protocol:
-  - WS
-Added-in: 7.86.0
----
+# Mapping Inheritance
 
-# NAME
+Mapping inheritance serves two functions:
 
-curl_ws_send - send WebSocket data
+- Inheriting mapping configuration from a base class or interface configuration
+- Runtime polymorphic mapping
 
-# SYNOPSIS
+Inheriting base class configuration is opt-in, and you can either explicitly specify the mapping to inherit from the base type configuration with `Include` or in the derived type configuration with `IncludeBase`:
 
-~~~c
-#include <curl/curl.h>
+```c#
+CreateMap<BaseEntity, BaseDto>()
+   .Include<DerivedEntity, DerivedDto>()
+   .ForMember(dest => dest.SomeMember, opt => opt.MapFrom(src => src.OtherMember));
 
-CURLcode curl_ws_send(CURL *curl, const void *buffer, size_t buflen,
-                      size_t *sent, curl_off_t fragsize,
-                      unsigned int flags);
-~~~
+CreateMap<DerivedEntity, DerivedDto>();
+```
 
-# DESCRIPTION
+or
 
-This function call is EXPERIMENTAL.
+```c#
+CreateMap<BaseEntity, BaseDto>()
+   .ForMember(dest => dest.SomeMember, opt => opt.MapFrom(src => src.OtherMember));
 
-Send the specific message fragment over an established WebSocket
-connection. The *buffer* holds the data to send and it is *buflen*
-number of payload bytes in that memory area.
+CreateMap<DerivedEntity, DerivedDto>()
+    .IncludeBase<BaseEntity, BaseDto>();
+```
 
-*sent* is returned as the number of payload bytes actually sent.
+In each case above, the derived mapping inherits the custom mapping configuration from the base map.
 
-To send a (huge) fragment using multiple calls with partial content per
-invoke, set the *CURLWS_OFFSET* bit and the *fragsize* argument as the
-total expected size for the first part, then set the *CURLWS_OFFSET* with
-a zero *fragsize* for the following parts.
+`Include`/`IncludeBase` applies recursively, so you only need to include the closest level in the hierarchy.
 
-If not sending a partial fragment or if this is raw mode, *fragsize*
-should be set to zero.
+If for some base class you have many directly derived classes, as a convenience, you can include all derived maps from the base type map configuration:
 
-If **CURLWS_RAW_MODE** is enabled in CURLOPT_WS_OPTIONS(3), the
-**flags** argument should be set to 0.
+```c#
+CreateMap<BaseEntity, BaseDto>()
+    .IncludeAllDerived();
 
-To send a message consisting of multiple frames, set the *CURLWS_CONT* bit
-in all frames except the final one.
+CreateMap<DerivedEntity, DerivedDto>();
+```
+Note that this will search all your mappings for derived types and it will be slower than explicitly specifying the derived maps.
 
-# FLAGS
+### Runtime polymorphism
 
-## CURLWS_TEXT
+Take:
 
-The buffer contains text data. Note that this makes a difference to WebSocket
-but libcurl itself does not make any verification of the content or
-precautions that you actually send valid UTF-8 content.
+```c#
+public class Order { }
+public class OnlineOrder : Order { }
+public class MailOrder : Order { }
 
-## CURLWS_BINARY
+public class OrderDto { }
+public class OnlineOrderDto : OrderDto { }
+public class MailOrderDto : OrderDto { }
 
-This is binary data.
+var configuration = new MapperConfiguration(cfg => {
+    cfg.CreateMap<Order, OrderDto>()
+        .Include<OnlineOrder, OnlineOrderDto>()
+        .Include<MailOrder, MailOrderDto>();
+    cfg.CreateMap<OnlineOrder, OnlineOrderDto>();
+    cfg.CreateMap<MailOrder, MailOrderDto>();
+});
 
-## CURLWS_CONT
+// Perform Mapping
+var order = new OnlineOrder();
+var mapped = mapper.Map(order, order.GetType(), typeof(OrderDto));
+Assert.IsType<OnlineOrderDto>(mapped);
+```
 
-This is not the final fragment of the message, which implies that there is
-another fragment coming as part of the same message where this bit is not set.
+You will notice that because the mapped object is a OnlineOrder, AutoMapper has seen you have a more specific mapping for OnlineOrder than OrderDto, and automatically chosen that.
 
-## CURLWS_CLOSE
+## Specifying inheritance in derived classes
 
-Close this transfer.
+Instead of configuring inheritance from the base class, you can specify inheritance from the derived classes:
 
-## CURLWS_PING
+```c#
+var configuration = new MapperConfiguration(cfg => {
+  cfg.CreateMap<Order, OrderDto>()
+    .ForMember(o => o.Id, m => m.MapFrom(s => s.OrderId));
+  cfg.CreateMap<OnlineOrder, OnlineOrderDto>()
+    .IncludeBase<Order, OrderDto>();
+  cfg.CreateMap<MailOrder, MailOrderDto>()
+    .IncludeBase<Order, OrderDto>();
+});
+```
 
-This is a ping.
+## As
 
-## CURLWS_PONG
+For simple cases, you can use `As` to redirect a base map to an existing derived map:
 
-This is a pong.
+```c#
+    cfg.CreateMap<Order, OnlineOrderDto>();
+    cfg.CreateMap<Order, OrderDto>().As<OnlineOrderDto>();
+    
+    mapper.Map<OrderDto>(new Order()).ShouldBeOfType<OnlineOrderDto>();
+```
 
-## CURLWS_OFFSET
+## Inheritance Mapping Priorities
 
-The provided data is only a partial fragment and there is more coming in a
-following call to *curl_ws_send()*. When sending only a piece of the
-fragment like this, the *fragsize* must be provided with the total
-expected fragment size in the first call and it needs to be zero in subsequent
-calls.
+This introduces additional complexity because there are multiple ways a property can be mapped. The priority of these sources are as follows
 
-# %PROTOCOLS%
+ - Explicit Mapping (using .MapFrom())
+ - Inherited Explicit Mapping
+ - Ignore Property Mapping
+ - Convention Mapping (Properties that are matched via convention)
 
-# EXAMPLE
+To demonstrate this, lets modify our classes shown above
 
-~~~c
-#include <string.h> /* for strlen */
-
-const char *send_payload = "magic";
-
-int main(void)
+```c#
+//Domain Objects
+public class Order { }
+public class OnlineOrder : Order
 {
-  size_t sent;
-  CURLcode res;
-  CURL *curl = curl_easy_init();
-  curl_easy_setopt(curl, CURLOPT_URL, "wss://example.com/");
-  curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
-  curl_easy_perform(curl);
-  res = curl_ws_send(curl, send_payload, strlen(send_payload), &sent, 0,
-                     CURLWS_PING);
-  curl_easy_cleanup(curl);
-  return (int)res;
+    public string Referrer { get; set; }
 }
-~~~
+public class MailOrder : Order { }
 
-# %AVAILABILITY%
+//Dtos
+public class OrderDto
+{
+    public string Referrer { get; set; }
+}
 
-# RETURN VALUE
+//Mappings
+var configuration = new MapperConfiguration(cfg => {
+    cfg.CreateMap<Order, OrderDto>()
+        .Include<OnlineOrder, OrderDto>()
+        .Include<MailOrder, OrderDto>()
+        .ForMember(o=>o.Referrer, m=>m.Ignore());
+    cfg.CreateMap<OnlineOrder, OrderDto>();
+    cfg.CreateMap<MailOrder, OrderDto>();
+});
 
-*CURLE_OK* (zero) means that the data was sent properly, non-zero means an
-error occurred as *\<curl/curl.h\>* defines. See the libcurl-errors(3) man
-page for the full list with descriptions.
+// Perform Mapping
+var order = new OnlineOrder { Referrer = "google" };
+var mapped = mapper.Map(order, order.GetType(), typeof(OrderDto));
+Assert.IsNull(mapped.Referrer);
+```
+
+Notice that in our mapping configuration, we have ignored `Referrer` (because it doesn't exist in the order base class) and that has a higher priority than convention mapping, so the property doesn't get mapped.
+
+If you do want the `Referrer` property to be mapped in the mapping from `OnlineOrder` to `OrderDto` you should include an explicit mapping in the mapping like this:
+
+```
+    cfg.CreateMap<OnlineOrder, OrderDto>()
+        .ForMember(o=>o.Referrer, m=>m.MapFrom(x=>x.Referrer));
+```
+
+Overall this feature should make using AutoMapper with classes that leverage inheritance feel more natural.

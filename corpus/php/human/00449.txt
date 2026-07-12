@@ -10,75 +10,269 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Util;
+namespace Composer\Test\Installer;
 
-use Composer\Util\TlsHelper;
+use Composer\InstalledVersions;
+use Composer\Installer\SuggestedPackagesReporter;
+use Composer\Semver\VersionParser;
+use Composer\Test\Mock\IOMock;
 use Composer\Test\TestCase;
 
-class TlsHelperTest extends TestCase
+/**
+ * @coversDefaultClass Composer\Installer\SuggestedPackagesReporter
+ */
+class SuggestedPackagesReporterTest extends TestCase
 {
     /**
-     * @dataProvider dataCheckCertificateHost
-     *
-     * @param string[] $certNames
+     * @var IOMock
      */
-    public function testCheckCertificateHost(bool $expectedResult, string $hostname, array $certNames): void
+    private $io;
+
+    /**
+     * @var \Composer\Installer\SuggestedPackagesReporter
+     */
+    private $suggestedPackagesReporter;
+
+    protected function setUp(): void
     {
-        $certificate['subject']['commonName'] = $expectedCn = array_shift($certNames);
-        $certificate['extensions']['subjectAltName'] = $certNames ? 'DNS:'.implode(',DNS:', $certNames) : '';
+        $this->io = $this->getIOMock();
 
-        // @phpstan-ignore staticMethod.deprecatedClass
-        $result = TlsHelper::checkCertificateHost($certificate, $hostname, $foundCn);
-
-        if (true === $expectedResult) {
-            self::assertTrue($result);
-            self::assertSame($expectedCn, $foundCn);
-        } else {
-            self::assertFalse($result);
-            self::assertNull($foundCn);
-        }
+        $this->suggestedPackagesReporter = new SuggestedPackagesReporter($this->io);
     }
 
-    public static function dataCheckCertificateHost(): array
+    /**
+     * @covers ::__construct
+     */
+    public function testConstructor(): void
+    {
+        $this->io->expects([['text' => 'b']], true);
+
+        $this->suggestedPackagesReporter->addPackage('a', 'b', 'c');
+        $this->suggestedPackagesReporter->output(SuggestedPackagesReporter::MODE_LIST);
+    }
+
+    /**
+     * @covers ::getPackages
+     */
+    public function testGetPackagesEmptyByDefault(): void
+    {
+        self::assertEmpty($this->suggestedPackagesReporter->getPackages());
+    }
+
+    /**
+     * @covers ::getPackages
+     * @covers ::addPackage
+     */
+    public function testGetPackages(): void
+    {
+        $suggestedPackage = $this->getSuggestedPackageArray();
+        $this->suggestedPackagesReporter->addPackage(
+            $suggestedPackage['source'],
+            $suggestedPackage['target'],
+            $suggestedPackage['reason']
+        );
+        self::assertSame(
+            [$suggestedPackage],
+            $this->suggestedPackagesReporter->getPackages()
+        );
+    }
+
+    /**
+     * Test addPackage appends packages.
+     * Also test targets can be duplicated.
+     *
+     * @covers ::addPackage
+     */
+    public function testAddPackageAppends(): void
+    {
+        $suggestedPackageA = $this->getSuggestedPackageArray();
+        $suggestedPackageB = $this->getSuggestedPackageArray();
+        $suggestedPackageB['source'] = 'different source';
+        $suggestedPackageB['reason'] = 'different reason';
+        $this->suggestedPackagesReporter->addPackage(
+            $suggestedPackageA['source'],
+            $suggestedPackageA['target'],
+            $suggestedPackageA['reason']
+        );
+        $this->suggestedPackagesReporter->addPackage(
+            $suggestedPackageB['source'],
+            $suggestedPackageB['target'],
+            $suggestedPackageB['reason']
+        );
+        self::assertSame(
+            [$suggestedPackageA, $suggestedPackageB],
+            $this->suggestedPackagesReporter->getPackages()
+        );
+    }
+
+    /**
+     * @covers ::addSuggestionsFromPackage
+     */
+    public function testAddSuggestionsFromPackage(): void
+    {
+        $package = $this->createPackageMock();
+        $package->expects($this->once())
+            ->method('getSuggests')
+            ->will($this->returnValue([
+                'target-a' => 'reason-a',
+                'target-b' => 'reason-b',
+            ]));
+        $package->expects($this->once())
+            ->method('getPrettyName')
+            ->will($this->returnValue('package-pretty-name'));
+
+        $this->suggestedPackagesReporter->addSuggestionsFromPackage($package);
+        self::assertSame([
+            [
+                'source' => 'package-pretty-name',
+                'target' => 'target-a',
+                'reason' => 'reason-a',
+            ],
+            [
+                'source' => 'package-pretty-name',
+                'target' => 'target-b',
+                'reason' => 'reason-b',
+            ],
+        ], $this->suggestedPackagesReporter->getPackages());
+    }
+
+    /**
+     * @covers ::output
+     */
+    public function testOutput(): void
+    {
+        $this->suggestedPackagesReporter->addPackage('a', 'b', 'c');
+
+        $this->io->expects([
+            ['text' => 'a suggests:'],
+            ['text' => ' - b: c'],
+            ['text' => ''],
+        ], true);
+
+        $this->suggestedPackagesReporter->output(SuggestedPackagesReporter::MODE_BY_PACKAGE);
+    }
+
+    /**
+     * @covers ::output
+     */
+    public function testOutputWithNoSuggestionReason(): void
+    {
+        $this->suggestedPackagesReporter->addPackage('a', 'b', '');
+
+        $this->io->expects([
+            ['text' => 'a suggests:'],
+            ['text' => ' - b'],
+            ['text' => ''],
+        ], true);
+
+        $this->suggestedPackagesReporter->output(SuggestedPackagesReporter::MODE_BY_PACKAGE);
+    }
+
+    /**
+     * @covers ::output
+     */
+    public function testOutputIgnoresFormatting(): void
+    {
+        $this->suggestedPackagesReporter->addPackage('source', 'target1', "\x1b[1;37;42m Like us\r\non Facebook \x1b[0m");
+        $this->suggestedPackagesReporter->addPackage('source', 'target2', "<bg=green>Like us on Facebook</>");
+
+        $this->io->expects([
+            ['text' => 'source suggests:'],
+            ['text' => ' - target1: [1;37;42m Like us on Facebook [0m'],
+            ['text' => ' - target2: <bg=green>Like us on Facebook</>'],
+            ['text' => ''],
+        ], true);
+
+        $this->suggestedPackagesReporter->output(SuggestedPackagesReporter::MODE_BY_PACKAGE);
+    }
+
+    /**
+     * @covers ::output
+     */
+    public function testOutputMultiplePackages(): void
+    {
+        $this->suggestedPackagesReporter->addPackage('a', 'b', 'c');
+        $this->suggestedPackagesReporter->addPackage('source package', 'target', 'because reasons');
+
+        $this->io->expects([
+            ['text' => 'a suggests:'],
+            ['text' => ' - b: c'],
+            ['text' => ''],
+            ['text' => 'source package suggests:'],
+            ['text' => ' - target: because reasons'],
+            ['text' => ''],
+        ], true);
+
+        $this->suggestedPackagesReporter->output(SuggestedPackagesReporter::MODE_BY_PACKAGE);
+    }
+
+    /**
+     * @covers ::output
+     */
+    public function testOutputSkipInstalledPackages(): void
+    {
+        $repository = $this->getMockBuilder('Composer\Repository\InstalledRepository')->disableOriginalConstructor()->getMock();
+        $package1 = $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
+        $package2 = $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
+
+        $package1->expects($this->once())
+            ->method('getNames')
+            ->will($this->returnValue(['x', 'y']));
+
+        $package2->expects($this->once())
+            ->method('getNames')
+            ->will($this->returnValue(['b']));
+
+        $repository->expects($this->once())
+            ->method('getPackages')
+            ->will($this->returnValue([
+                $package1,
+                $package2,
+            ]));
+
+        $this->suggestedPackagesReporter->addPackage('a', 'b', 'c');
+        $this->suggestedPackagesReporter->addPackage('source package', 'target', 'because reasons');
+
+        $this->io->expects([
+            ['text' => 'source package suggests:'],
+            ['text' => ' - target: because reasons'],
+            ['text' => ''],
+        ], true);
+
+        $this->suggestedPackagesReporter->output(SuggestedPackagesReporter::MODE_BY_PACKAGE, $repository);
+    }
+
+    /**
+     * @covers ::output
+     */
+    public function testOutputNotGettingInstalledPackagesWhenNoSuggestions(): void
+    {
+        $repository = $this->getMockBuilder('Composer\Repository\InstalledRepository')->disableOriginalConstructor()->getMock();
+        $repository->expects($this->exactly(0))
+            ->method('getPackages');
+
+        $this->suggestedPackagesReporter->output(SuggestedPackagesReporter::MODE_BY_PACKAGE, $repository);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function getSuggestedPackageArray(): array
     {
         return [
-            [true, 'getcomposer.org', ['getcomposer.org']],
-            [true, 'getcomposer.org', ['getcomposer.org', 'packagist.org']],
-            [true, 'getcomposer.org', ['packagist.org', 'getcomposer.org']],
-            [true, 'foo.getcomposer.org', ['*.getcomposer.org']],
-            [false, 'xyz.foo.getcomposer.org', ['*.getcomposer.org']],
-            [true, 'foo.getcomposer.org', ['getcomposer.org', '*.getcomposer.org']],
-            [true, 'foo.getcomposer.org', ['foo.getcomposer.org', 'foo*.getcomposer.org']],
-            [true, 'foo1.getcomposer.org', ['foo.getcomposer.org', 'foo*.getcomposer.org']],
-            [true, 'foo2.getcomposer.org', ['foo.getcomposer.org', 'foo*.getcomposer.org']],
-            [false, 'foo2.another.getcomposer.org', ['foo.getcomposer.org', 'foo*.getcomposer.org']],
-            [false, 'test.example.net', ['**.example.net', '**.example.net']],
-            [false, 'test.example.net', ['t*t.example.net', 't*t.example.net']],
-            [false, 'xyz.example.org', ['*z.example.org', '*z.example.org']],
-            [false, 'foo.bar.example.com', ['foo.*.example.com', 'foo.*.example.com']],
-            [false, 'example.com', ['example.*', 'example.*']],
-            [true, 'localhost', ['localhost']],
-            [false, 'localhost', ['*']],
-            [false, 'localhost', ['local*']],
-            [false, 'example.net', ['*.net', '*.org', 'ex*.net']],
-            [true, 'example.net', ['*.net', '*.org', 'example.net']],
+            'source' => 'a',
+            'target' => 'b',
+            'reason' => 'c',
         ];
     }
 
-    public function testGetCertificateNames(): void
+    /**
+     * @return \Composer\Package\PackageInterface&\PHPUnit\Framework\MockObject\MockObject
+     */
+    private function createPackageMock()
     {
-        $certificate['subject']['commonName'] = 'example.net';
-        $certificate['extensions']['subjectAltName'] = 'DNS: example.com, IP: 127.0.0.1, DNS: getcomposer.org, Junk: blah, DNS: composer.example.org';
-
-        // @phpstan-ignore staticMethod.deprecatedClass
-        $names = TlsHelper::getCertificateNames($certificate);
-
-        self::assertIsArray($names);
-        self::assertSame('example.net', $names['cn']);
-        self::assertSame([
-            'example.com',
-            'getcomposer.org',
-            'composer.example.org',
-        ], $names['san']);
+        return $this->getMockBuilder('Composer\Package\Package')
+            ->setConstructorArgs([md5((string) mt_rand()), '1.0.0.0', '1.0.0'])
+            ->getMock();
     }
 }

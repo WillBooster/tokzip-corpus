@@ -10,115 +10,239 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Installer;
+namespace Composer\Test\Config;
 
-use Composer\Package\PackageInterface;
-use Composer\Repository\InstalledRepositoryInterface;
-use InvalidArgumentException;
-use React\Promise\PromiseInterface;
+use Composer\Config\JsonConfigSource;
+use Composer\Json\JsonFile;
+use Composer\Test\TestCase;
+use Composer\Util\Filesystem;
 
-/**
- * Interface for the package installation manager.
- *
- * @author Konstantin Kudryashov <ever.zet@gmail.com>
- * @author Jordi Boggiano <j.boggiano@seld.be>
- */
-interface InstallerInterface
+class JsonConfigSourceTest extends TestCase
 {
-    /**
-     * Decides if the installer supports the given type
-     *
-     * @return bool
-     */
-    public function supports(string $packageType);
+    /** @var Filesystem */
+    private $fs;
+    /** @var string */
+    private $workingDir;
+
+    protected static function fixturePath(string $name): string
+    {
+        return __DIR__.'/Fixtures/'.$name;
+    }
+
+    protected function setUp(): void
+    {
+        $this->fs = new Filesystem;
+        $this->workingDir = self::getUniqueTmpDirectory();
+    }
+
+    protected function tearDown(): void
+    {
+        parent::tearDown();
+        if (is_dir($this->workingDir)) {
+            $this->fs->removeDirectory($this->workingDir);
+        }
+    }
+
+    public function testAddRepository(): void
+    {
+        $config = $this->workingDir.'/composer.json';
+        copy(self::fixturePath('composer-repositories.json'), $config);
+        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
+        $jsonConfigSource->addRepository('example_tld', ['type' => 'git', 'url' => 'example.tld']);
+
+        self::assertFileEquals(self::fixturePath('config/config-with-exampletld-repository.json'), $config);
+    }
+
+    public function testAddRepositoryWithOptions(): void
+    {
+        $config = $this->workingDir.'/composer.json';
+        copy(self::fixturePath('composer-repositories.json'), $config);
+        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
+        $jsonConfigSource->addRepository('example_tld', [
+            'type' => 'composer',
+            'url' => 'https://example.tld',
+            'options' => [
+                'ssl' => [
+                    'local_cert' => '/home/composer/.ssl/composer.pem',
+                ],
+            ],
+        ]);
+
+        self::assertFileEquals(self::fixturePath('config/config-with-exampletld-repository-and-options.json'), $config);
+    }
+
+    public function testRemoveRepository(): void
+    {
+        $config = $this->workingDir.'/composer.json';
+        copy(self::fixturePath('config/config-with-exampletld-repository.json'), $config);
+        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
+        $jsonConfigSource->removeRepository('example_tld');
+
+        self::assertFileEquals(self::fixturePath('composer-repositories.json'), $config);
+    }
+
+    public function testAddPackagistRepositoryWithFalseValue(): void
+    {
+        $config = $this->workingDir.'/composer.json';
+        copy(self::fixturePath('composer-repositories.json'), $config);
+        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
+        $jsonConfigSource->addRepository('packagist', false);
+
+        self::assertFileEquals(self::fixturePath('config/config-with-packagist-false.json'), $config);
+    }
+
+    public function testRemovePackagist(): void
+    {
+        $config = $this->workingDir.'/composer.json';
+        copy(self::fixturePath('config/config-with-packagist-false.json'), $config);
+        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
+        $jsonConfigSource->removeRepository('packagist');
+
+        self::assertFileEquals(self::fixturePath('composer-repositories.json'), $config);
+    }
 
     /**
-     * Checks that provided package is installed.
+     * Test addLink()
      *
-     * @param InstalledRepositoryInterface $repo    repository in which to check
-     * @param PackageInterface             $package package instance
+     * @param string $sourceFile     Source file
+     * @param string $type           Type (require, require-dev, provide, suggest, replace, conflict)
+     * @param string $name           Name
+     * @param string $value          Value
+     * @param string $compareAgainst File to compare against after making changes
      *
-     * @return bool
+     * @dataProvider provideAddLinkData
      */
-    public function isInstalled(InstalledRepositoryInterface $repo, PackageInterface $package);
+    public function testAddLink(string $sourceFile, string $type, string $name, string $value, string $compareAgainst): void
+    {
+        $composerJson = $this->workingDir.'/composer.json';
+        copy($sourceFile, $composerJson);
+        $jsonConfigSource = new JsonConfigSource(new JsonFile($composerJson));
+
+        $jsonConfigSource->addLink($type, $name, $value);
+
+        self::assertFileEquals($compareAgainst, $composerJson);
+    }
 
     /**
-     * Downloads the files needed to later install the given package.
+     * Test removeLink()
      *
-     * @param  PackageInterface      $package     package instance
-     * @param  PackageInterface      $prevPackage previous package instance in case of an update
-     * @return PromiseInterface|null
-     * @phpstan-return PromiseInterface<void|null>|null
+     * @param string $sourceFile     Source file
+     * @param string $type           Type (require, require-dev, provide, suggest, replace, conflict)
+     * @param string $name           Name
+     * @param string $compareAgainst File to compare against after making changes
+     *
+     * @dataProvider provideRemoveLinkData
      */
-    public function download(PackageInterface $package, ?PackageInterface $prevPackage = null);
+    public function testRemoveLink(string $sourceFile, string $type, string $name, string $compareAgainst): void
+    {
+        $composerJson = $this->workingDir.'/composer.json';
+        copy($sourceFile, $composerJson);
+        $jsonConfigSource = new JsonConfigSource(new JsonFile($composerJson));
+
+        $jsonConfigSource->removeLink($type, $name);
+
+        self::assertFileEquals($compareAgainst, $composerJson);
+    }
 
     /**
-     * Do anything that needs to be done between all downloads have been completed and the actual operation is executed
+     * @return string[]
      *
-     * All packages get first downloaded, then all together prepared, then all together installed/updated/uninstalled. Therefore
-     * for error recovery it is important to avoid failing during install/update/uninstall as much as possible, and risky things or
-     * user prompts should happen in the prepare step rather. In case of failure, cleanup() will be called so that changes can
-     * be undone as much as possible.
-     *
-     * @param  string                $type        one of install/update/uninstall
-     * @param  PackageInterface      $package     package instance
-     * @param  PackageInterface      $prevPackage previous package instance in case of an update
-     * @return PromiseInterface|null
-     * @phpstan-return PromiseInterface<void|null>|null
+     * @phpstan-return array{string, string, string, string, string}
      */
-    public function prepare(string $type, PackageInterface $package, ?PackageInterface $prevPackage = null);
+    protected static function addLinkDataArguments(string $type, string $name, string $value, string $fixtureBasename, string $before): array
+    {
+        return [
+            $before,
+            $type,
+            $name,
+            $value,
+            self::fixturePath('addLink/'.$fixtureBasename.'.json'),
+        ];
+    }
 
     /**
-     * Installs specific package.
-     *
-     * @param  InstalledRepositoryInterface $repo    repository in which to check
-     * @param  PackageInterface             $package package instance
-     * @return PromiseInterface|null
-     * @phpstan-return PromiseInterface<void|null>|null
+     * Provide data for testAddLink
      */
-    public function install(InstalledRepositoryInterface $repo, PackageInterface $package);
+    public static function provideAddLinkData(): array
+    {
+        $empty = self::fixturePath('composer-empty.json');
+        $oneOfEverything = self::fixturePath('composer-one-of-everything.json');
+        $twoOfEverything = self::fixturePath('composer-two-of-everything.json');
+
+        return [
+            self::addLinkDataArguments('require', 'my-vend/my-lib', '1.*', 'require-from-empty', $empty),
+            self::addLinkDataArguments('require', 'my-vend/my-lib', '1.*', 'require-from-oneOfEverything', $oneOfEverything),
+            self::addLinkDataArguments('require', 'my-vend/my-lib', '1.*', 'require-from-twoOfEverything', $twoOfEverything),
+
+            self::addLinkDataArguments('require-dev', 'my-vend/my-lib-tests', '1.*', 'require-dev-from-empty', $empty),
+            self::addLinkDataArguments('require-dev', 'my-vend/my-lib-tests', '1.*', 'require-dev-from-oneOfEverything', $oneOfEverything),
+            self::addLinkDataArguments('require-dev', 'my-vend/my-lib-tests', '1.*', 'require-dev-from-twoOfEverything', $twoOfEverything),
+
+            self::addLinkDataArguments('provide', 'my-vend/my-lib-interface', '1.*', 'provide-from-empty', $empty),
+            self::addLinkDataArguments('provide', 'my-vend/my-lib-interface', '1.*', 'provide-from-oneOfEverything', $oneOfEverything),
+            self::addLinkDataArguments('provide', 'my-vend/my-lib-interface', '1.*', 'provide-from-twoOfEverything', $twoOfEverything),
+
+            self::addLinkDataArguments('suggest', 'my-vend/my-optional-extension', '1.*', 'suggest-from-empty', $empty),
+            self::addLinkDataArguments('suggest', 'my-vend/my-optional-extension', '1.*', 'suggest-from-oneOfEverything', $oneOfEverything),
+            self::addLinkDataArguments('suggest', 'my-vend/my-optional-extension', '1.*', 'suggest-from-twoOfEverything', $twoOfEverything),
+
+            self::addLinkDataArguments('replace', 'my-vend/other-app', '1.*', 'replace-from-empty', $empty),
+            self::addLinkDataArguments('replace', 'my-vend/other-app', '1.*', 'replace-from-oneOfEverything', $oneOfEverything),
+            self::addLinkDataArguments('replace', 'my-vend/other-app', '1.*', 'replace-from-twoOfEverything', $twoOfEverything),
+
+            self::addLinkDataArguments('conflict', 'my-vend/my-old-app', '1.*', 'conflict-from-empty', $empty),
+            self::addLinkDataArguments('conflict', 'my-vend/my-old-app', '1.*', 'conflict-from-oneOfEverything', $oneOfEverything),
+            self::addLinkDataArguments('conflict', 'my-vend/my-old-app', '1.*', 'conflict-from-twoOfEverything', $twoOfEverything),
+        ];
+    }
 
     /**
-     * Updates specific package.
+     * @return string[]
      *
-     * @param  InstalledRepositoryInterface $repo    repository in which to check
-     * @param  PackageInterface             $initial already installed package version
-     * @param  PackageInterface             $target  updated version
-     * @throws InvalidArgumentException     if $initial package is not installed
-     * @return PromiseInterface|null
-     * @phpstan-return PromiseInterface<void|null>|null
+     * @phpstan-return array{string, string, string, string}
      */
-    public function update(InstalledRepositoryInterface $repo, PackageInterface $initial, PackageInterface $target);
+    protected static function removeLinkDataArguments(string $type, string $name, string $fixtureBasename, ?string $after = null): array
+    {
+        return [
+            self::fixturePath('removeLink/'.$fixtureBasename.'.json'),
+            $type,
+            $name,
+            $after ?: self::fixturePath('removeLink/'.$fixtureBasename.'-after.json'),
+        ];
+    }
 
     /**
-     * Uninstalls specific package.
-     *
-     * @param  InstalledRepositoryInterface $repo    repository in which to check
-     * @param  PackageInterface             $package package instance
-     * @return PromiseInterface|null
-     * @phpstan-return PromiseInterface<void|null>|null
+     * Provide data for testRemoveLink
      */
-    public function uninstall(InstalledRepositoryInterface $repo, PackageInterface $package);
+    public static function provideRemoveLinkData(): array
+    {
+        $oneOfEverything = self::fixturePath('composer-one-of-everything.json');
+        $twoOfEverything = self::fixturePath('composer-two-of-everything.json');
 
-    /**
-     * Do anything to cleanup changes applied in the prepare or install/update/uninstall steps
-     *
-     * Note that cleanup will be called for all packages regardless if they failed an operation or not, to give
-     * all installers a change to cleanup things they did previously, so you need to keep track of changes
-     * applied in the installer/downloader themselves.
-     *
-     * @param  string                $type        one of install/update/uninstall
-     * @param  PackageInterface      $package     package instance
-     * @param  PackageInterface      $prevPackage previous package instance in case of an update
-     * @return PromiseInterface|null
-     * @phpstan-return PromiseInterface<void|null>|null
-     */
-    public function cleanup(string $type, PackageInterface $package, ?PackageInterface $prevPackage = null);
+        return [
+            self::removeLinkDataArguments('require', 'my-vend/my-lib', 'require-to-empty'),
+            self::removeLinkDataArguments('require', 'my-vend/my-lib', 'require-to-oneOfEverything', $oneOfEverything),
+            self::removeLinkDataArguments('require', 'my-vend/my-lib', 'require-to-twoOfEverything', $twoOfEverything),
 
-    /**
-     * Returns the absolute installation path of a package.
-     *
-     * @return string|null absolute path to install to, which MUST not end with a slash, or null if the package does not have anything installed on disk
-     */
-    public function getInstallPath(PackageInterface $package);
+            self::removeLinkDataArguments('require-dev', 'my-vend/my-lib-tests', 'require-dev-to-empty'),
+            self::removeLinkDataArguments('require-dev', 'my-vend/my-lib-tests', 'require-dev-to-oneOfEverything', $oneOfEverything),
+            self::removeLinkDataArguments('require-dev', 'my-vend/my-lib-tests', 'require-dev-to-twoOfEverything', $twoOfEverything),
+
+            self::removeLinkDataArguments('provide', 'my-vend/my-lib-interface', 'provide-to-empty'),
+            self::removeLinkDataArguments('provide', 'my-vend/my-lib-interface', 'provide-to-oneOfEverything', $oneOfEverything),
+            self::removeLinkDataArguments('provide', 'my-vend/my-lib-interface', 'provide-to-twoOfEverything', $twoOfEverything),
+
+            self::removeLinkDataArguments('suggest', 'my-vend/my-optional-extension', 'suggest-to-empty'),
+            self::removeLinkDataArguments('suggest', 'my-vend/my-optional-extension', 'suggest-to-oneOfEverything', $oneOfEverything),
+            self::removeLinkDataArguments('suggest', 'my-vend/my-optional-extension', 'suggest-to-twoOfEverything', $twoOfEverything),
+
+            self::removeLinkDataArguments('replace', 'my-vend/other-app', 'replace-to-empty'),
+            self::removeLinkDataArguments('replace', 'my-vend/other-app', 'replace-to-oneOfEverything', $oneOfEverything),
+            self::removeLinkDataArguments('replace', 'my-vend/other-app', 'replace-to-twoOfEverything', $twoOfEverything),
+
+            self::removeLinkDataArguments('conflict', 'my-vend/my-old-app', 'conflict-to-empty'),
+            self::removeLinkDataArguments('conflict', 'my-vend/my-old-app', 'conflict-to-oneOfEverything', $oneOfEverything),
+            self::removeLinkDataArguments('conflict', 'my-vend/my-old-app', 'conflict-to-twoOfEverything', $twoOfEverything),
+        ];
+    }
 }

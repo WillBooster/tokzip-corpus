@@ -10,306 +10,134 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Installer;
+namespace Composer\Repository;
 
-use Composer\Installer\InstallationManager;
-use Composer\Installer\NoopInstaller;
-use Composer\DependencyResolver\Operation\InstallOperation;
-use Composer\DependencyResolver\Operation\UpdateOperation;
-use Composer\DependencyResolver\Operation\UninstallOperation;
-use Composer\Test\TestCase;
+use Composer\IO\IOInterface;
+use Composer\Json\JsonFile;
+use Composer\Package\BasePackage;
+use Composer\Package\Loader\ArrayLoader;
+use Composer\Package\Loader\LoaderInterface;
+use Composer\Util\Platform;
+use Composer\Util\Tar;
+use Composer\Util\Zip;
 
-class InstallationManagerTest extends TestCase
+/**
+ * @author Serge Smertin <serg.smertin@gmail.com>
+ */
+class ArtifactRepository extends ArrayRepository implements ConfigurableRepositoryInterface
 {
-    /**
-     * @var \Composer\Repository\InstalledRepositoryInterface&\PHPUnit\Framework\MockObject\MockObject
-     */
-    protected $repository;
+    /** @var LoaderInterface */
+    protected $loader;
+
+    /** @var string */
+    protected $lookup;
+    /** @var array{url: string} */
+    protected $repoConfig;
+    /** @var IOInterface */
+    private $io;
 
     /**
-     * @var \Composer\Util\Loop&\PHPUnit\Framework\MockObject\MockObject
+     * @param array{url: string} $repoConfig
      */
-    protected $loop;
-
-    /**
-     * @var \Composer\IO\IOInterface&\PHPUnit\Framework\MockObject\MockObject
-     */
-    protected $io;
-
-    public function setUp(): void
+    public function __construct(array $repoConfig, IOInterface $io)
     {
-        $this->loop = $this->getMockBuilder('Composer\Util\Loop')->disableOriginalConstructor()->getMock();
-        $this->repository = $this->getMockBuilder('Composer\Repository\InstalledRepositoryInterface')->getMock();
-        $this->io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        parent::__construct();
+        if (!extension_loaded('zip')) {
+            throw new \RuntimeException('The artifact repository requires PHP\'s zip extension');
+        }
+
+        $this->loader = new ArrayLoader();
+        $this->lookup = Platform::expandPath($repoConfig['url']);
+        $this->io = $io;
+        $this->repoConfig = $repoConfig;
     }
 
-    public function testAddGetInstaller(): void
+    public function getRepoName()
     {
-        $installer = $this->createInstallerMock();
-
-        $installer
-            ->expects($this->exactly(2))
-            ->method('supports')
-            ->will($this->returnCallback(static function ($arg): bool {
-                return $arg === 'vendor';
-            }));
-
-        $manager = new InstallationManager($this->loop, $this->io);
-
-        $manager->addInstaller($installer);
-        self::assertSame($installer, $manager->getInstaller('vendor'));
-
-        self::expectException('InvalidArgumentException');
-        $manager->getInstaller('unregistered');
+        return 'artifact repo ('.$this->lookup.')';
     }
 
-    public function testAddRemoveInstaller(): void
+    public function getRepoConfig()
     {
-        $installer = $this->createInstallerMock();
-
-        $installer
-            ->expects($this->exactly(2))
-            ->method('supports')
-            ->will($this->returnCallback(static function ($arg): bool {
-                return $arg === 'vendor';
-            }));
-
-        $installer2 = $this->createInstallerMock();
-
-        $installer2
-            ->expects($this->exactly(1))
-            ->method('supports')
-            ->will($this->returnCallback(static function ($arg): bool {
-                return $arg === 'vendor';
-            }));
-
-        $manager = new InstallationManager($this->loop, $this->io);
-
-        $manager->addInstaller($installer);
-        self::assertSame($installer, $manager->getInstaller('vendor'));
-        $manager->addInstaller($installer2);
-        self::assertSame($installer2, $manager->getInstaller('vendor'));
-        $manager->removeInstaller($installer2);
-        self::assertSame($installer, $manager->getInstaller('vendor'));
+        return $this->repoConfig;
     }
 
-    public function testExecute(): void
+    protected function initialize()
     {
-        $manager = $this->getMockBuilder('Composer\Installer\InstallationManager')
-            ->setConstructorArgs([$this->loop, $this->io])
-            ->onlyMethods(['install', 'update', 'uninstall'])
-            ->getMock();
+        parent::initialize();
 
-        $installOperation = new InstallOperation($package = $this->createPackageMock());
-        $removeOperation = new UninstallOperation($package);
-        $updateOperation = new UpdateOperation(
-            $package,
-            $package
-        );
-
-        $package->expects($this->any())
-            ->method('getType')
-            ->will($this->returnValue('library'));
-
-        $manager
-            ->expects($this->once())
-            ->method('install')
-            ->with($this->repository, $installOperation);
-        $manager
-            ->expects($this->once())
-            ->method('uninstall')
-            ->with($this->repository, $removeOperation);
-        $manager
-            ->expects($this->once())
-            ->method('update')
-            ->with($this->repository, $updateOperation);
-
-        $manager->addInstaller(new NoopInstaller());
-        $manager->execute($this->repository, [$installOperation, $removeOperation, $updateOperation]);
+        $this->scanDirectory($this->lookup);
     }
 
-    public function testInstall(): void
+    private function scanDirectory(string $path): void
     {
-        $installer = $this->createInstallerMock();
-        $manager = new InstallationManager($this->loop, $this->io);
-        $manager->addInstaller($installer);
+        $io = $this->io;
 
-        $package = $this->createPackageMock();
-        $operation = new InstallOperation($package);
+        $directory = new \RecursiveDirectoryIterator($path, \RecursiveDirectoryIterator::FOLLOW_SYMLINKS);
+        $iterator = new \RecursiveIteratorIterator($directory);
+        $regex = new \RegexIterator($iterator, '/^.+\.(zip|tar|gz|tgz)$/i');
+        foreach ($regex as $file) {
+            /* @var $file \SplFileInfo */
+            if (!$file->isFile()) {
+                continue;
+            }
 
-        $package
-            ->expects($this->once())
-            ->method('getType')
-            ->will($this->returnValue('library'));
+            $package = $this->getComposerInformation($file);
+            if (!$package) {
+                $io->writeError("File <comment>{$file->getBasename()}</comment> doesn't seem to hold a package", true, IOInterface::VERBOSE);
+                continue;
+            }
 
-        $installer
-            ->expects($this->once())
-            ->method('supports')
-            ->with('library')
-            ->will($this->returnValue(true));
+            $template = 'Found package <info>%s</info> (<comment>%s</comment>) in file <info>%s</info>';
+            $io->writeError(sprintf($template, $package->getName(), $package->getPrettyVersion(), $file->getBasename()), true, IOInterface::VERBOSE);
 
-        $installer
-            ->expects($this->once())
-            ->method('install')
-            ->with($this->repository, $package);
-
-        $manager->install($this->repository, $operation);
-    }
-
-    public function testUpdateWithEqualTypes(): void
-    {
-        $installer = $this->createInstallerMock();
-        $manager = new InstallationManager($this->loop, $this->io);
-        $manager->addInstaller($installer);
-
-        $initial = $this->createPackageMock();
-        $target = $this->createPackageMock();
-        $operation = new UpdateOperation($initial, $target);
-
-        $initial
-            ->expects($this->once())
-            ->method('getType')
-            ->will($this->returnValue('library'));
-        $target
-            ->expects($this->once())
-            ->method('getType')
-            ->will($this->returnValue('library'));
-
-        $installer
-            ->expects($this->once())
-            ->method('supports')
-            ->with('library')
-            ->will($this->returnValue(true));
-
-        $installer
-            ->expects($this->once())
-            ->method('update')
-            ->with($this->repository, $initial, $target);
-
-        $manager->update($this->repository, $operation);
-    }
-
-    public function testUpdateWithNotEqualTypes(): void
-    {
-        $libInstaller = $this->createInstallerMock();
-        $bundleInstaller = $this->createInstallerMock();
-        $manager = new InstallationManager($this->loop, $this->io);
-        $manager->addInstaller($libInstaller);
-        $manager->addInstaller($bundleInstaller);
-
-        $initial = $this->createPackageMock();
-        $initial
-            ->expects($this->once())
-            ->method('getType')
-            ->will($this->returnValue('library'));
-
-        $target = $this->createPackageMock();
-        $target
-            ->expects($this->once())
-            ->method('getType')
-            ->will($this->returnValue('bundles'));
-
-        $bundleInstaller
-            ->expects($this->exactly(2))
-            ->method('supports')
-            ->will($this->returnCallback(static function ($arg): bool {
-                return $arg === 'bundles';
-            }));
-
-        $libInstaller
-            ->expects($this->once())
-            ->method('supports')
-            ->with('library')
-            ->will($this->returnValue(true));
-
-        $libInstaller
-            ->expects($this->once())
-            ->method('uninstall')
-            ->with($this->repository, $initial);
-
-        $bundleInstaller
-            ->expects($this->once())
-            ->method('install')
-            ->with($this->repository, $target);
-
-        $operation = new UpdateOperation($initial, $target);
-        $manager->update($this->repository, $operation);
-    }
-
-    public function testUninstall(): void
-    {
-        $installer = $this->createInstallerMock();
-        $manager = new InstallationManager($this->loop, $this->io);
-        $manager->addInstaller($installer);
-
-        $package = $this->createPackageMock();
-        $operation = new UninstallOperation($package);
-
-        $package
-            ->expects($this->once())
-            ->method('getType')
-            ->will($this->returnValue('library'));
-
-        $installer
-            ->expects($this->once())
-            ->method('uninstall')
-            ->with($this->repository, $package);
-
-        $installer
-            ->expects($this->once())
-            ->method('supports')
-            ->with('library')
-            ->will($this->returnValue(true));
-
-        $manager->uninstall($this->repository, $operation);
-    }
-
-    public function testInstallBinary(): void
-    {
-        $installer = $this->getMockBuilder('Composer\Installer\LibraryInstaller')
-            ->disableOriginalConstructor()
-            ->getMock();
-        $manager = new InstallationManager($this->loop, $this->io);
-        $manager->addInstaller($installer);
-
-        $package = $this->createPackageMock();
-
-        $package
-            ->expects($this->once())
-            ->method('getType')
-            ->will($this->returnValue('library'));
-
-        $installer
-            ->expects($this->once())
-            ->method('supports')
-            ->with('library')
-            ->will($this->returnValue(true));
-
-        $installer
-            ->expects($this->once())
-            ->method('ensureBinariesPresence')
-            ->with($package);
-
-        $manager->ensureBinariesPresence($package);
+            $this->addPackage($package);
+        }
     }
 
     /**
-     * @return \Composer\Installer\InstallerInterface&\PHPUnit\Framework\MockObject\MockObject
+     * @return ?BasePackage
      */
-    private function createInstallerMock()
+    private function getComposerInformation(\SplFileInfo $file): ?BasePackage
     {
-        return $this->getMockBuilder('Composer\Installer\InstallerInterface')
-            ->getMock();
-    }
+        $json = null;
+        $fileType = null;
+        $fileExtension = pathinfo($file->getPathname(), PATHINFO_EXTENSION);
+        if (in_array($fileExtension, ['gz', 'tar', 'tgz'], true)) {
+            $fileType = 'tar';
+        } elseif ($fileExtension === 'zip') {
+            $fileType = 'zip';
+        } else {
+            throw new \RuntimeException('Files with "'.$fileExtension.'" extensions aren\'t supported. Only ZIP and TAR/TAR.GZ/TGZ archives are supported.');
+        }
 
-    /**
-     * @return \Composer\Package\PackageInterface&\PHPUnit\Framework\MockObject\MockObject
-     */
-    private function createPackageMock()
-    {
-        $mock = $this->getMockBuilder('Composer\Package\PackageInterface')
-            ->getMock();
+        try {
+            if ($fileType === 'tar') {
+                $json = Tar::getComposerJson($file->getPathname());
+            } else {
+                $json = Zip::getComposerJson($file->getPathname());
+            }
+        } catch (\Exception $exception) {
+            $this->io->write('Failed loading package '.$file->getPathname().': '.$exception->getMessage(), false, IOInterface::VERBOSE);
+        }
 
-        return $mock;
+        if (null === $json) {
+            return null;
+        }
+
+        $package = JsonFile::parseJson($json, $file->getPathname().'#composer.json');
+        $package['dist'] = [
+            'type' => $fileType,
+            'url' => strtr($file->getPathname(), '\\', '/'),
+            'shasum' => sha1_file($file->getRealPath()),
+        ];
+
+        try {
+            $package = $this->loader->load($package);
+        } catch (\UnexpectedValueException $e) {
+            throw new \UnexpectedValueException('Failed loading package in '.$file.': '.$e->getMessage(), 0, $e);
+        }
+
+        return $package;
     }
 }

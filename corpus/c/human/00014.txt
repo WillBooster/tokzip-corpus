@@ -24,1093 +24,634 @@
 
 #include "curl_setup.h"
 
-#ifdef USE_MSH3
+#if (defined(USE_CURL_NTLM_CORE) && !defined(USE_WINDOWS_SSPI)) \
+    || !defined(CURL_DISABLE_DIGEST_AUTH)
 
-#include "urldata.h"
-#include "hash.h"
-#include "timeval.h"
-#include "multiif.h"
-#include "sendf.h"
-#include "curl_trc.h"
-#include "cfilters.h"
-#include "cf-socket.h"
-#include "connect.h"
-#include "progress.h"
-#include "http1.h"
-#include "curl_msh3.h"
-#include "socketpair.h"
-#include "vtls/vtls.h"
-#include "vquic/vquic.h"
+#include <string.h>
+#include <curl/curl.h>
+
+#include "curl_md5.h"
+#include "curl_hmac.h"
+#include "warnless.h"
+
+#ifdef USE_MBEDTLS
+#include <mbedtls/version.h>
+
+#if(MBEDTLS_VERSION_NUMBER >= 0x02070000) && \
+   (MBEDTLS_VERSION_NUMBER < 0x03000000)
+  #define HAS_MBEDTLS_RESULT_CODE_BASED_FUNCTIONS
+#endif
+#endif /* USE_MBEDTLS */
+
+#ifdef USE_OPENSSL
+  #include <openssl/opensslconf.h>
+  #if !defined(OPENSSL_NO_MD5) && !defined(OPENSSL_NO_DEPRECATED_3_0)
+    #define USE_OPENSSL_MD5
+  #endif
+#endif
+
+#ifdef USE_WOLFSSL
+  #include <wolfssl/options.h>
+  #ifndef NO_MD5
+    #define USE_WOLFSSL_MD5
+  #endif
+#endif
+
+#if defined(USE_GNUTLS)
+#include <nettle/md5.h>
+#elif defined(USE_OPENSSL_MD5)
+#include <openssl/md5.h>
+#elif defined(USE_WOLFSSL_MD5)
+#include <wolfssl/openssl/md5.h>
+#elif defined(USE_MBEDTLS)
+#include <mbedtls/md5.h>
+#elif (defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && \
+              (__MAC_OS_X_VERSION_MAX_ALLOWED >= 1040) && \
+       defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && \
+              (__MAC_OS_X_VERSION_MIN_REQUIRED < 101500)) || \
+      (defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && \
+              (__IPHONE_OS_VERSION_MAX_ALLOWED >= 20000) && \
+       defined(__IPHONE_OS_VERSION_MIN_REQUIRED) && \
+              (__IPHONE_OS_VERSION_MIN_REQUIRED < 130000))
+#define AN_APPLE_OS
+#include <CommonCrypto/CommonDigest.h>
+#elif defined(USE_WIN32_CRYPTO)
+#include <wincrypt.h>
+#endif
 
 /* The last 3 #include files should be in this order */
 #include "curl_printf.h"
 #include "curl_memory.h"
 #include "memdebug.h"
 
-#ifdef CURL_DISABLE_SOCKETPAIR
-#error "MSH3 cannot be build with CURL_DISABLE_SOCKETPAIR set"
+#if defined(USE_GNUTLS)
+
+typedef struct md5_ctx my_md5_ctx;
+
+static CURLcode my_md5_init(my_md5_ctx *ctx)
+{
+  md5_init(ctx);
+  return CURLE_OK;
+}
+
+static void my_md5_update(my_md5_ctx *ctx,
+                          const unsigned char *input,
+                          unsigned int inputLen)
+{
+  md5_update(ctx, inputLen, input);
+}
+
+static void my_md5_final(unsigned char *digest, my_md5_ctx *ctx)
+{
+  md5_digest(ctx, 16, digest);
+}
+
+#elif defined(USE_OPENSSL_MD5) || defined(USE_WOLFSSL_MD5)
+
+typedef MD5_CTX my_md5_ctx;
+
+static CURLcode my_md5_init(my_md5_ctx *ctx)
+{
+  if(!MD5_Init(ctx))
+    return CURLE_OUT_OF_MEMORY;
+
+  return CURLE_OK;
+}
+
+static void my_md5_update(my_md5_ctx *ctx,
+                          const unsigned char *input,
+                          unsigned int len)
+{
+  (void)MD5_Update(ctx, input, len);
+}
+
+static void my_md5_final(unsigned char *digest, my_md5_ctx *ctx)
+{
+  (void)MD5_Final(digest, ctx);
+}
+
+#elif defined(USE_MBEDTLS)
+
+typedef mbedtls_md5_context my_md5_ctx;
+
+static CURLcode my_md5_init(my_md5_ctx *ctx)
+{
+#if (MBEDTLS_VERSION_NUMBER >= 0x03000000)
+  if(mbedtls_md5_starts(ctx))
+    return CURLE_OUT_OF_MEMORY;
+#elif defined(HAS_MBEDTLS_RESULT_CODE_BASED_FUNCTIONS)
+  if(mbedtls_md5_starts_ret(ctx))
+    return CURLE_OUT_OF_MEMORY;
+#else
+  (void)mbedtls_md5_starts(ctx);
 #endif
-
-#define H3_STREAM_WINDOW_SIZE (128 * 1024)
-#define H3_STREAM_CHUNK_SIZE   (16 * 1024)
-#define H3_STREAM_RECV_CHUNKS \
-          (H3_STREAM_WINDOW_SIZE / H3_STREAM_CHUNK_SIZE)
-
-#ifdef _WIN32
-#define msh3_lock CRITICAL_SECTION
-#define msh3_lock_initialize(lock) InitializeCriticalSection(lock)
-#define msh3_lock_uninitialize(lock) DeleteCriticalSection(lock)
-#define msh3_lock_acquire(lock) EnterCriticalSection(lock)
-#define msh3_lock_release(lock) LeaveCriticalSection(lock)
-#else /* !_WIN32 */
-#include <pthread.h>
-#define msh3_lock pthread_mutex_t
-#define msh3_lock_initialize(lock) do { \
-  pthread_mutexattr_t attr; \
-  pthread_mutexattr_init(&attr); \
-  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE); \
-  pthread_mutex_init(lock, &attr); \
-  pthread_mutexattr_destroy(&attr); \
-}while(0)
-#define msh3_lock_uninitialize(lock) pthread_mutex_destroy(lock)
-#define msh3_lock_acquire(lock) pthread_mutex_lock(lock)
-#define msh3_lock_release(lock) pthread_mutex_unlock(lock)
-#endif /* _WIN32 */
-
-
-static void MSH3_CALL msh3_conn_connected(MSH3_CONNECTION *Connection,
-                                          void *IfContext);
-static void MSH3_CALL msh3_conn_shutdown_complete(MSH3_CONNECTION *Connection,
-                                          void *IfContext);
-static void MSH3_CALL msh3_conn_new_request(MSH3_CONNECTION *Connection,
-                                          void *IfContext,
-                                          MSH3_REQUEST *Request);
-static void MSH3_CALL msh3_header_received(MSH3_REQUEST *Request,
-                                           void *IfContext,
-                                           const MSH3_HEADER *Header);
-static bool MSH3_CALL msh3_data_received(MSH3_REQUEST *Request,
-                                        void *IfContext, uint32_t *Length,
-                                        const uint8_t *Data);
-static void MSH3_CALL msh3_complete(MSH3_REQUEST *Request, void *IfContext,
-                                    bool Aborted, uint64_t AbortError);
-static void MSH3_CALL msh3_shutdown_complete(MSH3_REQUEST *Request,
-                                             void *IfContext);
-static void MSH3_CALL msh3_data_sent(MSH3_REQUEST *Request,
-                                     void *IfContext, void *SendContext);
-
-
-void Curl_msh3_ver(char *p, size_t len)
-{
-  uint32_t v[4];
-  MsH3Version(v);
-  (void)msnprintf(p, len, "msh3/%d.%d.%d.%d", v[0], v[1], v[2], v[3]);
+  return CURLE_OK;
 }
 
-#define SP_LOCAL   0
-#define SP_REMOTE  1
-
-struct cf_msh3_ctx {
-  MSH3_API *api;
-  MSH3_CONNECTION *qconn;
-  struct Curl_sockaddr_ex addr;
-  curl_socket_t sock[2]; /* fake socket pair until we get support in msh3 */
-  char l_ip[MAX_IPADR_LEN];          /* local IP as string */
-  int l_port;                        /* local port number */
-  struct cf_call_data call_data;
-  struct curltime connect_started;   /* time the current attempt started */
-  struct curltime handshake_at;      /* time connect handshake finished */
-  struct Curl_hash streams;          /* hash `data->id` to `stream_ctx` */
-  /* Flags written by msh3/msquic thread */
-  bool handshake_complete;
-  bool handshake_succeeded;
-  bool connected;
-  /* Flags written by curl thread */
-  BIT(verbose);
-  BIT(active);
-};
-
-static struct cf_msh3_ctx *h3_get_msh3_ctx(struct Curl_easy *data);
-
-/* How to access `call_data` from a cf_msh3 filter */
-#undef CF_CTX_CALL_DATA
-#define CF_CTX_CALL_DATA(cf)  \
-  ((struct cf_msh3_ctx *)(cf)->ctx)->call_data
-
-/**
- * All about the H3 internals of a stream
- */
-struct stream_ctx {
-  struct MSH3_REQUEST *req;
-  struct bufq recvbuf;   /* h3 response */
-#ifdef _WIN32
-  CRITICAL_SECTION recv_lock;
-#else /* !_WIN32 */
-  pthread_mutex_t recv_lock;
-#endif /* _WIN32 */
-  uint64_t error3; /* HTTP/3 stream error code */
-  int status_code; /* HTTP status code */
-  CURLcode recv_error;
-  bool closed;
-  bool reset;
-  bool upload_done;
-  bool firstheader;  /* FALSE until headers arrive */
-  bool recv_header_complete;
-};
-
-#define H3_STREAM_CTX(ctx,data)   ((struct stream_ctx *)((data && ctx)? \
-                Curl_hash_offt_get(&(ctx)->streams, (data)->id) : NULL))
-
-static void h3_stream_ctx_free(struct stream_ctx *stream)
+static void my_md5_update(my_md5_ctx *ctx,
+                          const unsigned char *data,
+                          unsigned int length)
 {
-  Curl_bufq_free(&stream->recvbuf);
-  free(stream);
+#if !defined(HAS_MBEDTLS_RESULT_CODE_BASED_FUNCTIONS)
+  (void) mbedtls_md5_update(ctx, data, length);
+#else
+  (void) mbedtls_md5_update_ret(ctx, data, length);
+#endif
 }
 
-static void h3_stream_hash_free(void *stream)
+static void my_md5_final(unsigned char *digest, my_md5_ctx *ctx)
 {
-  DEBUGASSERT(stream);
-  h3_stream_ctx_free((struct stream_ctx *)stream);
+#if !defined(HAS_MBEDTLS_RESULT_CODE_BASED_FUNCTIONS)
+  (void) mbedtls_md5_finish(ctx, digest);
+#else
+  (void) mbedtls_md5_finish_ret(ctx, digest);
+#endif
 }
 
-static CURLcode h3_data_setup(struct Curl_cfilter *cf,
-                              struct Curl_easy *data)
+#elif defined(AN_APPLE_OS)
+
+/* For Apple operating systems: CommonCrypto has the functions we need.
+   These functions are available on Tiger and later, as well as iOS 2.0
+   and later. If you are building for an older cat, well, sorry.
+
+   Declaring the functions as static like this seems to be a bit more
+   reliable than defining COMMON_DIGEST_FOR_OPENSSL on older cats. */
+#  define my_md5_ctx CC_MD5_CTX
+
+static CURLcode my_md5_init(my_md5_ctx *ctx)
 {
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-
-  if(stream)
-    return CURLE_OK;
-
-  stream = calloc(1, sizeof(*stream));
-  if(!stream)
+  if(!CC_MD5_Init(ctx))
     return CURLE_OUT_OF_MEMORY;
 
-  stream->req = ZERO_NULL;
-  msh3_lock_initialize(&stream->recv_lock);
-  Curl_bufq_init2(&stream->recvbuf, H3_STREAM_CHUNK_SIZE,
-                  H3_STREAM_RECV_CHUNKS, BUFQ_OPT_SOFT_LIMIT);
-  CURL_TRC_CF(data, cf, "data setup");
+  return CURLE_OK;
+}
 
-  if(!Curl_hash_offt_set(&ctx->streams, data->id, stream)) {
-    h3_stream_ctx_free(stream);
+static void my_md5_update(my_md5_ctx *ctx,
+                          const unsigned char *input,
+                          unsigned int inputLen)
+{
+  CC_MD5_Update(ctx, input, inputLen);
+}
+
+static void my_md5_final(unsigned char *digest, my_md5_ctx *ctx)
+{
+  CC_MD5_Final(digest, ctx);
+}
+
+#elif defined(USE_WIN32_CRYPTO)
+
+struct md5_ctx {
+  HCRYPTPROV hCryptProv;
+  HCRYPTHASH hHash;
+};
+typedef struct md5_ctx my_md5_ctx;
+
+static CURLcode my_md5_init(my_md5_ctx *ctx)
+{
+  if(!CryptAcquireContext(&ctx->hCryptProv, NULL, NULL, PROV_RSA_FULL,
+                          CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
     return CURLE_OUT_OF_MEMORY;
+
+  if(!CryptCreateHash(ctx->hCryptProv, CALG_MD5, 0, 0, &ctx->hHash)) {
+    CryptReleaseContext(ctx->hCryptProv, 0);
+    ctx->hCryptProv = 0;
+    return CURLE_FAILED_INIT;
   }
 
   return CURLE_OK;
 }
 
-static void h3_data_done(struct Curl_cfilter *cf, struct Curl_easy *data)
+static void my_md5_update(my_md5_ctx *ctx,
+                          const unsigned char *input,
+                          unsigned int inputLen)
 {
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-
-  (void)cf;
-  if(stream) {
-    CURL_TRC_CF(data, cf, "easy handle is done");
-    Curl_hash_offt_remove(&ctx->streams, data->id);
-  }
+  CryptHashData(ctx->hHash, (unsigned char *)input, inputLen, 0);
 }
 
-static void drain_stream_from_other_thread(struct Curl_easy *data,
-                                           struct stream_ctx *stream)
+static void my_md5_final(unsigned char *digest, my_md5_ctx *ctx)
 {
-  unsigned char bits;
-
-  /* risky */
-  bits = CURL_CSELECT_IN;
-  if(stream && !stream->upload_done)
-    bits |= CURL_CSELECT_OUT;
-  if(data->state.select_bits != bits) {
-    data->state.select_bits = bits;
-    /* cannot expire from other thread */
-  }
+  unsigned long length = 0;
+  CryptGetHashParam(ctx->hHash, HP_HASHVAL, NULL, &length, 0);
+  if(length == 16)
+    CryptGetHashParam(ctx->hHash, HP_HASHVAL, digest, &length, 0);
+  if(ctx->hHash)
+    CryptDestroyHash(ctx->hHash);
+  if(ctx->hCryptProv)
+    CryptReleaseContext(ctx->hCryptProv, 0);
 }
 
-static void drain_stream(struct Curl_cfilter *cf,
-                         struct Curl_easy *data)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  unsigned char bits;
+#else
 
-  (void)cf;
-  bits = CURL_CSELECT_IN;
-  if(stream && !stream->upload_done)
-    bits |= CURL_CSELECT_OUT;
-  if(data->state.select_bits != bits) {
-    data->state.select_bits = bits;
-    Curl_expire(data, 0, EXPIRE_RUN_NOW);
-  }
-}
-
-static const MSH3_CONNECTION_IF msh3_conn_if = {
-  msh3_conn_connected,
-  msh3_conn_shutdown_complete,
-  msh3_conn_new_request
-};
-
-static void MSH3_CALL msh3_conn_connected(MSH3_CONNECTION *Connection,
-                                          void *IfContext)
-{
-  struct Curl_cfilter *cf = IfContext;
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct Curl_easy *data = CF_DATA_CURRENT(cf);
-  (void)Connection;
-
-  CURL_TRC_CF(data, cf, "[MSH3] connected");
-  ctx->handshake_succeeded = true;
-  ctx->connected = true;
-  ctx->handshake_complete = true;
-}
-
-static void MSH3_CALL msh3_conn_shutdown_complete(MSH3_CONNECTION *Connection,
-                                          void *IfContext)
-{
-  struct Curl_cfilter *cf = IfContext;
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct Curl_easy *data = CF_DATA_CURRENT(cf);
-
-  (void)Connection;
-  CURL_TRC_CF(data, cf, "[MSH3] shutdown complete");
-  ctx->connected = false;
-  ctx->handshake_complete = true;
-}
-
-static void MSH3_CALL msh3_conn_new_request(MSH3_CONNECTION *Connection,
-                                          void *IfContext,
-                                          MSH3_REQUEST *Request)
-{
-  (void)Connection;
-  (void)IfContext;
-  (void)Request;
-}
-
-static const MSH3_REQUEST_IF msh3_request_if = {
-  msh3_header_received,
-  msh3_data_received,
-  msh3_complete,
-  msh3_shutdown_complete,
-  msh3_data_sent
-};
-
-/* Decode HTTP status code. Returns -1 if no valid status code was
-   decoded. (duplicate from http2.c) */
-static int decode_status_code(const char *value, size_t len)
-{
-  int i;
-  int res;
-
-  if(len != 3) {
-    return -1;
-  }
-
-  res = 0;
-
-  for(i = 0; i < 3; ++i) {
-    char c = value[i];
-
-    if(c < '0' || c > '9') {
-      return -1;
-    }
-
-    res *= 10;
-    res += c - '0';
-  }
-
-  return res;
-}
+/* When no other crypto library is available we use this code segment */
 
 /*
- * write_resp_raw() copies response data in raw format to the `data`'s
-  * receive buffer. If not enough space is available, it appends to the
- * `data`'s overflow buffer.
+ * This is an OpenSSL-compatible implementation of the RSA Data Security, Inc.
+ * MD5 Message-Digest Algorithm (RFC 1321).
+ *
+ * Homepage:
+ https://openwall.info/wiki/people/solar/software/public-domain-source-code/md5
+ *
+ * Author:
+ * Alexander Peslyak, better known as Solar Designer <solar at openwall.com>
+ *
+ * This software was written by Alexander Peslyak in 2001. No copyright is
+ * claimed, and the software is hereby placed in the public domain.
+ * In case this attempt to disclaim copyright and place the software in the
+ * public domain is deemed null and void, then the software is
+ * Copyright (c) 2001 Alexander Peslyak and it is hereby released to the
+ * general public under the following terms:
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted.
+ *
+ * There is ABSOLUTELY NO WARRANTY, express or implied.
+ *
+ * (This is a heavily cut-down "BSD license".)
+ *
+ * This differs from Colin Plumb's older public domain implementation in that
+ * no exactly 32-bit integer data type is required (any 32-bit or wider
+ * unsigned integer data type will do), there is no compile-time endianness
+ * configuration, and the function prototypes match OpenSSL's. No code from
+ * Colin Plumb's implementation has been reused; this comment merely compares
+ * the properties of the two independent implementations.
+ *
+ * The primary goals of this implementation are portability and ease of use.
+ * It is meant to be fast, but not as fast as possible. Some known
+ * optimizations are not included to reduce source code size and avoid
+ * compile-time configuration.
  */
-static CURLcode write_resp_raw(struct Curl_easy *data,
-                               const void *mem, size_t memlen)
-{
-  struct cf_msh3_ctx *ctx = h3_get_msh3_ctx(data);
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  CURLcode result = CURLE_OK;
-  ssize_t nwritten;
 
-  if(!stream)
-    return CURLE_RECV_ERROR;
+/* Any 32-bit or wider unsigned integer data type will do */
+typedef unsigned int MD5_u32plus;
 
-  nwritten = Curl_bufq_write(&stream->recvbuf, mem, memlen, &result);
-  if(nwritten < 0) {
-    return result;
-  }
+struct md5_ctx {
+  MD5_u32plus lo, hi;
+  MD5_u32plus a, b, c, d;
+  unsigned char buffer[64];
+  MD5_u32plus block[16];
+};
+typedef struct md5_ctx my_md5_ctx;
 
-  if((size_t)nwritten < memlen) {
-    /* This MUST not happen. Our recbuf is dimensioned to hold the
-     * full max_stream_window and then some for this very reason. */
-    DEBUGASSERT(0);
-    return CURLE_RECV_ERROR;
-  }
-  return result;
-}
+static CURLcode my_md5_init(my_md5_ctx *ctx);
+static void my_md5_update(my_md5_ctx *ctx, const void *data,
+                          unsigned long size);
+static void my_md5_final(unsigned char *result, my_md5_ctx *ctx);
 
-static void MSH3_CALL msh3_header_received(MSH3_REQUEST *Request,
-                                           void *userp,
-                                           const MSH3_HEADER *hd)
-{
-  struct Curl_easy *data = userp;
-  struct cf_msh3_ctx *ctx = h3_get_msh3_ctx(data);
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  CURLcode result;
-  (void)Request;
+/*
+ * The basic MD5 functions.
+ *
+ * F and G are optimized compared to their RFC 1321 definitions for
+ * architectures that lack an AND-NOT instruction, just like in Colin Plumb's
+ * implementation.
+ */
+#define MD5_F(x, y, z)                  ((z) ^ ((x) & ((y) ^ (z))))
+#define MD5_G(x, y, z)                  ((y) ^ ((z) & ((x) ^ (y))))
+#define MD5_H(x, y, z)                  (((x) ^ (y)) ^ (z))
+#define MD5_H2(x, y, z)                 ((x) ^ ((y) ^ (z)))
+#define MD5_I(x, y, z)                  ((y) ^ ((x) | ~(z)))
 
-  DEBUGF(infof(data, "[MSH3] header received, stream=%d", !!stream));
-  if(!stream || stream->recv_header_complete) {
-    return;
-  }
+/*
+ * The MD5 transformation for all four rounds.
+ */
+#define MD5_STEP(f, a, b, c, d, x, t, s) \
+        (a) += f((b), (c), (d)) + (x) + (t); \
+        (a) = (((a) << (s)) | (((a) & 0xffffffff) >> (32 - (s)))); \
+        (a) += (b);
 
-  msh3_lock_acquire(&stream->recv_lock);
-
-  if((hd->NameLength == 7) &&
-     !strncmp(HTTP_PSEUDO_STATUS, (char *)hd->Name, 7)) {
-    char line[14]; /* status line is always 13 characters long */
-    size_t ncopy;
-
-    DEBUGASSERT(!stream->firstheader);
-    stream->status_code = decode_status_code(hd->Value, hd->ValueLength);
-    DEBUGASSERT(stream->status_code != -1);
-    ncopy = msnprintf(line, sizeof(line), "HTTP/3 %03d \r\n",
-                      stream->status_code);
-    result = write_resp_raw(data, line, ncopy);
-    if(result)
-      stream->recv_error = result;
-    stream->firstheader = TRUE;
-  }
-  else {
-    /* store as an HTTP1-style header */
-    DEBUGASSERT(stream->firstheader);
-    result = write_resp_raw(data, hd->Name, hd->NameLength);
-    if(!result)
-      result = write_resp_raw(data, ": ", 2);
-    if(!result)
-      result = write_resp_raw(data, hd->Value, hd->ValueLength);
-    if(!result)
-      result = write_resp_raw(data, "\r\n", 2);
-    if(result) {
-      stream->recv_error = result;
-    }
-  }
-
-  drain_stream_from_other_thread(data, stream);
-  msh3_lock_release(&stream->recv_lock);
-}
-
-static bool MSH3_CALL msh3_data_received(MSH3_REQUEST *Request,
-                                         void *IfContext, uint32_t *buflen,
-                                         const uint8_t *buf)
-{
-  struct Curl_easy *data = IfContext;
-  struct cf_msh3_ctx *ctx = h3_get_msh3_ctx(data);
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  CURLcode result;
-  bool rv = FALSE;
-
-  /* TODO: we would like to limit the amount of data we are buffer here.
-   * There seems to be no mechanism in msh3 to adjust flow control and
-   * it is undocumented what happens if we return FALSE here or less
-   * length (buflen is an inout parameter).
-   */
-  (void)Request;
-  if(!stream)
-    return FALSE;
-
-  msh3_lock_acquire(&stream->recv_lock);
-
-  if(!stream->recv_header_complete) {
-    result = write_resp_raw(data, "\r\n", 2);
-    if(result) {
-      stream->recv_error = result;
-      goto out;
-    }
-    stream->recv_header_complete = true;
-  }
-
-  result = write_resp_raw(data, buf, *buflen);
-  if(result) {
-    stream->recv_error = result;
-  }
-  rv = TRUE;
-
-out:
-  msh3_lock_release(&stream->recv_lock);
-  return rv;
-}
-
-static void MSH3_CALL msh3_complete(MSH3_REQUEST *Request, void *IfContext,
-                                    bool aborted, uint64_t error)
-{
-  struct Curl_easy *data = IfContext;
-  struct cf_msh3_ctx *ctx = h3_get_msh3_ctx(data);
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-
-  (void)Request;
-  if(!stream)
-    return;
-  msh3_lock_acquire(&stream->recv_lock);
-  stream->closed = TRUE;
-  stream->recv_header_complete = true;
-  if(error)
-    stream->error3 = error;
-  if(aborted)
-    stream->reset = TRUE;
-  msh3_lock_release(&stream->recv_lock);
-}
-
-static void MSH3_CALL msh3_shutdown_complete(MSH3_REQUEST *Request,
-                                             void *IfContext)
-{
-  struct Curl_easy *data = IfContext;
-  struct cf_msh3_ctx *ctx = h3_get_msh3_ctx(data);
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-
-  if(!stream)
-    return;
-  (void)Request;
-  (void)stream;
-}
-
-static void MSH3_CALL msh3_data_sent(MSH3_REQUEST *Request,
-                                     void *IfContext, void *SendContext)
-{
-  struct Curl_easy *data = IfContext;
-  struct cf_msh3_ctx *ctx = h3_get_msh3_ctx(data);
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  if(!stream)
-    return;
-  (void)Request;
-  (void)stream;
-  (void)SendContext;
-}
-
-static ssize_t recv_closed_stream(struct Curl_cfilter *cf,
-                                  struct Curl_easy *data,
-                                  CURLcode *err)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  ssize_t nread = -1;
-
-  if(!stream) {
-    *err = CURLE_RECV_ERROR;
-    return -1;
-  }
-  (void)cf;
-  if(stream->reset) {
-    failf(data, "HTTP/3 stream reset by server");
-    *err = CURLE_PARTIAL_FILE;
-    CURL_TRC_CF(data, cf, "cf_recv, was reset -> %d", *err);
-    goto out;
-  }
-  else if(stream->error3) {
-    failf(data, "HTTP/3 stream was not closed cleanly: (error %zd)",
-          (ssize_t)stream->error3);
-    *err = CURLE_HTTP3;
-    CURL_TRC_CF(data, cf, "cf_recv, closed uncleanly -> %d", *err);
-    goto out;
-  }
-  else {
-    CURL_TRC_CF(data, cf, "cf_recv, closed ok -> %d", *err);
-  }
-  *err = CURLE_OK;
-  nread = 0;
-
-out:
-  return nread;
-}
-
-static void set_quic_expire(struct Curl_cfilter *cf, struct Curl_easy *data)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-
-  /* we have no indication from msh3 when it would be a good time
-   * to juggle the connection again. So, we compromise by calling
-   * us again every some milliseconds. */
-  (void)cf;
-  if(stream && stream->req && !stream->closed) {
-    Curl_expire(data, 10, EXPIRE_QUIC);
-  }
-  else {
-    Curl_expire(data, 50, EXPIRE_QUIC);
-  }
-}
-
-static ssize_t cf_msh3_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
-                            char *buf, size_t len, CURLcode *err)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  ssize_t nread = -1;
-  struct cf_call_data save;
-
-  CURL_TRC_CF(data, cf, "cf_recv(len=%zu), stream=%d", len, !!stream);
-  if(!stream) {
-    *err = CURLE_RECV_ERROR;
-    return -1;
-  }
-  CF_DATA_SAVE(save, cf, data);
-
-  msh3_lock_acquire(&stream->recv_lock);
-
-  if(stream->recv_error) {
-    failf(data, "request aborted");
-    *err = stream->recv_error;
-    goto out;
-  }
-
-  *err = CURLE_OK;
-
-  if(!Curl_bufq_is_empty(&stream->recvbuf)) {
-    nread = Curl_bufq_read(&stream->recvbuf,
-                           (unsigned char *)buf, len, err);
-    CURL_TRC_CF(data, cf, "read recvbuf(len=%zu) -> %zd, %d",
-                len, nread, *err);
-    if(nread < 0)
-      goto out;
-    if(stream->closed)
-      drain_stream(cf, data);
-  }
-  else if(stream->closed) {
-    nread = recv_closed_stream(cf, data, err);
-    goto out;
-  }
-  else {
-    CURL_TRC_CF(data, cf, "req: nothing here, call again");
-    *err = CURLE_AGAIN;
-  }
-
-out:
-  msh3_lock_release(&stream->recv_lock);
-  set_quic_expire(cf, data);
-  CF_DATA_RESTORE(cf, save);
-  return nread;
-}
-
-static ssize_t cf_msh3_send(struct Curl_cfilter *cf, struct Curl_easy *data,
-                            const void *buf, size_t len, CURLcode *err)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  struct h1_req_parser h1;
-  struct dynhds h2_headers;
-  MSH3_HEADER *nva = NULL;
-  size_t nheader, i;
-  ssize_t nwritten = -1;
-  struct cf_call_data save;
-  bool eos;
-
-  CF_DATA_SAVE(save, cf, data);
-
-  Curl_h1_req_parse_init(&h1, H1_PARSE_DEFAULT_MAX_LINE_LEN);
-  Curl_dynhds_init(&h2_headers, 0, DYN_HTTP_REQUEST);
-
-  /* Sizes must match for cast below to work" */
-  DEBUGASSERT(stream);
-  CURL_TRC_CF(data, cf, "req: send %zu bytes", len);
-
-  if(!stream->req) {
-    /* The first send on the request contains the headers and possibly some
-       data. Parse out the headers and create the request, then if there is
-       any data left over go ahead and send it too. */
-    nwritten = Curl_h1_req_parse_read(&h1, buf, len, NULL, 0, err);
-    if(nwritten < 0)
-      goto out;
-    DEBUGASSERT(h1.done);
-    DEBUGASSERT(h1.req);
-
-    *err = Curl_http_req_to_h2(&h2_headers, h1.req, data);
-    if(*err) {
-      nwritten = -1;
-      goto out;
-    }
-
-    nheader = Curl_dynhds_count(&h2_headers);
-    nva = malloc(sizeof(MSH3_HEADER) * nheader);
-    if(!nva) {
-      *err = CURLE_OUT_OF_MEMORY;
-      nwritten = -1;
-      goto out;
-    }
-
-    for(i = 0; i < nheader; ++i) {
-      struct dynhds_entry *e = Curl_dynhds_getn(&h2_headers, i);
-      nva[i].Name = e->name;
-      nva[i].NameLength = e->namelen;
-      nva[i].Value = e->value;
-      nva[i].ValueLength = e->valuelen;
-    }
-
-    switch(data->state.httpreq) {
-    case HTTPREQ_POST:
-    case HTTPREQ_POST_FORM:
-    case HTTPREQ_POST_MIME:
-    case HTTPREQ_PUT:
-      /* known request body size or -1 */
-      eos = FALSE;
-      break;
-    default:
-      /* there is not request body */
-      eos = TRUE;
-      stream->upload_done = TRUE;
-      break;
-    }
-
-    CURL_TRC_CF(data, cf, "req: send %zu headers", nheader);
-    stream->req = MsH3RequestOpen(ctx->qconn, &msh3_request_if, data,
-                                  nva, nheader,
-                                  eos ? MSH3_REQUEST_FLAG_FIN :
-                                  MSH3_REQUEST_FLAG_NONE);
-    if(!stream->req) {
-      failf(data, "request open failed");
-      *err = CURLE_SEND_ERROR;
-      goto out;
-    }
-    *err = CURLE_OK;
-    nwritten = len;
-    goto out;
-  }
-  else {
-    /* request is open */
-    CURL_TRC_CF(data, cf, "req: send %zu body bytes", len);
-    if(len > 0xFFFFFFFF) {
-      len = 0xFFFFFFFF;
-    }
-
-    if(!MsH3RequestSend(stream->req, MSH3_REQUEST_FLAG_NONE, buf,
-                        (uint32_t)len, stream)) {
-      *err = CURLE_SEND_ERROR;
-      goto out;
-    }
-
-    /* TODO - msh3/msquic will hold onto this memory until the send complete
-       event. How do we make sure curl does not free it until then? */
-    *err = CURLE_OK;
-    nwritten = len;
-  }
-
-out:
-  set_quic_expire(cf, data);
-  free(nva);
-  Curl_h1_req_parse_free(&h1);
-  Curl_dynhds_free(&h2_headers);
-  CF_DATA_RESTORE(cf, save);
-  return nwritten;
-}
-
-static void cf_msh3_adjust_pollset(struct Curl_cfilter *cf,
-                                   struct Curl_easy *data,
-                                   struct easy_pollset *ps)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  struct cf_call_data save;
-
-  CF_DATA_SAVE(save, cf, data);
-  if(stream && ctx->sock[SP_LOCAL] != CURL_SOCKET_BAD) {
-    if(stream->recv_error) {
-      Curl_pollset_add_in(data, ps, ctx->sock[SP_LOCAL]);
-      drain_stream(cf, data);
-    }
-    else if(stream->req) {
-      Curl_pollset_add_out(data, ps, ctx->sock[SP_LOCAL]);
-      drain_stream(cf, data);
-    }
-  }
-}
-
-static bool cf_msh3_data_pending(struct Curl_cfilter *cf,
-                                 const struct Curl_easy *data)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  struct cf_call_data save;
-  bool pending = FALSE;
-
-  CF_DATA_SAVE(save, cf, data);
-
-  (void)cf;
-  if(stream && stream->req) {
-    msh3_lock_acquire(&stream->recv_lock);
-    CURL_TRC_CF((struct Curl_easy *)data, cf, "data pending = %zu",
-                Curl_bufq_len(&stream->recvbuf));
-    pending = !Curl_bufq_is_empty(&stream->recvbuf);
-    msh3_lock_release(&stream->recv_lock);
-    if(pending)
-      drain_stream(cf, (struct Curl_easy *)data);
-  }
-
-  CF_DATA_RESTORE(cf, save);
-  return pending;
-}
-
-static CURLcode h3_data_pause(struct Curl_cfilter *cf,
-                              struct Curl_easy *data,
-                              bool pause)
-{
-  if(!pause) {
-    drain_stream(cf, data);
-    Curl_expire(data, 0, EXPIRE_RUN_NOW);
-  }
-  return CURLE_OK;
-}
-
-static CURLcode cf_msh3_data_event(struct Curl_cfilter *cf,
-                                   struct Curl_easy *data,
-                                   int event, int arg1, void *arg2)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  struct cf_call_data save;
-  CURLcode result = CURLE_OK;
-
-  CF_DATA_SAVE(save, cf, data);
-
-  (void)arg1;
-  (void)arg2;
-  switch(event) {
-  case CF_CTRL_DATA_SETUP:
-    result = h3_data_setup(cf, data);
-    break;
-  case CF_CTRL_DATA_PAUSE:
-    result = h3_data_pause(cf, data, (arg1 != 0));
-    break;
-  case CF_CTRL_DATA_DONE:
-    h3_data_done(cf, data);
-    break;
-  case CF_CTRL_DATA_DONE_SEND:
-    CURL_TRC_CF(data, cf, "req: send done");
-    if(stream) {
-      stream->upload_done = TRUE;
-      if(stream->req) {
-        char buf[1];
-        if(!MsH3RequestSend(stream->req, MSH3_REQUEST_FLAG_FIN,
-                            buf, 0, data)) {
-          result = CURLE_SEND_ERROR;
-        }
-      }
-    }
-    break;
-  default:
-    break;
-  }
-
-  CF_DATA_RESTORE(cf, save);
-  return result;
-}
-
-static CURLcode cf_connect_start(struct Curl_cfilter *cf,
-                                 struct Curl_easy *data)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct ssl_primary_config *conn_config;
-  MSH3_ADDR addr = {0};
-  CURLcode result;
-  bool verify;
-
-  Curl_hash_offt_init(&ctx->streams, 63, h3_stream_hash_free);
-  conn_config = Curl_ssl_cf_get_primary_config(cf);
-  if(!conn_config)
-    return CURLE_FAILED_INIT;
-  verify = !!conn_config->verifypeer;
-
-  memcpy(&addr, &ctx->addr.sa_addr, ctx->addr.addrlen);
-  MSH3_SET_PORT(&addr, (uint16_t)cf->conn->remote_port);
-
-  if(verify && (conn_config->CAfile || conn_config->CApath)) {
-    /* TODO: need a way to provide trust anchors to MSH3 */
-#ifdef DEBUGBUILD
-    /* we need this for our test cases to run */
-    CURL_TRC_CF(data, cf, "non-standard CA not supported, "
-                "switching off verifypeer in DEBUG mode");
-    verify = 0;
+/*
+ * SET reads 4 input bytes in little-endian byte order and stores them
+ * in a properly aligned word in host byte order.
+ *
+ * The check for little-endian architectures that tolerate unaligned
+ * memory accesses is just an optimization. Nothing will break if it
+ * does not work.
+ */
+#if defined(__i386__) || defined(__x86_64__) || defined(__vax__)
+#define MD5_SET(n) \
+        (*(MD5_u32plus *)(void *)&ptr[(n) * 4])
+#define MD5_GET(n) \
+        MD5_SET(n)
 #else
-    CURL_TRC_CF(data, cf, "non-standard CA not supported, "
-                "attempting with built-in verification");
+#define MD5_SET(n) \
+        (ctx->block[(n)] = \
+        (MD5_u32plus)ptr[(n) * 4] | \
+        ((MD5_u32plus)ptr[(n) * 4 + 1] << 8) | \
+        ((MD5_u32plus)ptr[(n) * 4 + 2] << 16) | \
+        ((MD5_u32plus)ptr[(n) * 4 + 3] << 24))
+#define MD5_GET(n) \
+        (ctx->block[(n)])
 #endif
-  }
 
-  CURL_TRC_CF(data, cf, "connecting to %s:%d (verify=%d)",
-              cf->conn->host.name, (int)cf->conn->remote_port, verify);
+/*
+ * This processes one or more 64-byte data blocks, but does NOT update
+ * the bit counters. There are no alignment requirements.
+ */
+static const void *my_md5_body(my_md5_ctx *ctx,
+                               const void *data, unsigned long size)
+{
+  const unsigned char *ptr;
+  MD5_u32plus a, b, c, d;
 
-  ctx->api = MsH3ApiOpen();
-  if(!ctx->api) {
-    failf(data, "cannot create msh3 api");
-    return CURLE_FAILED_INIT;
-  }
+  ptr = (const unsigned char *)data;
 
-  ctx->qconn = MsH3ConnectionOpen(ctx->api,
-                                  &msh3_conn_if,
-                                  cf,
-                                  cf->conn->host.name,
-                                  &addr,
-                                  !verify);
-  if(!ctx->qconn) {
-    failf(data, "cannot create msh3 connection");
-    if(ctx->api) {
-      MsH3ApiClose(ctx->api);
-      ctx->api = NULL;
-    }
-    return CURLE_FAILED_INIT;
-  }
+  a = ctx->a;
+  b = ctx->b;
+  c = ctx->c;
+  d = ctx->d;
 
-  result = h3_data_setup(cf, data);
-  if(result)
-    return result;
+  do {
+    MD5_u32plus saved_a, saved_b, saved_c, saved_d;
+
+    saved_a = a;
+    saved_b = b;
+    saved_c = c;
+    saved_d = d;
+
+/* Round 1 */
+    MD5_STEP(MD5_F, a, b, c, d, MD5_SET(0), 0xd76aa478, 7)
+    MD5_STEP(MD5_F, d, a, b, c, MD5_SET(1), 0xe8c7b756, 12)
+    MD5_STEP(MD5_F, c, d, a, b, MD5_SET(2), 0x242070db, 17)
+    MD5_STEP(MD5_F, b, c, d, a, MD5_SET(3), 0xc1bdceee, 22)
+    MD5_STEP(MD5_F, a, b, c, d, MD5_SET(4), 0xf57c0faf, 7)
+    MD5_STEP(MD5_F, d, a, b, c, MD5_SET(5), 0x4787c62a, 12)
+    MD5_STEP(MD5_F, c, d, a, b, MD5_SET(6), 0xa8304613, 17)
+    MD5_STEP(MD5_F, b, c, d, a, MD5_SET(7), 0xfd469501, 22)
+    MD5_STEP(MD5_F, a, b, c, d, MD5_SET(8), 0x698098d8, 7)
+    MD5_STEP(MD5_F, d, a, b, c, MD5_SET(9), 0x8b44f7af, 12)
+    MD5_STEP(MD5_F, c, d, a, b, MD5_SET(10), 0xffff5bb1, 17)
+    MD5_STEP(MD5_F, b, c, d, a, MD5_SET(11), 0x895cd7be, 22)
+    MD5_STEP(MD5_F, a, b, c, d, MD5_SET(12), 0x6b901122, 7)
+    MD5_STEP(MD5_F, d, a, b, c, MD5_SET(13), 0xfd987193, 12)
+    MD5_STEP(MD5_F, c, d, a, b, MD5_SET(14), 0xa679438e, 17)
+    MD5_STEP(MD5_F, b, c, d, a, MD5_SET(15), 0x49b40821, 22)
+
+/* Round 2 */
+    MD5_STEP(MD5_G, a, b, c, d, MD5_GET(1), 0xf61e2562, 5)
+    MD5_STEP(MD5_G, d, a, b, c, MD5_GET(6), 0xc040b340, 9)
+    MD5_STEP(MD5_G, c, d, a, b, MD5_GET(11), 0x265e5a51, 14)
+    MD5_STEP(MD5_G, b, c, d, a, MD5_GET(0), 0xe9b6c7aa, 20)
+    MD5_STEP(MD5_G, a, b, c, d, MD5_GET(5), 0xd62f105d, 5)
+    MD5_STEP(MD5_G, d, a, b, c, MD5_GET(10), 0x02441453, 9)
+    MD5_STEP(MD5_G, c, d, a, b, MD5_GET(15), 0xd8a1e681, 14)
+    MD5_STEP(MD5_G, b, c, d, a, MD5_GET(4), 0xe7d3fbc8, 20)
+    MD5_STEP(MD5_G, a, b, c, d, MD5_GET(9), 0x21e1cde6, 5)
+    MD5_STEP(MD5_G, d, a, b, c, MD5_GET(14), 0xc33707d6, 9)
+    MD5_STEP(MD5_G, c, d, a, b, MD5_GET(3), 0xf4d50d87, 14)
+    MD5_STEP(MD5_G, b, c, d, a, MD5_GET(8), 0x455a14ed, 20)
+    MD5_STEP(MD5_G, a, b, c, d, MD5_GET(13), 0xa9e3e905, 5)
+    MD5_STEP(MD5_G, d, a, b, c, MD5_GET(2), 0xfcefa3f8, 9)
+    MD5_STEP(MD5_G, c, d, a, b, MD5_GET(7), 0x676f02d9, 14)
+    MD5_STEP(MD5_G, b, c, d, a, MD5_GET(12), 0x8d2a4c8a, 20)
+
+/* Round 3 */
+    MD5_STEP(MD5_H, a, b, c, d, MD5_GET(5), 0xfffa3942, 4)
+    MD5_STEP(MD5_H2, d, a, b, c, MD5_GET(8), 0x8771f681, 11)
+    MD5_STEP(MD5_H, c, d, a, b, MD5_GET(11), 0x6d9d6122, 16)
+    MD5_STEP(MD5_H2, b, c, d, a, MD5_GET(14), 0xfde5380c, 23)
+    MD5_STEP(MD5_H, a, b, c, d, MD5_GET(1), 0xa4beea44, 4)
+    MD5_STEP(MD5_H2, d, a, b, c, MD5_GET(4), 0x4bdecfa9, 11)
+    MD5_STEP(MD5_H, c, d, a, b, MD5_GET(7), 0xf6bb4b60, 16)
+    MD5_STEP(MD5_H2, b, c, d, a, MD5_GET(10), 0xbebfbc70, 23)
+    MD5_STEP(MD5_H, a, b, c, d, MD5_GET(13), 0x289b7ec6, 4)
+    MD5_STEP(MD5_H2, d, a, b, c, MD5_GET(0), 0xeaa127fa, 11)
+    MD5_STEP(MD5_H, c, d, a, b, MD5_GET(3), 0xd4ef3085, 16)
+    MD5_STEP(MD5_H2, b, c, d, a, MD5_GET(6), 0x04881d05, 23)
+    MD5_STEP(MD5_H, a, b, c, d, MD5_GET(9), 0xd9d4d039, 4)
+    MD5_STEP(MD5_H2, d, a, b, c, MD5_GET(12), 0xe6db99e5, 11)
+    MD5_STEP(MD5_H, c, d, a, b, MD5_GET(15), 0x1fa27cf8, 16)
+    MD5_STEP(MD5_H2, b, c, d, a, MD5_GET(2), 0xc4ac5665, 23)
+
+/* Round 4 */
+    MD5_STEP(MD5_I, a, b, c, d, MD5_GET(0), 0xf4292244, 6)
+    MD5_STEP(MD5_I, d, a, b, c, MD5_GET(7), 0x432aff97, 10)
+    MD5_STEP(MD5_I, c, d, a, b, MD5_GET(14), 0xab9423a7, 15)
+    MD5_STEP(MD5_I, b, c, d, a, MD5_GET(5), 0xfc93a039, 21)
+    MD5_STEP(MD5_I, a, b, c, d, MD5_GET(12), 0x655b59c3, 6)
+    MD5_STEP(MD5_I, d, a, b, c, MD5_GET(3), 0x8f0ccc92, 10)
+    MD5_STEP(MD5_I, c, d, a, b, MD5_GET(10), 0xffeff47d, 15)
+    MD5_STEP(MD5_I, b, c, d, a, MD5_GET(1), 0x85845dd1, 21)
+    MD5_STEP(MD5_I, a, b, c, d, MD5_GET(8), 0x6fa87e4f, 6)
+    MD5_STEP(MD5_I, d, a, b, c, MD5_GET(15), 0xfe2ce6e0, 10)
+    MD5_STEP(MD5_I, c, d, a, b, MD5_GET(6), 0xa3014314, 15)
+    MD5_STEP(MD5_I, b, c, d, a, MD5_GET(13), 0x4e0811a1, 21)
+    MD5_STEP(MD5_I, a, b, c, d, MD5_GET(4), 0xf7537e82, 6)
+    MD5_STEP(MD5_I, d, a, b, c, MD5_GET(11), 0xbd3af235, 10)
+    MD5_STEP(MD5_I, c, d, a, b, MD5_GET(2), 0x2ad7d2bb, 15)
+    MD5_STEP(MD5_I, b, c, d, a, MD5_GET(9), 0xeb86d391, 21)
+
+    a += saved_a;
+    b += saved_b;
+    c += saved_c;
+    d += saved_d;
+
+    ptr += 64;
+  } while(size -= 64);
+
+  ctx->a = a;
+  ctx->b = b;
+  ctx->c = c;
+  ctx->d = d;
+
+  return ptr;
+}
+
+static CURLcode my_md5_init(my_md5_ctx *ctx)
+{
+  ctx->a = 0x67452301;
+  ctx->b = 0xefcdab89;
+  ctx->c = 0x98badcfe;
+  ctx->d = 0x10325476;
+
+  ctx->lo = 0;
+  ctx->hi = 0;
 
   return CURLE_OK;
 }
 
-static CURLcode cf_msh3_connect(struct Curl_cfilter *cf,
-                                struct Curl_easy *data,
-                                bool blocking, bool *done)
+static void my_md5_update(my_md5_ctx *ctx, const void *data,
+                          unsigned long size)
 {
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct cf_call_data save;
-  CURLcode result = CURLE_OK;
+  MD5_u32plus saved_lo;
+  unsigned long used;
 
-  (void)blocking;
-  if(cf->connected) {
-    *done = TRUE;
-    return CURLE_OK;
-  }
+  saved_lo = ctx->lo;
+  ctx->lo = (saved_lo + size) & 0x1fffffff;
+  if(ctx->lo < saved_lo)
+    ctx->hi++;
+  ctx->hi += (MD5_u32plus)size >> 29;
 
-  CF_DATA_SAVE(save, cf, data);
+  used = saved_lo & 0x3f;
 
-  if(ctx->sock[SP_LOCAL] == CURL_SOCKET_BAD) {
-    if(Curl_socketpair(AF_UNIX, SOCK_STREAM, 0, &ctx->sock[0], FALSE) < 0) {
-      ctx->sock[SP_LOCAL] = CURL_SOCKET_BAD;
-      ctx->sock[SP_REMOTE] = CURL_SOCKET_BAD;
-      return CURLE_COULDNT_CONNECT;
+  if(used) {
+    unsigned long available = 64 - used;
+
+    if(size < available) {
+      memcpy(&ctx->buffer[used], data, size);
+      return;
     }
+
+    memcpy(&ctx->buffer[used], data, available);
+    data = (const unsigned char *)data + available;
+    size -= available;
+    my_md5_body(ctx, ctx->buffer, 64);
   }
 
-  *done = FALSE;
-  if(!ctx->qconn) {
-    ctx->connect_started = Curl_now();
-    result = cf_connect_start(cf, data);
-    if(result)
-      goto out;
+  if(size >= 64) {
+    data = my_md5_body(ctx, data, size & ~(unsigned long)0x3f);
+    size &= 0x3f;
   }
 
-  if(ctx->handshake_complete) {
-    ctx->handshake_at = Curl_now();
-    if(ctx->handshake_succeeded) {
-      CURL_TRC_CF(data, cf, "handshake succeeded");
-      cf->conn->bits.multiplex = TRUE; /* at least potentially multiplexed */
-      cf->conn->httpversion = 30;
-      cf->conn->bundle->multiuse = BUNDLE_MULTIPLEX;
-      cf->connected = TRUE;
-      cf->conn->alpn = CURL_HTTP_VERSION_3;
-      *done = TRUE;
-      connkeep(cf->conn, "HTTP/3 default");
-      Curl_pgrsTime(data, TIMER_APPCONNECT);
-    }
-    else {
-      failf(data, "failed to connect, handshake failed");
-      result = CURLE_COULDNT_CONNECT;
-    }
-  }
-
-out:
-  CF_DATA_RESTORE(cf, save);
-  return result;
+  memcpy(ctx->buffer, data, size);
 }
 
-static void cf_msh3_close(struct Curl_cfilter *cf, struct Curl_easy *data)
+static void my_md5_final(unsigned char *result, my_md5_ctx *ctx)
 {
-  struct cf_msh3_ctx *ctx = cf->ctx;
-  struct cf_call_data save;
+  unsigned long used, available;
 
-  (void)data;
-  CF_DATA_SAVE(save, cf, data);
+  used = ctx->lo & 0x3f;
 
-  if(ctx) {
-    CURL_TRC_CF(data, cf, "destroying");
-    if(ctx->qconn) {
-      MsH3ConnectionClose(ctx->qconn);
-      ctx->qconn = NULL;
-    }
-    if(ctx->api) {
-      MsH3ApiClose(ctx->api);
-      ctx->api = NULL;
-    }
-    Curl_hash_destroy(&ctx->streams);
+  ctx->buffer[used++] = 0x80;
 
-    if(ctx->active) {
-      /* We share our socket at cf->conn->sock[cf->sockindex] when active.
-       * If it is no longer there, someone has stolen (and hopefully
-       * closed it) and we just forget about it.
-       */
-      ctx->active = FALSE;
-      if(ctx->sock[SP_LOCAL] == cf->conn->sock[cf->sockindex]) {
-        CURL_TRC_CF(data, cf, "cf_msh3_close(%d) active",
-                    (int)ctx->sock[SP_LOCAL]);
-        cf->conn->sock[cf->sockindex] = CURL_SOCKET_BAD;
-      }
-      else {
-        CURL_TRC_CF(data, cf, "cf_socket_close(%d) no longer at "
-                    "conn->sock[], discarding", (int)ctx->sock[SP_LOCAL]);
-        ctx->sock[SP_LOCAL] = CURL_SOCKET_BAD;
-      }
-      if(cf->sockindex == FIRSTSOCKET)
-        cf->conn->remote_addr = NULL;
-    }
-    if(ctx->sock[SP_LOCAL] != CURL_SOCKET_BAD) {
-      sclose(ctx->sock[SP_LOCAL]);
-    }
-    if(ctx->sock[SP_REMOTE] != CURL_SOCKET_BAD) {
-      sclose(ctx->sock[SP_REMOTE]);
-    }
-    ctx->sock[SP_LOCAL] = CURL_SOCKET_BAD;
-    ctx->sock[SP_REMOTE] = CURL_SOCKET_BAD;
+  available = 64 - used;
+
+  if(available < 8) {
+    memset(&ctx->buffer[used], 0, available);
+    my_md5_body(ctx, ctx->buffer, 64);
+    used = 0;
+    available = 64;
   }
-  CF_DATA_RESTORE(cf, save);
+
+  memset(&ctx->buffer[used], 0, available - 8);
+
+  ctx->lo <<= 3;
+  ctx->buffer[56] = curlx_ultouc((ctx->lo)&0xff);
+  ctx->buffer[57] = curlx_ultouc((ctx->lo >> 8)&0xff);
+  ctx->buffer[58] = curlx_ultouc((ctx->lo >> 16)&0xff);
+  ctx->buffer[59] = curlx_ultouc(ctx->lo >> 24);
+  ctx->buffer[60] = curlx_ultouc((ctx->hi)&0xff);
+  ctx->buffer[61] = curlx_ultouc((ctx->hi >> 8)&0xff);
+  ctx->buffer[62] = curlx_ultouc((ctx->hi >> 16)&0xff);
+  ctx->buffer[63] = curlx_ultouc(ctx->hi >> 24);
+
+  my_md5_body(ctx, ctx->buffer, 64);
+
+  result[0] = curlx_ultouc((ctx->a)&0xff);
+  result[1] = curlx_ultouc((ctx->a >> 8)&0xff);
+  result[2] = curlx_ultouc((ctx->a >> 16)&0xff);
+  result[3] = curlx_ultouc(ctx->a >> 24);
+  result[4] = curlx_ultouc((ctx->b)&0xff);
+  result[5] = curlx_ultouc((ctx->b >> 8)&0xff);
+  result[6] = curlx_ultouc((ctx->b >> 16)&0xff);
+  result[7] = curlx_ultouc(ctx->b >> 24);
+  result[8] = curlx_ultouc((ctx->c)&0xff);
+  result[9] = curlx_ultouc((ctx->c >> 8)&0xff);
+  result[10] = curlx_ultouc((ctx->c >> 16)&0xff);
+  result[11] = curlx_ultouc(ctx->c >> 24);
+  result[12] = curlx_ultouc((ctx->d)&0xff);
+  result[13] = curlx_ultouc((ctx->d >> 8)&0xff);
+  result[14] = curlx_ultouc((ctx->d >> 16)&0xff);
+  result[15] = curlx_ultouc(ctx->d >> 24);
+
+  memset(ctx, 0, sizeof(*ctx));
 }
 
-static void cf_msh3_destroy(struct Curl_cfilter *cf, struct Curl_easy *data)
-{
-  struct cf_call_data save;
+#endif /* CRYPTO LIBS */
 
-  CF_DATA_SAVE(save, cf, data);
-  cf_msh3_close(cf, data);
-  free(cf->ctx);
-  cf->ctx = NULL;
-  /* no CF_DATA_RESTORE(cf, save); its gone */
-
-}
-
-static CURLcode cf_msh3_query(struct Curl_cfilter *cf,
-                              struct Curl_easy *data,
-                              int query, int *pres1, void *pres2)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-
-  switch(query) {
-  case CF_QUERY_MAX_CONCURRENT: {
-    /* TODO: we do not have access to this so far, fake it */
-    (void)ctx;
-    *pres1 = 100;
-    return CURLE_OK;
+const struct HMAC_params Curl_HMAC_MD5[] = {
+  {
+    /* Hash initialization function. */
+    CURLX_FUNCTION_CAST(HMAC_hinit_func, my_md5_init),
+    /* Hash update function. */
+    CURLX_FUNCTION_CAST(HMAC_hupdate_func, my_md5_update),
+    /* Hash computation end function. */
+    CURLX_FUNCTION_CAST(HMAC_hfinal_func, my_md5_final),
+    /* Size of hash context structure. */
+    sizeof(my_md5_ctx),
+    /* Maximum key length. */
+    64,
+    /* Result size. */
+    16
   }
-  case CF_QUERY_TIMER_CONNECT: {
-    struct curltime *when = pres2;
-    /* we do not know when the first byte arrived */
-    if(cf->connected)
-      *when = ctx->handshake_at;
-    return CURLE_OK;
-  }
-  case CF_QUERY_TIMER_APPCONNECT: {
-    struct curltime *when = pres2;
-    if(cf->connected)
-      *when = ctx->handshake_at;
-    return CURLE_OK;
-  }
-  default:
-    break;
-  }
-  return cf->next?
-    cf->next->cft->query(cf->next, data, query, pres1, pres2) :
-    CURLE_UNKNOWN_OPTION;
-}
-
-static bool cf_msh3_conn_is_alive(struct Curl_cfilter *cf,
-                                  struct Curl_easy *data,
-                                  bool *input_pending)
-{
-  struct cf_msh3_ctx *ctx = cf->ctx;
-
-  (void)data;
-  *input_pending = FALSE;
-  return ctx && ctx->sock[SP_LOCAL] != CURL_SOCKET_BAD && ctx->qconn &&
-         ctx->connected;
-}
-
-struct Curl_cftype Curl_cft_http3 = {
-  "HTTP/3",
-  CF_TYPE_IP_CONNECT | CF_TYPE_SSL | CF_TYPE_MULTIPLEX,
-  0,
-  cf_msh3_destroy,
-  cf_msh3_connect,
-  cf_msh3_close,
-  Curl_cf_def_shutdown,
-  Curl_cf_def_get_host,
-  cf_msh3_adjust_pollset,
-  cf_msh3_data_pending,
-  cf_msh3_send,
-  cf_msh3_recv,
-  cf_msh3_data_event,
-  cf_msh3_conn_is_alive,
-  Curl_cf_def_conn_keep_alive,
-  cf_msh3_query,
 };
 
-static struct cf_msh3_ctx *h3_get_msh3_ctx(struct Curl_easy *data)
-{
-  if(data && data->conn) {
-    struct Curl_cfilter *cf = data->conn->cfilter[FIRSTSOCKET];
-    while(cf) {
-      if(cf->cft == &Curl_cft_http3)
-        return cf->ctx;
-      cf = cf->next;
-    }
+const struct MD5_params Curl_DIGEST_MD5[] = {
+  {
+    /* Digest initialization function */
+    CURLX_FUNCTION_CAST(Curl_MD5_init_func, my_md5_init),
+    /* Digest update function */
+    CURLX_FUNCTION_CAST(Curl_MD5_update_func, my_md5_update),
+    /* Digest computation end function */
+    CURLX_FUNCTION_CAST(Curl_MD5_final_func, my_md5_final),
+    /* Size of digest context struct */
+    sizeof(my_md5_ctx),
+    /* Result size */
+    16
   }
-  DEBUGF(infof(data, "no filter context found"));
-  return NULL;
-}
+};
 
-CURLcode Curl_cf_msh3_create(struct Curl_cfilter **pcf,
-                             struct Curl_easy *data,
-                             struct connectdata *conn,
-                             const struct Curl_addrinfo *ai)
+/*
+ * @unittest: 1601
+ * Returns CURLE_OK on success.
+ */
+CURLcode Curl_md5it(unsigned char *outbuffer, const unsigned char *input,
+                    const size_t len)
 {
-  struct cf_msh3_ctx *ctx = NULL;
-  struct Curl_cfilter *cf = NULL;
   CURLcode result;
+  my_md5_ctx ctx;
 
-  (void)data;
-  (void)conn;
-  (void)ai; /* TODO: msh3 resolves itself? */
-  ctx = calloc(1, sizeof(*ctx));
-  if(!ctx) {
-    result = CURLE_OUT_OF_MEMORY;
-    goto out;
+  result = my_md5_init(&ctx);
+  if(!result) {
+    my_md5_update(&ctx, input, curlx_uztoui(len));
+    my_md5_final(outbuffer, &ctx);
   }
-  Curl_sock_assign_addr(&ctx->addr, ai, TRNSPRT_QUIC);
-  ctx->sock[SP_LOCAL] = CURL_SOCKET_BAD;
-  ctx->sock[SP_REMOTE] = CURL_SOCKET_BAD;
-
-  result = Curl_cf_create(&cf, &Curl_cft_http3, ctx);
-
-out:
-  *pcf = (!result)? cf : NULL;
-  if(result) {
-    Curl_safefree(cf);
-    Curl_safefree(ctx);
-  }
-
   return result;
 }
 
-bool Curl_conn_is_msh3(const struct Curl_easy *data,
-                       const struct connectdata *conn,
-                       int sockindex)
+struct MD5_context *Curl_MD5_init(const struct MD5_params *md5params)
 {
-  struct Curl_cfilter *cf = conn? conn->cfilter[sockindex] : NULL;
+  struct MD5_context *ctxt;
 
-  (void)data;
-  for(; cf; cf = cf->next) {
-    if(cf->cft == &Curl_cft_http3)
-      return TRUE;
-    if(cf->cft->flags & CF_TYPE_IP_CONNECT)
-      return FALSE;
+  /* Create MD5 context */
+  ctxt = malloc(sizeof(*ctxt));
+
+  if(!ctxt)
+    return ctxt;
+
+  ctxt->md5_hashctx = malloc(md5params->md5_ctxtsize);
+
+  if(!ctxt->md5_hashctx) {
+    free(ctxt);
+    return NULL;
   }
-  return FALSE;
+
+  ctxt->md5_hash = md5params;
+
+  if((*md5params->md5_init_func)(ctxt->md5_hashctx)) {
+    free(ctxt->md5_hashctx);
+    free(ctxt);
+    return NULL;
+  }
+
+  return ctxt;
 }
 
-#endif /* USE_MSH3 */
+CURLcode Curl_MD5_update(struct MD5_context *context,
+                         const unsigned char *data,
+                         unsigned int len)
+{
+  (*context->md5_hash->md5_update_func)(context->md5_hashctx, data, len);
+
+  return CURLE_OK;
+}
+
+CURLcode Curl_MD5_final(struct MD5_context *context, unsigned char *result)
+{
+  (*context->md5_hash->md5_final_func)(result, context->md5_hashctx);
+
+  free(context->md5_hashctx);
+  free(context);
+
+  return CURLE_OK;
+}
+
+#endif /* Using NTLM (without SSPI) || Digest */

@@ -21,147 +21,95 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-#include "tool_setup.h"
-
-#include <sys/stat.h>
-
-#ifdef _WIN32
-#  include <direct.h>
-#endif
-
-#define ENABLE_CURLX_PRINTF
-/* use our own printf() functions */
-#include "curlx.h"
-
-#include "tool_dirhie.h"
-#include "tool_msgs.h"
-
-#include "memdebug.h" /* keep this as LAST include */
-
-#if defined(_WIN32) || (defined(MSDOS) && !defined(__DJGPP__))
-#  define mkdir(x,y) (mkdir)((x))
-#  ifndef F_OK
-#    define F_OK 0
-#  endif
-#endif
-
-static void show_dir_errno(struct GlobalConfig *global, const char *name)
-{
-  switch(errno) {
-#ifdef EACCES
-  case EACCES:
-    errorf(global, "You do not have permission to create %s", name);
-    break;
-#endif
-#ifdef ENAMETOOLONG
-  case ENAMETOOLONG:
-    errorf(global, "The directory name %s is too long", name);
-    break;
-#endif
-#ifdef EROFS
-  case EROFS:
-    errorf(global, "%s resides on a read-only file system", name);
-    break;
-#endif
-#ifdef ENOSPC
-  case ENOSPC:
-    errorf(global, "No space left on the file system that will "
-           "contain the directory %s", name);
-    break;
-#endif
-#ifdef EDQUOT
-  case EDQUOT:
-    errorf(global, "Cannot create directory %s because you "
-           "exceeded your quota", name);
-    break;
-#endif
-  default:
-    errorf(global, "Error creating directory %s", name);
-    break;
-  }
-}
-
-/*
- * Create the needed directory hierarchy recursively in order to save
- *  multi-GETs in file output, ie:
- *  curl "http://example.org/dir[1-5]/file[1-5].txt" -o "dir#1/file#2.txt"
- *  should create all the dir* automagically
+/* <DESC>
+ * A basic application source code using the multi interface doing two
+ * transfers in parallel.
+ * </DESC>
  */
 
-#if defined(_WIN32) || defined(__DJGPP__)
-/* systems that may use either or when specifying a path */
-#define PATH_DELIMITERS "\\/"
-#else
-#define PATH_DELIMITERS DIR_CHAR
-#endif
+#include <stdio.h>
+#include <string.h>
 
+/* curl stuff */
+#include <curl/curl.h>
 
-CURLcode create_dir_hierarchy(const char *outfile, struct GlobalConfig *global)
+/*
+ * Download an HTTP file and upload an FTP file simultaneously.
+ */
+
+#define HANDLECOUNT 2   /* Number of simultaneous transfers */
+#define HTTP_HANDLE 0   /* Index for the HTTP transfer */
+#define FTP_HANDLE 1    /* Index for the FTP transfer */
+
+int main(void)
 {
-  char *tempdir;
-  char *tempdir2;
-  char *outdup;
-  char *dirbuildup;
-  CURLcode result = CURLE_OK;
-  size_t outlen;
+  CURL *handles[HANDLECOUNT];
+  CURLM *multi_handle;
 
-  outlen = strlen(outfile);
-  outdup = strdup(outfile);
-  if(!outdup)
-    return CURLE_OUT_OF_MEMORY;
+  int still_running = 1; /* keep number of running handles */
+  int i;
 
-  dirbuildup = malloc(outlen + 1);
-  if(!dirbuildup) {
-    Curl_safefree(outdup);
-    return CURLE_OUT_OF_MEMORY;
+  CURLMsg *msg; /* for picking up messages with the transfer status */
+  int msgs_left; /* how many messages are left */
+
+  /* Allocate one CURL handle per transfer */
+  for(i = 0; i<HANDLECOUNT; i++)
+    handles[i] = curl_easy_init();
+
+  /* set the options (I left out a few, you get the point anyway) */
+  curl_easy_setopt(handles[HTTP_HANDLE], CURLOPT_URL, "https://example.com");
+
+  curl_easy_setopt(handles[FTP_HANDLE], CURLOPT_URL, "ftp://example.com");
+  curl_easy_setopt(handles[FTP_HANDLE], CURLOPT_UPLOAD, 1L);
+
+  /* init a multi stack */
+  multi_handle = curl_multi_init();
+
+  /* add the individual transfers */
+  for(i = 0; i<HANDLECOUNT; i++)
+    curl_multi_add_handle(multi_handle, handles[i]);
+
+  while(still_running) {
+    CURLMcode mc = curl_multi_perform(multi_handle, &still_running);
+
+    if(still_running)
+      /* wait for activity, timeout or "nothing" */
+      mc = curl_multi_poll(multi_handle, NULL, 0, 1000, NULL);
+
+    if(mc)
+      break;
   }
-  dirbuildup[0] = '\0';
+  /* See how the transfers went */
+  /* !checksrc! disable EQUALSNULL 1 */
+  while((msg = curl_multi_info_read(multi_handle, &msgs_left)) != NULL) {
+    if(msg->msg == CURLMSG_DONE) {
+      int idx;
 
-  /* Allow strtok() here since this is not used threaded */
-  /* !checksrc! disable BANNEDFUNC 2 */
-  tempdir = strtok(outdup, PATH_DELIMITERS);
-
-  while(tempdir) {
-    bool skip = false;
-    tempdir2 = strtok(NULL, PATH_DELIMITERS);
-    /* since strtok returns a token for the last word even
-       if not ending with DIR_CHAR, we need to prune it */
-    if(tempdir2) {
-      size_t dlen = strlen(dirbuildup);
-      if(dlen)
-        msnprintf(&dirbuildup[dlen], outlen - dlen, "%s%s", DIR_CHAR, tempdir);
-      else {
-        if(outdup == tempdir) {
-#if defined(_WIN32) || defined(MSDOS)
-          /* Skip creating a drive's current directory.
-             It may seem as though that would harmlessly fail but it could be
-             a corner case if X: did not exist, since we would be creating it
-             erroneously.
-             eg if outfile is X:\foo\bar\filename then do not mkdir X:
-             This logic takes into account unsupported drives !:, 1:, etc. */
-          char *p = strchr(tempdir, ':');
-          if(p && !p[1])
-            skip = true;
-#endif
-          /* the output string does not start with a separator */
-          strcpy(dirbuildup, tempdir);
-        }
-        else
-          msnprintf(dirbuildup, outlen, "%s%s", DIR_CHAR, tempdir);
+      /* Find out which handle this message is about */
+      for(idx = 0; idx<HANDLECOUNT; idx++) {
+        int found = (msg->easy_handle == handles[idx]);
+        if(found)
+          break;
       }
-      /* Create directory. Ignore access denied error to allow traversal. */
-      if(!skip && (-1 == mkdir(dirbuildup, (mode_t)0000750)) &&
-         (errno != EACCES) && (errno != EEXIST)) {
-        show_dir_errno(global, dirbuildup);
-        result = CURLE_WRITE_ERROR;
-        break; /* get out of loop */
+
+      switch(idx) {
+      case HTTP_HANDLE:
+        printf("HTTP transfer completed with status %d\n", msg->data.result);
+        break;
+      case FTP_HANDLE:
+        printf("FTP transfer completed with status %d\n", msg->data.result);
+        break;
       }
     }
-    tempdir = tempdir2;
   }
 
-  Curl_safefree(dirbuildup);
-  Curl_safefree(outdup);
+  /* remove the transfers and cleanup the handles */
+  for(i = 0; i<HANDLECOUNT; i++) {
+    curl_multi_remove_handle(multi_handle, handles[i]);
+    curl_easy_cleanup(handles[i]);
+  }
 
-  return result;
+  curl_multi_cleanup(multi_handle);
+
+  return 0;
 }

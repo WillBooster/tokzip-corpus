@@ -21,137 +21,93 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-#include "tool_setup.h"
+#include "curlcheck.h"
 
-#ifdef HAVE_PWD_H
-#  undef __NO_NET_API /* required for building for AmigaOS */
-#  include <pwd.h>
-#endif
+#include "urldata.h"
+#include "altsvc.h"
 
-#ifdef HAVE_SYS_STAT_H
-#include <sys/stat.h>
-#endif
-#ifdef HAVE_FCNTL_H
-#include <fcntl.h>
-#endif
-
-#include <curl/mprintf.h>
-
-#include "tool_findfile.h"
-
-#include "memdebug.h" /* keep this as LAST include */
-
-struct finder {
-  const char *env;
-  const char *append;
-  bool withoutdot;
-};
-
-/* The order of the variables below is important, as the index number is used
-   in the findfile() function */
-static const struct finder conf_list[] = {
-  { "CURL_HOME", NULL, FALSE },
-  { "XDG_CONFIG_HOME", NULL, FALSE }, /* index == 1, used in the code */
-  { "HOME", NULL, FALSE },
-#ifdef _WIN32
-  { "USERPROFILE", NULL, FALSE },
-  { "APPDATA", NULL, FALSE },
-  { "USERPROFILE", "\\Application Data", FALSE},
-#endif
-  /* these are for .curlrc if XDG_CONFIG_HOME is not defined */
-  { "CURL_HOME", "/.config", TRUE },
-  { "HOME", "/.config", TRUE },
-
-  { NULL, NULL, FALSE }
-};
-
-static char *checkhome(const char *home, const char *fname, bool dotscore)
+static CURLcode
+unit_setup(void)
 {
-  const char pref[2] = { '.', '_' };
-  int i;
-  for(i = 0; i < (dotscore ? 2 : 1); i++) {
-    char *c;
-    if(dotscore)
-      c = curl_maprintf("%s" DIR_CHAR "%c%s", home, pref[i], &fname[1]);
-    else
-      c = curl_maprintf("%s" DIR_CHAR "%s", home, fname);
-    if(c) {
-      int fd = open(c, O_RDONLY);
-      if(fd >= 0) {
-        char *path = strdup(c);
-        close(fd);
-        curl_free(c);
-        return path;
-      }
-      curl_free(c);
-    }
-  }
-  return NULL;
+  return CURLE_OK;
 }
 
-/*
- * findfile() - return the full path name of the file.
- *
- * If 'dotscore' is TRUE, then check for the file first with a leading dot
- * and then with a leading underscore.
- *
- * 1. Iterate over the environment variables in order, and if set, check for
- *    the given file to be accessed there, then it is a match.
- * 2. Non-windows: try getpwuid
- */
-char *findfile(const char *fname, int dotscore)
+static void
+unit_stop(void)
 {
-  int i;
-  bool xdg = FALSE;
-  DEBUGASSERT(fname && fname[0]);
-  DEBUGASSERT((dotscore != 1) || (fname[0] == '.'));
-
-  if(!fname[0])
-    return NULL;
-
-  for(i = 0; conf_list[i].env; i++) {
-    char *home = curl_getenv(conf_list[i].env);
-    if(home) {
-      char *path;
-      const char *filename = fname;
-      if(i == 1 /* XDG_CONFIG_HOME */)
-        xdg = TRUE;
-      if(!home[0]) {
-        curl_free(home);
-        continue;
-      }
-      if(conf_list[i].append) {
-        char *c = curl_maprintf("%s%s", home, conf_list[i].append);
-        curl_free(home);
-        if(!c)
-          return NULL;
-        home = c;
-      }
-      if(conf_list[i].withoutdot) {
-        if(!dotscore || xdg) {
-          /* this is not looking for .curlrc, or the XDG_CONFIG_HOME was
-             defined so we skip the extended check */
-          curl_free(home);
-          continue;
-        }
-        filename++; /* move past the leading dot */
-        dotscore = 0; /* disable it for this check */
-      }
-      path = checkhome(home, filename, dotscore ? dotscore - 1 : 0);
-      curl_free(home);
-      if(path)
-        return path;
-    }
-  }
-#if defined(HAVE_GETPWUID) && defined(HAVE_GETEUID)
-  {
-    struct passwd *pw = getpwuid(geteuid());
-    if(pw) {
-      char *home = pw->pw_dir;
-      if(home && home[0])
-        return checkhome(home, fname, FALSE);
-    }
-  }
-#endif /* PWD-stuff */
-  return NULL;
+  curl_global_cleanup();
 }
+
+UNITTEST_START
+#if !defined(CURL_DISABLE_HTTP) && !defined(CURL_DISABLE_ALTSVC)
+{
+  char outname[256];
+  CURL *curl;
+  CURLcode result;
+  struct altsvcinfo *asi = Curl_altsvc_init();
+  abort_if(!asi, "Curl_altsvc_i");
+  result = Curl_altsvc_load(asi, arg);
+  if(result) {
+    fail_if(result, "Curl_altsvc_load");
+    goto fail;
+  }
+  curl_global_init(CURL_GLOBAL_ALL);
+  curl = curl_easy_init();
+  if(!curl) {
+    fail_if(!curl, "curl_easy_init");
+    goto fail;
+  }
+  fail_unless(asi->list.size == 4, "wrong number of entries");
+  msnprintf(outname, sizeof(outname), "%s-out", arg);
+
+  result = Curl_altsvc_parse(curl, asi, "h2=\"example.com:8080\"\r\n",
+                             ALPN_h1, "example.org", 8080);
+  fail_if(result, "Curl_altsvc_parse() failed!");
+  fail_unless(asi->list.size == 5, "wrong number of entries");
+
+  result = Curl_altsvc_parse(curl, asi, "h3=\":8080\"\r\n",
+                             ALPN_h1, "2.example.org", 8080);
+  fail_if(result, "Curl_altsvc_parse(2) failed!");
+  fail_unless(asi->list.size == 6, "wrong number of entries");
+
+  result = Curl_altsvc_parse(curl, asi,
+                             "h2=\"example.com:8080\", h3=\"yesyes.com\"\r\n",
+                             ALPN_h1, "3.example.org", 8080);
+  fail_if(result, "Curl_altsvc_parse(3) failed!");
+  /* that one should make two entries */
+  fail_unless(asi->list.size == 8, "wrong number of entries");
+
+  result = Curl_altsvc_parse(curl, asi,
+                             "h2=\"example.com:443\"; ma = 120;\r\n",
+                             ALPN_h2, "example.org", 80);
+  fail_if(result, "Curl_altsvc_parse(4) failed!");
+  fail_unless(asi->list.size == 9, "wrong number of entries");
+
+  /* quoted 'ma' value */
+  result = Curl_altsvc_parse(curl, asi,
+                             "h2=\"example.net:443\"; ma=\"180\";\r\n",
+                             ALPN_h2, "example.net", 80);
+  fail_if(result, "Curl_altsvc_parse(4) failed!");
+  fail_unless(asi->list.size == 10, "wrong number of entries");
+
+  result =
+    Curl_altsvc_parse(curl, asi,
+                      "h2=\":443\", h3=\":443\"; ma = 120; persist = 1\r\n",
+                      ALPN_h1, "curl.se", 80);
+  fail_if(result, "Curl_altsvc_parse(5) failed!");
+  fail_unless(asi->list.size == 12, "wrong number of entries");
+
+  /* clear that one again and decrease the counter */
+  result = Curl_altsvc_parse(curl, asi, "clear;\r\n",
+                             ALPN_h1, "curl.se", 80);
+  fail_if(result, "Curl_altsvc_parse(6) failed!");
+  fail_unless(asi->list.size == 10, "wrong number of entries");
+
+  Curl_altsvc_save(curl, asi, outname);
+
+  curl_easy_cleanup(curl);
+fail:
+  Curl_altsvc_cleanup(&asi);
+}
+#endif
+UNITTEST_STOP

@@ -10,260 +10,248 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test;
+namespace Composer\Util;
 
-use Composer\Autoload\ClassLoader;
-use Composer\InstalledVersions;
-use Composer\Semver\VersionParser;
+use Composer\Factory;
+use Composer\IO\IOInterface;
+use Composer\Config;
+use Composer\Downloader\TransportException;
 
-class InstalledVersionsTest extends TestCase
+/**
+ * @author Paul Wenke <wenke.paul@gmail.com>
+ */
+class Bitbucket
 {
-    /** @var array<ClassLoader> */
-    private static $previousRegisteredLoaders;
+    /** @var IOInterface */
+    private $io;
+    /** @var Config */
+    private $config;
+    /** @var ProcessExecutor */
+    private $process;
+    /** @var HttpDownloader */
+    private $httpDownloader;
+    /** @var array{access_token: string, expires_in?: int}|null */
+    private $token = null;
+    /** @var int|null */
+    private $time;
+
+    public const OAUTH2_ACCESS_TOKEN_URL = 'https://bitbucket.org/site/oauth2/access_token';
 
     /**
-     * @var string
+     * Constructor.
+     *
+     * @param IOInterface     $io             The IO instance
+     * @param Config          $config         The composer configuration
+     * @param ProcessExecutor $process        Process instance, injectable for mocking
+     * @param HttpDownloader  $httpDownloader Remote Filesystem, injectable for mocking
+     * @param int             $time           Timestamp, injectable for mocking
      */
-    private $root;
-
-    public static function setUpBeforeClass(): void
+    public function __construct(IOInterface $io, Config $config, ?ProcessExecutor $process = null, ?HttpDownloader $httpDownloader = null, ?int $time = null)
     {
-        // disable multiple-ClassLoader-based checks of InstalledVersions by making it seem like no
-        // class loaders are registered
-        $prop = new \ReflectionProperty('Composer\Autoload\ClassLoader', 'registeredLoaders');
-        $prop->setAccessible(true);
-        self::$previousRegisteredLoaders = $prop->getValue();
-        $prop->setValue(null, []);
+        $this->io = $io;
+        $this->config = $config;
+        $this->process = $process ?: new ProcessExecutor($io);
+        $this->httpDownloader = $httpDownloader ?: Factory::createHttpDownloader($this->io, $config);
+        $this->time = $time;
     }
 
-    public static function tearDownAfterClass(): void
+    public function getToken(): string
     {
-        $prop = new \ReflectionProperty('Composer\Autoload\ClassLoader', 'registeredLoaders');
-        $prop->setAccessible(true);
-        $prop->setValue(null, self::$previousRegisteredLoaders);
-        InstalledVersions::reload(null); // @phpstan-ignore argument.type
-    }
+        if (!isset($this->token['access_token'])) {
+            return '';
+        }
 
-    public function setUp(): void
-    {
-        $this->root = self::getUniqueTmpDirectory();
-
-        $dir = $this->root;
-        InstalledVersions::reload(require __DIR__.'/Repository/Fixtures/installed_relative.php');
-    }
-
-    public function testGetInstalledPackages(): void
-    {
-        $names = [
-            '__root__',
-            'a/provider',
-            'a/provider2',
-            'b/replacer',
-            'c/c',
-            'foo/impl',
-            'foo/impl2',
-            'foo/replaced',
-            'meta/package',
-        ];
-        self::assertSame($names, InstalledVersions::getInstalledPackages());
+        return $this->token['access_token'];
     }
 
     /**
-     * @dataProvider isInstalledProvider
+     * Attempts to authorize a Bitbucket domain via OAuth
+     *
+     * @param  string $originUrl The host this Bitbucket instance is located at
+     * @return bool   true on success
      */
-    public function testIsInstalled(bool $expected, string $name, bool $includeDevRequirements = true): void
+    public function authorizeOAuth(string $originUrl): bool
     {
-        self::assertSame($expected, InstalledVersions::isInstalled($name, $includeDevRequirements));
+        if ($originUrl !== 'bitbucket.org') {
+            return false;
+        }
+
+        // if available use token from git config
+        if (0 === $this->process->execute('git config bitbucket.accesstoken', $output)) {
+            $this->io->setAuthentication($originUrl, 'x-token-auth', trim($output));
+
+            return true;
+        }
+
+        return false;
     }
 
-    public static function isInstalledProvider(): array
+    private function requestAccessToken(): bool
     {
-        return [
-            [true,  'foo/impl'],
-            [true,  'foo/replaced'],
-            [true,  'c/c'],
-            [false, 'c/c', false],
-            [true,  '__root__'],
-            [true,  'b/replacer'],
-            [false, 'not/there'],
-            [true,  'meta/package'],
-        ];
+        try {
+            $response = $this->httpDownloader->get(self::OAUTH2_ACCESS_TOKEN_URL, [
+                'retry-auth-failure' => false,
+                'http' => [
+                    'method' => 'POST',
+                    'content' => 'grant_type=client_credentials',
+                ],
+            ]);
+
+            $token = $response->decodeJson();
+            if (!isset($token['expires_in']) || !isset($token['access_token'])) {
+                throw new \LogicException('Expected a token configured with expires_in and access_token present, got '.json_encode($token));
+            }
+
+            $this->token = $token;
+        } catch (TransportException $e) {
+            if ($e->getCode() === 400) {
+                $this->io->writeError('<error>Invalid OAuth consumer provided.</error>');
+                $this->io->writeError('This can have three reasons:');
+                $this->io->writeError('1. You are authenticating with a bitbucket username/password combination');
+                $this->io->writeError('2. You are using an OAuth consumer, but didn\'t configure a (dummy) callback url');
+                $this->io->writeError('3. You are using an OAuth consumer, but didn\'t configure it as private consumer');
+
+                return false;
+            }
+            if (in_array($e->getCode(), [403, 401])) {
+                $this->io->writeError('<error>Invalid OAuth consumer provided.</error>');
+                $this->io->writeError('You can also add it manually later by using "composer config --global --auth bitbucket-oauth.bitbucket.org <consumer-key> <consumer-secret>"');
+
+                return false;
+            }
+
+            throw $e;
+        }
+
+        return true;
     }
 
     /**
-     * @dataProvider satisfiesProvider
+     * Authorizes a Bitbucket domain interactively via OAuth
+     *
+     * @param  string                        $originUrl The host this Bitbucket instance is located at
+     * @param  string                        $message   The reason this authorization is required
+     * @throws \RuntimeException
+     * @throws TransportException|\Exception
+     * @return bool                          true on success
      */
-    public function testSatisfies(bool $expected, string $name, string $constraint): void
+    public function authorizeOAuthInteractively(string $originUrl, ?string $message = null): bool
     {
-        self::assertSame($expected, InstalledVersions::satisfies(new VersionParser, $name, $constraint));
-    }
+        if ($message) {
+            $this->io->writeError($message);
+        }
 
-    public static function satisfiesProvider(): array
-    {
-        return [
-            [true,  'foo/impl', '1.5'],
-            [true,  'foo/impl', '1.2'],
-            [true,  'foo/impl', '^1.0'],
-            [true,  'foo/impl', '^3 || ^2'],
-            [false, 'foo/impl', '^3'],
+        $localAuthConfig = $this->config->getLocalAuthConfigSource();
+        $url = 'https://support.atlassian.com/bitbucket-cloud/docs/use-oauth-on-bitbucket-cloud/';
+        $this->io->writeError('Follow the instructions here:');
+        $this->io->writeError($url);
+        $this->io->writeError(sprintf('to create a consumer. It will be stored in "%s" for future use by Composer.', ($localAuthConfig !== null ? $localAuthConfig->getName() . ' OR ' : '') . $this->config->getAuthConfigSource()->getName()));
+        $this->io->writeError('Ensure you enter a "Callback URL" (http://example.com is fine) or it will not be possible to create an Access Token (this callback url will not be used by composer)');
 
-            [true,  'foo/replaced', '3.5'],
-            [true,  'foo/replaced', '^3.2'],
-            [false,  'foo/replaced', '4.0'],
+        $storeInLocalAuthConfig = false;
+        if ($localAuthConfig !== null) {
+            $storeInLocalAuthConfig = $this->io->askConfirmation('A local auth config source was found, do you want to store the token there?', true);
+        }
 
-            [true,  'c/c', '3.0.0'],
-            [true,  'c/c', '^3'],
-            [false, 'c/c', '^3.1'],
+        $consumerKey = trim((string) $this->io->askAndHideAnswer('Consumer Key (hidden): '));
 
-            [true,  '__root__', 'dev-master'],
-            [true,  '__root__', '^1.10'],
-            [false, '__root__', '^2'],
+        if (!$consumerKey) {
+            $this->io->writeError('<warning>No consumer key given, aborting.</warning>');
+            $this->io->writeError('You can also add it manually later by using "composer config --global --auth bitbucket-oauth.bitbucket.org <consumer-key> <consumer-secret>"');
 
-            [true,  'b/replacer', '^2.1'],
-            [false, 'b/replacer', '^2.3'],
+            return false;
+        }
 
-            [true,  'a/provider2', '^1.2'],
-            [true,  'a/provider2', '^1.4'],
-            [false, 'a/provider2', '^1.5'],
-        ];
+        $consumerSecret = trim((string) $this->io->askAndHideAnswer('Consumer Secret (hidden): '));
+
+        if (!$consumerSecret) {
+            $this->io->writeError('<warning>No consumer secret given, aborting.</warning>');
+            $this->io->writeError('You can also add it manually later by using "composer config --global --auth bitbucket-oauth.bitbucket.org <consumer-key> <consumer-secret>"');
+
+            return false;
+        }
+
+        $this->io->setAuthentication($originUrl, $consumerKey, $consumerSecret);
+
+        if (!$this->requestAccessToken()) {
+            return false;
+        }
+
+        // store value in user config
+        $authConfigSource = $storeInLocalAuthConfig && $localAuthConfig !== null ? $localAuthConfig : $this->config->getAuthConfigSource();
+        $this->storeInAuthConfig($authConfigSource, $originUrl, $consumerKey, $consumerSecret);
+
+        // Remove conflicting basic auth credentials (if available)
+        $this->config->getAuthConfigSource()->removeConfigSetting('http-basic.' . $originUrl);
+
+        $this->io->writeError('<info>Consumer stored successfully.</info>');
+
+        return true;
     }
 
     /**
-     * @dataProvider getVersionRangesProvider
+     * Retrieves an access token from Bitbucket.
      */
-    public function testGetVersionRanges(string $expected, string $name): void
+    public function requestToken(string $originUrl, string $consumerKey, string $consumerSecret): string
     {
-        self::assertSame($expected, InstalledVersions::getVersionRanges($name));
-    }
+        if ($this->token !== null || $this->getTokenFromConfig($originUrl)) {
+            return $this->token['access_token'];
+        }
 
-    public static function getVersionRangesProvider(): array
-    {
-        return [
-            ['dev-master || 1.10.x-dev',   '__root__'],
-            ['^1.1 || 1.2 || 1.4 || 2.0',  'foo/impl'],
-            ['2.2 || 2.0',                 'foo/impl2'],
-            ['^3.0',                       'foo/replaced'],
-            ['1.1',                        'a/provider'],
-            ['1.2 || 1.4',                 'a/provider2'],
-            ['2.2',                        'b/replacer'],
-            ['3.0',                        'c/c'],
-        ];
+        $this->io->setAuthentication($originUrl, $consumerKey, $consumerSecret);
+        if (!$this->requestAccessToken()) {
+            return '';
+        }
+
+        $this->storeInAuthConfig($this->config->getLocalAuthConfigSource() ?? $this->config->getAuthConfigSource(), $originUrl, $consumerKey, $consumerSecret);
+
+        if (!isset($this->token['access_token'])) {
+            throw new \LogicException('Failed to initialize token above');
+        }
+
+        return $this->token['access_token'];
     }
 
     /**
-     * @dataProvider getVersionProvider
+     * Store the new/updated credentials to the configuration
      */
-    public function testGetVersion(?string $expected, string $name): void
+    private function storeInAuthConfig(Config\ConfigSourceInterface $authConfigSource, string $originUrl, string $consumerKey, string $consumerSecret): void
     {
-        self::assertSame($expected, InstalledVersions::getVersion($name));
-    }
+        $this->config->getConfigSource()->removeConfigSetting('bitbucket-oauth.'.$originUrl);
 
-    public static function getVersionProvider(): array
-    {
-        return [
-            ['dev-master',  '__root__'],
-            [null, 'foo/impl'],
-            [null, 'foo/impl2'],
-            [null, 'foo/replaced'],
-            ['1.1.0.0', 'a/provider'],
-            ['1.2.0.0', 'a/provider2'],
-            ['2.2.0.0', 'b/replacer'],
-            ['3.0.0.0', 'c/c'],
+        if (null === $this->token || !isset($this->token['expires_in'])) {
+            throw new \LogicException('Expected a token configured with expires_in present, got '.json_encode($this->token));
+        }
+
+        $time = null === $this->time ? time() : $this->time;
+        $consumer = [
+            "consumer-key" => $consumerKey,
+            "consumer-secret" => $consumerSecret,
+            "access-token" => $this->token['access_token'],
+            "access-token-expiration" => $time + $this->token['expires_in'],
         ];
+
+        $this->config->getAuthConfigSource()->addConfigSetting('bitbucket-oauth.'.$originUrl, $consumer);
     }
 
     /**
-     * @dataProvider getPrettyVersionProvider
+     * @phpstan-assert-if-true array{access_token: string} $this->token
      */
-    public function testGetPrettyVersion(?string $expected, string $name): void
+    private function getTokenFromConfig(string $originUrl): bool
     {
-        self::assertSame($expected, InstalledVersions::getPrettyVersion($name));
-    }
+        $authConfig = $this->config->get('bitbucket-oauth');
 
-    public static function getPrettyVersionProvider(): array
-    {
-        return [
-            ['dev-master',  '__root__'],
-            [null, 'foo/impl'],
-            [null, 'foo/impl2'],
-            [null, 'foo/replaced'],
-            ['1.1', 'a/provider'],
-            ['1.2', 'a/provider2'],
-            ['2.2', 'b/replacer'],
-            ['3.0', 'c/c'],
-        ];
-    }
+        if (
+            !isset($authConfig[$originUrl]['access-token'], $authConfig[$originUrl]['access-token-expiration'])
+            || time() > $authConfig[$originUrl]['access-token-expiration']
+        ) {
+            return false;
+        }
 
-    public function testGetVersionOutOfBounds(): void
-    {
-        self::expectException('OutOfBoundsException');
-        InstalledVersions::getVersion('not/installed');
-    }
-
-    public function testGetRootPackage(): void
-    {
-        self::assertSame([
-            'name' => '__root__',
-            'pretty_version' => 'dev-master',
-            'version' => 'dev-master',
-            'reference' => 'sourceref-by-default',
-            'type' => 'library',
-            'install_path' => $this->root . '/./',
-            'aliases' => [
-                '1.10.x-dev',
-            ],
-            'dev' => true,
-        ], InstalledVersions::getRootPackage());
-    }
-
-    /**
-     * @group legacy
-     */
-    public function testGetRawData(): void
-    {
-        $dir = $this->root;
-        self::assertSame(require __DIR__.'/Repository/Fixtures/installed_relative.php', InstalledVersions::getRawData());
-    }
-
-    /**
-     * @dataProvider getReferenceProvider
-     */
-    public function testGetReference(?string $expected, string $name): void
-    {
-        self::assertSame($expected, InstalledVersions::getReference($name));
-    }
-
-    public static function getReferenceProvider(): array
-    {
-        return [
-            ['sourceref-by-default',  '__root__'],
-            [null, 'foo/impl'],
-            [null, 'foo/impl2'],
-            [null, 'foo/replaced'],
-            ['distref-as-no-source', 'a/provider'],
-            ['distref-as-installed-from-dist', 'a/provider2'],
-            [null, 'b/replacer'],
-            [null, 'c/c'],
-        ];
-    }
-
-    public function testGetInstalledPackagesByType(): void
-    {
-        $names = [
-            '__root__',
-            'a/provider',
-            'a/provider2',
-            'b/replacer',
-            'c/c',
+        $this->token = [
+            'access_token' => $authConfig[$originUrl]['access-token'],
         ];
 
-        self::assertSame($names, \Composer\InstalledVersions::getInstalledPackagesByType('library'));
-    }
-
-    public function testGetInstallPath(): void
-    {
-        self::assertSame(realpath($this->root), realpath(\Composer\InstalledVersions::getInstallPath('__root__')));
-        self::assertSame('/foo/bar/vendor/c/c', \Composer\InstalledVersions::getInstallPath('c/c'));
-        self::assertNull(\Composer\InstalledVersions::getInstallPath('foo/impl'));
+        return true;
     }
 }

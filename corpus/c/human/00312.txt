@@ -1,5 +1,3 @@
-#ifndef HEADER_CURL_HTTP_CHUNKS_H
-#define HEADER_CURL_HTTP_CHUNKS_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -23,123 +21,82 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+#include "test.h"
 
-#ifndef CURL_DISABLE_HTTP
+#include "memdebug.h"
 
-#include "dynbuf.h"
+/* The size of data should be kept below MAX_INITIAL_POST_SIZE! */
+static char data[]="this is a short string.\n";
 
-struct connectdata;
+static size_t data_size = sizeof(data) / sizeof(char);
 
-/*
- * The longest possible hexadecimal number we support in a chunked transfer.
- * Neither RFC2616 nor the later HTTP specs define a maximum chunk size.
- * For 64-bit curl_off_t we support 16 digits. For 32-bit, 8 digits.
- */
-#define CHUNK_MAXNUM_LEN (SIZEOF_CURL_OFF_T * 2)
+static int progress_callback(void *clientp, double dltotal, double dlnow,
+                             double ultotal, double ulnow)
+{
+  FILE *moo = fopen(libtest_arg2, "wb");
 
-typedef enum {
-  /* await and buffer all hexadecimal digits until we get one that is not a
-     hexadecimal digit. When done, we go CHUNK_LF */
-  CHUNK_HEX,
+  (void)clientp; /* UNUSED */
+  (void)dltotal; /* UNUSED */
+  (void)dlnow; /* UNUSED */
 
-  /* wait for LF, ignore all else */
-  CHUNK_LF,
+  if(moo) {
+    if((size_t)ultotal == data_size && (size_t)ulnow == data_size)
+      fprintf(moo, "PASSED, UL data matched data size\n");
+    else
+      fprintf(moo, "Progress callback called with UL %f out of %f\n",
+              ulnow, ultotal);
+    fclose(moo);
+  }
+  return 0;
+}
 
-  /* We eat the amount of data specified. When done, we move on to the
-     POST_CR state. */
-  CHUNK_DATA,
+CURLcode test(char *URL)
+{
+  CURL *curl;
+  CURLcode res = CURLE_OK;
 
-  /* POSTLF should get a CR and then a LF and nothing else, then move back to
-     HEX as the CRLF combination marks the end of a chunk. A missing CR is no
-     big deal. */
-  CHUNK_POSTLF,
+  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+    fprintf(stderr, "curl_global_init() failed\n");
+    return TEST_ERR_MAJOR_BAD;
+  }
 
-  /* Used to mark that we are out of the game. NOTE: that there is a
-     'datasize' field in the struct that will tell how many bytes that were
-     not passed to the client in the end of the last buffer! */
-  CHUNK_STOP,
+  curl = curl_easy_init();
+  if(!curl) {
+    fprintf(stderr, "curl_easy_init() failed\n");
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
 
-  /* At this point optional trailer headers can be found, unless the next line
-     is CRLF */
-  CHUNK_TRAILER,
+  /* First set the URL that is about to receive our POST. */
+  test_setopt(curl, CURLOPT_URL, URL);
 
-  /* A trailer CR has been found - next state is CHUNK_TRAILER_POSTCR.
-     Next char must be a LF */
-  CHUNK_TRAILER_CR,
+  /* Now specify we want to POST data */
+  test_setopt(curl, CURLOPT_POST, 1L);
 
-  /* A trailer LF must be found now, otherwise CHUNKE_BAD_CHUNK will be
-     signalled If this is an empty trailer CHUNKE_STOP will be signalled.
-     Otherwise the trailer will be broadcasted via Curl_client_write() and the
-     next state will be CHUNK_TRAILER */
-  CHUNK_TRAILER_POSTCR,
+  /* Set the expected POST size */
+  test_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)data_size);
+  test_setopt(curl, CURLOPT_POSTFIELDS, data);
 
-  /* Successfully de-chunked everything */
-  CHUNK_DONE,
+  /* we want to use our own progress function */
+  CURL_IGNORE_DEPRECATION(
+    test_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    test_setopt(curl, CURLOPT_PROGRESSFUNCTION, progress_callback);
+  )
 
-  /* Failed on seeing a bad or not correctly terminated chunk */
-  CHUNK_FAILED
-} ChunkyState;
+  /* get verbose debug output please */
+  test_setopt(curl, CURLOPT_VERBOSE, 1L);
 
-typedef enum {
-  CHUNKE_OK = 0,
-  CHUNKE_TOO_LONG_HEX = 1,
-  CHUNKE_ILLEGAL_HEX,
-  CHUNKE_BAD_CHUNK,
-  CHUNKE_BAD_ENCODING,
-  CHUNKE_OUT_OF_MEMORY,
-  CHUNKE_PASSTHRU_ERROR /* Curl_httpchunk_read() returns a CURLcode to use */
-} CHUNKcode;
+  /* include headers in the output */
+  test_setopt(curl, CURLOPT_HEADER, 1L);
 
-struct Curl_chunker {
-  curl_off_t datasize;
-  ChunkyState state;
-  CHUNKcode last_code;
-  struct dynbuf trailer; /* for chunked-encoded trailer */
-  unsigned char hexindex;
-  char hexbuffer[CHUNK_MAXNUM_LEN + 1]; /* +1 for null-terminator */
-  BIT(ignore_body); /* never write response body data */
-};
+  /* Perform the request, res will get the return code */
+  res = curl_easy_perform(curl);
 
-/* The following functions are defined in http_chunks.c */
-void Curl_httpchunk_init(struct Curl_easy *data, struct Curl_chunker *ch,
-                         bool ignore_body);
-void Curl_httpchunk_free(struct Curl_easy *data, struct Curl_chunker *ch);
-void Curl_httpchunk_reset(struct Curl_easy *data, struct Curl_chunker *ch,
-                          bool ignore_body);
+test_cleanup:
 
-/*
- * Read BODY bytes in HTTP/1.1 chunked encoding from `buf` and return
- * the amount of bytes consumed. The actual response bytes and trailer
- * headers are written out to the client.
- * On success, this will consume all bytes up to the end of the response,
- * e.g. the last chunk, has been processed.
- * @param data   the transfer involved
- * @param ch     the chunker instance keeping state across calls
- * @param buf    the response data
- * @param blen   amount of bytes in `buf`
- * @param pconsumed  on successful return, the number of bytes in `buf`
- *                   consumed
- *
- * This function always uses ASCII hex values to accommodate non-ASCII hosts.
- * For example, 0x0d and 0x0a are used instead of '\r' and '\n'.
- */
-CURLcode Curl_httpchunk_read(struct Curl_easy *data, struct Curl_chunker *ch,
-                             char *buf, size_t blen, size_t *pconsumed);
+  /* always cleanup */
+  curl_easy_cleanup(curl);
+  curl_global_cleanup();
 
-/**
- * @return TRUE iff chunked decoded has finished successfully.
- */
-bool Curl_httpchunk_is_done(struct Curl_easy *data, struct Curl_chunker *ch);
-
-extern const struct Curl_cwtype Curl_httpchunk_unencoder;
-
-extern const struct Curl_crtype Curl_httpchunk_encoder;
-
-/**
- * Add a transfer-encoding "chunked" reader to the transfers reader stack
- */
-CURLcode Curl_httpchunk_add_reader(struct Curl_easy *data);
-
-#endif /* !CURL_DISABLE_HTTP */
-
-#endif /* HEADER_CURL_HTTP_CHUNKS_H */
+  return res;
+}

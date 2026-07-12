@@ -1,106 +1,223 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
+using System.Reflection;
+using System.Threading;
 using NUnit.Framework.Interfaces;
+using NUnit.Framework.Internal;
+using NUnit.Framework.Internal.Builders;
+using NUnit.Framework.Internal.Execution;
+using NUnit.Framework.Internal.Abstractions;
 
-namespace NUnit.Framework.Tests.Internal.Results
+#nullable enable
+
+namespace NUnit.Framework.Tests.TestUtilities
 {
-    public class TestResultInconclusiveWithReasonGivenTests : TestResultInconclusiveTests
+    /// <summary>
+    /// Utility Class used to build and run NUnit tests used as test data
+    /// </summary>
+    internal static class TestBuilder
     {
-        public TestResultInconclusiveWithReasonGivenTests() : base(NonWhitespaceIgnoreReason, node => ReasonNodeExpectedValidation(node, NonWhitespaceIgnoreReason))
-        {
-        }
-    }
+        #region Build Tests
 
-    public class TestResultInconclusiveWithEmptyReasonGivenTests : TestResultInconclusiveTests
-    {
-        public TestResultInconclusiveWithEmptyReasonGivenTests() : base(string.Empty, NoReasonNodeExpectedValidation)
+        public static TestSuite MakeSuite(string name)
         {
-        }
-    }
-
-    public class TestResultInconclusiveWithWhitespaceReasonGivenTests : TestResultInconclusiveTests
-    {
-        public TestResultInconclusiveWithWhitespaceReasonGivenTests() : base(" ", NoReasonNodeExpectedValidation)
-        {
-        }
-    }
-
-    public abstract class TestResultInconclusiveTests : TestResultTests
-    {
-        private readonly string _inconclusiveReason;
-        private readonly Action<TNode> _xmlReasonNodeValidation;
-
-        protected TestResultInconclusiveTests(string inconclusiveReason, Action<TNode> xmlReasonNodeValidation)
-        {
-            _inconclusiveReason = inconclusiveReason;
-            _xmlReasonNodeValidation = xmlReasonNodeValidation;
+            return new TestSuite(name);
         }
 
-        [SetUp]
-        public void SimulateTestRun()
+        public static TestSuite MakeFixture(Type type)
         {
-            TestResult.SetResult(ResultState.Inconclusive, _inconclusiveReason);
-            SuiteResult.AddResult(TestResult);
+            return new DefaultSuiteBuilder().BuildFrom(new TypeWrapper(type));
         }
 
-        [Test]
-        public void TestResultIsInconclusive()
+        public static TestSuite MakeFixture(object fixture)
         {
-            Assert.Multiple(() =>
+            TestSuite suite = MakeFixture(fixture.GetType());
+            suite.Fixture = fixture;
+            return suite;
+        }
+
+        public static TestSuite MakeParameterizedMethodSuite(Type type, string methodName)
+        {
+            var suite = MakeTestFromMethod(type, methodName) as TestSuite;
+            Assert.That(suite, Is.Not.Null, "Unable to create parameterized suite - most likely there is no data provided");
+            return suite;
+        }
+
+        public static TestMethod MakeTestCase(Type type, string methodName)
+        {
+            var test = MakeTestFromMethod(type, methodName) as TestMethod;
+            Assert.That(test, Is.Not.Null, $"Unable to create TestMethod from {methodName}");
+
+            return test;
+        }
+
+        // Will return either a ParameterizedMethodSuite or an NUnitTestMethod
+        // depending on whether the method takes arguments or not
+        internal static Test MakeTestFromMethod(Type type, string methodName)
+        {
+            return new DefaultTestCaseBuilder().BuildFrom(new MethodWrapper(type, methodName));
+        }
+
+        #endregion
+
+        #region Create WorkItems
+
+        public static WorkItem CreateWorkItem(Type type)
+        {
+            return CreateWorkItem(MakeFixture(type));
+        }
+
+        public static WorkItem CreateWorkItem(Type type, string methodName)
+        {
+            return CreateWorkItem(MakeTestFromMethod(type, methodName));
+        }
+
+        public static WorkItem CreateWorkItem(Test test)
+        {
+            var context = new TestExecutionContext();
+            context.Dispatcher = new SuperSimpleDispatcher();
+
+            return CreateWorkItem(test, context);
+        }
+
+        public static WorkItem CreateWorkItem(Test test, object? testObject, IDebugger? debugger = null)
+        {
+            var context = new TestExecutionContext
             {
-                Assert.That(TestResult.ResultState, Is.EqualTo(ResultState.Inconclusive));
-                Assert.That(TestResult.Message, Is.EqualTo(_inconclusiveReason));
-            });
+                TestObject = testObject,
+                Dispatcher = new SuperSimpleDispatcher()
+            };
+
+            return CreateWorkItem(test, context, debugger);
         }
 
-        [Test]
-        public void SuiteResultIsInconclusive()
+        public static WorkItem CreateWorkItem(Test test, TestExecutionContext context, IDebugger? debugger = null)
         {
-            Assert.Multiple(() =>
-            {
-                Assert.That(SuiteResult.ResultState, Is.EqualTo(ResultState.Inconclusive));
-                Assert.That(SuiteResult.Message, Is.Empty);
-                Assert.That(SuiteResult.TotalCount, Is.EqualTo(1));
-                Assert.That(SuiteResult.PassCount, Is.EqualTo(0));
-                Assert.That(SuiteResult.FailCount, Is.EqualTo(0));
-                Assert.That(SuiteResult.WarningCount, Is.EqualTo(0));
-                Assert.That(SuiteResult.SkipCount, Is.EqualTo(0));
-                Assert.That(SuiteResult.InconclusiveCount, Is.EqualTo(1));
-                Assert.That(SuiteResult.AssertCount, Is.EqualTo(0));
-            });
+            var work = WorkItemBuilder.CreateWorkItem(test, TestFilter.Empty, debugger ?? new DebuggerProxy(), true);
+            Assert.That(work, Is.Not.Null);
+            work.InitializeContext(context);
+
+            return work;
         }
 
-        [Test]
-        public void TestResultXmlNodeIsInconclusive()
+        #endregion
+
+        #region Run Tests
+
+        public static ITestResult RunTestFixture(Type type)
         {
-            TNode testNode = TestResult.ToXml(true);
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(testNode.Attributes["result"], Is.EqualTo("Inconclusive"));
-                Assert.That(testNode.Attributes["label"], Is.Null);
-                Assert.That(testNode.Attributes["site"], Is.Null);
-            });
-            _xmlReasonNodeValidation(testNode);
+            return RunTest(MakeFixture(type), null);
         }
 
-        [Test]
-        public void SuiteResultXmlNodeIsInconclusive()
+        public static ITestResult RunTestFixture(object fixture)
         {
-            TNode suiteNode = SuiteResult.ToXml(true);
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(suiteNode.Attributes["result"], Is.EqualTo("Inconclusive"));
-                Assert.That(suiteNode.Attributes["label"], Is.Null);
-                Assert.That(suiteNode.Attributes["passed"], Is.EqualTo("0"));
-                Assert.That(suiteNode.Attributes["failed"], Is.EqualTo("0"));
-                Assert.That(suiteNode.Attributes["warnings"], Is.EqualTo("0"));
-                Assert.That(suiteNode.Attributes["skipped"], Is.EqualTo("0"));
-                Assert.That(suiteNode.Attributes["inconclusive"], Is.EqualTo("1"));
-                Assert.That(suiteNode.Attributes["asserts"], Is.EqualTo("0"));
-            });
+            return RunTest(MakeFixture(fixture), fixture);
         }
+
+        public static ITestResult RunParameterizedMethodSuite(Type type, string methodName)
+        {
+            var suite = MakeParameterizedMethodSuite(type, methodName);
+
+            object? testObject = null;
+            if (!type.IsStatic())
+                testObject = Reflect.Construct(type);
+
+            return RunTest(suite, testObject);
+        }
+
+        public static ITestResult RunTestCase(Type type, string methodName)
+        {
+            var testMethod = MakeTestCase(type, methodName);
+
+            object? testObject = null;
+            if (!type.IsStatic())
+                testObject = Reflect.Construct(type);
+
+            return RunTest(testMethod, testObject);
+        }
+
+        public static ITestResult RunTestCase(object fixture, string methodName)
+        {
+            var testMethod = MakeTestCase(fixture.GetType(), methodName);
+
+            return RunTest(testMethod, fixture);
+        }
+
+        public static ITestResult RunAsTestCase(Action action)
+        {
+            var method = action.GetMethodInfo();
+            Assert.That(method, Is.Not.Null);
+            Assert.That(method.DeclaringType, Is.Not.Null);
+            var testMethod = MakeTestCase(method.DeclaringType, method.Name);
+            return RunTest(testMethod);
+        }
+
+        public static ITestResult RunTest(Test test)
+        {
+            return RunTest(test, null);
+        }
+
+        public static ITestResult RunTest(Test test, object? testObject, IDebugger? debugger = null)
+        {
+            return ExecuteWorkItem(CreateWorkItem(test, testObject, debugger ?? new DebuggerProxy()));
+        }
+
+        public static ITestResult ExecuteWorkItem(WorkItem work)
+        {
+            var savedContext = TestExecutionContext.CurrentContext;
+
+            try
+            {
+                return ExecuteUntilComplete(work);
+            }
+            finally
+            {
+                savedContext.EstablishExecutionEnvironment();
+            }
+
+            static ITestResult ExecuteUntilComplete(WorkItem work)
+            {
+                work.Execute();
+
+                // TODO: Replace with an event - but not while method is static
+                while (work.State != WorkItemState.Complete)
+                {
+                    Thread.Sleep(1);
+                }
+
+                return work.Result;
+            }
+        }
+
+        #endregion
+
+        #region Nested TestDispatcher Class
+
+        /// <summary>
+        /// SuperSimpleDispatcher merely executes the work item.
+        /// It is needed particularly when running suites, since
+        /// the child items require a dispatcher in the context.
+        /// </summary>
+        private class SuperSimpleDispatcher : IWorkItemDispatcher
+        {
+            public int LevelOfParallelism => 0;
+
+            public void Start(WorkItem topLevelWorkItem)
+            {
+                topLevelWorkItem.Execute();
+            }
+
+            public void Dispatch(WorkItem work)
+            {
+                work.Execute();
+            }
+
+            public void CancelRun(bool force)
+            {
+                throw new NotImplementedException();
+            }
+        }
+        #endregion
     }
 }

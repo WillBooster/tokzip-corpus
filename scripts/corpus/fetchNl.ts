@@ -4,21 +4,23 @@ import { join, relative } from "node:path";
 import sources from "./nl-sources.json";
 import {
   appendManifest,
+  chunkDocument,
   cloneAtRef,
+  isContainedFile,
   noticePathFor,
   resetOrigin,
   resolvedSha,
   sizeBucketOf,
+  syncNoticeFiles,
   writeSample,
 } from "./shared.ts";
-
-const CHUNK_TARGETS = [512, 2048, 8192, 24_576];
 
 interface GitDocsSource {
   repo: string;
   ref: string;
   license: string;
   trainable: true;
+  excludePrefixes?: string[];
 }
 
 interface LocaleSources {
@@ -42,6 +44,7 @@ function fetchGitDocs(locale: string, entries: GitDocsSource[]): void {
   for (const entry of entries) {
     const dir = cloneAtRef(entry.repo, entry.ref);
     if (!dir) continue;
+    syncNoticeFiles(dir, entry.repo);
     const sha = resolvedSha(dir);
     let bytes = 0;
     const walk = (current: string): void => {
@@ -52,11 +55,28 @@ function fetchGitDocs(locale: string, entries: GitDocsSource[]): void {
           walk(path);
           continue;
         }
-        if (!dirent.name.endsWith(".md") || statSync(path).size < 500) continue;
+        const sourcePath = relative(dir, path);
+        if (
+          entry.excludePrefixes?.some(
+            (excluded) => sourcePath === excluded || sourcePath.startsWith(`${excluded}/`),
+          )
+        ) {
+          continue;
+        }
+        // Symlinks to directories pass the extension check but would crash readFileSync, and a
+        // link out of the checkout would read a host file. Broken links are skipped, not fatal.
+        if (!isContainedFile(dir, path)) continue;
+        let stat;
+        try {
+          stat = statSync(path);
+        } catch {
+          continue;
+        }
+        if (!dirent.name.endsWith(".md") || stat.size < 500) continue;
         bytes += saveChunks(
           locale,
           readFileSync(path, "utf8"),
-          `${entry.repo}@${sha}:${relative(dir, path)}`,
+          `${entry.repo}@${sha}:${sourcePath}`,
           entry.license,
           noticePathFor(entry.repo),
         );
@@ -75,17 +95,7 @@ function saveChunks(
   notice: string,
 ): number {
   let saved = 0;
-  let offset = 0;
-  let chunkIndex = 0;
-  while (offset < text.length) {
-    const target = CHUNK_TARGETS[chunkIndex % CHUNK_TARGETS.length]!;
-    let end = Math.min(offset + target, text.length);
-    const paragraphBreak = text.indexOf("\n\n", end);
-    if (paragraphBreak !== -1 && paragraphBreak - end < target) end = paragraphBreak + 2;
-    const chunk = text.slice(offset, end).trim();
-    offset = end;
-    chunkIndex++;
-    if (chunk.length < 200) continue;
+  for (const { chunk, chunkIndex } of chunkDocument(text)) {
     const name = `${String(counters.get(locale) ?? 0).padStart(5, "0")}.txt`;
     counters.set(locale, (counters.get(locale) ?? 0) + 1);
     writeSample(locale, "human", name, chunk);

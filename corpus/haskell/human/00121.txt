@@ -1,50 +1,79 @@
-{-# LANGUAGE NoImplicitPrelude #-}
-{-# LANGUAGE OverloadedStrings #-}
-module Twitter.Hermes where
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE TemplateHaskellQuotes #-}
+module Data.Aeson.Internal.ByteString (
+    mkBS, 
+    withBS,
+#ifdef MIN_VERSION_template_haskell
+    liftSBS,
+#endif
+) where
 
-import Prelude.Compat
+import Data.ByteString.Internal (ByteString (..))
+import Data.Word (Word8)
+import Foreign.ForeignPtr (ForeignPtr)
 
-import Data.Int (Int64)
+#if !MIN_VERSION_bytestring(0,11,0)
+import GHC.ForeignPtr (plusForeignPtr)
+#endif
 
-import qualified Data.Hermes as H
-import qualified Twitter as T
+#ifdef MIN_VERSION_template_haskell
+import Data.ByteString.Short (ShortByteString, fromShort)
+import Data.ByteString.Short.Internal (createFromPtr)
+import GHC.Exts (Addr#, Ptr (Ptr))
+import System.IO.Unsafe (unsafeDupablePerformIO)
 
-twitterResultDecoder :: H.Value -> H.Decoder T.Result
-twitterResultDecoder = H.withObject $ \obj ->
-  T.Result
-    <$> H.atKey "results" (H.list storyDecoder) obj
-    <*> H.atKey "max_id" int64 obj
-    <*> H.atKey "since_id" int64 obj
-    <*> H.atKey "refresh_url" H.text obj
-    <*> H.atKey "next_page" H.text obj
-    <*> H.atKey "results_per_page" H.int obj
-    <*> H.atKey "page" H.int obj
-    <*> H.atKey "completed_in" H.double obj
-    <*> H.atKey "since_id_str" H.text obj
-    <*> H.atKey "max_id_str" H.text obj
-    <*> H.atKey "query" H.text obj
+import qualified Language.Haskell.TH.Lib as TH
+import qualified Language.Haskell.TH.Syntax as TH
 
-storyDecoder :: H.Value -> H.Decoder T.Story
-storyDecoder = H.withObject $ \obj ->
-  T.Story
-    <$> H.atKey "from_user_id_str" H.text obj
-    <*> H.atKey "profile_image_url" H.text obj
-    <*> H.atKey "created_at" H.text obj
-    <*> H.atKey "from_user" H.text obj
-    <*> H.atKey "id_str" H.text obj
-    <*> H.atKey "metadata" metadataDecoder obj
-    <*> H.atKey "to_user_id" (H.nullable int64) obj
-    <*> H.atKey "text" H.text obj
-    <*> H.atKey "id" int64 obj
-    <*> H.atKey "from_user_id" int64 obj 
-    <*> pure Nothing -- our bench corpus doesn't have any geolocated tweets
-    <*> H.atKey "iso_language_code" H.text obj
-    <*> H.atKey "to_user_id_str" (H.nullable H.text) obj
-    <*> H.atKey "source" H.text obj
+#if !MIN_VERSION_template_haskell(2,16,0)
+import qualified Data.ByteString as BS
+#endif
+#endif
 
-int64 :: H.Value -> H.Decoder Int64
-int64 = fmap fromIntegral <$> H.int
+-------------------------------------------------------------------------------
+-- bytestring-0.11 compat
+-------------------------------------------------------------------------------
 
-metadataDecoder :: H.Value -> H.Decoder T.Metadata
-metadataDecoder = H.withObject $ \obj ->
-  T.Metadata <$> H.atKey "result_type" H.text obj
+mkBS :: ForeignPtr Word8 -> Int -> ByteString
+#if MIN_VERSION_bytestring(0,11,0)
+mkBS dfp n = BS dfp n
+#else
+mkBS dfp n = PS dfp 0 n
+#endif
+{-# INLINE mkBS #-}
+
+withBS :: ByteString -> (ForeignPtr Word8 -> Int -> r) -> r
+#if MIN_VERSION_bytestring(0,11,0)
+withBS (BS !sfp !slen)       kont = kont sfp slen
+#else
+withBS (PS !sfp !soff !slen) kont = kont (plusForeignPtr sfp soff) slen
+#endif
+{-# INLINE withBS #-}
+
+-------------------------------------------------------------------------------
+-- Template Haskell
+-------------------------------------------------------------------------------
+
+#ifdef MIN_VERSION_template_haskell
+liftSBS :: ShortByteString -> TH.ExpQ
+#if MIN_VERSION_template_haskell(2,16,0)
+liftSBS sbs = withBS bs $ \ptr len -> [| unsafePackLenLiteral |]
+    `TH.appE` TH.litE (TH.integerL (fromIntegral len))
+    `TH.appE` TH.litE (TH.BytesPrimL $ TH.Bytes ptr 0 (fromIntegral len))
+    where
+      bs = fromShort sbs
+#else
+liftSBS sbs = withBS bs $ \_ len -> [| unsafePackLenLiteral |]
+    `TH.appE` TH.litE (TH.integerL (fromIntegral len))
+    `TH.appE` TH.litE (TH.StringPrimL $ BS.unpack bs)
+    where
+      bs = fromShort sbs
+#endif
+
+-- this is copied verbatim from @bytestring@, but only in recent versions.
+unsafePackLenLiteral :: Int -> Addr# -> ShortByteString
+unsafePackLenLiteral len addr# =
+    unsafeDupablePerformIO $ createFromPtr (Ptr addr#) len
+#endif

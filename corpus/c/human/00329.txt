@@ -21,84 +21,132 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-#include "test.h"
-
-#include "testutil.h"
-#include "warnless.h"
-#include "memdebug.h"
-
-#define TEST_HANG_TIMEOUT 60 * 1000
-
-/*
- * Source code in here hugely as reported in bug report 651460 by
- * Christopher R. Palmer.
- *
- * Use multi interface to get HTTPS document over proxy, and provide
- * auth info.
+/* <DESC>
+ * FTP wildcard pattern matching
+ * </DESC>
  */
+#include <curl/curl.h>
+#include <stdio.h>
 
-CURLcode test(char *URL)
+struct callback_data {
+  FILE *output;
+};
+
+static long file_is_coming(struct curl_fileinfo *finfo,
+                           struct callback_data *data,
+                           int remains);
+
+static long file_is_downloaded(struct callback_data *data);
+
+static size_t write_it(char *buff, size_t size, size_t nmemb,
+                       void *cb_data);
+
+int main(int argc, char **argv)
 {
-  CURL *c = NULL;
-  CURLM *m = NULL;
-  CURLcode res = CURLE_OK;
-  int running;
+  /* curl easy handle */
+  CURL *handle;
 
-  start_test_timing();
+  /* help data */
+  struct callback_data data = { 0 };
 
-  global_init(CURL_GLOBAL_ALL);
+  /* global initialization */
+  CURLcode rc = curl_global_init(CURL_GLOBAL_ALL);
+  if(rc)
+    return (int)rc;
 
-  easy_init(c);
-
-  easy_setopt(c, CURLOPT_PROXY, libtest_arg2); /* set in first.c */
-  easy_setopt(c, CURLOPT_URL, URL);
-  easy_setopt(c, CURLOPT_USERPWD, "test:ing");
-  easy_setopt(c, CURLOPT_PROXYUSERNAME, "test%20");
-  easy_setopt(c, CURLOPT_PROXYPASSWORD, "ing%41");
-  easy_setopt(c, CURLOPT_HTTPPROXYTUNNEL, 1L);
-  easy_setopt(c, CURLOPT_HEADER, 1L);
-  easy_setopt(c, CURLOPT_VERBOSE, 1L);
-
-  multi_init(m);
-
-  multi_add_handle(m, c);
-
-  for(;;) {
-    struct timeval interval;
-    fd_set rd, wr, exc;
-    int maxfd = -99;
-
-    interval.tv_sec = 1;
-    interval.tv_usec = 0;
-
-    multi_perform(m, &running);
-
-    abort_on_test_timeout();
-
-    if(!running)
-      break; /* done */
-
-    FD_ZERO(&rd);
-    FD_ZERO(&wr);
-    FD_ZERO(&exc);
-
-    multi_fdset(m, &rd, &wr, &exc, &maxfd);
-
-    /* At this point, maxfd is guaranteed to be greater or equal than -1. */
-
-    select_test(maxfd + 1, &rd, &wr, &exc, &interval);
-
-    abort_on_test_timeout();
+  /* initialization of easy handle */
+  handle = curl_easy_init();
+  if(!handle) {
+    curl_global_cleanup();
+    return CURLE_OUT_OF_MEMORY;
   }
 
-test_cleanup:
+  /* turn on wildcard matching */
+  curl_easy_setopt(handle, CURLOPT_WILDCARDMATCH, 1L);
 
-  /* proper cleanup sequence - type PA */
+  /* callback is called before download of concrete file started */
+  curl_easy_setopt(handle, CURLOPT_CHUNK_BGN_FUNCTION, file_is_coming);
 
-  curl_multi_remove_handle(m, c);
-  curl_multi_cleanup(m);
-  curl_easy_cleanup(c);
+  /* callback is called after data from the file have been transferred */
+  curl_easy_setopt(handle, CURLOPT_CHUNK_END_FUNCTION, file_is_downloaded);
+
+  /* this callback writes contents into files */
+  curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, write_it);
+
+  /* put transfer data into callbacks */
+  curl_easy_setopt(handle, CURLOPT_CHUNK_DATA, &data);
+  curl_easy_setopt(handle, CURLOPT_WRITEDATA, &data);
+
+  /* curl_easy_setopt(handle, CURLOPT_VERBOSE, 1L); */
+
+  /* set a URL containing wildcard pattern (only in the last part) */
+  if(argc == 2)
+    curl_easy_setopt(handle, CURLOPT_URL, argv[1]);
+  else
+    curl_easy_setopt(handle, CURLOPT_URL, "ftp://example.com/test/*");
+
+  /* and start transfer! */
+  rc = curl_easy_perform(handle);
+
+  curl_easy_cleanup(handle);
   curl_global_cleanup();
+  return (int)rc;
+}
 
-  return res;
+static long file_is_coming(struct curl_fileinfo *finfo,
+                           struct callback_data *data,
+                           int remains)
+{
+  printf("%3d %40s %10luB ", remains, finfo->filename,
+         (unsigned long)finfo->size);
+
+  switch(finfo->filetype) {
+  case CURLFILETYPE_DIRECTORY:
+    printf(" DIR\n");
+    break;
+  case CURLFILETYPE_FILE:
+    printf("FILE ");
+    break;
+  default:
+    printf("OTHER\n");
+    break;
+  }
+
+  if(finfo->filetype == CURLFILETYPE_FILE) {
+    /* do not transfer files >= 50B */
+    if(finfo->size > 50) {
+      printf("SKIPPED\n");
+      return CURL_CHUNK_BGN_FUNC_SKIP;
+    }
+
+    data->output = fopen(finfo->filename, "wb");
+    if(!data->output) {
+      return CURL_CHUNK_BGN_FUNC_FAIL;
+    }
+  }
+
+  return CURL_CHUNK_BGN_FUNC_OK;
+}
+
+static long file_is_downloaded(struct callback_data *data)
+{
+  if(data->output) {
+    printf("DOWNLOADED\n");
+    fclose(data->output);
+    data->output = 0x0;
+  }
+  return CURL_CHUNK_END_FUNC_OK;
+}
+
+static size_t write_it(char *buff, size_t size, size_t nmemb,
+                       void *cb_data)
+{
+  struct callback_data *data = cb_data;
+  size_t written = 0;
+  if(data->output)
+    written = fwrite(buff, size, nmemb, data->output);
+  else
+    /* listing output */
+    written = fwrite(buff, size, nmemb, stdout);
+  return written;
 }

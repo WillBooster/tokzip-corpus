@@ -1,125 +1,257 @@
 const std = @import("std");
-const zls = @import("zls");
-
 const Ast = std.zig.Ast;
+const log = std.log.scoped(.zls_document_symbol);
 
-const Context = @import("../context.zig").Context;
+const types = @import("../lsp.zig");
+const offsets = @import("../offsets.zig");
+const ast = @import("../ast.zig");
+const analysis = @import("../analysis.zig");
+const tracy = @import("tracy");
 
-const offsets = zls.offsets;
-const translate_c = zls.translate_c;
+const Symbol = struct {
+    name: []const u8,
+    detail: ?[]const u8 = null,
+    kind: types.SymbolKind,
+    loc: offsets.Loc,
+    selection_loc: offsets.Loc,
+    children: std.ArrayListUnmanaged(Symbol),
+};
 
-const allocator: std.mem.Allocator = std.testing.allocator;
+const Context = struct {
+    arena: std.mem.Allocator,
+    last_var_decl_name: ?[]const u8,
+    parent_container: Ast.Node.Index,
+    parent_node: Ast.Node.Index,
+    parent_symbols: *std.ArrayListUnmanaged(Symbol),
+    total_symbol_count: *usize,
+};
 
-test "zig compile server - translate c" {
-    var result1 = try testTranslate(
-        \\void foo(int);
-        \\void bar(float*);
-    );
-    defer result1.deinit(allocator);
-    try std.testing.expect(result1 == .success);
-
-    var result2 = try testTranslate(
-        \\#include <this_file_doesnt_exist>
-    );
-    defer result2.deinit(allocator);
-    try std.testing.expect(result2 == .failure);
-}
-
-test "empty" {
-    try testConvertCInclude("@cImport()", "");
-    try testConvertCInclude("@cImport({})", "");
-    try testConvertCInclude("@cImport({{}, {}})", "");
-}
-
-test "cInclude" {
-    try testConvertCInclude(
-        \\@cImport(@cInclude("foo.zig"))
-    ,
-        \\#include <foo.zig>
-    );
-
-    try testConvertCInclude(
-        \\@cImport(@cInclude("foo.zig"), @cInclude("bar.zig"))
-    ,
-        \\#include <foo.zig>
-        \\#include <bar.zig>
-    );
-}
-
-test "cDefine" {
-    try testConvertCInclude(
-        \\@cImport(@cDefine("FOO", "BAR"))
-    ,
-        \\#define FOO BAR
-    );
-    try testConvertCInclude(
-        \\@cImport(@cDefine("FOO", {}))
-    ,
-        \\#define FOO
-    );
-}
-
-test "cUndef" {
-    try testConvertCInclude(
-        \\@cImport(@cUndef("FOO"))
-    ,
-        \\#undef FOO
-    );
-}
-
-fn testConvertCInclude(cimport_source: []const u8, expected: []const u8) !void {
-    const source: [:0]u8 = try std.fmt.allocPrintZ(allocator, "const c = {s};", .{cimport_source});
-    defer allocator.free(source);
-
-    var tree = try Ast.parse(allocator, source, .zig);
-    defer tree.deinit(allocator);
+fn callback(ctx: *Context, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
+    if (node == 0) return;
 
     const node_tags = tree.nodes.items(.tag);
     const main_tokens = tree.nodes.items(.main_token);
+    const token_tags = tree.tokens.items(.tag);
 
-    const node: Ast.Node.Index = blk: {
-        for (node_tags, main_tokens, 0..) |tag, token, i| {
-            switch (tag) {
-                .builtin_call_two,
-                .builtin_call_two_comma,
-                .builtin_call,
-                .builtin_call_comma,
-                => {},
-                else => continue,
-            }
+    const decl_name_token = analysis.getContainerDeclNameToken(tree, ctx.parent_container, node);
+    const decl_name = if (decl_name_token) |name_token| analysis.declNameTokenToSlice(tree, name_token) else null;
 
-            if (!std.mem.eql(u8, offsets.tokenToSlice(tree, token), "@cImport")) continue;
+    var new_ctx = ctx.*;
+    const maybe_symbol: ?Symbol = switch (node_tags[node]) {
+        .global_var_decl,
+        .local_var_decl,
+        .simple_var_decl,
+        .aligned_var_decl,
+        => blk: {
+            new_ctx.last_var_decl_name = decl_name;
+            if (!ast.isContainer(tree, ctx.parent_node)) break :blk null;
 
-            break :blk @intCast(i);
-        }
-        return error.TestUnexpectedResult; // source doesn't contain a cImport
+            const kind: types.SymbolKind = switch (token_tags[main_tokens[node]]) {
+                .keyword_var => .Variable,
+                .keyword_const => .Constant,
+                else => unreachable,
+            };
+
+            break :blk .{
+                .name = decl_name orelse break :blk null,
+                .detail = null,
+                .kind = kind,
+                .loc = offsets.nodeToLoc(tree, node),
+                .selection_loc = offsets.tokenToLoc(tree, decl_name_token.?),
+                .children = .{},
+            };
+        },
+
+        .test_decl,
+        .fn_decl,
+        => |tag| blk: {
+            const kind: types.SymbolKind = switch (tag) {
+                .test_decl => .Method, // there is no SymbolKind that represents a tests
+                .fn_decl => .Function,
+                else => unreachable,
+            };
+
+            var buffer: [1]Ast.Node.Index = undefined;
+            const detail = if (tree.fullFnProto(&buffer, node)) |fn_info| analysis.getFunctionSignature(tree, fn_info) else null;
+
+            break :blk .{
+                .name = decl_name orelse break :blk null,
+                .detail = detail,
+                .kind = kind,
+                .loc = offsets.nodeToLoc(tree, node),
+                .selection_loc = offsets.tokenToLoc(tree, decl_name_token.?),
+                .children = .{},
+            };
+        },
+
+        .container_field_init,
+        .container_field_align,
+        .container_field,
+        => blk: {
+            const kind: types.SymbolKind = switch (node_tags[ctx.parent_container]) {
+                .root => .Field,
+                .container_decl,
+                .container_decl_trailing,
+                .container_decl_arg,
+                .container_decl_arg_trailing,
+                .container_decl_two,
+                .container_decl_two_trailing,
+                => switch (token_tags[main_tokens[ctx.parent_container]]) {
+                    .keyword_struct => .Field,
+                    .keyword_union => .Field,
+                    .keyword_enum => .EnumMember,
+                    .keyword_opaque => break :blk null,
+                    else => unreachable,
+                },
+                .tagged_union,
+                .tagged_union_trailing,
+                .tagged_union_enum_tag,
+                .tagged_union_enum_tag_trailing,
+                .tagged_union_two,
+                .tagged_union_two_trailing,
+                => .Field,
+                else => unreachable,
+            };
+
+            break :blk .{
+                .name = decl_name orelse break :blk null,
+                .detail = ctx.last_var_decl_name,
+                .kind = kind,
+                .loc = offsets.nodeToLoc(tree, node),
+                .selection_loc = offsets.tokenToLoc(tree, decl_name_token.?),
+                .children = .{},
+            };
+        },
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        => blk: {
+            new_ctx.parent_container = node;
+            break :blk null;
+        },
+        else => null,
     };
 
-    const output = try translate_c.convertCInclude(allocator, tree, node);
-    defer allocator.free(output);
+    new_ctx.parent_node = node;
+    if (maybe_symbol) |symbol| {
+        var symbol_ptr = try ctx.parent_symbols.addOne(ctx.arena);
+        symbol_ptr.* = symbol;
+        new_ctx.parent_symbols = &symbol_ptr.children;
+        ctx.total_symbol_count.* += 1;
+    }
 
-    const trimmed_output = std.mem.trimRight(u8, output, &.{'\n'});
-
-    try std.testing.expectEqualStrings(expected, trimmed_output);
+    try ast.iterateChildren(tree, node, &new_ctx, error{OutOfMemory}, callback);
 }
 
-fn testTranslate(c_source: []const u8) !translate_c.Result {
-    if (!std.process.can_spawn) return error.SkipZigTest;
+/// a mapping from a source index to a line character pair
+const IndexToPositionEntry = struct {
+    output: *types.Position,
+    source_index: usize,
 
-    var ctx = try Context.init();
-    defer ctx.deinit();
+    const Self = @This();
 
-    const result = (try translate_c.translate(allocator, zls.DocumentStore.Config.fromMainConfig(ctx.server.config), &.{}, c_source)).?;
-
-    switch (result) {
-        .success => |uri| {
-            const path = try zls.URI.parse(allocator, uri);
-            defer allocator.free(path);
-            try std.testing.expect(std.fs.path.isAbsolute(path));
-        },
-        .failure => |message| {
-            try std.testing.expect(message.errorMessageCount() != 0);
-        },
+    fn lessThan(_: void, lhs: Self, rhs: Self) bool {
+        return lhs.source_index < rhs.source_index;
     }
+};
+
+/// converts `Symbol` to `types.DocumentSymbol`
+fn convertSymbols(
+    arena: std.mem.Allocator,
+    tree: Ast,
+    from: []const Symbol,
+    total_symbol_count: usize,
+    encoding: offsets.Encoding,
+) error{OutOfMemory}![]types.DocumentSymbol {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    var symbol_buffer = std.ArrayListUnmanaged(types.DocumentSymbol){};
+    try symbol_buffer.ensureTotalCapacityPrecise(arena, total_symbol_count);
+
+    // instead of converting every `offsets.Loc` to `types.Range` by calling `offsets.locToRange`
+    // we instead store a mapping from source indices to their desired position, sort them by their source index
+    // and then iterate through them which avoids having to re-iterate through the source file to find out the line number
+    // this reduces algorithmic complexity from `O(file_size*symbol_count)` to `O(symbol_count*log(symbol_count))`
+    var mappings = std.ArrayListUnmanaged(IndexToPositionEntry){};
+    try mappings.ensureTotalCapacityPrecise(arena, total_symbol_count * 4);
+
+    const result = convertSymbolsInternal(from, &symbol_buffer, &mappings);
+
+    // sort items based on their source position
+    std.mem.sort(IndexToPositionEntry, mappings.items, {}, IndexToPositionEntry.lessThan);
+
+    var last_index: usize = 0;
+    var last_position: types.Position = .{ .line = 0, .character = 0 };
+    for (mappings.items) |mapping| {
+        const index = mapping.source_index;
+        const position = offsets.advancePosition(tree.source, last_position, last_index, index, encoding);
+        defer last_index = index;
+        defer last_position = position;
+
+        mapping.output.* = position;
+    }
+
     return result;
+}
+
+fn convertSymbolsInternal(
+    from: []const Symbol,
+    symbol_buffer: *std.ArrayListUnmanaged(types.DocumentSymbol),
+    mappings: *std.ArrayListUnmanaged(IndexToPositionEntry),
+) []types.DocumentSymbol {
+    // acquire storage for exactly `from.len` symbols
+    const prev_len = symbol_buffer.items.len;
+    symbol_buffer.items.len += from.len;
+    const to: []types.DocumentSymbol = symbol_buffer.items[prev_len..];
+
+    for (from, to) |symbol, *out| {
+        out.* = .{
+            .name = symbol.name,
+            .detail = symbol.detail,
+            .kind = symbol.kind,
+            // will be set later through the mapping below
+            .range = undefined,
+            .selectionRange = undefined,
+            .children = convertSymbolsInternal(symbol.children.items, symbol_buffer, mappings),
+        };
+        mappings.appendSliceAssumeCapacity(&[4]IndexToPositionEntry{
+            .{ .output = &out.range.start, .source_index = symbol.loc.start },
+            .{ .output = &out.selectionRange.start, .source_index = symbol.selection_loc.start },
+            .{ .output = &out.selectionRange.end, .source_index = symbol.selection_loc.end },
+            .{ .output = &out.range.end, .source_index = symbol.loc.end },
+        });
+    }
+
+    return to;
+}
+
+pub fn getDocumentSymbols(
+    arena: std.mem.Allocator,
+    tree: Ast,
+    encoding: offsets.Encoding,
+) error{OutOfMemory}![]types.DocumentSymbol {
+    var root_symbols = std.ArrayListUnmanaged(Symbol){};
+    var total_symbol_count: usize = 0;
+
+    var ctx = Context{
+        .arena = arena,
+        .last_var_decl_name = null,
+        .parent_node = 0, // root-node
+        .parent_container = 0, // root-node
+        .parent_symbols = &root_symbols,
+        .total_symbol_count = &total_symbol_count,
+    };
+    try ast.iterateChildren(tree, 0, &ctx, error{OutOfMemory}, callback);
+
+    return try convertSymbols(arena, tree, root_symbols.items, ctx.total_symbol_count.*, encoding);
 }

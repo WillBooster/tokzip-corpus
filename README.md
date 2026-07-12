@@ -8,7 +8,8 @@ Public, versioned corpus data and generation tooling for training and evaluating
 - `corpus/`: human-written source code and natural-language samples, with one
   `manifest.jsonl` per language or locale.
 - `scripts/corpus/`: pinned permissive-source definitions, fetchers, compliance
-  validation, near-duplicate clustering, and the deterministic `bench-v1` split.
+  validation, near-duplicate clustering, and the deterministic, source- and size-stratified
+  `bench-v2` split.
 - `THIRD_PARTY_NOTICES/`: exact license, copyright, attribution, and NOTICE material
   shipped by every upstream repository represented in the corpus.
 
@@ -28,15 +29,21 @@ unreviewed generated content are intentionally excluded from the distributed cor
 
 ```bash
 bun install --frozen-lockfile
-bun run rebuild:quick
+bun run rebuild
 bun run validate
 ```
 
-The rebuild fetches natural-language sources first, then OSS sources so the shared `text`
+The full rebuild fetches natural-language sources first, then all OSS sources so the shared `text`
 corpus consistently includes documentation from every pinned repository, and finally
 recreates the seeded split. Every source is pinned to an exact Git commit. Validation fails
 if a sample lacks an approved license, upstream license bundle, immutable source pin,
 manifest membership, or matching content digest.
+
+Code samples preserve upstream file content, including a leading UTF-8 BOM when present.
+This keeps the benchmark honest about source text that real file readers can return.
+
+Use `bun run rebuild:quick` for a smaller local smoke corpus built from each language's
+designated quick source. The committed corpus is always produced by the full rebuild.
 
 ## Consumers
 

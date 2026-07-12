@@ -21,454 +21,788 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+#include <assert.h>
 
-#include "curl_setup.h"
+#include <apr_optional.h>
+#include <apr_optional_hooks.h>
+#include <apr_strings.h>
+#include <apr_cstr.h>
+#include <apr_time.h>
+#include <apr_want.h>
 
-#include <curl/curl.h>
+#include <httpd.h>
+#include <http_protocol.h>
+#include <http_request.h>
+#include <http_log.h>
 
-#include "urldata.h"
-#include "cfilters.h"
-#include "headers.h"
-#include "multiif.h"
-#include "sendf.h"
-#include "cw-out.h"
+static void curltest_hooks(apr_pool_t *pool);
+static int curltest_echo_handler(request_rec *r);
+static int curltest_put_handler(request_rec *r);
+static int curltest_tweak_handler(request_rec *r);
+static int curltest_1_1_required(request_rec *r);
+static int curltest_sslinfo_handler(request_rec *r);
 
-/* The last 3 #include files should be in this order */
-#include "curl_printf.h"
-#include "curl_memory.h"
-#include "memdebug.h"
-
-
-/**
- * OVERALL DESIGN of this client writer
- *
- * The 'cw-out' writer is supposed to be the last writer in a transfer's
- * stack. It is always added when that stack is initialized. Its purpose
- * is to pass BODY and HEADER bytes to the client-installed callback
- * functions.
- *
- * These callback may return `CURL_WRITEFUNC_PAUSE` to indicate that the
- * data had not been written and the whole transfer should stop receiving
- * new data. Or at least, stop calling the functions. When the transfer
- * is "unpaused" by the client, the previous data shall be passed as
- * if nothing happened.
- *
- * The `cw-out` writer therefore manages buffers for bytes that could
- * not be written. Data that was already in flight from the server also
- * needs buffering on paused transfer when it arrives.
- *
- * In addition, the writer allows buffering of "small" body writes,
- * so client functions are called less often. That is only enabled on a
- * number of conditions.
- *
- * HEADER and BODY data may arrive in any order. For paused transfers,
- * a list of `struct cw_out_buf` is kept for `cw_out_type` types. The
- * list may be: [BODY]->[HEADER]->[BODY]->[HEADER]....
- * When unpausing, this list is "played back" to the client callbacks.
- *
- * The amount of bytes being buffered is limited by `DYN_PAUSE_BUFFER`
- * and when that is exceeded `CURLE_TOO_LARGE` is returned as error.
- */
-typedef enum {
-  CW_OUT_NONE,
-  CW_OUT_BODY,
-  CW_OUT_HDS
-} cw_out_type;
-
-struct cw_out_buf {
-  struct cw_out_buf *next;
-  struct dynbuf b;
-  cw_out_type type;
+AP_DECLARE_MODULE(curltest) = {
+  STANDARD20_MODULE_STUFF,
+  NULL, /* func to create per dir config */
+  NULL,  /* func to merge per dir config */
+  NULL, /* func to create per server config */
+  NULL,  /* func to merge per server config */
+  NULL,              /* command handlers */
+  curltest_hooks,
+#if defined(AP_MODULE_FLAG_NONE)
+  AP_MODULE_FLAG_ALWAYS_MERGE
+#endif
 };
 
-static struct cw_out_buf *cw_out_buf_create(cw_out_type otype)
+static int curltest_post_config(apr_pool_t *p, apr_pool_t *plog,
+                                apr_pool_t *ptemp, server_rec *s)
 {
-  struct cw_out_buf *cwbuf = calloc(1, sizeof(*cwbuf));
-  if(cwbuf) {
-    cwbuf->type = otype;
-    Curl_dyn_init(&cwbuf->b, DYN_PAUSE_BUFFER);
+  void *data = NULL;
+  const char *key = "mod_curltest_init_counter";
+
+  (void)plog;(void)ptemp;
+
+  apr_pool_userdata_get(&data, key, s->process->pool);
+  if(!data) {
+    /* dry run */
+    apr_pool_userdata_set((const void *)1, key,
+                          apr_pool_cleanup_null, s->process->pool);
+    return APR_SUCCESS;
   }
-  return cwbuf;
+
+  /* mess with the overall server here */
+
+  return APR_SUCCESS;
 }
 
-static void cw_out_buf_free(struct cw_out_buf *cwbuf)
+static void curltest_hooks(apr_pool_t *pool)
 {
-  if(cwbuf) {
-    Curl_dyn_free(&cwbuf->b);
-    free(cwbuf);
-  }
+  ap_log_perror(APLOG_MARK, APLOG_TRACE1, 0, pool, "installing hooks");
+
+  /* Run once after configuration is set, but before mpm children initialize.
+   */
+  ap_hook_post_config(curltest_post_config, NULL, NULL, APR_HOOK_MIDDLE);
+
+  /* curl test handlers */
+  ap_hook_handler(curltest_echo_handler, NULL, NULL, APR_HOOK_MIDDLE);
+  ap_hook_handler(curltest_put_handler, NULL, NULL, APR_HOOK_MIDDLE);
+  ap_hook_handler(curltest_tweak_handler, NULL, NULL, APR_HOOK_MIDDLE);
+  ap_hook_handler(curltest_1_1_required, NULL, NULL, APR_HOOK_MIDDLE);
+  ap_hook_handler(curltest_sslinfo_handler, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
-struct cw_out_ctx {
-  struct Curl_cwriter super;
-  struct cw_out_buf *buf;
-  BIT(paused);
-  BIT(errored);
-};
+#define SECS_PER_HOUR      (60*60)
+#define SECS_PER_DAY       (24*SECS_PER_HOUR)
 
-static CURLcode cw_out_write(struct Curl_easy *data,
-                             struct Curl_cwriter *writer, int type,
-                             const char *buf, size_t nbytes);
-static void cw_out_close(struct Curl_easy *data, struct Curl_cwriter *writer);
-static CURLcode cw_out_init(struct Curl_easy *data,
-                            struct Curl_cwriter *writer);
-
-struct Curl_cwtype Curl_cwt_out = {
-  "cw-out",
-  NULL,
-  cw_out_init,
-  cw_out_write,
-  cw_out_close,
-  sizeof(struct cw_out_ctx)
-};
-
-static CURLcode cw_out_init(struct Curl_easy *data,
-                            struct Curl_cwriter *writer)
+static apr_status_t duration_parse(apr_interval_time_t *ptimeout, const char *value,
+                                   const char *def_unit)
 {
-  struct cw_out_ctx *ctx = writer->ctx;
-  (void)data;
-  ctx->buf = NULL;
-  return CURLE_OK;
-}
+  char *endp;
+  apr_int64_t n;
 
-static void cw_out_bufs_free(struct cw_out_ctx *ctx)
-{
-  while(ctx->buf) {
-    struct cw_out_buf *next = ctx->buf->next;
-    cw_out_buf_free(ctx->buf);
-    ctx->buf = next;
+  n = apr_strtoi64(value, &endp, 10);
+  if(errno) {
+    return errno;
   }
-}
-
-static size_t cw_out_bufs_len(struct cw_out_ctx *ctx)
-{
-  struct cw_out_buf *cwbuf = ctx->buf;
-  size_t len = 0;
-  while(cwbuf) {
-    len += Curl_dyn_len(&cwbuf->b);
-    cwbuf = cwbuf->next;
+  if(!endp || !*endp) {
+    if (!def_unit) def_unit = "s";
   }
-  return len;
-}
-
-static void cw_out_close(struct Curl_easy *data, struct Curl_cwriter *writer)
-{
-  struct cw_out_ctx *ctx = writer->ctx;
-
-  (void)data;
-  cw_out_bufs_free(ctx);
-}
-
-/**
- * Return the current curl_write_callback and user_data for the buf type
- */
-static void cw_get_writefunc(struct Curl_easy *data, cw_out_type otype,
-                             curl_write_callback *pwcb, void **pwcb_data,
-                             size_t *pmax_write, size_t *pmin_write)
-{
-  switch(otype) {
-  case CW_OUT_BODY:
-    *pwcb = data->set.fwrite_func;
-    *pwcb_data = data->set.out;
-    *pmax_write = CURL_MAX_WRITE_SIZE;
-    /* if we ever want buffering of BODY output, we can set `min_write`
-     * the preferred size. The default should always be to pass data
-     * to the client as it comes without delay */
-    *pmin_write = 0;
-    break;
-  case CW_OUT_HDS:
-    *pwcb = data->set.fwrite_header? data->set.fwrite_header :
-             (data->set.writeheader? data->set.fwrite_func : NULL);
-    *pwcb_data = data->set.writeheader;
-    *pmax_write = 0; /* do not chunk-write headers, write them as they are */
-    *pmin_write = 0;
-    break;
-  default:
-    *pwcb = NULL;
-    *pwcb_data = NULL;
-    *pmax_write = CURL_MAX_WRITE_SIZE;
-    *pmin_write = 0;
-  }
-}
-
-static CURLcode cw_out_ptr_flush(struct cw_out_ctx *ctx,
-                                 struct Curl_easy *data,
-                                 cw_out_type otype,
-                                 bool flush_all,
-                                 const char *buf, size_t blen,
-                                 size_t *pconsumed)
-{
-  curl_write_callback wcb;
-  void *wcb_data;
-  size_t max_write, min_write;
-  size_t wlen, nwritten;
-
-  /* If we errored once, we do not invoke the client callback  again */
-  if(ctx->errored)
-    return CURLE_WRITE_ERROR;
-
-  /* write callbacks may get NULLed by the client between calls. */
-  cw_get_writefunc(data, otype, &wcb, &wcb_data, &max_write, &min_write);
-  if(!wcb) {
-    *pconsumed = blen;
-    return CURLE_OK;
-  }
-
-  *pconsumed = 0;
-  while(blen && !ctx->paused) {
-    if(!flush_all && blen < min_write)
-      break;
-    wlen = max_write? CURLMIN(blen, max_write) : blen;
-    Curl_set_in_callback(data, TRUE);
-    nwritten = wcb((char *)buf, 1, wlen, wcb_data);
-    Curl_set_in_callback(data, FALSE);
-    CURL_TRC_WRITE(data, "cw_out, wrote %zu %s bytes -> %zu",
-                   wlen, (otype == CW_OUT_BODY)? "body" : "header",
-                   nwritten);
-    if(CURL_WRITEFUNC_PAUSE == nwritten) {
-      if(data->conn && data->conn->handler->flags & PROTOPT_NONETWORK) {
-        /* Protocols that work without network cannot be paused. This is
-           actually only FILE:// just now, and it cannot pause since the
-           transfer is not done using the "normal" procedure. */
-        failf(data, "Write callback asked for PAUSE when not supported");
-        return CURLE_WRITE_ERROR;
-      }
-      /* mark the connection as RECV paused */
-      data->req.keepon |= KEEP_RECV_PAUSE;
-      ctx->paused = TRUE;
-      CURL_TRC_WRITE(data, "cw_out, PAUSE requested by client");
-      break;
-    }
-    else if(CURL_WRITEFUNC_ERROR == nwritten) {
-      failf(data, "client returned ERROR on write of %zu bytes", wlen);
-      return CURLE_WRITE_ERROR;
-    }
-    else if(nwritten != wlen) {
-      failf(data, "Failure writing output to destination, "
-            "passed %zu returned %zd", wlen, nwritten);
-      return CURLE_WRITE_ERROR;
-    }
-    *pconsumed += nwritten;
-    blen -= nwritten;
-    buf += nwritten;
-  }
-  return CURLE_OK;
-}
-
-static CURLcode cw_out_buf_flush(struct cw_out_ctx *ctx,
-                                 struct Curl_easy *data,
-                                 struct cw_out_buf *cwbuf,
-                                 bool flush_all)
-{
-  CURLcode result = CURLE_OK;
-
-  if(Curl_dyn_len(&cwbuf->b)) {
-    size_t consumed;
-
-    result = cw_out_ptr_flush(ctx, data, cwbuf->type, flush_all,
-                              Curl_dyn_ptr(&cwbuf->b),
-                              Curl_dyn_len(&cwbuf->b),
-                              &consumed);
-    if(result)
-      return result;
-
-    if(consumed) {
-      if(consumed == Curl_dyn_len(&cwbuf->b)) {
-        Curl_dyn_free(&cwbuf->b);
-      }
-      else {
-        DEBUGASSERT(consumed < Curl_dyn_len(&cwbuf->b));
-        result = Curl_dyn_tail(&cwbuf->b, Curl_dyn_len(&cwbuf->b) - consumed);
-        if(result)
-          return result;
-      }
-    }
-  }
-  return result;
-}
-
-static CURLcode cw_out_flush_chain(struct cw_out_ctx *ctx,
-                                   struct Curl_easy *data,
-                                   struct cw_out_buf **pcwbuf,
-                                   bool flush_all)
-{
-  struct cw_out_buf *cwbuf = *pcwbuf;
-  CURLcode result;
-
-  if(!cwbuf)
-    return CURLE_OK;
-  if(ctx->paused)
-    return CURLE_OK;
-
-  /* write the end of the chain until it blocks or gets empty */
-  while(cwbuf->next) {
-    struct cw_out_buf **plast = &cwbuf->next;
-    while((*plast)->next)
-      plast = &(*plast)->next;
-    result = cw_out_flush_chain(ctx, data, plast, flush_all);
-    if(result)
-      return result;
-    if(*plast) {
-      /* could not write last, paused again? */
-      DEBUGASSERT(ctx->paused);
-      return CURLE_OK;
-    }
-  }
-
-  result = cw_out_buf_flush(ctx, data, cwbuf, flush_all);
-  if(result)
-    return result;
-  if(!Curl_dyn_len(&cwbuf->b)) {
-    cw_out_buf_free(cwbuf);
-    *pcwbuf = NULL;
-  }
-  return CURLE_OK;
-}
-
-static CURLcode cw_out_append(struct cw_out_ctx *ctx,
-                              cw_out_type otype,
-                              const char *buf, size_t blen)
-{
-  if(cw_out_bufs_len(ctx) + blen > DYN_PAUSE_BUFFER)
-    return CURLE_TOO_LARGE;
-
-  /* if we do not have a buffer, or it is of another type, make a new one.
-   * And for CW_OUT_HDS always make a new one, so we "replay" headers
-   * exactly as they came in */
-  if(!ctx->buf || (ctx->buf->type != otype) || (otype == CW_OUT_HDS)) {
-    struct cw_out_buf *cwbuf = cw_out_buf_create(otype);
-    if(!cwbuf)
-      return CURLE_OUT_OF_MEMORY;
-    cwbuf->next = ctx->buf;
-    ctx->buf = cwbuf;
-  }
-  DEBUGASSERT(ctx->buf && (ctx->buf->type == otype));
-  return Curl_dyn_addn(&ctx->buf->b, buf, blen);
-}
-
-static CURLcode cw_out_do_write(struct cw_out_ctx *ctx,
-                                struct Curl_easy *data,
-                                cw_out_type otype,
-                                bool flush_all,
-                                const char *buf, size_t blen)
-{
-  CURLcode result = CURLE_OK;
-
-  /* if we have buffered data and it is a different type than what
-   * we are writing now, try to flush all */
-  if(ctx->buf && ctx->buf->type != otype) {
-    result = cw_out_flush_chain(ctx, data, &ctx->buf, TRUE);
-    if(result)
-      goto out;
-  }
-
-  if(ctx->buf) {
-    /* still have buffered data, append and flush */
-    result = cw_out_append(ctx, otype, buf, blen);
-    if(result)
-      return result;
-    result = cw_out_flush_chain(ctx, data, &ctx->buf, flush_all);
-    if(result)
-      goto out;
+  else if(endp == value) {
+    return APR_EINVAL;
   }
   else {
-    /* nothing buffered, try direct write */
-    size_t consumed;
-    result = cw_out_ptr_flush(ctx, data, otype, flush_all,
-                              buf, blen, &consumed);
-    if(result)
-      return result;
-    if(consumed < blen) {
-      /* did not write all, append the rest */
-      result = cw_out_append(ctx, otype, buf + consumed, blen - consumed);
-      if(result)
-        goto out;
+    def_unit = endp;
+  }
+
+  switch(*def_unit) {
+  case 'D':
+  case 'd':
+    *ptimeout = apr_time_from_sec(n * SECS_PER_DAY);
+    break;
+  case 's':
+  case 'S':
+    *ptimeout = (apr_interval_time_t) apr_time_from_sec(n);
+    break;
+  case 'h':
+  case 'H':
+    /* Time is in hours */
+    *ptimeout = (apr_interval_time_t) apr_time_from_sec(n * SECS_PER_HOUR);
+    break;
+  case 'm':
+  case 'M':
+    switch(*(++def_unit)) {
+    /* Time is in milliseconds */
+    case 's':
+    case 'S':
+      *ptimeout = (apr_interval_time_t) n * 1000;
+      break;
+    /* Time is in minutes */
+    case 'i':
+    case 'I':
+      *ptimeout = (apr_interval_time_t) apr_time_from_sec(n * 60);
+      break;
+    default:
+      return APR_EGENERAL;
+    }
+    break;
+  case 'u':
+  case 'U':
+    switch(*(++def_unit)) {
+    /* Time is in microseconds */
+    case 's':
+    case 'S':
+      *ptimeout = (apr_interval_time_t) n;
+      break;
+    default:
+      return APR_EGENERAL;
+    }
+    break;
+  default:
+    return APR_EGENERAL;
+  }
+  return APR_SUCCESS;
+}
+
+static int status_from_str(const char *s, apr_status_t *pstatus)
+{
+  if(!strcmp("timeout", s)) {
+    *pstatus = APR_TIMEUP;
+    return 1;
+  }
+  else if(!strcmp("reset", s)) {
+    *pstatus = APR_ECONNRESET;
+    return 1;
+  }
+  return 0;
+}
+
+static int curltest_echo_handler(request_rec *r)
+{
+  conn_rec *c = r->connection;
+  apr_bucket_brigade *bb;
+  apr_bucket *b;
+  apr_status_t rv;
+  char buffer[8192];
+  const char *ct;
+  apr_off_t die_after_len = -1, total_read_len = 0;
+  int just_die = 0, die_after_100 = 0;
+  long l;
+
+  if(strcmp(r->handler, "curltest-echo")) {
+    return DECLINED;
+  }
+  if(r->method_number != M_GET && r->method_number != M_POST) {
+    return DECLINED;
+  }
+
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, "echo_handler: processing");
+  if(r->args) {
+    apr_array_header_t *args = NULL;
+    int i;
+    args = apr_cstr_split(r->args, "&", 1, r->pool);
+    for(i = 0; i < args->nelts; ++i) {
+      char *s, *val, *arg = APR_ARRAY_IDX(args, i, char*);
+      s = strchr(arg, '=');
+      if(s) {
+        *s = '\0';
+        val = s + 1;
+        if(!strcmp("die_after", arg)) {
+          die_after_len = (apr_off_t)apr_atoi64(val);
+          continue;
+        }
+        else if(!strcmp("just_die", arg)) {
+          just_die = 1;
+          continue;
+        }
+        else if(!strcmp("die_after_100", arg)) {
+          die_after_100 = 1;
+          continue;
+        }
+      }
     }
   }
 
-out:
-  if(result) {
-    /* We do not want to invoked client callbacks a second time after
-     * encountering an error. See issue #13337 */
-    ctx->errored = TRUE;
-    cw_out_bufs_free(ctx);
-  }
-  return result;
-}
-
-static CURLcode cw_out_write(struct Curl_easy *data,
-                             struct Curl_cwriter *writer, int type,
-                             const char *buf, size_t blen)
-{
-  struct cw_out_ctx *ctx = writer->ctx;
-  CURLcode result;
-  bool flush_all;
-
-  flush_all = (type & CLIENTWRITE_EOS)? TRUE:FALSE;
-  if((type & CLIENTWRITE_BODY) ||
-     ((type & CLIENTWRITE_HEADER) && data->set.include_header)) {
-    result = cw_out_do_write(ctx, data, CW_OUT_BODY, flush_all, buf, blen);
-    if(result)
-      return result;
+  if(just_die) {
+    ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                  "echo_handler: dying right away");
+    /* Generate no HTTP response at all. */
+    ap_remove_output_filter_byhandle(r->output_filters, "HTTP_HEADER");
+    r->connection->keepalive = AP_CONN_CLOSE;
+    return AP_FILTER_ERROR;
   }
 
-  if(type & (CLIENTWRITE_HEADER|CLIENTWRITE_INFO)) {
-    result = cw_out_do_write(ctx, data, CW_OUT_HDS, flush_all, buf, blen);
-    if(result)
-      return result;
+  r->status = 200;
+  if(die_after_len >= 0) {
+    r->clength = die_after_len + 1;
+    r->chunked = 0;
+    apr_table_set(r->headers_out, "Content-Length",
+                  apr_ltoa(r->pool, (long)r->clength));
   }
+  else {
+    r->clength = -1;
+    r->chunked = 1;
+    apr_table_unset(r->headers_out, "Content-Length");
+  }
+  /* Discourage content-encodings */
+  apr_table_unset(r->headers_out, "Content-Encoding");
+  apr_table_setn(r->subprocess_env, "no-brotli", "1");
+  apr_table_setn(r->subprocess_env, "no-gzip", "1");
 
-  return CURLE_OK;
-}
+  ct = apr_table_get(r->headers_in, "content-type");
+  ap_set_content_type(r, ct? ct : "application/octet-stream");
 
-bool Curl_cw_out_is_paused(struct Curl_easy *data)
-{
-  struct Curl_cwriter *cw_out;
-  struct cw_out_ctx *ctx;
-
-  cw_out = Curl_cwriter_get_by_type(data, &Curl_cwt_out);
-  if(!cw_out)
-    return FALSE;
-
-  ctx = (struct cw_out_ctx *)cw_out;
-  CURL_TRC_WRITE(data, "cw-out is%spaused", ctx->paused? "" : " not");
-  return ctx->paused;
-}
-
-static CURLcode cw_out_flush(struct Curl_easy *data,
-                             bool unpause, bool flush_all)
-{
-  struct Curl_cwriter *cw_out;
-  CURLcode result = CURLE_OK;
-
-  cw_out = Curl_cwriter_get_by_type(data, &Curl_cwt_out);
-  if(cw_out) {
-    struct cw_out_ctx *ctx = (struct cw_out_ctx *)cw_out;
-    if(ctx->errored)
-      return CURLE_WRITE_ERROR;
-    if(unpause && ctx->paused)
-      ctx->paused = FALSE;
-    if(ctx->paused)
-      return CURLE_OK;  /* not doing it */
-
-    result = cw_out_flush_chain(ctx, data, &ctx->buf, flush_all);
-    if(result) {
-      ctx->errored = TRUE;
-      cw_out_bufs_free(ctx);
-      return result;
+  bb = apr_brigade_create(r->pool, c->bucket_alloc);
+  /* copy any request body into the response */
+  if((rv = ap_setup_client_block(r, REQUEST_CHUNKED_DECHUNK))) goto cleanup;
+  if(die_after_100) {
+    ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                  "echo_handler: dying after 100-continue");
+    /* Generate no HTTP response at all. */
+    ap_remove_output_filter_byhandle(r->output_filters, "HTTP_HEADER");
+    r->connection->keepalive = AP_CONN_CLOSE;
+    return AP_FILTER_ERROR;
+  }
+  if(ap_should_client_block(r)) {
+    while(0 < (l = ap_get_client_block(r, &buffer[0], sizeof(buffer)))) {
+      total_read_len += l;
+      if(die_after_len >= 0 && total_read_len >= die_after_len) {
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                      "echo_handler: dying after %ld bytes as requested",
+                      (long)total_read_len);
+        ap_pass_brigade(r->output_filters, bb);
+        ap_remove_output_filter_byhandle(r->output_filters, "HTTP_HEADER");
+        r->connection->keepalive = AP_CONN_CLOSE;
+        return DONE;
+      }
+      ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                    "echo_handler: copying %ld bytes from request body", l);
+      rv = apr_brigade_write(bb, NULL, NULL, buffer, l);
+      if (APR_SUCCESS != rv) goto cleanup;
+      rv = ap_pass_brigade(r->output_filters, bb);
+      if (APR_SUCCESS != rv) goto cleanup;
+      ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                    "echo_handler: passed %ld bytes from request body", l);
     }
   }
-  return result;
+  /* we are done */
+  b = apr_bucket_eos_create(c->bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(bb, b);
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, "echo_handler: request read");
+
+  if(r->trailers_in && !apr_is_empty_table(r->trailers_in)) {
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                  "echo_handler: seeing incoming trailers");
+    apr_table_setn(r->trailers_out, "h2test-trailers-in",
+                   apr_itoa(r->pool, 1));
+  }
+
+  rv = ap_pass_brigade(r->output_filters, bb);
+
+cleanup:
+  if(rv == APR_SUCCESS ||
+     r->status != HTTP_OK ||
+     c->aborted) {
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r, "echo_handler: done");
+    return OK;
+  }
+  else {
+    /* no way to know what type of error occurred */
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r, "echo_handler failed");
+    return AP_FILTER_ERROR;
+  }
+  return DECLINED;
 }
 
-CURLcode Curl_cw_out_unpause(struct Curl_easy *data)
+static int curltest_tweak_handler(request_rec *r)
 {
-  CURL_TRC_WRITE(data, "cw-out unpause");
-  return cw_out_flush(data, TRUE, FALSE);
+  conn_rec *c = r->connection;
+  apr_bucket_brigade *bb;
+  apr_bucket *b;
+  apr_status_t rv;
+  char buffer[16*1024];
+  int i, chunks = 3, error_bucket = 1;
+  size_t chunk_size = sizeof(buffer);
+  const char *request_id = "none";
+  apr_time_t delay = 0, chunk_delay = 0, close_delay = 0;
+  apr_array_header_t *args = NULL;
+  int http_status = 200;
+  apr_status_t error = APR_SUCCESS, body_error = APR_SUCCESS;
+  int close_conn = 0, with_cl = 0;
+
+  if(strcmp(r->handler, "curltest-tweak")) {
+    return DECLINED;
+  }
+  if(r->method_number == M_DELETE) {
+    http_status = 204;
+    chunks = 0;
+  }
+  else if(r->method_number != M_GET && r->method_number != M_POST) {
+    return DECLINED;
+  }
+
+  if(r->args) {
+    args = apr_cstr_split(r->args, "&", 1, r->pool);
+    for(i = 0; i < args->nelts; ++i) {
+      char *s, *val, *arg = APR_ARRAY_IDX(args, i, char*);
+      s = strchr(arg, '=');
+      if(s) {
+        *s = '\0';
+        val = s + 1;
+        if(!strcmp("status", arg)) {
+          http_status = (int)apr_atoi64(val);
+          if(http_status > 0) {
+            continue;
+          }
+        }
+        else if(!strcmp("chunks", arg)) {
+          chunks = (int)apr_atoi64(val);
+          if(chunks >= 0) {
+            continue;
+          }
+        }
+        else if(!strcmp("chunk_size", arg)) {
+          chunk_size = (int)apr_atoi64(val);
+          if(chunk_size >= 0) {
+            if(chunk_size > sizeof(buffer)) {
+              ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                            "chunk_size %zu too large", chunk_size);
+              ap_die(HTTP_BAD_REQUEST, r);
+              return OK;
+            }
+            continue;
+          }
+        }
+        else if(!strcmp("id", arg)) {
+          /* just an id for repeated requests with curl's url globbing */
+          request_id = val;
+          continue;
+        }
+        else if(!strcmp("error", arg)) {
+          if(status_from_str(val, &error)) {
+            continue;
+          }
+        }
+        else if(!strcmp("error_bucket", arg)) {
+          error_bucket = (int)apr_atoi64(val);
+          if(error_bucket >= 0) {
+            continue;
+          }
+        }
+        else if(!strcmp("body_error", arg)) {
+          if(status_from_str(val, &body_error)) {
+            continue;
+          }
+        }
+        else if(!strcmp("delay", arg)) {
+          rv = duration_parse(&delay, val, "s");
+          if(APR_SUCCESS == rv) {
+            continue;
+          }
+        }
+        else if(!strcmp("chunk_delay", arg)) {
+          rv = duration_parse(&chunk_delay, val, "s");
+          if(APR_SUCCESS == rv) {
+            continue;
+          }
+        }
+        else if(!strcmp("close_delay", arg)) {
+          rv = duration_parse(&close_delay, val, "s");
+          if(APR_SUCCESS == rv) {
+            continue;
+          }
+        }
+      }
+      else if(!strcmp("close", arg)) {
+        /* we are asked to close the connection */
+        close_conn = 1;
+        continue;
+      }
+      else if(!strcmp("with_cl", arg)) {
+        with_cl = 1;
+        continue;
+      }
+      ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "query parameter not "
+                    "understood: '%s' in %s",
+                    arg, r->args);
+      ap_die(HTTP_BAD_REQUEST, r);
+      return OK;
+    }
+  }
+
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, "error_handler: processing "
+                "request, %s", r->args? r->args : "(no args)");
+  r->status = http_status;
+  r->clength = with_cl? (chunks * chunk_size) : -1;
+  r->chunked = (r->proto_num >= HTTP_VERSION(1,1)) && !with_cl;
+  apr_table_setn(r->headers_out, "request-id", request_id);
+  if(r->clength >= 0) {
+    apr_table_set(r->headers_out, "Content-Length",
+                  apr_ltoa(r->pool, (long)r->clength));
+  }
+  else
+    apr_table_unset(r->headers_out, "Content-Length");
+  /* Discourage content-encodings */
+  apr_table_unset(r->headers_out, "Content-Encoding");
+  apr_table_setn(r->subprocess_env, "no-brotli", "1");
+  apr_table_setn(r->subprocess_env, "no-gzip", "1");
+
+  ap_set_content_type(r, "application/octet-stream");
+  bb = apr_brigade_create(r->pool, c->bucket_alloc);
+
+  if(delay) {
+    apr_sleep(delay);
+  }
+  if(error != APR_SUCCESS) {
+    return ap_map_http_request_error(error, HTTP_BAD_REQUEST);
+  }
+  /* flush response */
+  b = apr_bucket_flush_create(c->bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(bb, b);
+  rv = ap_pass_brigade(r->output_filters, bb);
+  if (APR_SUCCESS != rv) goto cleanup;
+
+  memset(buffer, 'X', sizeof(buffer));
+  for(i = 0; i < chunks; ++i) {
+    if(chunk_delay) {
+      apr_sleep(chunk_delay);
+    }
+    rv = apr_brigade_write(bb, NULL, NULL, buffer, chunk_size);
+    if(APR_SUCCESS != rv) goto cleanup;
+    rv = ap_pass_brigade(r->output_filters, bb);
+    if(APR_SUCCESS != rv) goto cleanup;
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                  "error_handler: passed %lu bytes as response body",
+                  (unsigned long)chunk_size);
+    if(body_error != APR_SUCCESS) {
+      rv = body_error;
+      goto cleanup;
+    }
+  }
+  /* we are done */
+  b = apr_bucket_eos_create(c->bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(bb, b);
+  rv = ap_pass_brigade(r->output_filters, bb);
+  apr_brigade_cleanup(bb);
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r,
+                "error_handler: response passed");
+
+cleanup:
+  if(close_conn) {
+    if(close_delay) {
+      b = apr_bucket_flush_create(c->bucket_alloc);
+      APR_BRIGADE_INSERT_TAIL(bb, b);
+      rv = ap_pass_brigade(r->output_filters, bb);
+      apr_brigade_cleanup(bb);
+      apr_sleep(close_delay);
+    }
+    r->connection->keepalive = AP_CONN_CLOSE;
+  }
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r,
+                "error_handler: request cleanup, r->status=%d, aborted=%d, "
+                "close=%d", r->status, c->aborted, close_conn);
+  if(rv == APR_SUCCESS) {
+    return OK;
+  }
+  if(error_bucket) {
+    http_status = ap_map_http_request_error(rv, HTTP_BAD_REQUEST);
+    b = ap_bucket_error_create(http_status, NULL, r->pool, c->bucket_alloc);
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r,
+                  "error_handler: passing error bucket, status=%d",
+                  http_status);
+    APR_BRIGADE_INSERT_TAIL(bb, b);
+    ap_pass_brigade(r->output_filters, bb);
+  }
+  return AP_FILTER_ERROR;
 }
 
-CURLcode Curl_cw_out_done(struct Curl_easy *data)
+static int curltest_put_handler(request_rec *r)
 {
-  CURL_TRC_WRITE(data, "cw-out done");
-  return cw_out_flush(data, FALSE, TRUE);
+  conn_rec *c = r->connection;
+  apr_bucket_brigade *bb;
+  apr_bucket *b;
+  apr_status_t rv;
+  char buffer[128*1024];
+  const char *ct;
+  apr_off_t rbody_len = 0;
+  const char *s_rbody_len;
+  const char *request_id = "none";
+  apr_time_t read_delay = 0, chunk_delay = 0;
+  apr_array_header_t *args = NULL;
+  long l;
+  int i;
+
+  if(strcmp(r->handler, "curltest-put")) {
+    return DECLINED;
+  }
+  if(r->method_number != M_PUT) {
+    return DECLINED;
+  }
+
+  if(r->args) {
+    args = apr_cstr_split(r->args, "&", 1, r->pool);
+    for(i = 0; i < args->nelts; ++i) {
+      char *s, *val, *arg = APR_ARRAY_IDX(args, i, char*);
+      s = strchr(arg, '=');
+      if(s) {
+        *s = '\0';
+        val = s + 1;
+        if(!strcmp("id", arg)) {
+          /* just an id for repeated requests with curl's url globbing */
+          request_id = val;
+          continue;
+        }
+        else if(!strcmp("read_delay", arg)) {
+          rv = duration_parse(&read_delay, val, "s");
+          if(APR_SUCCESS == rv) {
+            continue;
+          }
+        }
+        else if(!strcmp("chunk_delay", arg)) {
+          rv = duration_parse(&chunk_delay, val, "s");
+          if(APR_SUCCESS == rv) {
+            continue;
+          }
+        }
+      }
+      ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "query parameter not "
+                    "understood: '%s' in %s",
+                    arg, r->args);
+      ap_die(HTTP_BAD_REQUEST, r);
+      return OK;
+    }
+  }
+
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, "put_handler: processing");
+  r->status = 200;
+  r->clength = -1;
+  r->chunked = 1;
+  apr_table_unset(r->headers_out, "Content-Length");
+  /* Discourage content-encodings */
+  apr_table_unset(r->headers_out, "Content-Encoding");
+  apr_table_setn(r->subprocess_env, "no-brotli", "1");
+  apr_table_setn(r->subprocess_env, "no-gzip", "1");
+
+  ct = apr_table_get(r->headers_in, "content-type");
+  ap_set_content_type(r, ct? ct : "text/plain");
+
+  if(read_delay) {
+    apr_sleep(read_delay);
+  }
+  bb = apr_brigade_create(r->pool, c->bucket_alloc);
+  /* copy any request body into the response */
+  if((rv = ap_setup_client_block(r, REQUEST_CHUNKED_DECHUNK))) goto cleanup;
+  if(ap_should_client_block(r)) {
+    while(0 < (l = ap_get_client_block(r, &buffer[0], sizeof(buffer)))) {
+      ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                    "put_handler: read %ld bytes from request body", l);
+      if(chunk_delay) {
+        apr_sleep(chunk_delay);
+      }
+      rbody_len += l;
+    }
+  }
+  /* we are done */
+  s_rbody_len = apr_psprintf(r->pool, "%"APR_OFF_T_FMT, rbody_len);
+  apr_table_setn(r->headers_out, "Received-Length", s_rbody_len);
+  rv = apr_brigade_puts(bb, NULL, NULL, s_rbody_len);
+  if(APR_SUCCESS != rv) goto cleanup;
+  b = apr_bucket_eos_create(c->bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(bb, b);
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, "put_handler: request read");
+
+  rv = ap_pass_brigade(r->output_filters, bb);
+
+cleanup:
+  if(rv == APR_SUCCESS
+     || r->status != HTTP_OK
+     || c->aborted) {
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r, "put_handler: done");
+    return OK;
+  }
+  else {
+    /* no way to know what type of error occurred */
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r, "put_handler failed");
+    return AP_FILTER_ERROR;
+  }
+  return DECLINED;
+}
+
+static int curltest_1_1_required(request_rec *r)
+{
+  conn_rec *c = r->connection;
+  apr_bucket_brigade *bb;
+  apr_bucket *b;
+  apr_status_t rv;
+  char buffer[16*1024];
+  const char *ct;
+  const char *request_id = "none";
+  apr_time_t chunk_delay = 0;
+  apr_array_header_t *args = NULL;
+  long l;
+  int i;
+
+  if(strcmp(r->handler, "curltest-1_1-required")) {
+    return DECLINED;
+  }
+
+  if (HTTP_VERSION_MAJOR(r->proto_num) > 1) {
+    apr_table_setn(r->notes, "ssl-renegotiate-forbidden", "1");
+    ap_die(HTTP_FORBIDDEN, r);
+    return OK;
+  }
+
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, "1_1_handler: processing");
+  r->status = 200;
+  r->clength = -1;
+  r->chunked = 1;
+  apr_table_unset(r->headers_out, "Content-Length");
+  /* Discourage content-encodings */
+  apr_table_unset(r->headers_out, "Content-Encoding");
+  apr_table_setn(r->subprocess_env, "no-brotli", "1");
+  apr_table_setn(r->subprocess_env, "no-gzip", "1");
+
+  ct = apr_table_get(r->headers_in, "content-type");
+  ap_set_content_type(r, ct? ct : "text/plain");
+
+  bb = apr_brigade_create(r->pool, c->bucket_alloc);
+  /* flush response */
+  b = apr_bucket_flush_create(c->bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(bb, b);
+  rv = ap_pass_brigade(r->output_filters, bb);
+  if (APR_SUCCESS != rv) goto cleanup;
+
+  /* we are done */
+  rv = apr_brigade_printf(bb, NULL, NULL, "well done!");
+  if(APR_SUCCESS != rv) goto cleanup;
+  b = apr_bucket_eos_create(c->bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(bb, b);
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, "1_1_handler: request read");
+
+  rv = ap_pass_brigade(r->output_filters, bb);
+
+cleanup:
+  if(rv == APR_SUCCESS
+     || r->status != HTTP_OK
+     || c->aborted) {
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r, "1_1_handler: done");
+    return OK;
+  }
+  else {
+    /* no way to know what type of error occurred */
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r, "1_1_handler failed");
+    return AP_FILTER_ERROR;
+  }
+  return DECLINED;
+}
+
+static int brigade_env_var(request_rec *r, apr_bucket_brigade *bb,
+                           const char *name)
+{
+  const char *s;
+  s = apr_table_get(r->subprocess_env, name);
+  if(s)
+    return apr_brigade_printf(bb, NULL, NULL, ",\n  \"%s\": \"%s\"", name, s);
+  return 0;
+}
+
+static int curltest_sslinfo_handler(request_rec *r)
+{
+  conn_rec *c = r->connection;
+  apr_bucket_brigade *bb;
+  apr_bucket *b;
+  apr_status_t rv;
+  apr_array_header_t *args = NULL;
+  const char *request_id = NULL;
+  int close_conn = 0;
+  long l;
+  int i;
+
+  if(strcmp(r->handler, "curltest-sslinfo")) {
+    return DECLINED;
+  }
+  if(r->method_number != M_GET) {
+    return DECLINED;
+  }
+
+  if(r->args) {
+    apr_array_header_t *args = apr_cstr_split(r->args, "&", 1, r->pool);
+    for(i = 0; i < args->nelts; ++i) {
+      char *s, *val, *arg = APR_ARRAY_IDX(args, i, char*);
+      s = strchr(arg, '=');
+      if(s) {
+        *s = '\0';
+        val = s + 1;
+        if(!strcmp("id", arg)) {
+          /* just an id for repeated requests with curl's url globbing */
+          request_id = val;
+          continue;
+        }
+      }
+      else if(!strcmp("close", arg)) {
+        /* we are asked to close the connection */
+        close_conn = 1;
+        continue;
+      }
+      ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "query parameter not "
+                    "understood: '%s' in %s",
+                    arg, r->args);
+      ap_die(HTTP_BAD_REQUEST, r);
+      return OK;
+    }
+  }
+
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, "sslinfo: processing");
+  r->status = 200;
+  r->clength = -1;
+  r->chunked = 1;
+  apr_table_unset(r->headers_out, "Content-Length");
+  /* Discourage content-encodings */
+  apr_table_unset(r->headers_out, "Content-Encoding");
+  apr_table_setn(r->subprocess_env, "no-brotli", "1");
+  apr_table_setn(r->subprocess_env, "no-gzip", "1");
+
+  ap_set_content_type(r, "application/json");
+
+  bb = apr_brigade_create(r->pool, c->bucket_alloc);
+
+  apr_brigade_puts(bb, NULL, NULL, "{\n  \"Name\": \"SSL-Information\"");
+  brigade_env_var(r, bb, "HTTPS");
+  brigade_env_var(r, bb, "SSL_PROTOCOL");
+  brigade_env_var(r, bb, "SSL_CIPHER");
+  brigade_env_var(r, bb, "SSL_SESSION_ID");
+  brigade_env_var(r, bb, "SSL_SESSION_RESUMED");
+  brigade_env_var(r, bb, "SSL_SRP_USER");
+  brigade_env_var(r, bb, "SSL_SRP_USERINFO");
+  brigade_env_var(r, bb, "SSL_TLS_SNI");
+  apr_brigade_puts(bb, NULL, NULL, "}\n");
+
+  /* flush response */
+  b = apr_bucket_flush_create(c->bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(bb, b);
+  rv = ap_pass_brigade(r->output_filters, bb);
+  if (APR_SUCCESS != rv) goto cleanup;
+
+  /* we are done */
+  b = apr_bucket_eos_create(c->bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(bb, b);
+  ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, "1_1_handler: request read");
+
+  rv = ap_pass_brigade(r->output_filters, bb);
+
+cleanup:
+  if(close_conn)
+    r->connection->keepalive = AP_CONN_CLOSE;
+  if(rv == APR_SUCCESS
+     || r->status != HTTP_OK
+     || c->aborted) {
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r, "1_1_handler: done");
+    return OK;
+  }
+  else {
+    /* no way to know what type of error occurred */
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r, "1_1_handler failed");
+    return AP_FILTER_ERROR;
+  }
+  return DECLINED;
 }

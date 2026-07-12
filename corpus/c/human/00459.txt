@@ -5,7 +5,6 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) Steve Holme, <steve_holme@hotmail.com>.
  * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
@@ -21,652 +20,448 @@
  *
  * SPDX-License-Identifier: curl
  *
- * RFC2831 DIGEST-MD5 authentication
- *
  ***************************************************************************/
+#include "tool_setup.h"
 
-#include "curl_setup.h"
+#define ENABLE_CURLX_PRINTF
+/* use our own printf() functions */
+#include "curlx.h"
 
-#if defined(USE_WINDOWS_SSPI) && !defined(CURL_DISABLE_DIGEST_AUTH)
+#include "tool_cfgable.h"
+#include "tool_getparam.h"
+#include "tool_helpers.h"
+#include "tool_findfile.h"
+#include "tool_msgs.h"
+#include "tool_parsecfg.h"
+#include "dynbuf.h"
+#include "curl_base64.h"
+#include "tool_paramhlp.h"
+#include "tool_writeout_json.h"
+#include "var.h"
 
-#include <curl/curl.h>
+#include "memdebug.h" /* keep this as LAST include */
 
-#include "vauth/vauth.h"
-#include "vauth/digest.h"
-#include "urldata.h"
-#include "warnless.h"
-#include "curl_multibyte.h"
-#include "sendf.h"
-#include "strdup.h"
-#include "strcase.h"
-#include "strerror.h"
+#define MAX_EXPAND_CONTENT 10000000
+#define MAX_VAR_LEN 128 /* max length of a name */
 
-/* The last #include files should be: */
-#include "curl_memory.h"
-#include "memdebug.h"
-
-/*
-* Curl_auth_is_digest_supported()
-*
-* This is used to evaluate if DIGEST is supported.
-*
-* Parameters: None
-*
-* Returns TRUE if DIGEST is supported by Windows SSPI.
-*/
-bool Curl_auth_is_digest_supported(void)
+static char *Memdup(const char *data, size_t len)
 {
-  PSecPkgInfo SecurityPackage;
-  SECURITY_STATUS status;
-
-  /* Query the security package for Digest */
-  status = s_pSecFn->QuerySecurityPackageInfo((TCHAR *) TEXT(SP_NAME_DIGEST),
-                                              &SecurityPackage);
-
-  /* Release the package buffer as it is not required anymore */
-  if(status == SEC_E_OK) {
-    s_pSecFn->FreeContextBuffer(SecurityPackage);
-  }
-
-  return (status == SEC_E_OK ? TRUE : FALSE);
+  char *p = malloc(len + 1);
+  if(!p)
+    return NULL;
+  if(len)
+    memcpy(p, data, len);
+  p[len] = 0;
+  return p;
 }
 
-/*
- * Curl_auth_create_digest_md5_message()
- *
- * This is used to generate an already encoded DIGEST-MD5 response message
- * ready for sending to the recipient.
- *
- * Parameters:
- *
- * data    [in]     - The session handle.
- * chlg    [in]     - The challenge message.
- * userp   [in]     - The username in the format User or Domain\User.
- * passwdp [in]     - The user's password.
- * service [in]     - The service type such as http, smtp, pop or imap.
- * out     [out]    - The result storage.
- *
- * Returns CURLE_OK on success.
- */
-CURLcode Curl_auth_create_digest_md5_message(struct Curl_easy *data,
-                                             const struct bufref *chlg,
-                                             const char *userp,
-                                             const char *passwdp,
-                                             const char *service,
-                                             struct bufref *out)
+/* free everything */
+void varcleanup(struct GlobalConfig *global)
 {
-  CURLcode result = CURLE_OK;
-  TCHAR *spn = NULL;
-  size_t token_max = 0;
-  unsigned char *output_token = NULL;
-  CredHandle credentials;
-  CtxtHandle context;
-  PSecPkgInfo SecurityPackage;
-  SEC_WINNT_AUTH_IDENTITY identity;
-  SEC_WINNT_AUTH_IDENTITY *p_identity;
-  SecBuffer chlg_buf;
-  SecBuffer resp_buf;
-  SecBufferDesc chlg_desc;
-  SecBufferDesc resp_desc;
-  SECURITY_STATUS status;
-  unsigned long attrs;
-  TimeStamp expiry; /* For Windows 9x compatibility of SSPI calls */
-
-  /* Ensure we have a valid challenge message */
-  if(!Curl_bufref_len(chlg)) {
-    infof(data, "DIGEST-MD5 handshake failure (empty challenge message)");
-    return CURLE_BAD_CONTENT_ENCODING;
+  struct var *list = global->variables;
+  while(list) {
+    struct var *t = list;
+    list = list->next;
+    free((char *)t->content);
+    free(t);
   }
+}
 
-  /* Query the security package for DigestSSP */
-  status = s_pSecFn->QuerySecurityPackageInfo((TCHAR *) TEXT(SP_NAME_DIGEST),
-                                              &SecurityPackage);
-  if(status != SEC_E_OK) {
-    failf(data, "SSPI: could not get auth info");
-    return CURLE_AUTH_ERROR;
-  }
-
-  token_max = SecurityPackage->cbMaxToken;
-
-  /* Release the package buffer as it is not required anymore */
-  s_pSecFn->FreeContextBuffer(SecurityPackage);
-
-  /* Allocate our response buffer */
-  output_token = malloc(token_max);
-  if(!output_token)
-    return CURLE_OUT_OF_MEMORY;
-
-  /* Generate our SPN */
-  spn = Curl_auth_build_spn(service, data->conn->host.name, NULL);
-  if(!spn) {
-    free(output_token);
-    return CURLE_OUT_OF_MEMORY;
-  }
-
-  if(userp && *userp) {
-    /* Populate our identity structure */
-    result = Curl_create_sspi_identity(userp, passwdp, &identity);
-    if(result) {
-      free(spn);
-      free(output_token);
-      return result;
+static const struct var *varcontent(struct GlobalConfig *global,
+                                    const char *name, size_t nlen)
+{
+  struct var *list = global->variables;
+  while(list) {
+    if((strlen(list->name) == nlen) &&
+       !strncmp(name, list->name, nlen)) {
+      return list;
     }
-
-    /* Allow proper cleanup of the identity structure */
-    p_identity = &identity;
+    list = list->next;
   }
-  else
-    /* Use the current Windows user */
-    p_identity = NULL;
-
-  /* Acquire our credentials handle */
-  status = s_pSecFn->AcquireCredentialsHandle(NULL,
-                                              (TCHAR *) TEXT(SP_NAME_DIGEST),
-                                              SECPKG_CRED_OUTBOUND, NULL,
-                                              p_identity, NULL, NULL,
-                                              &credentials, &expiry);
-
-  if(status != SEC_E_OK) {
-    Curl_sspi_free_identity(p_identity);
-    free(spn);
-    free(output_token);
-    return CURLE_LOGIN_DENIED;
-  }
-
-  /* Setup the challenge "input" security buffer */
-  chlg_desc.ulVersion = SECBUFFER_VERSION;
-  chlg_desc.cBuffers  = 1;
-  chlg_desc.pBuffers  = &chlg_buf;
-  chlg_buf.BufferType = SECBUFFER_TOKEN;
-  chlg_buf.pvBuffer   = (void *) Curl_bufref_ptr(chlg);
-  chlg_buf.cbBuffer   = curlx_uztoul(Curl_bufref_len(chlg));
-
-  /* Setup the response "output" security buffer */
-  resp_desc.ulVersion = SECBUFFER_VERSION;
-  resp_desc.cBuffers  = 1;
-  resp_desc.pBuffers  = &resp_buf;
-  resp_buf.BufferType = SECBUFFER_TOKEN;
-  resp_buf.pvBuffer   = output_token;
-  resp_buf.cbBuffer   = curlx_uztoul(token_max);
-
-  /* Generate our response message */
-  status = s_pSecFn->InitializeSecurityContext(&credentials, NULL, spn,
-                                               0, 0, 0, &chlg_desc, 0,
-                                               &context, &resp_desc, &attrs,
-                                               &expiry);
-
-  if(status == SEC_I_COMPLETE_NEEDED ||
-     status == SEC_I_COMPLETE_AND_CONTINUE)
-    s_pSecFn->CompleteAuthToken(&credentials, &resp_desc);
-  else if(status != SEC_E_OK && status != SEC_I_CONTINUE_NEEDED) {
-#if !defined(CURL_DISABLE_VERBOSE_STRINGS)
-    char buffer[STRERROR_LEN];
-#endif
-
-    s_pSecFn->FreeCredentialsHandle(&credentials);
-    Curl_sspi_free_identity(p_identity);
-    free(spn);
-    free(output_token);
-
-    if(status == SEC_E_INSUFFICIENT_MEMORY)
-      return CURLE_OUT_OF_MEMORY;
-
-#if !defined(CURL_DISABLE_VERBOSE_STRINGS)
-    infof(data, "schannel: InitializeSecurityContext failed: %s",
-          Curl_sspi_strerror(status, buffer, sizeof(buffer)));
-#endif
-
-    return CURLE_AUTH_ERROR;
-  }
-
-  /* Return the response. */
-  Curl_bufref_set(out, output_token, resp_buf.cbBuffer, curl_free);
-
-  /* Free our handles */
-  s_pSecFn->DeleteSecurityContext(&context);
-  s_pSecFn->FreeCredentialsHandle(&credentials);
-
-  /* Free the identity structure */
-  Curl_sspi_free_identity(p_identity);
-
-  /* Free the SPN */
-  free(spn);
-
-  return result;
+  return NULL;
 }
 
-/*
- * Curl_override_sspi_http_realm()
- *
- * This is used to populate the domain in a SSPI identity structure
- * The realm is extracted from the challenge message and used as the
- * domain if it is not already explicitly set.
- *
- * Parameters:
- *
- * chlg     [in]     - The challenge message.
- * identity [in/out] - The identity structure.
- *
- * Returns CURLE_OK on success.
- */
-CURLcode Curl_override_sspi_http_realm(const char *chlg,
-                                       SEC_WINNT_AUTH_IDENTITY *identity)
+#define ENDOFFUNC(x) (((x) == '}') || ((x) == ':'))
+#define FUNCMATCH(ptr,name,len)                         \
+  (!strncmp(ptr, name, len) && ENDOFFUNC(ptr[len]))
+
+#define FUNC_TRIM "trim"
+#define FUNC_TRIM_LEN (sizeof(FUNC_TRIM) - 1)
+#define FUNC_JSON "json"
+#define FUNC_JSON_LEN (sizeof(FUNC_JSON) - 1)
+#define FUNC_URL "url"
+#define FUNC_URL_LEN (sizeof(FUNC_URL) - 1)
+#define FUNC_B64 "b64"
+#define FUNC_B64_LEN (sizeof(FUNC_B64) - 1)
+
+static ParameterError varfunc(struct GlobalConfig *global,
+                              char *c, /* content */
+                              size_t clen, /* content length */
+                              char *f, /* functions */
+                              size_t flen, /* function string length */
+                              struct curlx_dynbuf *out)
 {
-  xcharp_u domain, dup_domain;
+  bool alloc = FALSE;
+  ParameterError err = PARAM_OK;
+  const char *finput = f;
 
-  /* If domain is blank or unset, check challenge message for realm */
-  if(!identity->Domain || !identity->DomainLength) {
-    for(;;) {
-      char value[DIGEST_MAX_VALUE_LENGTH];
-      char content[DIGEST_MAX_CONTENT_LENGTH];
+  /* The functions are independent and runs left to right */
+  while(*f && !err) {
+    if(*f == '}')
+      /* end of functions */
+      break;
+    /* On entry, this is known to be a colon already. In subsequent laps, it
+       is also known to be a colon since that is part of the FUNCMATCH()
+       checks */
+    f++;
+    if(FUNCMATCH(f, FUNC_TRIM, FUNC_TRIM_LEN)) {
+      size_t len = clen;
+      f += FUNC_TRIM_LEN;
+      if(clen) {
+        /* skip leading white space, including CRLF */
+        while(*c && ISSPACE(*c)) {
+          c++;
+          len--;
+        }
+        while(len && ISSPACE(c[len-1]))
+          len--;
+      }
+      /* put it in the output */
+      curlx_dyn_reset(out);
+      if(curlx_dyn_addn(out, c, len)) {
+        err = PARAM_NO_MEM;
+        break;
+      }
+    }
+    else if(FUNCMATCH(f, FUNC_JSON, FUNC_JSON_LEN)) {
+      f += FUNC_JSON_LEN;
+      curlx_dyn_reset(out);
+      if(clen) {
+        if(jsonquoted(c, clen, out, FALSE)) {
+          err = PARAM_NO_MEM;
+          break;
+        }
+      }
+    }
+    else if(FUNCMATCH(f, FUNC_URL, FUNC_URL_LEN)) {
+      f += FUNC_URL_LEN;
+      curlx_dyn_reset(out);
+      if(clen) {
+        char *enc = curl_easy_escape(NULL, c, (int)clen);
+        if(!enc) {
+          err = PARAM_NO_MEM;
+          break;
+        }
 
-      /* Pass all additional spaces here */
-      while(*chlg && ISBLANK(*chlg))
-        chlg++;
+        /* put it in the output */
+        if(curlx_dyn_add(out, enc))
+          err = PARAM_NO_MEM;
+        curl_free(enc);
+        if(err)
+          break;
+      }
+    }
+    else if(FUNCMATCH(f, FUNC_B64, FUNC_B64_LEN)) {
+      f += FUNC_B64_LEN;
+      curlx_dyn_reset(out);
+      if(clen) {
+        char *enc;
+        size_t elen;
+        CURLcode result = curlx_base64_encode(c, clen, &enc, &elen);
+        if(result) {
+          err = PARAM_NO_MEM;
+          break;
+        }
 
-      /* Extract a value=content pair */
-      if(Curl_auth_digest_get_pair(chlg, value, content, &chlg)) {
-        if(strcasecompare(value, "realm")) {
+        /* put it in the output */
+        if(curlx_dyn_addn(out, enc, elen))
+          err = PARAM_NO_MEM;
+        curl_free(enc);
+        if(err)
+          break;
+      }
+    }
+    else {
+      /* unsupported function */
+      errorf(global, "unknown variable function in '%.*s'",
+             (int)flen, finput);
+      err = PARAM_EXPAND_ERROR;
+      break;
+    }
+    if(alloc)
+      free(c);
 
-          /* Setup identity's domain and length */
-          domain.tchar_ptr = curlx_convert_UTF8_to_tchar((char *) content);
-          if(!domain.tchar_ptr)
-            return CURLE_OUT_OF_MEMORY;
+    clen = curlx_dyn_len(out);
+    c = Memdup(curlx_dyn_ptr(out), clen);
+    if(!c) {
+      err = PARAM_NO_MEM;
+      break;
+    }
+    alloc = TRUE;
+  }
+  if(alloc)
+    free(c);
+  if(err)
+    curlx_dyn_free(out);
+  return err;
+}
 
-          dup_domain.tchar_ptr = _tcsdup(domain.tchar_ptr);
-          if(!dup_domain.tchar_ptr) {
-            curlx_unicodefree(domain.tchar_ptr);
-            return CURLE_OUT_OF_MEMORY;
-          }
+ParameterError varexpand(struct GlobalConfig *global,
+                         const char *line, struct curlx_dynbuf *out,
+                         bool *replaced)
+{
+  CURLcode result;
+  char *envp;
+  bool added = FALSE;
+  const char *input = line;
+  *replaced = FALSE;
+  curlx_dyn_init(out, MAX_EXPAND_CONTENT);
+  do {
+    envp = strstr(line, "{{");
+    if((envp > line) && envp[-1] == '\\') {
+      /* preceding backslash, we want this verbatim */
 
-          free(identity->Domain);
-          identity->Domain = dup_domain.tbyte_ptr;
-          identity->DomainLength = curlx_uztoul(_tcslen(dup_domain.tchar_ptr));
-          dup_domain.tchar_ptr = NULL;
+      /* insert the text up to this point, minus the backslash */
+      result = curlx_dyn_addn(out, line, envp - line - 1);
+      if(result)
+        return PARAM_NO_MEM;
 
-          curlx_unicodefree(domain.tchar_ptr);
+      /* output '{{' then continue from here */
+      result = curlx_dyn_addn(out, "{{", 2);
+      if(result)
+        return PARAM_NO_MEM;
+      line = &envp[2];
+    }
+    else if(envp) {
+      char name[MAX_VAR_LEN];
+      size_t nlen;
+      size_t i;
+      char *funcp;
+      char *clp = strstr(envp, "}}");
+      size_t prefix;
+
+      if(!clp) {
+        /* uneven braces */
+        warnf(global, "missing close '}}' in '%s'", input);
+        break;
+      }
+
+      prefix = 2;
+      envp += 2; /* move over the {{ */
+
+      /* if there is a function, it ends the name with a colon */
+      funcp = memchr(envp, ':', clp - envp);
+      if(funcp)
+        nlen = funcp - envp;
+      else
+        nlen = clp - envp;
+      if(!nlen || (nlen >= sizeof(name))) {
+        warnf(global, "bad variable name length '%s'", input);
+        /* insert the text as-is since this is not an env variable */
+        result = curlx_dyn_addn(out, line, clp - line + prefix);
+        if(result)
+          return PARAM_NO_MEM;
+      }
+      else {
+        /* insert the text up to this point */
+        result = curlx_dyn_addn(out, line, envp - prefix - line);
+        if(result)
+          return PARAM_NO_MEM;
+
+        /* copy the name to separate buffer */
+        memcpy(name, envp, nlen);
+        name[nlen] = 0;
+
+        /* verify that the name looks sensible */
+        for(i = 0; (i < nlen) &&
+              (ISALNUM(name[i]) || (name[i] == '_')); i++);
+        if(i != nlen) {
+          warnf(global, "bad variable name: %s", name);
+          /* insert the text as-is since this is not an env variable */
+          result = curlx_dyn_addn(out, envp - prefix,
+                                  clp - envp + prefix + 2);
+          if(result)
+            return PARAM_NO_MEM;
         }
         else {
-          /* Unknown specifier, ignore it! */
+          char *value;
+          size_t vlen = 0;
+          struct curlx_dynbuf buf;
+          const struct var *v = varcontent(global, name, nlen);
+          if(v) {
+            value = (char *)v->content;
+            vlen = v->clen;
+          }
+          else
+            value = NULL;
+
+          curlx_dyn_init(&buf, MAX_EXPAND_CONTENT);
+          if(funcp) {
+            /* apply the list of functions on the value */
+            size_t flen = clp - funcp;
+            ParameterError err = varfunc(global, value, vlen, funcp, flen,
+                                         &buf);
+            if(err)
+              return err;
+            value = curlx_dyn_ptr(&buf);
+            vlen = curlx_dyn_len(&buf);
+          }
+
+          if(value && vlen > 0) {
+            /* A variable might contain null bytes. Such bytes cannot be shown
+               using normal means, this is an error. */
+            char *nb = memchr(value, '\0', vlen);
+            if(nb) {
+              errorf(global, "variable contains null byte");
+              return PARAM_EXPAND_ERROR;
+            }
+          }
+          /* insert the value */
+          result = curlx_dyn_addn(out, value, vlen);
+          curlx_dyn_free(&buf);
+          if(result)
+            return PARAM_NO_MEM;
+
+          added = true;
         }
       }
-      else
-        break; /* We are done here */
-
-      /* Pass all additional spaces here */
-      while(*chlg && ISBLANK(*chlg))
-        chlg++;
-
-      /* Allow the list to be comma-separated */
-      if(',' == *chlg)
-        chlg++;
+      line = &clp[2];
     }
-  }
 
-  return CURLE_OK;
+  } while(envp);
+  if(added && *line) {
+    /* add the "suffix" as well */
+    result = curlx_dyn_add(out, line);
+    if(result)
+      return PARAM_NO_MEM;
+  }
+  *replaced = added;
+  if(!added)
+    curlx_dyn_free(out);
+  return PARAM_OK;
 }
 
 /*
- * Curl_auth_decode_digest_http_message()
- *
- * This is used to decode an HTTP DIGEST challenge message into the separate
- * attributes.
- *
- * Parameters:
- *
- * chlg    [in]     - The challenge message.
- * digest  [in/out] - The digest data struct being used and modified.
- *
- * Returns CURLE_OK on success.
+ * Created in a way that is not revealing how variables are actually stored so
+ * that we can improve this if we want better performance when managing many
+ * at a later point.
  */
-CURLcode Curl_auth_decode_digest_http_message(const char *chlg,
-                                              struct digestdata *digest)
+static ParameterError addvariable(struct GlobalConfig *global,
+                                  const char *name,
+                                  size_t nlen,
+                                  const char *content,
+                                  size_t clen,
+                                  bool contalloc)
 {
-  size_t chlglen = strlen(chlg);
+  struct var *p;
+  const struct var *check = varcontent(global, name, nlen);
+  DEBUGASSERT(nlen);
+  if(check)
+    notef(global, "Overwriting variable '%s'", check->name);
 
-  /* We had an input token before so if there is another one now that means we
-     provided bad credentials in the previous request or it is stale. */
-  if(digest->input_token) {
-    bool stale = false;
-    const char *p = chlg;
+  p = calloc(1, sizeof(struct var) + nlen);
+  if(p) {
+    memcpy(p->name, name, nlen);
 
-    /* Check for the 'stale' directive */
-    for(;;) {
-      char value[DIGEST_MAX_VALUE_LENGTH];
-      char content[DIGEST_MAX_CONTENT_LENGTH];
+    p->content = contalloc ? content: Memdup(content, clen);
+    if(p->content) {
+      p->clen = clen;
 
-      while(*p && ISBLANK(*p))
-        p++;
-
-      if(!Curl_auth_digest_get_pair(p, value, content, &p))
-        break;
-
-      if(strcasecompare(value, "stale") &&
-         strcasecompare(content, "true")) {
-        stale = true;
-        break;
-      }
-
-      while(*p && ISBLANK(*p))
-        p++;
-
-      if(',' == *p)
-        p++;
+      p->next = global->variables;
+      global->variables = p;
+      return PARAM_OK;
     }
-
-    if(stale)
-      Curl_auth_digest_cleanup(digest);
-    else
-      return CURLE_LOGIN_DENIED;
+    free(p);
   }
-
-  /* Store the challenge for use later */
-  digest->input_token = (BYTE *) Curl_memdup(chlg, chlglen + 1);
-  if(!digest->input_token)
-    return CURLE_OUT_OF_MEMORY;
-
-  digest->input_token_len = chlglen;
-
-  return CURLE_OK;
+  return PARAM_NO_MEM;
 }
 
-/*
- * Curl_auth_create_digest_http_message()
- *
- * This is used to generate an HTTP DIGEST response message ready for sending
- * to the recipient.
- *
- * Parameters:
- *
- * data    [in]     - The session handle.
- * userp   [in]     - The username in the format User or Domain\User.
- * passwdp [in]     - The user's password.
- * request [in]     - The HTTP request.
- * uripath [in]     - The path of the HTTP uri.
- * digest  [in/out] - The digest data struct being used and modified.
- * outptr  [in/out] - The address where a pointer to newly allocated memory
- *                    holding the result will be stored upon completion.
- * outlen  [out]    - The length of the output message.
- *
- * Returns CURLE_OK on success.
- */
-CURLcode Curl_auth_create_digest_http_message(struct Curl_easy *data,
-                                              const char *userp,
-                                              const char *passwdp,
-                                              const unsigned char *request,
-                                              const unsigned char *uripath,
-                                              struct digestdata *digest,
-                                              char **outptr, size_t *outlen)
+ParameterError setvariable(struct GlobalConfig *global,
+                           const char *input)
 {
-  size_t token_max;
-  char *resp;
-  BYTE *output_token;
-  size_t output_token_len = 0;
-  PSecPkgInfo SecurityPackage;
-  SecBuffer chlg_buf[5];
-  SecBufferDesc chlg_desc;
-  SECURITY_STATUS status;
+  const char *name;
+  size_t nlen;
+  char *content = NULL;
+  size_t clen = 0;
+  bool contalloc = FALSE;
+  const char *line = input;
+  ParameterError err = PARAM_OK;
+  bool import = FALSE;
+  char *ge = NULL;
+  char buf[MAX_VAR_LEN];
 
-  (void) data;
-
-  /* Query the security package for DigestSSP */
-  status = s_pSecFn->QuerySecurityPackageInfo((TCHAR *) TEXT(SP_NAME_DIGEST),
-                                              &SecurityPackage);
-  if(status != SEC_E_OK) {
-    failf(data, "SSPI: could not get auth info");
-    return CURLE_AUTH_ERROR;
+  if(*input == '%') {
+    import = TRUE;
+    line++;
   }
-
-  token_max = SecurityPackage->cbMaxToken;
-
-  /* Release the package buffer as it is not required anymore */
-  s_pSecFn->FreeContextBuffer(SecurityPackage);
-
-  /* Allocate the output buffer according to the max token size as indicated
-     by the security package */
-  output_token = malloc(token_max);
-  if(!output_token) {
-    return CURLE_OUT_OF_MEMORY;
+  name = line;
+  while(*line && (ISALNUM(*line) || (*line == '_')))
+    line++;
+  nlen = line - name;
+  if(!nlen || (nlen >= MAX_VAR_LEN)) {
+    warnf(global, "Bad variable name length (%zd), skipping", nlen);
+    return PARAM_OK;
   }
-
-  /* If the user/passwd that was used to make the identity for http_context
-     has changed then delete that context. */
-  if((userp && !digest->user) || (!userp && digest->user) ||
-     (passwdp && !digest->passwd) || (!passwdp && digest->passwd) ||
-     (userp && digest->user && Curl_timestrcmp(userp, digest->user)) ||
-     (passwdp && digest->passwd && Curl_timestrcmp(passwdp, digest->passwd))) {
-    if(digest->http_context) {
-      s_pSecFn->DeleteSecurityContext(digest->http_context);
-      Curl_safefree(digest->http_context);
+  if(import) {
+    /* this does not use curl_getenv() because we want "" support for blank
+       content */
+    if(*line) {
+      /* if there is a default action, we need to copy the name */
+      memcpy(buf, name, nlen);
+      buf[nlen] = 0;
+      name = buf;
     }
-    Curl_safefree(digest->user);
-    Curl_safefree(digest->passwd);
-  }
-
-  if(digest->http_context) {
-    chlg_desc.ulVersion    = SECBUFFER_VERSION;
-    chlg_desc.cBuffers     = 5;
-    chlg_desc.pBuffers     = chlg_buf;
-    chlg_buf[0].BufferType = SECBUFFER_TOKEN;
-    chlg_buf[0].pvBuffer   = NULL;
-    chlg_buf[0].cbBuffer   = 0;
-    chlg_buf[1].BufferType = SECBUFFER_PKG_PARAMS;
-    chlg_buf[1].pvBuffer   = (void *) request;
-    chlg_buf[1].cbBuffer   = curlx_uztoul(strlen((const char *) request));
-    chlg_buf[2].BufferType = SECBUFFER_PKG_PARAMS;
-    chlg_buf[2].pvBuffer   = (void *) uripath;
-    chlg_buf[2].cbBuffer   = curlx_uztoul(strlen((const char *) uripath));
-    chlg_buf[3].BufferType = SECBUFFER_PKG_PARAMS;
-    chlg_buf[3].pvBuffer   = NULL;
-    chlg_buf[3].cbBuffer   = 0;
-    chlg_buf[4].BufferType = SECBUFFER_PADDING;
-    chlg_buf[4].pvBuffer   = output_token;
-    chlg_buf[4].cbBuffer   = curlx_uztoul(token_max);
-
-    status = s_pSecFn->MakeSignature(digest->http_context, 0, &chlg_desc, 0);
-    if(status == SEC_E_OK)
-      output_token_len = chlg_buf[4].cbBuffer;
-    else { /* delete the context so a new one can be made */
-      infof(data, "digest_sspi: MakeSignature failed, error 0x%08lx",
-            (long)status);
-      s_pSecFn->DeleteSecurityContext(digest->http_context);
-      Curl_safefree(digest->http_context);
+    ge = getenv(name);
+    if(!*line && !ge) {
+      /* no assign, no variable, fail */
+      errorf(global, "Variable '%s' import fail, not set", name);
+      return PARAM_EXPAND_ERROR;
+    }
+    else if(ge) {
+      /* there is a value to use */
+      content = ge;
+      clen = strlen(ge);
     }
   }
-
-  if(!digest->http_context) {
-    CredHandle credentials;
-    SEC_WINNT_AUTH_IDENTITY identity;
-    SEC_WINNT_AUTH_IDENTITY *p_identity;
-    SecBuffer resp_buf;
-    SecBufferDesc resp_desc;
-    unsigned long attrs;
-    TimeStamp expiry; /* For Windows 9x compatibility of SSPI calls */
-    TCHAR *spn;
-
-    /* free the copy of user/passwd used to make the previous identity */
-    Curl_safefree(digest->user);
-    Curl_safefree(digest->passwd);
-
-    if(userp && *userp) {
-      /* Populate our identity structure */
-      if(Curl_create_sspi_identity(userp, passwdp, &identity)) {
-        free(output_token);
-        return CURLE_OUT_OF_MEMORY;
-      }
-
-      /* Populate our identity domain */
-      if(Curl_override_sspi_http_realm((const char *) digest->input_token,
-                                       &identity)) {
-        free(output_token);
-        return CURLE_OUT_OF_MEMORY;
-      }
-
-      /* Allow proper cleanup of the identity structure */
-      p_identity = &identity;
-    }
-    else
-      /* Use the current Windows user */
-      p_identity = NULL;
-
-    if(userp) {
-      digest->user = strdup(userp);
-
-      if(!digest->user) {
-        free(output_token);
-        return CURLE_OUT_OF_MEMORY;
+  if(content)
+    ;
+  else if(*line == '@') {
+    /* read from file or stdin */
+    FILE *file;
+    bool use_stdin;
+    line++;
+    use_stdin = !strcmp(line, "-");
+    if(use_stdin)
+      file = stdin;
+    else {
+      file = fopen(line, "rb");
+      if(!file) {
+        errorf(global, "Failed to open %s", line);
+        return PARAM_READ_ERROR;
       }
     }
-
-    if(passwdp) {
-      digest->passwd = strdup(passwdp);
-
-      if(!digest->passwd) {
-        free(output_token);
-        Curl_safefree(digest->user);
-        return CURLE_OUT_OF_MEMORY;
-      }
-    }
-
-    /* Acquire our credentials handle */
-    status = s_pSecFn->AcquireCredentialsHandle(NULL,
-                                                (TCHAR *) TEXT(SP_NAME_DIGEST),
-                                                SECPKG_CRED_OUTBOUND, NULL,
-                                                p_identity, NULL, NULL,
-                                                &credentials, &expiry);
-    if(status != SEC_E_OK) {
-      Curl_sspi_free_identity(p_identity);
-      free(output_token);
-
-      return CURLE_LOGIN_DENIED;
-    }
-
-    /* Setup the challenge "input" security buffer if present */
-    chlg_desc.ulVersion    = SECBUFFER_VERSION;
-    chlg_desc.cBuffers     = 3;
-    chlg_desc.pBuffers     = chlg_buf;
-    chlg_buf[0].BufferType = SECBUFFER_TOKEN;
-    chlg_buf[0].pvBuffer   = digest->input_token;
-    chlg_buf[0].cbBuffer   = curlx_uztoul(digest->input_token_len);
-    chlg_buf[1].BufferType = SECBUFFER_PKG_PARAMS;
-    chlg_buf[1].pvBuffer   = (void *) request;
-    chlg_buf[1].cbBuffer   = curlx_uztoul(strlen((const char *) request));
-    chlg_buf[2].BufferType = SECBUFFER_PKG_PARAMS;
-    chlg_buf[2].pvBuffer   = NULL;
-    chlg_buf[2].cbBuffer   = 0;
-
-    /* Setup the response "output" security buffer */
-    resp_desc.ulVersion = SECBUFFER_VERSION;
-    resp_desc.cBuffers  = 1;
-    resp_desc.pBuffers  = &resp_buf;
-    resp_buf.BufferType = SECBUFFER_TOKEN;
-    resp_buf.pvBuffer   = output_token;
-    resp_buf.cbBuffer   = curlx_uztoul(token_max);
-
-    spn = curlx_convert_UTF8_to_tchar((char *) uripath);
-    if(!spn) {
-      s_pSecFn->FreeCredentialsHandle(&credentials);
-
-      Curl_sspi_free_identity(p_identity);
-      free(output_token);
-
-      return CURLE_OUT_OF_MEMORY;
-    }
-
-    /* Allocate our new context handle */
-    digest->http_context = calloc(1, sizeof(CtxtHandle));
-    if(!digest->http_context)
-      return CURLE_OUT_OF_MEMORY;
-
-    /* Generate our response message */
-    status = s_pSecFn->InitializeSecurityContext(&credentials, NULL,
-                                                 spn,
-                                                 ISC_REQ_USE_HTTP_STYLE, 0, 0,
-                                                 &chlg_desc, 0,
-                                                 digest->http_context,
-                                                 &resp_desc, &attrs, &expiry);
-    curlx_unicodefree(spn);
-
-    if(status == SEC_I_COMPLETE_NEEDED ||
-       status == SEC_I_COMPLETE_AND_CONTINUE)
-      s_pSecFn->CompleteAuthToken(&credentials, &resp_desc);
-    else if(status != SEC_E_OK && status != SEC_I_CONTINUE_NEEDED) {
-#if !defined(CURL_DISABLE_VERBOSE_STRINGS)
-      char buffer[STRERROR_LEN];
-#endif
-
-      s_pSecFn->FreeCredentialsHandle(&credentials);
-
-      Curl_sspi_free_identity(p_identity);
-      free(output_token);
-
-      Curl_safefree(digest->http_context);
-
-      if(status == SEC_E_INSUFFICIENT_MEMORY)
-        return CURLE_OUT_OF_MEMORY;
-
-#if !defined(CURL_DISABLE_VERBOSE_STRINGS)
-      infof(data, "schannel: InitializeSecurityContext failed: %s",
-            Curl_sspi_strerror(status, buffer, sizeof(buffer)));
-#endif
-
-      return CURLE_AUTH_ERROR;
-    }
-
-    output_token_len = resp_buf.cbBuffer;
-
-    s_pSecFn->FreeCredentialsHandle(&credentials);
-    Curl_sspi_free_identity(p_identity);
+    err = file2memory(&content, &clen, file);
+    /* in case of out of memory, this should fail the entire operation */
+    contalloc = TRUE;
+    if(!use_stdin)
+      fclose(file);
+    if(err)
+      return err;
   }
-
-  resp = malloc(output_token_len + 1);
-  if(!resp) {
-    free(output_token);
-
-    return CURLE_OUT_OF_MEMORY;
+  else if(*line == '=') {
+    line++;
+    /* this is the exact content */
+    content = (char *)line;
+    clen = strlen(line);
   }
-
-  /* Copy the generated response */
-  memcpy(resp, output_token, output_token_len);
-  resp[output_token_len] = 0;
-
-  /* Return the response */
-  *outptr = resp;
-  *outlen = output_token_len;
-
-  /* Free the response buffer */
-  free(output_token);
-
-  return CURLE_OK;
+  else {
+    warnf(global, "Bad --variable syntax, skipping: %s", input);
+    return PARAM_OK;
+  }
+  err = addvariable(global, name, nlen, content, clen, contalloc);
+  if(err) {
+    if(contalloc)
+      free(content);
+  }
+  return err;
 }
-
-/*
- * Curl_auth_digest_cleanup()
- *
- * This is used to clean up the digest specific data.
- *
- * Parameters:
- *
- * digest    [in/out] - The digest data struct being cleaned up.
- *
- */
-void Curl_auth_digest_cleanup(struct digestdata *digest)
-{
-  /* Free the input token */
-  Curl_safefree(digest->input_token);
-
-  /* Reset any variables */
-  digest->input_token_len = 0;
-
-  /* Delete security context */
-  if(digest->http_context) {
-    s_pSecFn->DeleteSecurityContext(digest->http_context);
-    Curl_safefree(digest->http_context);
-  }
-
-  /* Free the copy of user/passwd used to make the identity for http_context */
-  Curl_safefree(digest->user);
-  Curl_safefree(digest->passwd);
-}
-
-#endif /* USE_WINDOWS_SSPI && !CURL_DISABLE_DIGEST_AUTH */

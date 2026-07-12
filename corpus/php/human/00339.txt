@@ -10,162 +10,115 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Package\Dumper;
+namespace Composer\Installer;
 
-use Composer\Package\BasePackage;
 use Composer\Package\PackageInterface;
-use Composer\Package\CompletePackageInterface;
-use Composer\Package\RootPackageInterface;
+use Composer\Repository\InstalledRepositoryInterface;
+use InvalidArgumentException;
+use React\Promise\PromiseInterface;
 
 /**
- * @author Konstantin Kudryashiv <ever.zet@gmail.com>
+ * Interface for the package installation manager.
+ *
+ * @author Konstantin Kudryashov <ever.zet@gmail.com>
  * @author Jordi Boggiano <j.boggiano@seld.be>
  */
-class ArrayDumper
+interface InstallerInterface
 {
     /**
-     * @return array<string, mixed>
+     * Decides if the installer supports the given type
+     *
+     * @return bool
      */
-    public function dump(PackageInterface $package): array
-    {
-        $keys = [
-            'binaries' => 'bin',
-            'type',
-            'extra',
-            'installationSource' => 'installation-source',
-            'autoload',
-            'devAutoload' => 'autoload-dev',
-            'notificationUrl' => 'notification-url',
-            'includePaths' => 'include-path',
-        ];
-
-        $data = [];
-        $data['name'] = $package->getPrettyName();
-        $data['version'] = $package->getPrettyVersion();
-        $data['version_normalized'] = $package->getVersion();
-
-        if ($package->getTargetDir() !== null) {
-            $data['target-dir'] = $package->getTargetDir();
-        }
-
-        if ($package->getSourceType() !== null) {
-            $data['source']['type'] = $package->getSourceType();
-            $data['source']['url'] = $package->getSourceUrl();
-            if (null !== ($value = $package->getSourceReference())) {
-                $data['source']['reference'] = $value;
-            }
-            if ($mirrors = $package->getSourceMirrors()) {
-                $data['source']['mirrors'] = $mirrors;
-            }
-        }
-
-        if ($package->getDistType() !== null) {
-            $data['dist']['type'] = $package->getDistType();
-            $data['dist']['url'] = $package->getDistUrl();
-            if (null !== ($value = $package->getDistReference())) {
-                $data['dist']['reference'] = $value;
-            }
-            if (null !== ($value = $package->getDistSha1Checksum())) {
-                $data['dist']['shasum'] = $value;
-            }
-            if ($mirrors = $package->getDistMirrors()) {
-                $data['dist']['mirrors'] = $mirrors;
-            }
-        }
-
-        foreach (BasePackage::$supportedLinkTypes as $type => $opts) {
-            $links = $package->{'get'.ucfirst($opts['method'])}();
-            if (\count($links) === 0) {
-                continue;
-            }
-            foreach ($links as $link) {
-                $data[$type][$link->getTarget()] = $link->getPrettyConstraint();
-            }
-            ksort($data[$type]);
-        }
-
-        $packages = $package->getSuggests();
-        if (\count($packages) > 0) {
-            ksort($packages);
-            $data['suggest'] = $packages;
-        }
-
-        if ($package->getReleaseDate() instanceof \DateTimeInterface) {
-            $data['time'] = $package->getReleaseDate()->format(DATE_RFC3339);
-        }
-
-        if ($package->isDefaultBranch()) {
-            $data['default-branch'] = true;
-        }
-
-        $data = $this->dumpValues($package, $keys, $data);
-
-        if ($package instanceof CompletePackageInterface) {
-            if ($package->getArchiveName()) {
-                $data['archive']['name'] = $package->getArchiveName();
-            }
-            if ($package->getArchiveExcludes()) {
-                $data['archive']['exclude'] = $package->getArchiveExcludes();
-            }
-
-            $keys = [
-                'scripts',
-                'license',
-                'authors',
-                'description',
-                'homepage',
-                'keywords',
-                'repositories',
-                'support',
-                'funding',
-            ];
-
-            $data = $this->dumpValues($package, $keys, $data);
-
-            if (isset($data['keywords']) && \is_array($data['keywords'])) {
-                sort($data['keywords']);
-            }
-
-            if ($package->isAbandoned()) {
-                $data['abandoned'] = $package->getReplacementPackage() ?: true;
-            }
-        }
-
-        if ($package instanceof RootPackageInterface) {
-            $minimumStability = $package->getMinimumStability();
-            if ($minimumStability !== '') {
-                $data['minimum-stability'] = $minimumStability;
-            }
-        }
-
-        if (\count($package->getTransportOptions()) > 0) {
-            $data['transport-options'] = $package->getTransportOptions();
-        }
-
-        return $data;
-    }
+    public function supports(string $packageType);
 
     /**
-     * @param array<int|string, string> $keys
-     * @param array<string, mixed>      $data
+     * Checks that provided package is installed.
      *
-     * @return array<string, mixed>
+     * @param InstalledRepositoryInterface $repo    repository in which to check
+     * @param PackageInterface             $package package instance
+     *
+     * @return bool
      */
-    private function dumpValues(PackageInterface $package, array $keys, array $data): array
-    {
-        foreach ($keys as $method => $key) {
-            if (is_numeric($method)) {
-                $method = $key;
-            }
+    public function isInstalled(InstalledRepositoryInterface $repo, PackageInterface $package);
 
-            $getter = 'get'.ucfirst($method);
-            $value = $package->{$getter}();
+    /**
+     * Downloads the files needed to later install the given package.
+     *
+     * @param  PackageInterface      $package     package instance
+     * @param  PackageInterface      $prevPackage previous package instance in case of an update
+     * @return PromiseInterface|null
+     * @phpstan-return PromiseInterface<void|null>|null
+     */
+    public function download(PackageInterface $package, ?PackageInterface $prevPackage = null);
 
-            if (null !== $value && !(\is_array($value) && 0 === \count($value))) {
-                $data[$key] = $value;
-            }
-        }
+    /**
+     * Do anything that needs to be done between all downloads have been completed and the actual operation is executed
+     *
+     * All packages get first downloaded, then all together prepared, then all together installed/updated/uninstalled. Therefore
+     * for error recovery it is important to avoid failing during install/update/uninstall as much as possible, and risky things or
+     * user prompts should happen in the prepare step rather. In case of failure, cleanup() will be called so that changes can
+     * be undone as much as possible.
+     *
+     * @param  string                $type        one of install/update/uninstall
+     * @param  PackageInterface      $package     package instance
+     * @param  PackageInterface      $prevPackage previous package instance in case of an update
+     * @return PromiseInterface|null
+     * @phpstan-return PromiseInterface<void|null>|null
+     */
+    public function prepare(string $type, PackageInterface $package, ?PackageInterface $prevPackage = null);
 
-        return $data;
-    }
+    /**
+     * Installs specific package.
+     *
+     * @param  InstalledRepositoryInterface $repo    repository in which to check
+     * @param  PackageInterface             $package package instance
+     * @return PromiseInterface|null
+     * @phpstan-return PromiseInterface<void|null>|null
+     */
+    public function install(InstalledRepositoryInterface $repo, PackageInterface $package);
+
+    /**
+     * Updates specific package.
+     *
+     * @param  InstalledRepositoryInterface $repo    repository in which to check
+     * @param  PackageInterface             $initial already installed package version
+     * @param  PackageInterface             $target  updated version
+     * @throws InvalidArgumentException     if $initial package is not installed
+     * @return PromiseInterface|null
+     * @phpstan-return PromiseInterface<void|null>|null
+     */
+    public function update(InstalledRepositoryInterface $repo, PackageInterface $initial, PackageInterface $target);
+
+    /**
+     * Uninstalls specific package.
+     *
+     * @param  InstalledRepositoryInterface $repo    repository in which to check
+     * @param  PackageInterface             $package package instance
+     * @return PromiseInterface|null
+     * @phpstan-return PromiseInterface<void|null>|null
+     */
+    public function uninstall(InstalledRepositoryInterface $repo, PackageInterface $package);
+
+    /**
+     * Do anything to cleanup changes applied in the prepare or install/update/uninstall steps
+     *
+     * Note that cleanup will be called for all packages regardless if they failed an operation or not, to give
+     * all installers a change to cleanup things they did previously, so you need to keep track of changes
+     * applied in the installer/downloader themselves.
+     *
+     * @param  string                $type        one of install/update/uninstall
+     * @param  PackageInterface      $package     package instance
+     * @param  PackageInterface      $prevPackage previous package instance in case of an update
+     * @return PromiseInterface|null
+     * @phpstan-return PromiseInterface<void|null>|null
+     */
+    public function cleanup(string $type, PackageInterface $package, ?PackageInterface $prevPackage = null);
+
+    /**
+     * Returns the absolute installation path of a package.
+     *
+     * @return string|null absolute path to install to, which MUST not end with a slash, or null if the package does not have anything installed on disk
+     */
+    public function getInstallPath(PackageInterface $package);
 }

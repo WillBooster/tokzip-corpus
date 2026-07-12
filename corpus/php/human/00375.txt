@@ -10,267 +10,312 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Repository;
+namespace Composer;
 
-use Composer\Package\BasePackage;
-use Composer\Package\PackageInterface;
-use Composer\Package\Version\VersionParser;
-use Composer\Semver\Constraint\ConstraintInterface;
-use Composer\Semver\Constraint\Constraint;
-use Composer\Semver\Constraint\MatchAllConstraint;
-use Composer\Package\RootPackageInterface;
-use Composer\Package\Link;
+use Composer\Json\JsonFile;
+use Composer\CaBundle\CaBundle;
+use Composer\Pcre\Preg;
+use Symfony\Component\Finder\Finder;
+use Symfony\Component\Process\Process;
+use Seld\PharUtils\Timestamps;
+use Seld\PharUtils\Linter;
 
 /**
- * Installed repository is a composite of all installed repo types.
+ * The Compiler class compiles composer into a phar
  *
- * The main use case is tagging a repo as an "installed" repository, and offering a way to get providers/replacers easily.
- *
- * Installed repos are LockArrayRepository, InstalledRepositoryInterface, RootPackageRepository and PlatformRepository
- *
+ * @author Fabien Potencier <fabien@symfony.com>
  * @author Jordi Boggiano <j.boggiano@seld.be>
  */
-class InstalledRepository extends CompositeRepository
+class Compiler
 {
-    /**
-     * @param ConstraintInterface|string|null $constraint
-     *
-     * @return BasePackage[]
-     */
-    public function findPackagesWithReplacersAndProviders(string $name, $constraint = null): array
-    {
-        $name = strtolower($name);
+    /** @var string */
+    private $version;
+    /** @var string */
+    private $branchAliasVersion = '';
+    /** @var \DateTime */
+    private $versionDate;
 
-        if (null !== $constraint && !$constraint instanceof ConstraintInterface) {
-            $versionParser = new VersionParser();
-            $constraint = $versionParser->parseConstraints($constraint);
+    /**
+     * Compiles composer into a single phar file
+     *
+     * @param string $pharFile The full path to the file to create
+     *
+     * @throws \RuntimeException
+     */
+    public function compile(string $pharFile = 'composer.phar'): void
+    {
+        if (file_exists($pharFile)) {
+            unlink($pharFile);
         }
 
-        $matches = [];
-        foreach ($this->getRepositories() as $repo) {
-            foreach ($repo->getPackages() as $candidate) {
-                if ($name === $candidate->getName()) {
-                    if (null === $constraint || $constraint->matches(new Constraint('==', $candidate->getVersion()))) {
-                        $matches[] = $candidate;
-                    }
-                    continue;
-                }
+        $process = new Process(['git', 'log', '--pretty=%H', '-n1', 'HEAD'], __DIR__);
+        if ($process->run() !== 0) {
+            throw new \RuntimeException('Can\'t run git log. You must ensure to run compile from composer git repository clone and that git binary is available.');
+        }
+        $this->version = trim($process->getOutput());
 
-                foreach (array_merge($candidate->getProvides(), $candidate->getReplaces()) as $link) {
-                    if (
-                        $name === $link->getTarget()
-                        && ($constraint === null || $constraint->matches($link->getConstraint()))
-                    ) {
-                        $matches[] = $candidate;
-                        continue 2;
-                    }
-                }
+        $process = new Process(['git', 'log', '-n1', '--pretty=%ci', 'HEAD'], __DIR__);
+        if ($process->run() !== 0) {
+            throw new \RuntimeException('Can\'t run git log. You must ensure to run compile from composer git repository clone and that git binary is available.');
+        }
+
+        $this->versionDate = new \DateTime(trim($process->getOutput()));
+        $this->versionDate->setTimezone(new \DateTimeZone('UTC'));
+
+        $process = new Process(['git', 'describe', '--tags', '--exact-match', 'HEAD'], __DIR__);
+        if ($process->run() === 0) {
+            $this->version = trim($process->getOutput());
+        } else {
+            // get branch-alias defined in composer.json for dev-main (if any)
+            $localConfig = __DIR__.'/../../composer.json';
+            $file = new JsonFile($localConfig);
+            $localConfig = $file->read();
+            if (isset($localConfig['extra']['branch-alias']['dev-main'])) {
+                $this->branchAliasVersion = $localConfig['extra']['branch-alias']['dev-main'];
             }
         }
 
-        return $matches;
+        $phar = new \Phar($pharFile, 0, 'composer.phar');
+        $phar->setSignatureAlgorithm(\Phar::SHA512);
+
+        $phar->startBuffering();
+
+        $finderSort = static function ($a, $b): int {
+            return strcmp(strtr($a->getRealPath(), '\\', '/'), strtr($b->getRealPath(), '\\', '/'));
+        };
+
+        // Add Composer sources
+        $finder = new Finder();
+        $finder->files()
+            ->ignoreVCS(true)
+            ->name('*.php')
+            ->notName('Compiler.php')
+            ->notName('ClassLoader.php')
+            ->notName('InstalledVersions.php')
+            ->in(__DIR__.'/..')
+            ->sort($finderSort)
+        ;
+        foreach ($finder as $file) {
+            $this->addFile($phar, $file);
+        }
+        // Add runtime utilities separately to make sure they retains the docblocks as these will get copied into projects
+        $this->addFile($phar, new \SplFileInfo(__DIR__ . '/Autoload/ClassLoader.php'), false);
+        $this->addFile($phar, new \SplFileInfo(__DIR__ . '/InstalledVersions.php'), false);
+
+        // Add Composer resources
+        $finder = new Finder();
+        $finder->files()
+            ->in(__DIR__.'/../../res')
+            ->sort($finderSort)
+        ;
+        foreach ($finder as $file) {
+            $this->addFile($phar, $file, false);
+        }
+
+        // Add vendor files
+        $finder = new Finder();
+        $finder->files()
+            ->ignoreVCS(true)
+            ->notPath('/\/(composer\.(json|lock)|[A-Z]+\.md(?:own)?|\.gitignore|appveyor.yml|phpunit\.xml\.dist|phpstan\.neon\.dist|phpstan-config\.neon|phpstan-baseline\.neon)$/')
+            ->notPath('/bin\/(jsonlint|validate-json|simple-phpunit|phpstan|phpstan\.phar)(\.bat)?$/')
+            ->notPath('justinrainbow/json-schema/demo/')
+            ->notPath('justinrainbow/json-schema/dist/')
+            ->notPath('composer/LICENSE')
+            ->exclude('Tests')
+            ->exclude('tests')
+            ->exclude('docs')
+            ->in(__DIR__.'/../../vendor/')
+            ->sort($finderSort)
+        ;
+
+        $extraFiles = [];
+        foreach ([
+            __DIR__ . '/../../vendor/composer/installed.json',
+            __DIR__ . '/../../vendor/composer/spdx-licenses/res/spdx-exceptions.json',
+            __DIR__ . '/../../vendor/composer/spdx-licenses/res/spdx-licenses.json',
+            CaBundle::getBundledCaBundlePath(),
+            __DIR__ . '/../../vendor/symfony/console/Resources/bin/hiddeninput.exe',
+            __DIR__ . '/../../vendor/symfony/console/Resources/completion.bash',
+        ] as $file) {
+            $extraFiles[$file] = realpath($file);
+            if (!file_exists($file)) {
+                throw new \RuntimeException('Extra file listed is missing from the filesystem: '.$file);
+            }
+        }
+        $unexpectedFiles = [];
+
+        foreach ($finder as $file) {
+            if (false !== ($index = array_search($file->getRealPath(), $extraFiles, true))) {
+                unset($extraFiles[$index]);
+            } elseif (!Preg::isMatch('{(^LICENSE$|\.php$)}', $file->getFilename())) {
+                $unexpectedFiles[] = (string) $file;
+            }
+
+            if (Preg::isMatch('{\.php[\d.]*$}', $file->getFilename())) {
+                $this->addFile($phar, $file);
+            } else {
+                $this->addFile($phar, $file, false);
+            }
+        }
+
+        if (count($extraFiles) > 0) {
+            throw new \RuntimeException('These files were expected but not added to the phar, they might be excluded or gone from the source package:'.PHP_EOL.var_export($extraFiles, true));
+        }
+        if (count($unexpectedFiles) > 0) {
+            throw new \RuntimeException('These files were unexpectedly added to the phar, make sure they are excluded or listed in $extraFiles:'.PHP_EOL.var_export($unexpectedFiles, true));
+        }
+
+        // Add bin/composer
+        $this->addComposerBin($phar);
+
+        // Stubs
+        $phar->setStub($this->getStub());
+
+        $phar->stopBuffering();
+
+        // disabled for interoperability with systems without gzip ext
+        // $phar->compressFiles(\Phar::GZ);
+
+        $this->addFile($phar, new \SplFileInfo(__DIR__.'/../../LICENSE'), false);
+
+        unset($phar);
+
+        // re-sign the phar with reproducible timestamp / signature
+        $util = new Timestamps($pharFile);
+        $util->updateTimestamps($this->versionDate);
+        $util->save($pharFile, \Phar::SHA512);
+
+        Linter::lint($pharFile, [
+            'vendor/symfony/console/Attribute/AsCommand.php',
+            'vendor/symfony/polyfill-intl-grapheme/bootstrap80.php',
+            'vendor/symfony/polyfill-intl-normalizer/bootstrap80.php',
+            'vendor/symfony/polyfill-mbstring/bootstrap80.php',
+            'vendor/symfony/polyfill-php73/Resources/stubs/JsonException.php',
+            'vendor/symfony/service-contracts/Attribute/SubscribedService.php',
+        ]);
+    }
+
+    private function getRelativeFilePath(\SplFileInfo $file): string
+    {
+        $realPath = $file->getRealPath();
+        $pathPrefix = dirname(__DIR__, 2).DIRECTORY_SEPARATOR;
+
+        $pos = strpos($realPath, $pathPrefix);
+        $relativePath = ($pos !== false) ? substr_replace($realPath, '', $pos, strlen($pathPrefix)) : $realPath;
+
+        return strtr($relativePath, '\\', '/');
+    }
+
+    private function addFile(\Phar $phar, \SplFileInfo $file, bool $strip = true): void
+    {
+        $path = $this->getRelativeFilePath($file);
+        $content = file_get_contents((string) $file);
+        if ($strip) {
+            $content = $this->stripWhitespace($content);
+        } elseif ('LICENSE' === $file->getFilename()) {
+            $content = "\n".$content."\n";
+        }
+
+        if ($path === 'src/Composer/Composer.php') {
+            $content = strtr(
+                $content,
+                [
+                    '@package_version@' => $this->version,
+                    '@package_branch_alias_version@' => $this->branchAliasVersion,
+                    '@release_date@' => $this->versionDate->format('Y-m-d H:i:s'),
+                ]
+            );
+            $content = Preg::replace('{SOURCE_VERSION = \'[^\']+\';}', 'SOURCE_VERSION = \'\';', $content);
+        }
+
+        $phar->addFromString($path, $content);
+    }
+
+    private function addComposerBin(\Phar $phar): void
+    {
+        $content = file_get_contents(__DIR__.'/../../bin/composer');
+        $content = Preg::replace('{^#!/usr/bin/env php\s*}', '', $content);
+        $phar->addFromString('bin/composer', $content);
     }
 
     /**
-     * Returns a list of links causing the requested needle packages to be installed, as an associative array with the
-     * dependent's name as key, and an array containing in order the PackageInterface and Link describing the relationship
-     * as values. If recursive lookup was requested a third value is returned containing an identically formed array up
-     * to the root package. That third value will be false in case a circular recursion was detected.
+     * Removes whitespace from a PHP source string while preserving line numbers.
      *
-     * @param  string|string[]          $needle        The package name(s) to inspect.
-     * @param  ConstraintInterface|null $constraint    Optional constraint to filter by.
-     * @param  bool                     $invert        Whether to invert matches to discover reasons for the package *NOT* to be installed.
-     * @param  bool                     $recurse       Whether to recursively expand the requirement tree up to the root package.
-     * @param  string[]                 $packagesFound Used internally when recurring
-     *
-     * @return array[] An associative array of arrays as described above.
-     * @phpstan-return array<array{0: PackageInterface, 1: Link, 2: mixed[]|bool}>
+     * @param  string $source A PHP string
+     * @return string The PHP string with the whitespace removed
      */
-    public function getDependents($needle, ?ConstraintInterface $constraint = null, bool $invert = false, bool $recurse = true, ?array $packagesFound = null): array
+    private function stripWhitespace(string $source): string
     {
-        $needles = array_map('strtolower', (array) $needle);
-        $results = [];
-
-        // initialize the array with the needles before any recursion occurs
-        if (null === $packagesFound) {
-            $packagesFound = $needles;
+        if (!function_exists('token_get_all')) {
+            return $source;
         }
 
-        // locate root package for use below
-        $rootPackage = null;
-        foreach ($this->getPackages() as $package) {
-            if ($package instanceof RootPackageInterface) {
-                $rootPackage = $package;
-                break;
-            }
-        }
-
-        // Loop over all currently installed packages.
-        foreach ($this->getPackages() as $package) {
-            $links = $package->getRequires();
-
-            // each loop needs its own "tree" as we want to show the complete dependent set of every needle
-            // without warning all the time about finding circular deps
-            $packagesInTree = $packagesFound;
-
-            // Replacements are considered valid reasons for a package to be installed during forward resolution
-            if (!$invert) {
-                $links += $package->getReplaces();
-
-                // On forward search, check if any replaced package was required and add the replaced
-                // packages to the list of needles. Contrary to the cross-reference link check below,
-                // replaced packages are the target of links.
-                foreach ($package->getReplaces() as $link) {
-                    foreach ($needles as $needle) {
-                        if ($link->getSource() === $needle) {
-                            if ($constraint === null || ($link->getConstraint()->matches($constraint) === true)) {
-                                // already displayed this node's dependencies, cutting short
-                                if (in_array($link->getTarget(), $packagesInTree)) {
-                                    $results[] = [$package, $link, false];
-                                    continue;
-                                }
-                                $packagesInTree[] = $link->getTarget();
-                                $dependents = $recurse ? $this->getDependents($link->getTarget(), null, false, true, $packagesInTree) : [];
-                                $results[] = [$package, $link, $dependents];
-                                $needles[] = $link->getTarget();
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Require-dev is only relevant for the root package
-            if ($package instanceof RootPackageInterface) {
-                $links += $package->getDevRequires();
-            }
-
-            // Cross-reference all discovered links to the needles
-            foreach ($links as $link) {
-                foreach ($needles as $needle) {
-                    if ($link->getTarget() === $needle) {
-                        if ($constraint === null || ($link->getConstraint()->matches($constraint) === !$invert)) {
-                            // already displayed this node's dependencies, cutting short
-                            if (in_array($link->getSource(), $packagesInTree)) {
-                                $results[] = [$package, $link, false];
-                                continue;
-                            }
-                            $packagesInTree[] = $link->getSource();
-                            $dependents = $recurse ? $this->getDependents($link->getSource(), null, false, true, $packagesInTree) : [];
-                            $results[] = [$package, $link, $dependents];
-                        }
-                    }
-                }
-            }
-
-            // When inverting, we need to check for conflicts of the needles against installed packages
-            if ($invert && in_array($package->getName(), $needles)) {
-                foreach ($package->getConflicts() as $link) {
-                    foreach ($this->findPackages($link->getTarget()) as $pkg) {
-                        $version = new Constraint('=', $pkg->getVersion());
-                        if ($link->getConstraint()->matches($version) === $invert) {
-                            $results[] = [$package, $link, false];
-                        }
-                    }
-                }
-            }
-
-            // List conflicts against X as they may explain why the current version was selected, or explain why it is rejected if the conflict matched when inverting
-            foreach ($package->getConflicts() as $link) {
-                if (in_array($link->getTarget(), $needles)) {
-                    foreach ($this->findPackages($link->getTarget()) as $pkg) {
-                        $version = new Constraint('=', $pkg->getVersion());
-                        if ($link->getConstraint()->matches($version) === $invert) {
-                            $results[] = [$package, $link, false];
-                        }
-                    }
-                }
-            }
-
-            // When inverting, we need to check for conflicts of the needles' requirements against installed packages
-            if ($invert && $constraint && in_array($package->getName(), $needles) && $constraint->matches(new Constraint('=', $package->getVersion()))) {
-                foreach ($package->getRequires() as $link) {
-                    if (PlatformRepository::isPlatformPackage($link->getTarget())) {
-                        if ($this->findPackage($link->getTarget(), $link->getConstraint())) {
-                            continue;
-                        }
-
-                        $platformPkg = $this->findPackage($link->getTarget(), '*');
-                        $description = $platformPkg ? 'but '.$platformPkg->getPrettyVersion().' is installed' : 'but it is missing';
-                        $results[] = [$package, new Link($package->getName(), $link->getTarget(), new MatchAllConstraint, Link::TYPE_REQUIRE, $link->getPrettyConstraint().' '.$description), false];
-
-                        continue;
-                    }
-
-                    foreach ($this->getPackages() as $pkg) {
-                        if (!in_array($link->getTarget(), $pkg->getNames())) {
-                            continue;
-                        }
-
-                        $version = new Constraint('=', $pkg->getVersion());
-
-                        if ($link->getTarget() !== $pkg->getName()) {
-                            foreach (array_merge($pkg->getReplaces(), $pkg->getProvides()) as $prov) {
-                                if ($link->getTarget() === $prov->getTarget()) {
-                                    $version = $prov->getConstraint();
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (!$link->getConstraint()->matches($version)) {
-                            // if we have a root package (we should but can not guarantee..) we show
-                            // the root requires as well to perhaps allow to find an issue there
-                            if ($rootPackage) {
-                                foreach (array_merge($rootPackage->getRequires(), $rootPackage->getDevRequires()) as $rootReq) {
-                                    if (in_array($rootReq->getTarget(), $pkg->getNames()) && !$rootReq->getConstraint()->matches($link->getConstraint())) {
-                                        $results[] = [$package, $link, false];
-                                        $results[] = [$rootPackage, $rootReq, false];
-                                        continue 3;
-                                    }
-                                }
-
-                                $results[] = [$package, $link, false];
-                                $results[] = [$rootPackage, new Link($rootPackage->getName(), $link->getTarget(), new MatchAllConstraint, Link::TYPE_DOES_NOT_REQUIRE, 'but ' . $pkg->getPrettyVersion() . ' is installed'), false];
-                            } else {
-                                // no root so let's just print whatever we found
-                                $results[] = [$package, $link, false];
-                            }
-                        }
-
-                        continue 2;
-                    }
-                }
+        $output = '';
+        foreach (token_get_all($source) as $token) {
+            if (is_string($token)) {
+                $output .= $token;
+            } elseif (in_array($token[0], [T_COMMENT, T_DOC_COMMENT])) {
+                $output .= str_repeat("\n", substr_count($token[1], "\n"));
+            } elseif (T_WHITESPACE === $token[0]) {
+                // reduce wide spaces
+                $whitespace = Preg::replace('{[ \t]+}', ' ', $token[1]);
+                // normalize newlines to \n
+                $whitespace = Preg::replace('{(?:\r\n|\r|\n)}', "\n", $whitespace);
+                // trim leading spaces
+                $whitespace = Preg::replace('{\n +}', "\n", $whitespace);
+                $output .= $whitespace;
+            } else {
+                $output .= $token[1];
             }
         }
 
-        ksort($results);
-
-        return $results;
+        return $output;
     }
 
-    public function getRepoName(): string
+    private function getStub(): string
     {
-        return 'installed repo ('.implode(', ', array_map(static function ($repo): string {
-            return $repo->getRepoName();
-        }, $this->getRepositories())).')';
+        $stub = <<<'EOF'
+#!/usr/bin/env php
+<?php
+/*
+ * This file is part of Composer.
+ *
+ * (c) Nils Adermann <naderman@naderman.de>
+ *     Jordi Boggiano <j.boggiano@seld.be>
+ *
+ * For the full copyright and license information, please view
+ * the license that is located at the bottom of this file.
+ */
+
+// Avoid APC causing random fatal errors per https://github.com/composer/composer/issues/264
+if (extension_loaded('apc') && filter_var(ini_get('apc.enable_cli'), FILTER_VALIDATE_BOOLEAN) && filter_var(ini_get('apc.cache_by_default'), FILTER_VALIDATE_BOOLEAN)) {
+    if (version_compare(phpversion('apc'), '3.0.12', '>=')) {
+        ini_set('apc.cache_by_default', 0);
+    } else {
+        fwrite(STDERR, 'Warning: APC <= 3.0.12 may cause fatal errors when running composer commands.'.PHP_EOL);
+        fwrite(STDERR, 'Update APC, or set apc.enable_cli or apc.cache_by_default to 0 in your php.ini.'.PHP_EOL);
     }
+}
 
-    /**
-     * @inheritDoc
-     */
-    public function addRepository(RepositoryInterface $repository): void
-    {
-        if (
-            $repository instanceof LockArrayRepository
-            || $repository instanceof InstalledRepositoryInterface
-            || $repository instanceof RootPackageRepository
-            || $repository instanceof PlatformRepository
-        ) {
-            parent::addRepository($repository);
+if (!class_exists('Phar')) {
+    echo 'PHP\'s phar extension is missing. Composer requires it to run. Enable the extension or recompile php without --disable-phar then try again.' . PHP_EOL;
+    exit(1);
+}
 
-            return;
+Phar::mapPhar('composer.phar');
+
+EOF;
+
+        // add warning once the phar is older than 60 days
+        if (Preg::isMatch('{^[a-f0-9]+$}', $this->version)) {
+            $warningTime = ((int) $this->versionDate->format('U')) + 60 * 86400;
+            $stub .= "define('COMPOSER_DEV_WARNING_TIME', $warningTime);\n";
         }
 
-        throw new \LogicException('An InstalledRepository can not contain a repository of type '.get_class($repository).' ('.$repository->getRepoName().')');
+        return $stub . <<<'EOF'
+require 'phar://composer.phar/bin/composer';
+
+__HALT_COMPILER();
+EOF;
     }
 }

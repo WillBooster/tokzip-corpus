@@ -1,112 +1,150 @@
-;(function(window) {
-  'use strict';
+'use strict';
 
-  /** The base path of the lodash builds. */
-  var basePath = '../';
+const _ = require('lodash');
+const async = require('async');
+const glob = require('glob');
+const path = require('path');
 
-  /** The lodash build to load. */
-  var build = (build = /build=([^&]+)/.exec(location.search)) && decodeURIComponent(build[1]);
+const file = require('../common/file');
+const mapping = require('../common/mapping');
+const util = require('../common/util');
 
-  /** The other library to load. */
-  var other = (other = /other=([^&]+)/.exec(location.search)) && decodeURIComponent(other[1]);
+const templatePath = path.join(__dirname, 'template/modules');
+const template = file.globTemplate(path.join(templatePath, '*.jst'));
 
-  /** The `ui` object. */
-  var ui = {};
+const aryMethods = _.union(
+  mapping.aryMethod[1],
+  mapping.aryMethod[2],
+  mapping.aryMethod[3],
+  mapping.aryMethod[4]
+);
 
-  /*--------------------------------------------------------------------------*/
+const categories = [
+  'array',
+  'collection',
+  'date',
+  'function',
+  'lang',
+  'math',
+  'number',
+  'object',
+  'seq',
+  'string',
+  'util'
+];
 
-  // Initialize controls.
-  addEventListener('load', function() {
-    function eventHandler(event) {
-      var buildIndex = buildList.selectedIndex,
-          otherIndex = otherList.selectedIndex,
-          search = location.search.replace(/^\?|&?(?:build|other)=[^&]*&?/g, '');
+const ignored = [
+  '_*.js',
+  'core.js',
+  'core.min.js',
+  'fp.js',
+  'index.js',
+  'lodash.js',
+  'lodash.min.js'
+];
 
-      if (event.stopPropagation) {
-        event.stopPropagation();
-      } else {
-        event.cancelBubble = true;
-      }
-      location.href =
-        location.href.split('?')[0] + '?' +
-        (search ? search + '&' : '') +
-        'build=' + (buildIndex < 0 ? build : buildList[buildIndex].value) + '&' +
-        'other=' + (otherIndex < 0 ? other : otherList[otherIndex].value);
-    }
+/**
+ * Checks if `name` is a method alias.
+ *
+ * @private
+ * @param {string} name The name to check.
+ * @returns {boolean} Returns `true` if `name` is a method alias, else `false`.
+ */
+function isAlias(name) {
+  return _.has(mapping.aliasToReal, name);
+}
 
-    var span1 = document.createElement('span');
-    span1.style.cssText = 'float:right';
-    span1.innerHTML =
-      '<label for="perf-build">Build: </label>' +
-      '<select id="perf-build">' +
-      '<option value="lodash">lodash (production)</option>' +
-      '</select>';
+/**
+ * Checks if `name` is a category name.
+ *
+ * @private
+ * @param {string} name The name to check.
+ * @returns {boolean} Returns `true` if `name` is a category name, else `false`.
+ */
+function isCategory(name) {
+  return _.includes(categories, name);
+}
 
-    var span2 = document.createElement('span');
-    span2.style.cssText = 'float:right';
-    span2.innerHTML =
-      '<label for="perf-other">Other Library: </label>' +
-      '<select id="perf-other">' +
-      '<option value="underscore-dev">Underscore (development)</option>' +
-      '<option value="underscore">Underscore (production)</option>' +
-      '<option value="lodash">lodash</option>' +
-      '</select>';
+/**
+ * Checks if `name` belongs to a method that's passed thru and not wrapped.
+ *
+ * @private
+ * @param {string} name The name to check.
+ * @returns {boolean} Returns `true` if `name` is of a pass thru method,
+ *  else `false`.
+ */
+function isThru(name) {
+  return !_.includes(aryMethods, name);
+}
 
-    var buildList = span1.lastChild,
-        otherList = span2.lastChild,
-        toolbar = document.getElementById('perf-toolbar');
+/**
+ * Gets metadata for `func`.
+ *
+ * @private
+ * @param {Function} func The function to query.
+ * @returns {*} Returns the metadata for `func`.
+ */
+function getTemplate(moduleName) {
+  const data = {
+    'name': _.get(mapping.aliasToReal, moduleName, moduleName),
+    'mapping': mapping
+  };
 
-    toolbar.appendChild(span2);
-    toolbar.appendChild(span1);
+  if (isAlias(moduleName)) {
+    return template.alias(data);
+  }
+  if (isCategory(moduleName)) {
+    return template.category(data);
+  }
+  if (isThru(moduleName)) {
+    return template.thru(data);
+  }
+  return template.module(data);
+}
 
-    buildList.selectedIndex = (function() {
-      switch (build) {
-        case 'lodash':
-        case null:                return 0;
-      }
-      return -1;
-    }());
+/*----------------------------------------------------------------------------*/
 
-    otherList.selectedIndex = (function() {
-      switch (other) {
-        case 'underscore-dev':    return 0;
-        case 'lodash':            return 2;
-        case 'underscore':
-        case null:                return 1;
-      }
-      return -1;
-    }());
+/**
+ * Creates FP modules at the `target` path.
+ *
+ * @private
+ * @param {string} target The output directory path.
+ */
+function build(target) {
+  target = path.resolve(target);
 
-    buildList.addEventListener('change', eventHandler);
-    otherList.addEventListener('change', eventHandler);
+  const fpPath = path.join(target, 'fp');
+
+  // Glob existing lodash module paths.
+  const modulePaths = glob.sync(path.join(target, '*.js'), {
+    'nodir': true,
+    'ignore': ignored.map(filename => {
+      return path.join(target, filename);
+    })
   });
 
-  // The lodash build file path.
-  ui.buildPath = (function() {
-    var result;
-    switch (build) {
-      case null:                build  = 'lodash';
-      case 'lodash':            result = 'dist/lodash.min.js'; break;
-      default:                  return build;
-    }
-    return basePath + result;
-  }());
+  // Add FP alias and remapped module paths.
+  _.each([mapping.aliasToReal, mapping.remap], data => {
+    _.forOwn(data, (realName, alias) => {
+      const modulePath = path.join(target, alias + '.js');
+      if (!_.includes(modulePaths, modulePath)) {
+        modulePaths.push(modulePath);
+      }
+    });
+  });
 
-  // The other library file path.
-  ui.otherPath = (function() {
-    var result;
-    switch (other) {
-      case 'lodash':            result = 'dist/lodash.min.js'; break;
-      case 'underscore-dev':    result = 'vendor/underscore/underscore.js'; break;
-      case null:                other  = 'underscore';
-      case 'underscore':        result = 'vendor/underscore/underscore-min.js'; break;
-      default:                  return other;
-    }
-    return basePath + result;
-  }());
+  const actions = modulePaths.map(modulePath => {
+    const moduleName = path.basename(modulePath, '.js');
+    return file.write(path.join(fpPath, moduleName + '.js'), getTemplate(moduleName));
+  });
 
-  ui.urlParams = { 'build': build, 'other': other };
+  actions.unshift(file.copy(path.join(__dirname, '../../fp'), fpPath));
+  actions.push(file.write(path.join(fpPath, '_falseOptions.js'), template._falseOptions()));
+  actions.push(file.write(path.join(fpPath, '_util.js'), template._util()));
+  actions.push(file.write(path.join(target, 'fp.js'), template.fp()));
+  actions.push(file.write(path.join(fpPath, 'convert.js'), template.convert()));
 
-  window.ui = ui;
+  async.series(actions, util.pitch);
+}
 
-}(this));
+build(_.last(process.argv));

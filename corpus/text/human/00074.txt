@@ -1,70 +1,105 @@
----
-c: Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
-SPDX-License-Identifier: curl
-Title: CURLOPT_TIMEVALUE_LARGE
-Section: 3
-Source: libcurl
-See-also:
-  - CURLINFO_FILETIME (3)
-  - CURLOPT_TIMECONDITION (3)
-  - CURLOPT_TIMEVALUE (3)
-Protocol:
-  - HTTP
-Added-in: 7.59.0
----
+Caching
+=======
 
-# NAME
+OkHttp implements an optional, off by default, Cache. OkHttp aims for RFC correct and
+pragmatic caching behaviour, following common real-world browser like Firefox/Chrome and 
+server behaviour when ambiguous.
 
-CURLOPT_TIMEVALUE_LARGE - time value for conditional
+# Basic Usage
 
-# SYNOPSIS
+```Kotlin tab=
+  private val client: OkHttpClient = OkHttpClient.Builder()
+      .cache(Cache(
+          directory = File(application.cacheDir, "http_cache"),
+          // $0.05 worth of phone storage in 2020
+          maxSize = 50L * 1024L * 1024L // 50 MiB
+      ))
+      .build()
+```
 
-~~~c
-#include <curl/curl.h>
+## EventListener events 
 
-CURLcode curl_easy_setopt(CURL *handle, CURLOPT_TIMEVALUE_LARGE,
-                          curl_off_t val);
-~~~
+Cache Events are exposed via the EventListener API.  Typical scenarios are below.
 
-# DESCRIPTION
+### Cache Hit
 
-Pass a curl_off_t *val* as parameter. This should be the time counted as
-seconds since 1 Jan 1970, and the time is used in a condition as specified
-with CURLOPT_TIMECONDITION(3).
+In the ideal scenario the cache can fulfill the request without any conditional call to the network.
+This will skip the normal events such as DNS, connecting to the network, and downloading the response body.
 
-The difference between this option and CURLOPT_TIMEVALUE(3) is the type of the
-argument. On systems where 'long' is only 32 bits wide, this option has to be
-used to set dates beyond the year 2038.
+As recommended by the HTTP RFC the max age of a document is defaulted to 10% of the 
+document's age at the time it was served based on "Last-Modified". Default expiration dates aren't used for URIs 
+containing a query.
 
-# DEFAULT
+ - CallStart
+ - **CacheHit**
+ - CallEnd
+ 
+### Cache Miss
 
-0
+Under a cache miss the normal request events are seen but an additional event shows the presence of the cache.
+Cache Miss will be typical if the item has not been read from the network, is uncacheable, or is past it's 
+lifetime based on Response cache headers.
 
-# %PROTOCOLS%
+ - CallStart 
+ - **CacheMiss**
+ - ProxySelectStart
+ - ... Standard Events ...
+ - CallEnd
+        
+### Conditional Cache Hit
+ 
+When cache flags require checking the cache results are still valid an early cacheConditionalHit event is
+received followed by a cache hit or miss.  Critically in the cache hit scenario the server won’t send the response body.
 
-# EXAMPLE
+The response will have non-null `cacheResponse` and `networkResponse`. The cacheResponse will be used as the top level
+response only if the response code is HTTP/1.1 304 Not Modified.
+ 
+ - CallStart
+ - **CacheConditionalHit**
+ - ConnectionAcquired
+ - ... Standard Events...
+ - ResponseBodyEnd _(0 bytes)_
+ - **CacheHit**
+ - ConnectionReleased
+ - CallEnd
+ 
+## Cache directory
 
-~~~c
-int main(void)
-{
-  CURL *curl = curl_easy_init();
-  if(curl) {
-    curl_easy_setopt(curl, CURLOPT_URL, "https://example.com");
+The cache directory must be exclusively owned by a single instance.
 
-    /* January 1, 2020 is 1577833200 */
-    curl_easy_setopt(curl, CURLOPT_TIMEVALUE_LARGE, (curl_off_t)1577833200);
+Deleting the cache when it is no longer needed can be done.  However this may delete the purpose of the cache
+which is designed to persist between app restarts.
 
-    /* If-Modified-Since the above time stamp */
-    curl_easy_setopt(curl, CURLOPT_TIMECONDITION, CURL_TIMECOND_IFMODSINCE);
+```
+cache.delete()
+```
+ 
+## Pruning the Cache
 
-    /* Perform the request */
-    curl_easy_perform(curl);
-  }
-}
-~~~
+Pruning the entire Cache to clear space temporarily can be done using evictAll.
 
-# %AVAILABILITY%
+```
+cache.evictAll()
+```
 
-# RETURN VALUE
+Removing individual items can be done using the urls iterator.
+This would be typical after a user initiates a force refresh by a pull to refresh type action.
 
-Returns CURLE_OK
+```
+    val urlIterator = cache.urls()
+    while (urlIterator.hasNext()) {
+      if (urlIterator.next().startsWith("https://www.google.com/")) {
+        urlIterator.remove()
+      }
+    }
+```
+
+### Troubleshooting
+
+1. Valid cacheable responses are not being cached
+
+Make sure you are reading responses fully as unless they are read fully, cancelled or stalled Responses will not be cached.
+
+### Overriding normal cache behaviour
+
+See Cache documentation. https://square.github.io/okhttp/4.x/okhttp/okhttp3/-cache/

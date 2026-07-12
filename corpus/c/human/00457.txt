@@ -21,333 +21,333 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+#include "tool_setup.h"
 
-#include "curl_setup.h"
-#ifndef CURL_DISABLE_NETRC
+#define ENABLE_CURLX_PRINTF
+/* use our own printf() functions */
+#include "curlx.h"
 
-#ifdef HAVE_PWD_H
-#include <pwd.h>
+#include "tool_cfgable.h"
+#include "tool_getparam.h"
+#include "tool_helpers.h"
+#include "tool_findfile.h"
+#include "tool_msgs.h"
+#include "tool_parsecfg.h"
+#include "dynbuf.h"
+
+#include "memdebug.h" /* keep this as LAST include */
+
+/* only acknowledge colon or equals as separators if the option was not
+   specified with an initial dash! */
+#define ISSEP(x,dash) (!dash && (((x) == '=') || ((x) == ':')))
+
+static const char *unslashquote(const char *line, char *param);
+
+#define MAX_CONFIG_LINE_LENGTH (10*1024*1024)
+static bool my_get_line(FILE *fp, struct curlx_dynbuf *, bool *error);
+
+#ifdef _WIN32
+static FILE *execpath(const char *filename, char **pathp)
+{
+  static char filebuffer[512];
+  /* Get the filename of our executable. GetModuleFileName is already declared
+   * via inclusions done in setup header file. We assume that we are using
+   * the ASCII version here.
+   */
+  unsigned long len = GetModuleFileNameA(0, filebuffer, sizeof(filebuffer));
+  if(len > 0 && len < sizeof(filebuffer)) {
+    /* We got a valid filename - get the directory part */
+    char *lastdirchar = strrchr(filebuffer, '\\');
+    if(lastdirchar) {
+      size_t remaining;
+      *lastdirchar = 0;
+      /* If we have enough space, build the RC filename */
+      remaining = sizeof(filebuffer) - strlen(filebuffer);
+      if(strlen(filename) < remaining - 1) {
+        FILE *f;
+        msnprintf(lastdirchar, remaining, "%s%s", DIR_CHAR, filename);
+        *pathp = filebuffer;
+        f = fopen(filebuffer, FOPEN_READTEXT);
+        return f;
+      }
+    }
+  }
+
+  return NULL;
+}
 #endif
 
-#include <curl/curl.h>
-#include "netrc.h"
-#include "strtok.h"
-#include "strcase.h"
-#include "curl_get_line.h"
 
-/* The last 3 #include files should be in this order */
-#include "curl_printf.h"
-#include "curl_memory.h"
-#include "memdebug.h"
-
-/* Get user and password from .netrc when given a machine name */
-
-enum host_lookup_state {
-  NOTHING,
-  HOSTFOUND,    /* the 'machine' keyword was found */
-  HOSTVALID,    /* this is "our" machine! */
-  MACDEF
-};
-
-#define NETRC_FILE_MISSING 1
-#define NETRC_FAILED -1
-#define NETRC_SUCCESS 0
-
-#define MAX_NETRC_LINE 4096
-
-/*
- * Returns zero on success.
- */
-static int parsenetrc(const char *host,
-                      char **loginp,
-                      char **passwordp,
-                      char *netrcfile)
+/* return 0 on everything-is-fine, and non-zero otherwise */
+int parseconfig(const char *filename, struct GlobalConfig *global)
 {
-  FILE *file;
-  int retcode = NETRC_FILE_MISSING;
-  char *login = *loginp;
-  char *password = *passwordp;
-  bool specific_login = (login && *login != 0);
-  bool login_alloc = FALSE;
-  bool password_alloc = FALSE;
-  enum host_lookup_state state = NOTHING;
+  FILE *file = NULL;
+  bool usedarg = FALSE;
+  int rc = 0;
+  struct OperationConfig *operation = global->last;
+  char *pathalloc = NULL;
 
-  char state_login = 0;      /* Found a login keyword */
-  char state_password = 0;   /* Found a password keyword */
-  int state_our_login = TRUE;  /* With specific_login, found *our* login
-                                  name (or login-less line) */
-
-  DEBUGASSERT(netrcfile);
-
-  file = fopen(netrcfile, FOPEN_READTEXT);
-  if(file) {
-    bool done = FALSE;
-    struct dynbuf buf;
-    Curl_dyn_init(&buf, MAX_NETRC_LINE);
-
-    while(!done && Curl_get_line(&buf, file)) {
-      char *tok;
-      char *tok_end;
-      bool quoted;
-      char *netrcbuffer = Curl_dyn_ptr(&buf);
-      if(state == MACDEF) {
-        if((netrcbuffer[0] == '\n') || (netrcbuffer[0] == '\r'))
-          state = NOTHING;
-        else
-          continue;
+  if(!filename) {
+    /* NULL means load .curlrc from homedir! */
+    char *curlrc = findfile(".curlrc", CURLRC_DOTSCORE);
+    if(curlrc) {
+      file = fopen(curlrc, FOPEN_READTEXT);
+      if(!file) {
+        free(curlrc);
+        return 1;
       }
-      tok = netrcbuffer;
-      while(tok) {
-        while(ISBLANK(*tok))
-          tok++;
-        /* tok is first non-space letter */
-        if(!*tok || (*tok == '#'))
-          /* end of line or the rest is a comment */
+      filename = pathalloc = curlrc;
+    }
+#ifdef _WIN32 /* Windows */
+    else {
+      char *fullp;
+      /* check for .curlrc then _curlrc in the dir of the executable */
+      file = execpath(".curlrc", &fullp);
+      if(!file)
+        file = execpath("_curlrc", &fullp);
+      if(file)
+        /* this is the filename we read from */
+        filename = fullp;
+    }
+#endif
+  }
+  else {
+    if(strcmp(filename, "-"))
+      file = fopen(filename, FOPEN_READTEXT);
+    else
+      file = stdin;
+  }
+
+  if(file) {
+    char *line;
+    char *option;
+    char *param;
+    int lineno = 0;
+    bool dashed_option;
+    struct curlx_dynbuf buf;
+    bool fileerror = FALSE;
+    curlx_dyn_init(&buf, MAX_CONFIG_LINE_LENGTH);
+    DEBUGASSERT(filename);
+
+    while(!rc && my_get_line(file, &buf, &fileerror)) {
+      ParameterError res;
+      bool alloced_param = FALSE;
+      lineno++;
+      line = curlx_dyn_ptr(&buf);
+      if(!line) {
+        rc = 1; /* out of memory */
+        break;
+      }
+
+      /* line with # in the first non-blank column is a comment! */
+      while(*line && ISSPACE(*line))
+        line++;
+
+      switch(*line) {
+      case '#':
+      case '/':
+      case '\r':
+      case '\n':
+      case '*':
+      case '\0':
+        curlx_dyn_reset(&buf);
+        continue;
+      }
+
+      /* the option keywords starts here */
+      option = line;
+
+      /* the option starts with a dash? */
+      dashed_option = option[0]=='-'?TRUE:FALSE;
+
+      while(*line && !ISSPACE(*line) && !ISSEP(*line, dashed_option))
+        line++;
+      /* ... and has ended here */
+
+      if(*line)
+        *line++ = '\0'; /* null-terminate, we have a local copy of the data */
+
+#ifdef DEBUG_CONFIG
+      fprintf(tool_stderr, "GOT: %s\n", option);
+#endif
+
+      /* pass spaces and separator(s) */
+      while(*line && (ISSPACE(*line) || ISSEP(*line, dashed_option)))
+        line++;
+
+      /* the parameter starts here (unless quoted) */
+      if(*line == '\"') {
+        /* quoted parameter, do the quote dance */
+        line++;
+        param = malloc(strlen(line) + 1); /* parameter */
+        if(!param) {
+          /* out of memory */
+          rc = 1;
           break;
-
-        /* leading double-quote means quoted string */
-        quoted = (*tok == '\"');
-
-        tok_end = tok;
-        if(!quoted) {
-          while(!ISSPACE(*tok_end))
-            tok_end++;
-          *tok_end = 0;
         }
-        else {
-          bool escape = FALSE;
-          bool endquote = FALSE;
-          char *store = tok;
-          tok_end++; /* pass the leading quote */
-          while(*tok_end) {
-            char s = *tok_end;
-            if(escape) {
-              escape = FALSE;
-              switch(s) {
-              case 'n':
-                s = '\n';
-                break;
-              case 'r':
-                s = '\r';
-                break;
-              case 't':
-                s = '\t';
-                break;
-              }
-            }
-            else if(s == '\\') {
-              escape = TRUE;
-              tok_end++;
-              continue;
-            }
-            else if(s == '\"') {
-              tok_end++; /* pass the ending quote */
-              endquote = TRUE;
-              break;
-            }
-            *store++ = s;
-            tok_end++;
-          }
-          *store = 0;
-          if(escape || !endquote) {
-            /* bad syntax, get out */
-            retcode = NETRC_FAILED;
-            goto out;
+        alloced_param = TRUE;
+        (void)unslashquote(line, param);
+      }
+      else {
+        param = line; /* parameter starts here */
+        while(*line && !ISSPACE(*line))
+          line++;
+
+        if(*line) {
+          *line = '\0'; /* null-terminate */
+
+          /* to detect mistakes better, see if there is data following */
+          line++;
+          /* pass all spaces */
+          while(*line && ISSPACE(*line))
+            line++;
+
+          switch(*line) {
+          case '\0':
+          case '\r':
+          case '\n':
+          case '#': /* comment */
+            break;
+          default:
+            warnf(operation->global, "%s:%d: warning: '%s' uses unquoted "
+                  "whitespace", filename, lineno, option);
+            warnf(operation->global, "This may cause side-effects. "
+                  "Consider using double quotes?");
           }
         }
+        if(!*param)
+          /* do this so getparameter can check for required parameters.
+             Otherwise it always thinks there is a parameter. */
+          param = NULL;
+      }
 
-        if((login && *login) && (password && *password)) {
-          done = TRUE;
-          break;
-        }
+#ifdef DEBUG_CONFIG
+      fprintf(tool_stderr, "PARAM: \"%s\"\n",(param ? param : "(null)"));
+#endif
+      res = getparameter(option, param, NULL, &usedarg, global, operation);
+      operation = global->last;
 
-        switch(state) {
-        case NOTHING:
-          if(strcasecompare("macdef", tok)) {
-            /* Define a macro. A macro is defined with the specified name; its
-               contents begin with the next .netrc line and continue until a
-               null line (consecutive new-line characters) is encountered. */
-            state = MACDEF;
-          }
-          else if(strcasecompare("machine", tok)) {
-            /* the next tok is the machine name, this is in itself the
-               delimiter that starts the stuff entered for this machine,
-               after this we need to search for 'login' and
-               'password'. */
-            state = HOSTFOUND;
-          }
-          else if(strcasecompare("default", tok)) {
-            state = HOSTVALID;
-            retcode = NETRC_SUCCESS; /* we did find our host */
-          }
-          break;
-        case MACDEF:
-          if(!strlen(tok)) {
-            state = NOTHING;
-          }
-          break;
-        case HOSTFOUND:
-          if(strcasecompare(host, tok)) {
-            /* and yes, this is our host! */
-            state = HOSTVALID;
-            retcode = NETRC_SUCCESS; /* we did find our host */
+      if(!res && param && *param && !usedarg)
+        /* we passed in a parameter that was not used! */
+        res = PARAM_GOT_EXTRA_PARAMETER;
+
+      if(res == PARAM_NEXT_OPERATION) {
+        if(operation->url_list && operation->url_list->url) {
+          /* Allocate the next config */
+          operation->next = malloc(sizeof(struct OperationConfig));
+          if(operation->next) {
+            /* Initialise the newly created config */
+            config_init(operation->next);
+
+            /* Set the global config pointer */
+            operation->next->global = global;
+
+            /* Update the last operation pointer */
+            global->last = operation->next;
+
+            /* Move onto the new config */
+            operation->next->prev = operation;
+            operation = operation->next;
           }
           else
-            /* not our host */
-            state = NOTHING;
-          break;
-        case HOSTVALID:
-          /* we are now parsing sub-keywords concerning "our" host */
-          if(state_login) {
-            if(specific_login) {
-              state_our_login = !Curl_timestrcmp(login, tok);
-            }
-            else if(!login || Curl_timestrcmp(login, tok)) {
-              if(login_alloc) {
-                free(login);
-                login_alloc = FALSE;
-              }
-              login = strdup(tok);
-              if(!login) {
-                retcode = NETRC_FAILED; /* allocation failed */
-                goto out;
-              }
-              login_alloc = TRUE;
-            }
-            state_login = 0;
-          }
-          else if(state_password) {
-            if((state_our_login || !specific_login)
-               && (!password || Curl_timestrcmp(password, tok))) {
-              if(password_alloc) {
-                free(password);
-                password_alloc = FALSE;
-              }
-              password = strdup(tok);
-              if(!password) {
-                retcode = NETRC_FAILED; /* allocation failed */
-                goto out;
-              }
-              password_alloc = TRUE;
-            }
-            state_password = 0;
-          }
-          else if(strcasecompare("login", tok))
-            state_login = 1;
-          else if(strcasecompare("password", tok))
-            state_password = 1;
-          else if(strcasecompare("machine", tok)) {
-            /* ok, there is machine here go => */
-            state = HOSTFOUND;
-            state_our_login = FALSE;
-          }
-          break;
-        } /* switch (state) */
-        tok = ++tok_end;
+            res = PARAM_NO_MEM;
+        }
       }
-    } /* while Curl_get_line() */
 
-out:
-    Curl_dyn_free(&buf);
-    if(!retcode) {
-      /* success */
-      if(login_alloc) {
-        if(*loginp)
-          free(*loginp);
-        *loginp = login;
+      if(res != PARAM_OK && res != PARAM_NEXT_OPERATION) {
+        /* the help request is not really an error */
+        if(!strcmp(filename, "-")) {
+          filename = "<stdin>";
+        }
+        if(res != PARAM_HELP_REQUESTED &&
+           res != PARAM_MANUAL_REQUESTED &&
+           res != PARAM_VERSION_INFO_REQUESTED &&
+           res != PARAM_ENGINES_REQUESTED) {
+          const char *reason = param2text(res);
+          errorf(operation->global, "%s:%d: '%s' %s",
+                 filename, lineno, option, reason);
+          rc = (int)res;
+        }
       }
-      if(password_alloc) {
-        if(*passwordp)
-          free(*passwordp);
-        *passwordp = password;
-      }
+
+      if(alloced_param)
+        Curl_safefree(param);
+
+      curlx_dyn_reset(&buf);
     }
-    else {
-      if(login_alloc)
-        free(login);
-      if(password_alloc)
-        free(password);
-    }
-    fclose(file);
+    curlx_dyn_free(&buf);
+    if(file != stdin)
+      fclose(file);
+    if(fileerror)
+      rc = 1;
   }
+  else
+    rc = 1; /* could not open the file */
 
-  return retcode;
+  free(pathalloc);
+  return rc;
 }
 
 /*
- * @unittest: 1304
- *
- * *loginp and *passwordp MUST be allocated if they are not NULL when passed
- * in.
+ * Copies the string from line to the buffer at param, unquoting
+ * backslash-quoted characters and NUL-terminating the output string.
+ * Stops at the first non-backslash-quoted double quote character or the
+ * end of the input string. param must be at least as long as the input
+ * string. Returns the pointer after the last handled input character.
  */
-int Curl_parsenetrc(const char *host, char **loginp, char **passwordp,
-                    char *netrcfile)
+static const char *unslashquote(const char *line, char *param)
 {
-  int retcode = 1;
-  char *filealloc = NULL;
+  while(*line && (*line != '\"')) {
+    if(*line == '\\') {
+      char out;
+      line++;
 
-  if(!netrcfile) {
-#if defined(HAVE_GETPWUID_R) && defined(HAVE_GETEUID)
-    char pwbuf[1024];
-#endif
-    char *home = NULL;
-    char *homea = curl_getenv("HOME"); /* portable environment reader */
-    if(homea) {
-      home = homea;
-#if defined(HAVE_GETPWUID_R) && defined(HAVE_GETEUID)
-    }
-    else {
-      struct passwd pw, *pw_res;
-      if(!getpwuid_r(geteuid(), &pw, pwbuf, sizeof(pwbuf), &pw_res)
-         && pw_res) {
-        home = pw.pw_dir;
+      /* default is to output the letter after the backslash */
+      switch(out = *line) {
+      case '\0':
+        continue; /* this'll break out of the loop */
+      case 't':
+        out = '\t';
+        break;
+      case 'n':
+        out = '\n';
+        break;
+      case 'r':
+        out = '\r';
+        break;
+      case 'v':
+        out = '\v';
+        break;
       }
-#elif defined(HAVE_GETPWUID) && defined(HAVE_GETEUID)
+      *param++ = out;
+      line++;
     }
-    else {
-      struct passwd *pw;
-      pw = getpwuid(geteuid());
-      if(pw) {
-        home = pw->pw_dir;
-      }
-#elif defined(_WIN32)
-    }
-    else {
-      homea = curl_getenv("USERPROFILE");
-      if(homea) {
-        home = homea;
-      }
-#endif
-    }
-
-    if(!home)
-      return retcode; /* no home directory found (or possibly out of
-                         memory) */
-
-    filealloc = curl_maprintf("%s%s.netrc", home, DIR_CHAR);
-    if(!filealloc) {
-      free(homea);
-      return -1;
-    }
-    retcode = parsenetrc(host, loginp, passwordp, filealloc);
-    free(filealloc);
-#ifdef _WIN32
-    if(retcode == NETRC_FILE_MISSING) {
-      /* fallback to the old-style "_netrc" file */
-      filealloc = curl_maprintf("%s%s_netrc", home, DIR_CHAR);
-      if(!filealloc) {
-        free(homea);
-        return -1;
-      }
-      retcode = parsenetrc(host, loginp, passwordp, filealloc);
-      free(filealloc);
-    }
-#endif
-    free(homea);
+    else
+      *param++ = *line++;
   }
-  else
-    retcode = parsenetrc(host, loginp, passwordp, netrcfile);
-  return retcode;
+  *param = '\0'; /* always null-terminate */
+  return line;
 }
 
-#endif
+/*
+ * Reads a line from the given file, ensuring is NUL terminated.
+ */
+static bool my_get_line(FILE *fp, struct curlx_dynbuf *db,
+                        bool *error)
+{
+  char buf[4096];
+  *error = FALSE;
+  do {
+    /* fgets() returns s on success, and NULL on error or when end of file
+       occurs while no characters have been read. */
+    if(!fgets(buf, sizeof(buf), fp))
+      /* only if there is data in the line, return TRUE */
+      return curlx_dyn_len(db) ? TRUE : FALSE;
+    if(curlx_dyn_add(db, buf)) {
+      *error = TRUE; /* error */
+      return FALSE; /* stop reading */
+    }
+  } while(!strchr(buf, '\n'));
+
+  return TRUE; /* continue */
+}

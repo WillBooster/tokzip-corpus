@@ -10,134 +10,86 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Repository;
+namespace Composer\Package\Archiver;
 
-use Composer\IO\IOInterface;
-use Composer\Json\JsonFile;
-use Composer\Package\BasePackage;
-use Composer\Package\Loader\ArrayLoader;
-use Composer\Package\Loader\LoaderInterface;
-use Composer\Util\Platform;
-use Composer\Util\Tar;
-use Composer\Util\Zip;
+use ZipArchive;
+use Composer\Util\Filesystem;
 
 /**
- * @author Serge Smertin <serg.smertin@gmail.com>
+ * @author Jan Prieser <jan@prieser.net>
  */
-class ArtifactRepository extends ArrayRepository implements ConfigurableRepositoryInterface
+class ZipArchiver implements ArchiverInterface
 {
-    /** @var LoaderInterface */
-    protected $loader;
-
-    /** @var string */
-    protected $lookup;
-    /** @var array{url: string} */
-    protected $repoConfig;
-    /** @var IOInterface */
-    private $io;
+    /** @var array<string, bool> */
+    protected static $formats = [
+        'zip' => true,
+    ];
 
     /**
-     * @param array{url: string} $repoConfig
+     * @inheritDoc
      */
-    public function __construct(array $repoConfig, IOInterface $io)
+    public function archive(string $sources, string $target, string $format, array $excludes = [], bool $ignoreFilters = false): string
     {
-        parent::__construct();
-        if (!extension_loaded('zip')) {
-            throw new \RuntimeException('The artifact repository requires PHP\'s zip extension');
+        $fs = new Filesystem();
+        $sourcesRealpath = realpath($sources);
+        if (false !== $sourcesRealpath) {
+            $sources = $sourcesRealpath;
         }
+        unset($sourcesRealpath);
+        $sources = $fs->normalizePath($sources);
 
-        $this->loader = new ArrayLoader();
-        $this->lookup = Platform::expandPath($repoConfig['url']);
-        $this->io = $io;
-        $this->repoConfig = $repoConfig;
-    }
+        $zip = new ZipArchive();
+        $res = $zip->open($target, ZipArchive::CREATE);
+        if ($res === true) {
+            $files = new ArchivableFilesFinder($sources, $excludes, $ignoreFilters);
+            foreach ($files as $file) {
+                /** @var \Symfony\Component\Finder\SplFileInfo $file */
+                $filepath = strtr($file->getPath()."/".$file->getFilename(), '\\', '/');
+                $localname = $filepath;
+                if (strpos($localname, $sources . '/') === 0) {
+                    $localname = substr($localname, strlen($sources . '/'));
+                }
+                if ($file->isDir()) {
+                    $zip->addEmptyDir($localname);
+                } else {
+                    $zip->addFile($filepath, $localname);
+                }
 
-    public function getRepoName()
-    {
-        return 'artifact repo ('.$this->lookup.')';
-    }
+                /**
+                 * setExternalAttributesName() is only available with libzip 0.11.2 or above
+                 */
+                if (method_exists($zip, 'setExternalAttributesName')) {
+                    $perms = fileperms($filepath);
 
-    public function getRepoConfig()
-    {
-        return $this->repoConfig;
-    }
-
-    protected function initialize()
-    {
-        parent::initialize();
-
-        $this->scanDirectory($this->lookup);
-    }
-
-    private function scanDirectory(string $path): void
-    {
-        $io = $this->io;
-
-        $directory = new \RecursiveDirectoryIterator($path, \RecursiveDirectoryIterator::FOLLOW_SYMLINKS);
-        $iterator = new \RecursiveIteratorIterator($directory);
-        $regex = new \RegexIterator($iterator, '/^.+\.(zip|tar|gz|tgz)$/i');
-        foreach ($regex as $file) {
-            /* @var $file \SplFileInfo */
-            if (!$file->isFile()) {
-                continue;
+                    /**
+                     * Ensure to preserve the permission umasks for the filepath in the archive.
+                     */
+                    $zip->setExternalAttributesName($localname, ZipArchive::OPSYS_UNIX, $perms << 16);
+                }
             }
-
-            $package = $this->getComposerInformation($file);
-            if (!$package) {
-                $io->writeError("File <comment>{$file->getBasename()}</comment> doesn't seem to hold a package", true, IOInterface::VERBOSE);
-                continue;
+            if ($zip->close()) {
+                return $target;
             }
-
-            $template = 'Found package <info>%s</info> (<comment>%s</comment>) in file <info>%s</info>';
-            $io->writeError(sprintf($template, $package->getName(), $package->getPrettyVersion(), $file->getBasename()), true, IOInterface::VERBOSE);
-
-            $this->addPackage($package);
         }
+        $message = sprintf(
+            "Could not create archive '%s' from '%s': %s",
+            $target,
+            $sources,
+            $zip->getStatusString()
+        );
+        throw new \RuntimeException($message);
     }
 
     /**
-     * @return ?BasePackage
+     * @inheritDoc
      */
-    private function getComposerInformation(\SplFileInfo $file): ?BasePackage
+    public function supports(string $format, ?string $sourceType): bool
     {
-        $json = null;
-        $fileType = null;
-        $fileExtension = pathinfo($file->getPathname(), PATHINFO_EXTENSION);
-        if (in_array($fileExtension, ['gz', 'tar', 'tgz'], true)) {
-            $fileType = 'tar';
-        } elseif ($fileExtension === 'zip') {
-            $fileType = 'zip';
-        } else {
-            throw new \RuntimeException('Files with "'.$fileExtension.'" extensions aren\'t supported. Only ZIP and TAR/TAR.GZ/TGZ archives are supported.');
-        }
+        return isset(static::$formats[$format]) && $this->compressionAvailable();
+    }
 
-        try {
-            if ($fileType === 'tar') {
-                $json = Tar::getComposerJson($file->getPathname());
-            } else {
-                $json = Zip::getComposerJson($file->getPathname());
-            }
-        } catch (\Exception $exception) {
-            $this->io->write('Failed loading package '.$file->getPathname().': '.$exception->getMessage(), false, IOInterface::VERBOSE);
-        }
-
-        if (null === $json) {
-            return null;
-        }
-
-        $package = JsonFile::parseJson($json, $file->getPathname().'#composer.json');
-        $package['dist'] = [
-            'type' => $fileType,
-            'url' => strtr($file->getPathname(), '\\', '/'),
-            'shasum' => sha1_file($file->getRealPath()),
-        ];
-
-        try {
-            $package = $this->loader->load($package);
-        } catch (\UnexpectedValueException $e) {
-            throw new \UnexpectedValueException('Failed loading package in '.$file.': '.$e->getMessage(), 0, $e);
-        }
-
-        return $package;
+    private function compressionAvailable(): bool
+    {
+        return class_exists('ZipArchive');
     }
 }

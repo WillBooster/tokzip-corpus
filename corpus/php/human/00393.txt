@@ -10,554 +10,324 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Package;
+namespace Composer\Test\DependencyResolver;
 
-use Composer\Json\JsonFile;
-use Composer\Installer\InstallationManager;
-use Composer\Pcre\Preg;
-use Composer\Repository\InstalledRepository;
+use Composer\Repository\ArrayRepository;
 use Composer\Repository\LockArrayRepository;
-use Composer\Repository\PlatformRepository;
-use Composer\Repository\RootPackageRepository;
-use Composer\Util\ProcessExecutor;
-use Composer\Package\Dumper\ArrayDumper;
-use Composer\Package\Loader\ArrayLoader;
-use Composer\Package\Version\VersionParser;
-use Composer\Plugin\PluginInterface;
-use Composer\Util\Git as GitUtil;
-use Composer\IO\IOInterface;
-use Seld\JsonLint\ParsingException;
+use Composer\DependencyResolver\DefaultPolicy;
+use Composer\Package\Link;
+use Composer\Package\AliasPackage;
+use Composer\Repository\RepositorySet;
+use Composer\Semver\Constraint\Constraint;
+use Composer\Test\TestCase;
 
-/**
- * Reads/writes project lockfile (composer.lock).
- *
- * @author Konstantin Kudryashiv <ever.zet@gmail.com>
- * @author Jordi Boggiano <j.boggiano@seld.be>
- */
-class Locker
+class DefaultPolicyTest extends TestCase
 {
-    /** @var JsonFile */
-    private $lockFile;
-    /** @var InstallationManager */
-    private $installationManager;
-    /** @var string */
-    private $hash;
-    /** @var string */
-    private $contentHash;
-    /** @var ArrayLoader */
-    private $loader;
-    /** @var ArrayDumper */
-    private $dumper;
-    /** @var ProcessExecutor */
-    private $process;
-    /** @var mixed[]|null */
-    private $lockDataCache = null;
-    /** @var bool */
-    private $virtualFileWritten = false;
+    /** @var RepositorySet */
+    protected $repositorySet;
+    /** @var ArrayRepository */
+    protected $repo;
+    /** @var LockArrayRepository */
+    protected $repoLocked;
+    /** @var DefaultPolicy */
+    protected $policy;
 
-    /**
-     * Initializes packages locker.
-     *
-     * @param JsonFile            $lockFile             lockfile loader
-     * @param InstallationManager $installationManager  installation manager instance
-     * @param string              $composerFileContents The contents of the composer file
-     */
-    public function __construct(IOInterface $io, JsonFile $lockFile, InstallationManager $installationManager, string $composerFileContents, ?ProcessExecutor $process = null)
+    public function setUp(): void
     {
-        $this->lockFile = $lockFile;
-        $this->installationManager = $installationManager;
-        $this->hash = md5($composerFileContents);
-        $this->contentHash = self::getContentHash($composerFileContents);
-        $this->loader = new ArrayLoader(null, true);
-        $this->dumper = new ArrayDumper();
-        $this->process = $process ?? new ProcessExecutor($io);
+        $this->repositorySet = new RepositorySet('dev');
+        $this->repo = new ArrayRepository;
+        $this->repoLocked = new LockArrayRepository;
+
+        $this->policy = new DefaultPolicy;
     }
 
-    /**
-     * Returns the md5 hash of the sorted content of the composer file.
-     *
-     * @param string $composerFileContents The contents of the composer file.
-     */
-    public static function getContentHash(string $composerFileContents): string
+    public function testSelectSingle(): void
     {
-        $content = JsonFile::parseJson($composerFileContents, 'composer.json');
+        $this->repo->addPackage($packageA = self::getPackage('A', '1.0'));
+        $this->repositorySet->addRepository($this->repo);
 
-        $relevantKeys = [
-            'name',
-            'version',
-            'require',
-            'require-dev',
-            'conflict',
-            'replace',
-            'provide',
-            'minimum-stability',
-            'prefer-stable',
-            'repositories',
-            'extra',
-        ];
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
 
-        $relevantContent = [];
+        $literals = [$packageA->getId()];
+        $expected = [$packageA->getId()];
 
-        foreach (array_intersect($relevantKeys, array_keys($content)) as $key) {
-            $relevantContent[$key] = $content[$key];
-        }
-        if (isset($content['config']['platform'])) {
-            $relevantContent['config']['platform'] = $content['config']['platform'];
-        }
+        $selected = $this->policy->selectPreferredPackages($pool, $literals);
 
-        ksort($relevantContent);
-
-        return md5(JsonFile::encode($relevantContent, 0));
+        self::assertSame($expected, $selected);
     }
 
-    /**
-     * Checks whether locker has been locked (lockfile found).
-     */
-    public function isLocked(): bool
+    public function testSelectNewest(): void
     {
-        if (!$this->virtualFileWritten && !$this->lockFile->exists()) {
-            return false;
-        }
+        $this->repo->addPackage($packageA1 = self::getPackage('A', '1.0'));
+        $this->repo->addPackage($packageA2 = self::getPackage('A', '2.0'));
+        $this->repositorySet->addRepository($this->repo);
 
-        $data = $this->getLockData();
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
 
-        return isset($data['packages']);
+        $literals = [$packageA1->getId(), $packageA2->getId()];
+        $expected = [$packageA2->getId()];
+
+        $selected = $this->policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
     }
 
-    /**
-     * Checks whether the lock file is still up to date with the current hash
-     */
-    public function isFresh(): bool
+    public function testSelectNewestPicksLatest(): void
     {
-        $lock = $this->lockFile->read();
+        $this->repo->addPackage($packageA1 = self::getPackage('A', '1.0.0'));
+        $this->repo->addPackage($packageA2 = self::getPackage('A', '1.0.1-alpha'));
+        $this->repositorySet->addRepository($this->repo);
 
-        if (!empty($lock['content-hash'])) {
-            // There is a content hash key, use that instead of the file hash
-            return $this->contentHash === $lock['content-hash'];
-        }
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
 
-        // BC support for old lock files without content-hash
-        if (!empty($lock['hash'])) {
-            return $this->hash === $lock['hash'];
-        }
+        $literals = [$packageA1->getId(), $packageA2->getId()];
+        $expected = [$packageA2->getId()];
 
-        // should not be reached unless the lock file is corrupted, so assume it's out of date
-        return false;
+        $selected = $this->policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
     }
 
-    /**
-     * Searches and returns an array of locked packages, retrieved from registered repositories.
-     *
-     * @param  bool                                     $withDevReqs true to retrieve the locked dev packages
-     * @throws \RuntimeException
-     */
-    public function getLockedRepository(bool $withDevReqs = false): LockArrayRepository
+    public function testSelectNewestPicksLatestStableWithPreferStable(): void
     {
-        $lockData = $this->getLockData();
-        $packages = new LockArrayRepository();
+        $this->repo->addPackage($packageA1 = self::getPackage('A', '1.0.0'));
+        $this->repo->addPackage($packageA2 = self::getPackage('A', '1.0.1-alpha'));
+        $this->repositorySet->addRepository($this->repo);
 
-        $lockedPackages = $lockData['packages'];
-        if ($withDevReqs) {
-            if (isset($lockData['packages-dev'])) {
-                $lockedPackages = array_merge($lockedPackages, $lockData['packages-dev']);
-            } else {
-                throw new \RuntimeException('The lock file does not contain require-dev information, run install with the --no-dev option or delete it and run composer update to generate a new lock file.');
-            }
-        }
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
 
-        if (empty($lockedPackages)) {
-            return $packages;
-        }
+        $literals = [$packageA1->getId(), $packageA2->getId()];
+        $expected = [$packageA1->getId()];
 
-        if (isset($lockedPackages[0]['name'])) {
-            $packageByName = [];
-            foreach ($lockedPackages as $info) {
-                $package = $this->loader->load($info);
-                $packages->addPackage($package);
-                $packageByName[$package->getName()] = $package;
+        $policy = new DefaultPolicy(true);
+        $selected = $policy->selectPreferredPackages($pool, $literals);
 
-                if ($package instanceof AliasPackage) {
-                    $packageByName[$package->getAliasOf()->getName()] = $package->getAliasOf();
-                }
-            }
-
-            if (isset($lockData['aliases'])) {
-                foreach ($lockData['aliases'] as $alias) {
-                    if (isset($packageByName[$alias['package']])) {
-                        $aliasPkg = new CompleteAliasPackage($packageByName[$alias['package']], $alias['alias_normalized'], $alias['alias']);
-                        $aliasPkg->setRootPackageAlias(true);
-                        $packages->addPackage($aliasPkg);
-                    }
-                }
-            }
-
-            return $packages;
-        }
-
-        throw new \RuntimeException('Your composer.lock is invalid. Run "composer update" to generate a new one.');
+        self::assertSame($expected, $selected);
     }
 
-    /**
-     * @return string[] Names of dependencies installed through require-dev
-     */
-    public function getDevPackageNames(): array
+    public function testSelectNewestWithDevPicksNonDev(): void
     {
-        $names = [];
-        $lockData = $this->getLockData();
-        if (isset($lockData['packages-dev'])) {
-            foreach ($lockData['packages-dev'] as $package) {
-                $names[] = strtolower($package['name']);
-            }
-        }
+        $this->repo->addPackage($packageA1 = self::getPackage('A', 'dev-foo'));
+        $this->repo->addPackage($packageA2 = self::getPackage('A', '1.0.0'));
+        $this->repositorySet->addRepository($this->repo);
 
-        return $names;
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
+
+        $literals = [$packageA1->getId(), $packageA2->getId()];
+        $expected = [$packageA2->getId()];
+
+        $selected = $this->policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
     }
 
-    /**
-     * Returns the platform requirements stored in the lock file
-     *
-     * @param  bool                     $withDevReqs if true, the platform requirements from the require-dev block are also returned
-     * @return \Composer\Package\Link[]
-     */
-    public function getPlatformRequirements(bool $withDevReqs = false): array
+    public function testSelectNewestWithPreferredVersionPicksPreferredVersionIfAvailable(): void
     {
-        $lockData = $this->getLockData();
-        $requirements = [];
+        $this->repo->addPackage($packageA1 = self::getPackage('A', '1.0.0'));
+        $this->repo->addPackage($packageA2 = self::getPackage('A', '1.1.0'));
+        $this->repo->addPackage($packageA2b = self::getPackage('A', '1.1.0'));
+        $this->repo->addPackage($packageA3 = self::getPackage('A', '1.2.0'));
+        $this->repositorySet->addRepository($this->repo);
 
-        if (!empty($lockData['platform'])) {
-            $requirements = $this->loader->parseLinks(
-                '__root__',
-                '1.0.0',
-                Link::TYPE_REQUIRE,
-                $lockData['platform'] ?? []
-            );
-        }
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
 
-        if ($withDevReqs && !empty($lockData['platform-dev'])) {
-            $devRequirements = $this->loader->parseLinks(
-                '__root__',
-                '1.0.0',
-                Link::TYPE_REQUIRE,
-                $lockData['platform-dev'] ?? []
-            );
+        $literals = [$packageA1->getId(), $packageA2->getId(), $packageA2b->getId(), $packageA3->getId()];
+        $expected = [$packageA2->getId(), $packageA2b->getId()];
 
-            $requirements = array_merge($requirements, $devRequirements);
-        }
+        $policy = new DefaultPolicy(false, false, ['a' => '1.1.0.0']);
+        $selected = $policy->selectPreferredPackages($pool, $literals);
 
-        return $requirements;
+        self::assertSame($expected, $selected);
     }
 
-    public function getMinimumStability(): string
+    public function testSelectNewestWithPreferredVersionPicksNewestOtherwise(): void
     {
-        $lockData = $this->getLockData();
+        $this->repo->addPackage($packageA1 = self::getPackage('A', '1.0.0'));
+        $this->repo->addPackage($packageA2 = self::getPackage('A', '1.2.0'));
+        $this->repositorySet->addRepository($this->repo);
 
-        return $lockData['minimum-stability'] ?? 'stable';
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
+
+        $literals = [$packageA1->getId(), $packageA2->getId()];
+        $expected = [$packageA2->getId()];
+
+        $policy = new DefaultPolicy(false, false, ['a' => '1.1.0.0']);
+        $selected = $policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
     }
 
-    /**
-     * @return array<string, string>
-     */
-    public function getStabilityFlags(): array
+    public function testSelectNewestWithPreferredVersionPicksLowestIfPreferLowest(): void
     {
-        $lockData = $this->getLockData();
+        $this->repo->addPackage($packageA1 = self::getPackage('A', '1.0.0'));
+        $this->repo->addPackage($packageA2 = self::getPackage('A', '1.2.0'));
+        $this->repositorySet->addRepository($this->repo);
 
-        return $lockData['stability-flags'] ?? [];
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
+
+        $literals = [$packageA1->getId(), $packageA2->getId()];
+        $expected = [$packageA1->getId()];
+
+        $policy = new DefaultPolicy(false, true, ['a' => '1.1.0.0']);
+        $selected = $policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
     }
 
-    public function getPreferStable(): ?bool
+    public function testRepositoryOrderingAffectsPriority(): void
     {
-        $lockData = $this->getLockData();
+        $repo1 = new ArrayRepository;
+        $repo2 = new ArrayRepository;
 
-        // return null if not set to allow caller logic to choose the
-        // right behavior since old lock files have no prefer-stable
-        return $lockData['prefer-stable'] ?? null;
+        $repo1->addPackage($package1 = self::getPackage('A', '1.0'));
+        $repo1->addPackage($package2 = self::getPackage('A', '1.1'));
+        $repo2->addPackage($package3 = self::getPackage('A', '1.1'));
+        $repo2->addPackage($package4 = self::getPackage('A', '1.2'));
+
+        $this->repositorySet->addRepository($repo1);
+        $this->repositorySet->addRepository($repo2);
+
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
+
+        $literals = [$package1->getId(), $package2->getId(), $package3->getId(), $package4->getId()];
+        $expected = [$package2->getId()];
+        $selected = $this->policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
+
+        $this->repositorySet = new RepositorySet('dev');
+        $this->repositorySet->addRepository($repo2);
+        $this->repositorySet->addRepository($repo1);
+
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
+
+        $expected = [$package4->getId()];
+        $selected = $this->policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
     }
 
-    public function getPreferLowest(): ?bool
+    public function testSelectLocalReposFirst(): void
     {
-        $lockData = $this->getLockData();
+        $repoImportant = new ArrayRepository;
 
-        // return null if not set to allow caller logic to choose the
-        // right behavior since old lock files have no prefer-lowest
-        return $lockData['prefer-lowest'] ?? null;
-    }
+        $this->repo->addPackage($packageA = self::getPackage('A', 'dev-master'));
+        $this->repo->addPackage($packageAAlias = new AliasPackage($packageA, '2.1.9999999.9999999-dev', '2.1.x-dev'));
+        $repoImportant->addPackage($packageAImportant = self::getPackage('A', 'dev-feature-a'));
+        $repoImportant->addPackage($packageAAliasImportant = new AliasPackage($packageAImportant, '2.1.9999999.9999999-dev', '2.1.x-dev'));
+        $repoImportant->addPackage($packageA2Important = self::getPackage('A', 'dev-master'));
+        $repoImportant->addPackage($packageA2AliasImportant = new AliasPackage($packageA2Important, '2.1.9999999.9999999-dev', '2.1.x-dev'));
+        $packageAAliasImportant->setRootPackageAlias(true);
 
-    /**
-     * @return array<string, string>
-     */
-    public function getPlatformOverrides(): array
-    {
-        $lockData = $this->getLockData();
+        $this->repositorySet->addRepository($repoImportant);
+        $this->repositorySet->addRepository($this->repo);
+        $this->repositorySet->addRepository($this->repoLocked);
 
-        return $lockData['platform-overrides'] ?? [];
-    }
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
 
-    /**
-     * @return string[][]
-     *
-     * @phpstan-return list<array{package: string, version: string, alias: string, alias_normalized: string}>
-     */
-    public function getAliases(): array
-    {
-        $lockData = $this->getLockData();
-
-        return $lockData['aliases'] ?? [];
-    }
-
-    /**
-     * @return string
-     */
-    public function getPluginApi()
-    {
-        $lockData = $this->getLockData();
-
-        return $lockData['plugin-api-version'] ?? '1.1.0';
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    public function getLockData(): array
-    {
-        if (null !== $this->lockDataCache) {
-            return $this->lockDataCache;
-        }
-
-        if (!$this->lockFile->exists()) {
-            throw new \LogicException('No lockfile found. Unable to read locked packages');
-        }
-
-        return $this->lockDataCache = $this->lockFile->read();
-    }
-
-    /**
-     * Locks provided data into lockfile.
-     *
-     * @param PackageInterface[]          $packages          array of packages
-     * @param PackageInterface[]|null     $devPackages       array of dev packages or null if installed without --dev
-     * @param array<string, string>       $platformReqs      array of package name => constraint for required platform packages
-     * @param array<string, string>       $platformDevReqs   array of package name => constraint for dev-required platform packages
-     * @param string[][]                  $aliases           array of aliases
-     * @param array<string, int>          $stabilityFlags
-     * @param array<string, string|false> $platformOverrides
-     * @param bool                        $write             Whether to actually write data to disk, useful in tests and for --dry-run
-     *
-     * @phpstan-param list<array{package: string, version: string, alias: string, alias_normalized: string}> $aliases
-     */
-    public function setLockData(array $packages, ?array $devPackages, array $platformReqs, array $platformDevReqs, array $aliases, string $minimumStability, array $stabilityFlags, bool $preferStable, bool $preferLowest, array $platformOverrides, bool $write = true): bool
-    {
-        // keep old default branch names normalized to DEFAULT_BRANCH_ALIAS for BC as that is how Composer 1 outputs the lock file
-        // when loading the lock file the version is anyway ignored in Composer 2, so it has no adverse effect
-        $aliases = array_map(static function ($alias): array {
-            if (in_array($alias['version'], ['dev-master', 'dev-trunk', 'dev-default'], true)) {
-                $alias['version'] = VersionParser::DEFAULT_BRANCH_ALIAS;
-            }
-
-            return $alias;
-        }, $aliases);
-
-        $lock = [
-            '_readme' => ['This file locks the dependencies of your project to a known state',
-                               'Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies',
-                               'This file is @gener'.'ated automatically', ],
-            'content-hash' => $this->contentHash,
-            'packages' => null,
-            'packages-dev' => null,
-            'aliases' => $aliases,
-            'minimum-stability' => $minimumStability,
-            'stability-flags' => $stabilityFlags,
-            'prefer-stable' => $preferStable,
-            'prefer-lowest' => $preferLowest,
-        ];
-
-        $lock['packages'] = $this->lockPackages($packages);
-        if (null !== $devPackages) {
-            $lock['packages-dev'] = $this->lockPackages($devPackages);
-        }
-
-        $lock['platform'] = $platformReqs;
-        $lock['platform-dev'] = $platformDevReqs;
-        if (\count($platformOverrides) > 0) {
-            $lock['platform-overrides'] = $platformOverrides;
-        }
-        $lock['plugin-api-version'] = PluginInterface::PLUGIN_API_VERSION;
-
-        try {
-            $isLocked = $this->isLocked();
-        } catch (ParsingException $e) {
-            $isLocked = false;
-        }
-        if (!$isLocked || $lock !== $this->getLockData()) {
-            if ($write) {
-                $this->lockFile->write($lock);
-                $this->lockDataCache = null;
-                $this->virtualFileWritten = false;
-            } else {
-                $this->virtualFileWritten = true;
-                $this->lockDataCache = JsonFile::parseJson(JsonFile::encode($lock));
-            }
-
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * @param PackageInterface[] $packages
-     *
-     * @return mixed[][]
-     *
-     * @phpstan-return list<array<string, mixed>>
-     */
-    private function lockPackages(array $packages): array
-    {
-        $locked = [];
-
+        $packages = $pool->whatProvides('a', new Constraint('=', '2.1.9999999.9999999-dev'));
+        $literals = [];
         foreach ($packages as $package) {
-            if ($package instanceof AliasPackage) {
-                continue;
-            }
-
-            $name = $package->getPrettyName();
-            $version = $package->getPrettyVersion();
-
-            if (!$name || !$version) {
-                throw new \LogicException(sprintf(
-                    'Package "%s" has no version or name and can not be locked',
-                    $package
-                ));
-            }
-
-            $spec = $this->dumper->dump($package);
-            unset($spec['version_normalized']);
-
-            // always move time to the end of the package definition
-            $time = $spec['time'] ?? null;
-            unset($spec['time']);
-            if ($package->isDev() && $package->getInstallationSource() === 'source') {
-                // use the exact commit time of the current reference if it's a dev package
-                $time = $this->getPackageTime($package) ?: $time;
-            }
-            if (null !== $time) {
-                $spec['time'] = $time;
-            }
-
-            unset($spec['installation-source']);
-
-            $locked[] = $spec;
+            $literals[] = $package->getId();
         }
 
-        usort($locked, static function ($a, $b) {
-            $comparison = strcmp($a['name'], $b['name']);
+        $expected = [$packageAAliasImportant->getId()];
 
-            if (0 !== $comparison) {
-                return $comparison;
-            }
+        $selected = $this->policy->selectPreferredPackages($pool, $literals);
 
-            // If it is the same package, compare the versions to make the order deterministic
-            return strcmp($a['version'], $b['version']);
-        });
-
-        return $locked;
+        self::assertSame($expected, $selected);
     }
 
-    /**
-     * Returns the packages's datetime for its source reference.
-     *
-     * @param  PackageInterface $package The package to scan.
-     * @return string|null      The formatted datetime or null if none was found.
-     */
-    private function getPackageTime(PackageInterface $package): ?string
+    public function testSelectAllProviders(): void
     {
-        if (!function_exists('proc_open')) {
-            return null;
-        }
+        $this->repo->addPackage($packageA = self::getPackage('A', '1.0'));
+        $this->repo->addPackage($packageB = self::getPackage('B', '2.0'));
 
-        $path = $this->installationManager->getInstallPath($package);
-        if ($path === null) {
-            return null;
-        }
-        $path = realpath($path);
-        $sourceType = $package->getSourceType();
-        $datetime = null;
+        $packageA->setProvides(['x' => new Link('A', 'X', new Constraint('==', '1.0'), Link::TYPE_PROVIDE)]);
+        $packageB->setProvides(['x' => new Link('B', 'X', new Constraint('==', '1.0'), Link::TYPE_PROVIDE)]);
 
-        if ($path && in_array($sourceType, ['git', 'hg'])) {
-            $sourceRef = $package->getSourceReference() ?: $package->getDistReference();
-            switch ($sourceType) {
-                case 'git':
-                    GitUtil::cleanEnv();
+        $this->repositorySet->addRepository($this->repo);
 
-                    if (0 === $this->process->execute('git log -n1 --pretty=%ct '.ProcessExecutor::escape($sourceRef).GitUtil::getNoShowSignatureFlag($this->process), $output, $path) && Preg::isMatch('{^\s*\d+\s*$}', $output)) {
-                        $datetime = new \DateTime('@'.trim($output), new \DateTimeZone('UTC'));
-                    }
-                    break;
+        $pool = $this->repositorySet->createPoolForPackages(['A', 'B'], $this->repoLocked);
 
-                case 'hg':
-                    if (0 === $this->process->execute('hg log --template "{date|hgdate}" -r '.ProcessExecutor::escape($sourceRef), $output, $path) && Preg::isMatch('{^\s*(\d+)\s*}', $output, $match)) {
-                        $datetime = new \DateTime('@'.$match[1], new \DateTimeZone('UTC'));
-                    }
-                    break;
-            }
-        }
+        $literals = [$packageA->getId(), $packageB->getId()];
+        $expected = $literals;
 
-        return $datetime ? $datetime->format(DATE_RFC3339) : null;
+        $selected = $this->policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
     }
 
-    /**
-     * @return array<string>
-     */
-    public function getMissingRequirementInfo(RootPackageInterface $package, bool $includeDev): array
+    public function testPreferNonReplacingFromSameRepo(): void
     {
-        $missingRequirementInfo = [];
-        $missingRequirements = false;
-        $sets = [['repo' => $this->getLockedRepository(false), 'method' => 'getRequires', 'description' => 'Required']];
-        if ($includeDev === true) {
-            $sets[] = ['repo' => $this->getLockedRepository(true), 'method' => 'getDevRequires', 'description' => 'Required (in require-dev)'];
-        }
-        $rootRepo = new RootPackageRepository(clone $package);
+        $this->repo->addPackage($packageA = self::getPackage('A', '1.0'));
+        $this->repo->addPackage($packageB = self::getPackage('B', '2.0'));
 
-        foreach ($sets as $set) {
-            $installedRepo = new InstalledRepository([$set['repo'], $rootRepo]);
+        $packageB->setReplaces(['a' => new Link('B', 'A', new Constraint('==', '1.0'), Link::TYPE_REPLACE)]);
 
-            foreach (call_user_func([$package, $set['method']]) as $link) {
-                if (PlatformRepository::isPlatformPackage($link->getTarget())) {
-                    continue;
-                }
-                if ($link->getPrettyConstraint() === 'self.version') {
-                    continue;
-                }
-                if ($installedRepo->findPackagesWithReplacersAndProviders($link->getTarget(), $link->getConstraint()) === []) {
-                    $results = $installedRepo->findPackagesWithReplacersAndProviders($link->getTarget());
+        $this->repositorySet->addRepository($this->repo);
 
-                    if ($results !== []) {
-                        $provider = reset($results);
-                        $description = $provider->getPrettyVersion();
-                        if ($provider->getName() !== $link->getTarget()) {
-                            foreach (['getReplaces' => 'replaced as %s by %s', 'getProvides' => 'provided as %s by %s'] as $method => $text) {
-                                foreach (call_user_func([$provider, $method]) as $providerLink) {
-                                    if ($providerLink->getTarget() === $link->getTarget()) {
-                                        $description = sprintf($text, $providerLink->getPrettyConstraint(), $provider->getPrettyName().' '.$provider->getPrettyVersion());
-                                        break 2;
-                                    }
-                                }
-                            }
-                        }
-                        $missingRequirementInfo[] = '- ' . $set['description'].' package "' . $link->getTarget() . '" is in the lock file as "'.$description.'" but that does not satisfy your constraint "'.$link->getPrettyConstraint().'".';
-                    } else {
-                        $missingRequirementInfo[] = '- ' . $set['description'].' package "' . $link->getTarget() . '" is not present in the lock file.';
-                    }
-                    $missingRequirements = true;
-                }
-            }
-        }
+        $pool = $this->repositorySet->createPoolForPackages(['A', 'B'], $this->repoLocked);
 
-        if ($missingRequirements) {
-            $missingRequirementInfo[] = 'This usually happens when composer files are incorrectly merged or the composer.json file is manually edited.';
-            $missingRequirementInfo[] = 'Read more about correctly resolving merge conflicts https://getcomposer.org/doc/articles/resolving-merge-conflicts.md';
-            $missingRequirementInfo[] = 'and prefer using the "require" command over editing the composer.json file directly https://getcomposer.org/doc/03-cli.md#require-r';
-        }
+        $literals = [$packageA->getId(), $packageB->getId()];
+        $expected = $literals;
 
-        return $missingRequirementInfo;
+        $selected = $this->policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
+    }
+
+    public function testPreferReplacingPackageFromSameVendor(): void
+    {
+        // test with default order
+        $this->repo->addPackage($packageB = self::getPackage('vendor-b/replacer', '1.0'));
+        $this->repo->addPackage($packageA = self::getPackage('vendor-a/replacer', '1.0'));
+
+        $packageA->setReplaces(['vendor-a/package' => new Link('vendor-a/replacer', 'vendor-a/package', new Constraint('==', '1.0'), Link::TYPE_REPLACE)]);
+        $packageB->setReplaces(['vendor-a/package' => new Link('vendor-b/replacer', 'vendor-a/package', new Constraint('==', '1.0'), Link::TYPE_REPLACE)]);
+
+        $this->repositorySet->addRepository($this->repo);
+
+        $pool = $this->repositorySet->createPoolForPackages(['vendor-a/replacer', 'vendor-b/replacer'], $this->repoLocked);
+
+        $literals = [$packageA->getId(), $packageB->getId()];
+        $expected = $literals;
+
+        $selected = $this->policy->selectPreferredPackages($pool, $literals, 'vendor-a/package');
+        self::assertEquals($expected, $selected);
+
+        // test with reversed order in repo
+        $repo = new ArrayRepository;
+        $repo->addPackage($packageA = clone $packageA);
+        $repo->addPackage($packageB = clone $packageB);
+
+        $repositorySet = new RepositorySet('dev');
+        $repositorySet->addRepository($this->repo);
+
+        $pool = $this->repositorySet->createPoolForPackages(['vendor-a/replacer', 'vendor-b/replacer'], $this->repoLocked);
+
+        $literals = [$packageA->getId(), $packageB->getId()];
+        $expected = $literals;
+
+        $selected = $this->policy->selectPreferredPackages($pool, $literals, 'vendor-a/package');
+        self::assertSame($expected, $selected);
+    }
+
+    public function testSelectLowest(): void
+    {
+        $policy = new DefaultPolicy(false, true);
+
+        $this->repo->addPackage($packageA1 = self::getPackage('A', '1.0'));
+        $this->repo->addPackage($packageA2 = self::getPackage('A', '2.0'));
+        $this->repositorySet->addRepository($this->repo);
+
+        $pool = $this->repositorySet->createPoolForPackage('A', $this->repoLocked);
+
+        $literals = [$packageA1->getId(), $packageA2->getId()];
+        $expected = [$packageA1->getId()];
+
+        $selected = $policy->selectPreferredPackages($pool, $literals);
+
+        self::assertSame($expected, $selected);
     }
 }

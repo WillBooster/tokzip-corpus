@@ -1,154 +1,109 @@
-# frozen_string_literal: true
+require_relative 'test_helper'
 
-RSpec.describe Rack::Protection do
-  it_behaves_like 'any rack application'
+begin
+require 'haml'
 
-  it 'passes on options' do
+class HAMLTest < Minitest::Test
+  def haml_app(&block)
     mock_app do
-      # the :track option is used by session_hijacking
-      use Rack::Protection, track: ['HTTP_FOO'], use: [:session_hijacking], except: [:remote_token]
-      run proc { |_e| [200, { 'content-type' => 'text/plain' }, ['hi']] }
+      set :views, __dir__ + '/views'
+      get('/', &block)
     end
-
-    session = { foo: :bar }
-    get '/', {}, 'rack.session' => session, 'HTTP_ACCEPT_ENCODING' => 'a'
-    get '/', {}, 'rack.session' => session, 'HTTP_ACCEPT_ENCODING' => 'b'
-    expect(session[:foo]).to eq(:bar)
-
-    get '/', {}, 'rack.session' => session, 'HTTP_FOO' => 'BAR'
-    # wont be empty if the remote_token middleware runs after session_hijacking
-    # why we run the mock app without remote_token
-    expect(session).to be_empty
+    get '/'
   end
 
-  it 'passes errors through if :reaction => :report is used' do
+  it 'renders inline HAML strings' do
+    haml_app { haml '%h1 Hiya' }
+    assert ok?
+    assert_equal "<h1>Hiya</h1>\n", body
+  end
+
+  it 'renders .haml files in views path' do
+    haml_app { haml :hello }
+    assert ok?
+    assert_equal "<h1>Hello From Haml</h1>\n", body
+  end
+
+  it "renders with inline layouts" do
     mock_app do
-      use Rack::Protection, reaction: :report
-      run proc { |e| [200, { 'content-type' => 'text/plain' }, [e['protection.failed'].to_s]] }
+      layout { %q(%h1!= 'THIS. IS. ' + yield.upcase) }
+      get('/') { haml '%em Sparta' }
     end
-
-    session = { foo: :bar }
-    post('/', {}, 'rack.session' => session, 'HTTP_ORIGIN' => 'http://malicious.com')
-    expect(last_response).to be_ok
-    expect(body).to eq('true')
+    get '/'
+    assert ok?
+    assert_equal "<h1>THIS. IS. <EM>SPARTA</EM>\n</h1>\n", body
   end
 
-  describe '#react' do
-    it 'prevents attacks and warns about it' do
-      io = StringIO.new
-      mock_app do
-        use Rack::Protection, logger: Logger.new(io)
-        run DummyApp
-      end
-      post('/', {}, 'rack.session' => {}, 'HTTP_ORIGIN' => 'http://malicious.com')
-      expect(io.string).to match(/prevented.*Origin/)
-    end
-
-    it 'reports attacks if reaction is to report' do
-      io = StringIO.new
-      mock_app do
-        use Rack::Protection, reaction: :report, logger: Logger.new(io)
-        run DummyApp
-      end
-      post('/', {}, 'rack.session' => {}, 'HTTP_ORIGIN' => 'http://malicious.com')
-      expect(io.string).to match(/reported.*Origin/)
-      expect(io.string).not_to match(/prevented.*Origin/)
-    end
-
-    it 'drops the session and warns if reaction is to drop_session' do
-      io = StringIO.new
-      mock_app do
-        use Rack::Protection, reaction: :drop_session, logger: Logger.new(io)
-        run DummyApp
-      end
-      session = { foo: :bar }
-      post('/', {}, 'rack.session' => session, 'HTTP_ORIGIN' => 'http://malicious.com')
-      expect(io.string).to match(/session dropped by Rack::Protection::HttpOrigin/)
-      expect(session).not_to have_key(:foo)
-    end
-
-    it 'passes errors to reaction method if specified' do
-      io = StringIO.new
-      Rack::Protection::Base.send(:define_method, :special) { |*args| io << args.inspect }
-      mock_app do
-        use Rack::Protection, reaction: :special, logger: Logger.new(io)
-        run DummyApp
-      end
-      post('/', {}, 'rack.session' => {}, 'HTTP_ORIGIN' => 'http://malicious.com')
-      expect(io.string).to match(/HTTP_ORIGIN.*malicious.com/)
-      expect(io.string).not_to match(/reported|prevented/)
-    end
+  it "renders with file layouts" do
+    haml_app { haml 'Hello World', :layout => :layout2 }
+    assert ok?
+    assert_equal "<h1>HAML Layout!</h1>\n<p>Hello World\n</p>\n", body
   end
 
-  describe '#html?' do
-    context 'given an appropriate content-type header' do
-      subject { Rack::Protection::Base.new(nil).html? 'content-type' => 'text/html' }
-      it { is_expected.to be_truthy }
-    end
-
-    context 'given an appropriate content-type header of text/xml' do
-      subject { Rack::Protection::Base.new(nil).html? 'content-type' => 'text/xml' }
-      it { is_expected.to be_truthy }
-    end
-
-    context 'given an appropriate content-type header of application/xml' do
-      subject { Rack::Protection::Base.new(nil).html? 'content-type' => 'application/xml' }
-      it { is_expected.to be_truthy }
-    end
-
-    context 'given an inappropriate content-type header' do
-      subject { Rack::Protection::Base.new(nil).html? 'content-type' => 'image/gif' }
-      it { is_expected.to be_falsey }
-    end
-
-    context 'given no content-type header' do
-      subject { Rack::Protection::Base.new(nil).html?({}) }
-      it { is_expected.to be_falsey }
-    end
+  it "raises error if template not found" do
+    mock_app { get('/') { haml :no_such_template } }
+    assert_raises(Errno::ENOENT) { get('/') }
   end
 
-  describe '#instrument' do
-    let(:env) { { 'rack.protection.attack' => 'base' } }
-    let(:instrumenter) { double('Instrumenter') }
-
-    after do
-      app.instrument(env)
-    end
-
-    context 'with an instrumenter specified' do
-      let(:app) { Rack::Protection::Base.new(nil, instrumenter: instrumenter) }
-
-      it { expect(instrumenter).to receive(:instrument).with('rack.protection', env) }
-    end
-
-    context 'with no instrumenter specified' do
-      let(:app) { Rack::Protection::Base.new(nil) }
-
-      it { expect(instrumenter).not_to receive(:instrument) }
-    end
+  it "passes HAML options to the Haml engine" do
+    mock_app {
+      get('/') { haml "!!!\n%h1 Hello World", :format => :html5 }
+    }
+    get '/'
+    assert ok?
+    assert_equal "<!DOCTYPE html>\n<h1>Hello World</h1>\n", body
   end
 
-  describe 'new' do
-    it 'should allow disable session protection' do
-      mock_app do
-        use Rack::Protection, without_session: true
-        run DummyApp
+  it "passes default HAML options to the Haml engine" do
+    mock_app do
+      set :haml, {:format => :html5}
+      get('/') { haml "!!!\n%h1 Hello World" }
+    end
+    get '/'
+    assert ok?
+    assert_equal "<!DOCTYPE html>\n<h1>Hello World</h1>\n", body
+  end
+
+  it "merges the default HAML options with the overrides and passes them to the Haml engine" do
+    mock_app do
+      set :haml, {:format => :html5}
+      get('/') { haml "!!!\n%h1{:class => :header} Hello World" }
+      get('/html4') {
+        haml "!!!\n%h1{:class => 'header'} Hello World", :format => :html4
+      }
+    end
+    get '/'
+    assert ok?
+    assert_equal "<!DOCTYPE html>\n<h1 class='header'>Hello World</h1>\n", body
+    get '/html4'
+    assert ok?
+    assert_match(/^<!DOCTYPE html PUBLIC (.*) HTML 4.01/, body)
+  end
+
+  it "is possible to pass locals" do
+    haml_app { haml "= foo", :locals => { :foo => 'bar' }}
+    assert_equal "bar\n", body
+  end
+
+  it "can render truly nested layouts by accepting a layout and a block with the contents" do
+    mock_app do
+      template(:main_outer_layout) { "%h1 Title\n!= yield" }
+      template(:an_inner_layout) { "%h2 Subtitle\n!= yield" }
+      template(:a_page) { "%p Contents." }
+      get('/') do
+        haml :main_outer_layout, :layout => false do
+          haml :an_inner_layout do
+            haml :a_page
+          end
+        end
       end
-
-      session = { foo: :bar }
-      get '/', {}, 'rack.session' => session, 'HTTP_USER_AGENT' => 'a'
-      get '/', {}, 'rack.session' => session, 'HTTP_USER_AGENT' => 'b'
-      expect(session[:foo]).to eq :bar
     end
-
-    it 'should allow disable CSRF protection' do
-      mock_app do
-        use Rack::Protection, without_session: true
-        run DummyApp
-      end
-
-      post('/', {}, 'HTTP_REFERER' => 'http://example.com/foo', 'HTTP_HOST' => 'example.org')
-      expect(last_response).to be_ok
-    end
+    get '/'
+    assert ok?
+    assert_body "<h1>Title</h1>\n<h2>Subtitle</h2>\n<p>Contents.</p>\n"
   end
+end
+
+rescue LoadError
+  warn "#{$!}: skipping haml tests"
 end

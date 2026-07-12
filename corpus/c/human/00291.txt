@@ -20,78 +20,250 @@
  *
  * SPDX-License-Identifier: curl
  *
- * RFC2195 CRAM-MD5 authentication
- *
  ***************************************************************************/
+#include "test.h"
 
-#include "curl_setup.h"
-
-#ifndef CURL_DISABLE_DIGEST_AUTH
-
-#include <curl/curl.h>
-#include "urldata.h"
-
-#include "vauth/vauth.h"
-#include "curl_hmac.h"
-#include "curl_md5.h"
-#include "warnless.h"
-#include "curl_printf.h"
-
-/* The last #include files should be: */
-#include "curl_memory.h"
 #include "memdebug.h"
 
+static char data[]=
+  "dummy\n";
 
-/*
- * Curl_auth_create_cram_md5_message()
- *
- * This is used to generate a CRAM-MD5 response message ready for sending to
- * the recipient.
- *
- * Parameters:
- *
- * chlg    [in]     - The challenge.
- * userp   [in]     - The username.
- * passwdp [in]     - The user's password.
- * out     [out]    - The result storage.
- *
- * Returns CURLE_OK on success.
- */
-CURLcode Curl_auth_create_cram_md5_message(const struct bufref *chlg,
-                                           const char *userp,
-                                           const char *passwdp,
-                                           struct bufref *out)
+struct WriteThis {
+  char *readptr;
+  curl_off_t sizeleft;
+};
+
+static size_t read_callback(char *ptr, size_t size, size_t nmemb, void *userp)
 {
-  struct HMAC_context *ctxt;
-  unsigned char digest[MD5_DIGEST_LEN];
-  char *response;
+  struct WriteThis *pooh = (struct WriteThis *)userp;
+  int eof = !*pooh->readptr;
 
-  /* Compute the digest using the password as the key */
-  ctxt = Curl_HMAC_init(Curl_HMAC_MD5,
-                        (const unsigned char *) passwdp,
-                        curlx_uztoui(strlen(passwdp)));
-  if(!ctxt)
-    return CURLE_OUT_OF_MEMORY;
+  if(size*nmemb < 1)
+    return 0;
 
-  /* Update the digest with the given challenge */
-  if(Curl_bufref_len(chlg))
-    Curl_HMAC_update(ctxt, Curl_bufref_ptr(chlg),
-                     curlx_uztoui(Curl_bufref_len(chlg)));
+#ifndef LIB645
+  eof = pooh->sizeleft <= 0;
+  if(!eof)
+    pooh->sizeleft--;
+#endif
 
-  /* Finalise the digest */
-  Curl_HMAC_final(ctxt, digest);
+  if(!eof) {
+    *ptr = *pooh->readptr;           /* copy one single byte */
+    pooh->readptr++;                 /* advance pointer */
+    return 1;                        /* we return 1 byte at a time! */
+  }
 
-  /* Generate the response */
-  response = aprintf(
-    "%s %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-    userp, digest[0], digest[1], digest[2], digest[3], digest[4],
-    digest[5], digest[6], digest[7], digest[8], digest[9], digest[10],
-    digest[11], digest[12], digest[13], digest[14], digest[15]);
-  if(!response)
-    return CURLE_OUT_OF_MEMORY;
+  return 0;                         /* no more data left to deliver */
+}
 
-  Curl_bufref_set(out, response, strlen(response), curl_free);
+static CURLcode once(char *URL, bool oldstyle)
+{
+  CURL *curl;
+  CURLcode res = CURLE_OK;
+
+  curl_mime *mime = NULL;
+  curl_mimepart *part = NULL;
+  struct WriteThis pooh;
+  struct WriteThis pooh2;
+  curl_off_t datasize = -1;
+
+  pooh.readptr = data;
+#ifndef LIB645
+  datasize = (curl_off_t)strlen(data);
+#endif
+  pooh.sizeleft = datasize;
+
+  curl = curl_easy_init();
+  if(!curl) {
+    fprintf(stderr, "curl_easy_init() failed\n");
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  mime = curl_mime_init(curl);
+  if(!mime) {
+    fprintf(stderr, "curl_mime_init() failed\n");
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  part = curl_mime_addpart(mime);
+  if(!part) {
+    fprintf(stderr, "curl_mime_addpart(1) failed\n");
+    curl_mime_free(mime);
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  /* Fill in the file upload part */
+  if(oldstyle) {
+    res = curl_mime_name(part, "sendfile");
+    if(!res)
+      res = curl_mime_data_cb(part, datasize, read_callback,
+                              NULL, NULL, &pooh);
+    if(!res)
+      res = curl_mime_filename(part, "postit2.c");
+  }
+  else {
+    /* new style */
+    res = curl_mime_name(part, "sendfile alternative");
+    if(!res)
+      res = curl_mime_data_cb(part, datasize, read_callback,
+                              NULL, NULL, &pooh);
+    if(!res)
+      res = curl_mime_filename(part, "file name 2");
+  }
+
+  if(res)
+    printf("curl_mime_xxx(1) = %s\n", curl_easy_strerror(res));
+
+  /* Now add the same data with another name and make it not look like
+     a file upload but still using the callback */
+
+  pooh2.readptr = data;
+#ifndef LIB645
+  datasize = (curl_off_t)strlen(data);
+#endif
+  pooh2.sizeleft = datasize;
+
+  part = curl_mime_addpart(mime);
+  if(!part) {
+    fprintf(stderr, "curl_mime_addpart(2) failed\n");
+    curl_mime_free(mime);
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+  /* Fill in the file upload part */
+  res = curl_mime_name(part, "callbackdata");
+  if(!res)
+    res = curl_mime_data_cb(part, datasize, read_callback,
+                            NULL, NULL, &pooh2);
+
+  if(res)
+    printf("curl_mime_xxx(2) = %s\n", curl_easy_strerror(res));
+
+  part = curl_mime_addpart(mime);
+  if(!part) {
+    fprintf(stderr, "curl_mime_addpart(3) failed\n");
+    curl_mime_free(mime);
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  /* Fill in the filename field */
+  res = curl_mime_name(part, "filename");
+  if(!res)
+    res = curl_mime_data(part, "postit2.c",
+                         CURL_ZERO_TERMINATED);
+
+  if(res)
+    printf("curl_mime_xxx(3) = %s\n", curl_easy_strerror(res));
+
+  /* Fill in a submit field too */
+  part = curl_mime_addpart(mime);
+  if(!part) {
+    fprintf(stderr, "curl_mime_addpart(4) failed\n");
+    curl_mime_free(mime);
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+  res = curl_mime_name(part, "submit");
+  if(!res)
+    res = curl_mime_data(part, "send",
+                         CURL_ZERO_TERMINATED);
+
+  if(res)
+    printf("curl_mime_xxx(4) = %s\n", curl_easy_strerror(res));
+
+  part = curl_mime_addpart(mime);
+  if(!part) {
+    fprintf(stderr, "curl_mime_addpart(5) failed\n");
+    curl_mime_free(mime);
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+    return TEST_ERR_MAJOR_BAD;
+  }
+  res = curl_mime_name(part, "somename");
+  if(!res)
+    res = curl_mime_filename(part, "somefile.txt");
+  if(!res)
+    res = curl_mime_data(part, "blah blah", 9);
+
+  if(res)
+    printf("curl_mime_xxx(5) = %s\n", curl_easy_strerror(res));
+
+  /* First set the URL that is about to receive our POST. */
+  test_setopt(curl, CURLOPT_URL, URL);
+
+  /* send a multi-part mimepost */
+  test_setopt(curl, CURLOPT_MIMEPOST, mime);
+
+  /* get verbose debug output please */
+  test_setopt(curl, CURLOPT_VERBOSE, 1L);
+
+  /* include headers in the output */
+  test_setopt(curl, CURLOPT_HEADER, 1L);
+
+  /* Perform the request, res will get the return code */
+  res = curl_easy_perform(curl);
+
+test_cleanup:
+
+  /* always cleanup */
+  curl_easy_cleanup(curl);
+
+  /* now cleanup the mimepost structure */
+  curl_mime_free(mime);
+
+  return res;
+}
+
+static CURLcode cyclic_add(void)
+{
+  CURL *easy = curl_easy_init();
+  curl_mime *mime = curl_mime_init(easy);
+  curl_mimepart *part = curl_mime_addpart(mime);
+  CURLcode a1 = curl_mime_subparts(part, mime);
+
+  if(a1 == CURLE_BAD_FUNCTION_ARGUMENT) {
+    curl_mime *submime = curl_mime_init(easy);
+    curl_mimepart *subpart = curl_mime_addpart(submime);
+
+    curl_mime_subparts(part, submime);
+    a1 = curl_mime_subparts(subpart, mime);
+  }
+
+  curl_mime_free(mime);
+  curl_easy_cleanup(easy);
+  if(a1 != CURLE_BAD_FUNCTION_ARGUMENT)
+    /* that should have failed */
+    return (CURLcode)1;
+
   return CURLE_OK;
 }
 
-#endif /* !CURL_DISABLE_DIGEST_AUTH */
+CURLcode test(char *URL)
+{
+  CURLcode res;
+
+  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+    fprintf(stderr, "curl_global_init() failed\n");
+    return TEST_ERR_MAJOR_BAD;
+  }
+
+  res = once(URL, TRUE); /* old */
+  if(!res)
+    res = once(URL, FALSE); /* new */
+
+  if(!res)
+    res = cyclic_add();
+
+  curl_global_cleanup();
+
+  return res;
+}

@@ -10,96 +10,181 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\DependencyResolver;
+namespace Composer\Test\Util\Http;
 
-/**
- * @author Nils Adermann <naderman@naderman.de>
- * @implements \Iterator<RuleSet::TYPE_*, Rule>
- */
-class RuleSetIterator implements \Iterator
+use Composer\Util\Http\RequestProxy;
+use Composer\Test\TestCase;
+
+class RequestProxyTest extends TestCase
 {
-    /** @var array<RuleSet::TYPE_*, Rule[]> */
-    protected $rules;
-    /** @var array<RuleSet::TYPE_*> */
-    protected $types;
-
-    /** @var int */
-    protected $currentOffset;
-    /** @var RuleSet::TYPE_*|-1 */
-    protected $currentType;
-    /** @var int */
-    protected $currentTypeOffset;
-
-    /**
-     * @param array<RuleSet::TYPE_*, Rule[]> $rules
-     */
-    public function __construct(array $rules)
+    public function testFactoryNone(): void
     {
-        $this->rules = $rules;
-        $this->types = array_keys($rules);
-        sort($this->types);
+        $proxy = RequestProxy::none();
 
-        $this->rewind();
+        $options = extension_loaded('curl') ? [CURLOPT_PROXY => ''] : [];
+        self::assertSame($options, $proxy->getCurlOptions([]));
+        self::assertNull($proxy->getContextOptions());
+        self::assertSame('', $proxy->getStatus());
     }
 
-    public function current(): Rule
+    public function testFactoryNoProxy(): void
     {
-        return $this->rules[$this->currentType][$this->currentOffset];
+        $proxy = RequestProxy::noProxy();
+
+        $options = extension_loaded('curl') ? [CURLOPT_PROXY => ''] : [];
+        self::assertSame($options, $proxy->getCurlOptions([]));
+        self::assertNull($proxy->getContextOptions());
+        self::assertSame('excluded by no_proxy', $proxy->getStatus());
     }
 
     /**
-     * @return RuleSet::TYPE_*|-1
+     * @dataProvider dataSecure
+     *
+     * @param ?non-empty-string $url
      */
-    public function key(): int
+    public function testIsSecure(?string $url, bool $expected): void
     {
-        return $this->currentType;
+        $proxy = new RequestProxy($url, null, null, null);
+        self::assertSame($expected, $proxy->isSecure());
     }
 
-    public function next(): void
+    /**
+     * @return array<string, array{0: ?non-empty-string, 1: bool}>
+     */
+    public static function dataSecure(): array
     {
-        $this->currentOffset++;
+        // url, expected
+        return [
+            'basic' => ['http://proxy.com:80', false],
+            'secure' => ['https://proxy.com:443', true],
+            'none' => [null, false],
+        ];
+    }
 
-        if (!isset($this->rules[$this->currentType])) {
-            return;
+    public function testGetStatusThrowsOnBadFormatSpecifier(): void
+    {
+        $proxy = new RequestProxy('http://proxy.com:80', null, null, 'http://proxy.com:80');
+        self::expectException('InvalidArgumentException');
+        $proxy->getStatus('using proxy');
+    }
+
+    /**
+     * @dataProvider dataStatus
+     *
+     * @param ?non-empty-string $url
+     */
+    public function testGetStatus(?string $url, ?string $format, string $expected): void
+    {
+        $proxy = new RequestProxy($url, null, null, $url);
+
+        if ($format === null) {
+            // try with and without optional param
+            self::assertSame($expected, $proxy->getStatus());
+            self::assertSame($expected, $proxy->getStatus($format));
+        } else {
+            self::assertSame($expected, $proxy->getStatus($format));
         }
-
-        if ($this->currentOffset >= \count($this->rules[$this->currentType])) {
-            $this->currentOffset = 0;
-
-            do {
-                $this->currentTypeOffset++;
-
-                if (!isset($this->types[$this->currentTypeOffset])) {
-                    $this->currentType = -1;
-                    break;
-                }
-
-                $this->currentType = $this->types[$this->currentTypeOffset];
-            } while (0 === \count($this->rules[$this->currentType]));
-        }
     }
 
-    public function rewind(): void
+    /**
+     * @return array<string, array{0: ?non-empty-string, 1: ?string, 2: string}>
+     */
+    public static function dataStatus(): array
     {
-        $this->currentOffset = 0;
+        $format = 'proxy (%s)';
 
-        $this->currentTypeOffset = -1;
-        $this->currentType = -1;
-
-        do {
-            $this->currentTypeOffset++;
-
-            if (!isset($this->types[$this->currentTypeOffset])) {
-                $this->currentType = -1;
-                break;
-            }
-
-            $this->currentType = $this->types[$this->currentTypeOffset];
-        } while (0 === \count($this->rules[$this->currentType]));
+        // url, format, expected
+        return [
+            'no-proxy' => [null, $format, ''],
+            'null-format' => ['http://proxy.com:80', null, 'http://proxy.com:80'],
+            'with-format' => ['http://proxy.com:80', $format, 'proxy (http://proxy.com:80)'],
+        ];
     }
 
-    public function valid(): bool
+    /**
+     * This test avoids HTTPS proxies so that it can be run on PHP < 7.3
+     *
+     * @requires extension curl
+     * @dataProvider dataCurlOptions
+     *
+     * @param ?non-empty-string $url
+     * @param ?non-empty-string $auth
+     * @param array<int, string|int> $expected
+     */
+    public function testGetCurlOptions(?string $url, ?string $auth, array $expected): void
     {
-        return isset($this->rules[$this->currentType], $this->rules[$this->currentType][$this->currentOffset]);
+        $proxy = new RequestProxy($url, $auth, null, null);
+        self::assertSame($expected, $proxy->getCurlOptions([]));
+    }
+
+    /**
+     * @return list<array{0: ?string, 1: ?string, 2: array<int, string|int>}>
+     */
+    public static function dataCurlOptions(): array
+    {
+        // url, auth, expected
+        return [
+            [null, null, [CURLOPT_PROXY => '']],
+            ['http://proxy.com:80', null,
+                [
+                    CURLOPT_PROXY => 'http://proxy.com:80',
+                    CURLOPT_NOPROXY => '',
+                ],
+            ],
+            ['http://proxy.com:80', 'user:p%40ss',
+                [
+                    CURLOPT_PROXY => 'http://proxy.com:80',
+                    CURLOPT_NOPROXY => '',
+                    CURLOPT_PROXYAUTH => CURLAUTH_BASIC,
+                    CURLOPT_PROXYUSERPWD => 'user:p%40ss',
+                ],
+            ],
+        ];
+    }
+
+    /**
+     * @requires PHP >= 7.3.0
+     * @requires extension curl >= 7.52.0
+     * @dataProvider dataCurlSSLOptions
+     *
+     * @param non-empty-string $url
+     * @param ?non-empty-string $auth
+     * @param array<string, string> $sslOptions
+     * @param array<int, string|int> $expected
+     */
+    public function testGetCurlOptionsWithSSL(string $url, ?string $auth, array $sslOptions, array $expected): void
+    {
+        $proxy = new RequestProxy($url, $auth, null, null);
+        self::assertSame($expected, $proxy->getCurlOptions($sslOptions));
+    }
+
+    /**
+     * @return list<array{0: string, 1: ?string, 2: array<string, string>, 3: array<int, string|int>}>
+     */
+    public static function dataCurlSSLOptions(): array
+    {
+        // for PHPStan on PHP < 7.3
+        $caInfo = 10246; // CURLOPT_PROXY_CAINFO
+        $caPath = 10247; // CURLOPT_PROXY_CAPATH
+
+        // url, auth, sslOptions, expected
+        return [
+            ['https://proxy.com:443', null, ['cafile' => '/certs/bundle.pem'],
+                [
+                    CURLOPT_PROXY => 'https://proxy.com:443',
+                    CURLOPT_NOPROXY => '',
+                    $caInfo => '/certs/bundle.pem',
+                ],
+            ],
+            ['https://proxy.com:443', 'user:p%40ss', ['capath' => '/certs'],
+                [
+                    CURLOPT_PROXY => 'https://proxy.com:443',
+                    CURLOPT_NOPROXY => '',
+                    CURLOPT_PROXYAUTH => CURLAUTH_BASIC,
+                    CURLOPT_PROXYUSERPWD => 'user:p%40ss',
+                    $caPath => '/certs',
+                ],
+            ],
+        ];
     }
 }

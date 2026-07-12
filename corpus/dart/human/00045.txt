@@ -1,223 +1,322 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:math' as math;
-import 'dart:typed_data' show Uint8List;
+part of 'http2_adapter.dart';
 
-import 'multipart_file.dart';
-import 'options.dart';
-import 'utils.dart';
+/// Default implementation of ConnectionManager
+class _ConnectionManager implements ConnectionManager {
+  _ConnectionManager({
+    Duration? idleTimeout,
+    this.onClientCreate,
+    this.proxyConnectedPredicate = defaultProxyConnectedPredicate,
+  }) : _idleTimeout = idleTimeout ?? const Duration(seconds: 1);
 
-const _boundaryName = '--dio-boundary';
-const _rn = '\r\n';
-final _rnU8 = Uint8List.fromList([13, 10]);
+  /// Callback when socket created.
+  ///
+  /// We can set trusted certificates and handler
+  /// for unverifiable certificates.
+  final void Function(Uri uri, ClientSetting)? onClientCreate;
 
-const _secureRandomSeedBound = 4294967296;
-final _random = math.Random();
+  /// {@macro dio_http2_adapter.ProxyConnectedPredicate}
+  final ProxyConnectedPredicate proxyConnectedPredicate;
 
-String get _nextRandomId =>
-    _random.nextInt(_secureRandomSeedBound).toString().padLeft(10, '0');
+  /// Sets the idle timeout(milliseconds) of non-active persistent
+  /// connections. For the sake of socket reuse feature with http/2,
+  /// the value should not be less than 1 second.
+  final Duration _idleTimeout;
 
-/// A class to create readable "multipart/form-data" streams.
-/// It can be used to submit forms and file uploads to http server.
-class FormData {
-  FormData({
-    this.boundaryName = _boundaryName,
-    this.camelCaseContentDisposition = false,
-  }) {
-    _init();
-  }
+  /// Saving the reusable connections
+  final _transportsMap = <String, _ClientTransportConnectionState>{};
 
-  /// Create [FormData] from a [Map].
-  FormData.fromMap(
-    Map<String, dynamic> map, [
-    ListFormat listFormat = ListFormat.multi,
-    this.camelCaseContentDisposition = false,
-    this.boundaryName = _boundaryName,
-  ]) {
-    _init(fromMap: map, listFormat: listFormat);
-  }
+  /// Saving the connecting futures
+  final _connectFutures = <String, Future<_ClientTransportConnectionState>>{};
 
-  /// Provides the boundary name which will be used to construct boundaries
-  /// in the [FormData] with additional prefix and suffix.
-  final String boundaryName;
+  bool _closed = false;
+  bool _forceClosed = false;
 
-  /// Whether the 'content-disposition' header can be 'Content-Disposition'.
-  final bool camelCaseContentDisposition;
-
-  void _init({
-    Map<String, dynamic>? fromMap,
-    ListFormat listFormat = ListFormat.multi,
-  }) {
-    // Get an unique boundary for the instance.
-    _boundary = '$boundaryName-$_nextRandomId';
-    if (fromMap != null) {
-      // Use [encodeMap] to recursively add fields and files.
-      // TODO(Alex): Write a proper/elegant implementation.
-      encodeMap(
-        fromMap,
-        (key, value) {
-          if (value is MultipartFile) {
-            files.add(MapEntry(key, value));
-          } else {
-            fields.add(MapEntry(key, value?.toString() ?? ''));
-          }
-          return null;
-        },
-        listFormat: listFormat,
-        encode: false,
+  @override
+  Future<ClientTransportConnection> getConnection(
+    RequestOptions options,
+  ) async {
+    if (_closed) {
+      throw Exception(
+        "Can't establish connection after [ConnectionManager] closed!",
       );
     }
-  }
-
-  /// The Content-Type field for multipart entities requires one parameter,
-  /// "boundary", which is used to specify the encapsulation boundary.
-  ///
-  /// See also: https://www.w3.org/Protocols/rfc1341/7_2_Multipart.html
-  String get boundary => _boundary;
-  late final String _boundary;
-
-  /// The form fields to send for this request.
-  final fields = <MapEntry<String, String>>[];
-
-  /// The [files].
-  final files = <MapEntry<String, MultipartFile>>[];
-
-  /// Whether [finalize] has been called.
-  bool get isFinalized => _isFinalized;
-  bool _isFinalized = false;
-
-  String get _contentDispositionKey => camelCaseContentDisposition
-      ? 'Content-Disposition'
-      : 'content-disposition';
-
-  /// Returns the header string for a field.
-  String _headerForField(String name, String value) {
-    return '$_contentDispositionKey'
-        ': form-data; name="${_browserEncode(name)}"'
-        '$_rn$_rn';
-  }
-
-  /// Returns the header string for a file. The return value is guaranteed to
-  /// contain only ASCII characters.
-  String _headerForFile(MapEntry<String, MultipartFile> entry) {
-    final file = entry.value;
-    String header = '$_contentDispositionKey'
-        ': form-data; name="${_browserEncode(entry.key)}"';
-    if (file.filename != null) {
-      header = '$header; filename="${_browserEncode(file.filename)}"';
-    }
-    header = '$header$_rn'
-        'content-type: ${file.contentType}';
-    if (file.headers != null) {
-      // append additional headers
-      file.headers!.forEach((key, values) {
-        for (final value in values) {
-          header = '$header$_rn'
-              '$key: $value';
-        }
-      });
-    }
-    return '$header$_rn$_rn';
-  }
-
-  /// Encode [value] that follows
-  /// [RFC 2388](http://tools.ietf.org/html/rfc2388).
-  ///
-  /// The standard mandates some complex encodings for field and file names,
-  /// but in practice user agents seem not to follow this at all.
-  /// Instead, they URL-encode `\r`, `\n`, and `\r\n` as `\r\n`;
-  /// URL-encode `"`; and do nothing else
-  /// (even for `%` or non-ASCII characters).
-  /// Here we follow their behavior.
-  String? _browserEncode(String? value) {
-    return value
-        ?.replaceAll(RegExp(r'\r\n|\r|\n'), '%0D%0A')
-        .replaceAll('"', '%22');
-  }
-
-  /// The total length of the request body, in bytes. This is calculated from
-  /// [fields] and [files] and cannot be set manually.
-  int get length {
-    int length = 0;
-    for (final entry in fields) {
-      length += '--'.length +
-          _boundary.length +
-          _rn.length +
-          utf8.encode(_headerForField(entry.key, entry.value)).length +
-          utf8.encode(entry.value).length +
-          _rn.length;
-    }
-
-    for (final file in files) {
-      length += '--'.length +
-          _boundary.length +
-          _rn.length +
-          utf8.encode(_headerForFile(file)).length +
-          file.value.length +
-          _rn.length;
-    }
-
-    return length + '--'.length + _boundary.length + '--$_rn'.length;
-  }
-
-  /// Commits all fields and files into a stream for the final sending.
-  Stream<Uint8List> finalize() {
-    if (isFinalized) {
-      throw StateError(
-        'The FormData has already been finalized. '
-        'This typically means you are using '
-        'the same FormData in repeated requests.',
-      );
-    }
-    _isFinalized = true;
-
-    final controller = StreamController<Uint8List>(sync: false);
-
-    void writeLine() => controller.add(_rnU8); // \r\n
-    void writeUtf8(String s) =>
-        controller.add(_effectiveU8Encoding(utf8.encode(s)));
-
-    for (final entry in fields) {
-      writeUtf8('--$boundary$_rn');
-      writeUtf8(_headerForField(entry.key, entry.value));
-      writeUtf8(entry.value);
-      writeLine();
-    }
-
-    Future<void>(() async {
-      for (final file in files) {
-        writeUtf8('--$boundary$_rn');
-        writeUtf8(_headerForFile(file));
-        await writeStreamToSink<Uint8List>(file.value.finalize(), controller);
-        writeLine();
+    final uri = options.uri;
+    final domain = '${uri.host}:${uri.port}';
+    _ClientTransportConnectionState? transportState = _transportsMap[domain];
+    if (transportState == null) {
+      Future<_ClientTransportConnectionState>? initFuture =
+          _connectFutures[domain];
+      if (initFuture == null) {
+        _connectFutures[domain] = initFuture = _connect(options);
       }
-    }).then((_) {
-      writeUtf8('--$boundary--$_rn');
-    }).whenComplete(() {
-      controller.close();
-    });
-
-    return controller.stream;
-  }
-
-  /// Transform the entire FormData contents as a list of bytes asynchronously.
-  Future<Uint8List> readAsBytes() {
-    return Future.sync(
-      () => finalize().reduce((a, b) => Uint8List.fromList([...a, ...b])),
-    );
-  }
-
-  // Convenience method to clone finalized FormData when retrying requests.
-  FormData clone() {
-    final clone = FormData();
-    clone.fields.addAll(fields);
-    for (final file in files) {
-      clone.files.add(MapEntry(file.key, file.value.clone()));
+      try {
+        transportState = await initFuture;
+      } catch (e) {
+        _connectFutures.remove(domain);
+        rethrow;
+      }
+      if (_forceClosed) {
+        transportState.dispose();
+      } else {
+        _transportsMap[domain] = transportState;
+        final _ = _connectFutures.remove(domain);
+      }
+    } else {
+      // Check whether the connection is terminated, if it is, reconnecting.
+      if (!transportState.transport.isOpen) {
+        transportState.dispose();
+        _transportsMap[domain] = transportState = await _connect(options);
+      }
     }
-    return clone;
+    return transportState.activeTransport;
+  }
+
+  Future<_ClientTransportConnectionState> _connect(
+    RequestOptions options,
+  ) async {
+    final uri = options.uri;
+    final domain = '${uri.host}:${uri.port}';
+    final clientConfig = ClientSetting();
+    if (onClientCreate != null) {
+      onClientCreate!(uri, clientConfig);
+    }
+
+    // Allow [Socket] for non-TLS connections
+    // or [SecureSocket] for TLS connections.
+    late final Socket socket;
+    try {
+      socket = await _createSocket(uri, options, clientConfig);
+    } on SocketException catch (e) {
+      if (e.osError == null) {
+        if (e.message.contains('timed out')) {
+          throw DioException.connectionTimeout(
+            timeout: options.connectTimeout ?? Duration.zero,
+            requestOptions: options,
+          );
+        }
+      }
+      rethrow;
+    }
+
+    if (clientConfig.validateCertificate != null) {
+      final certificate =
+          socket is SecureSocket ? socket.peerCertificate : null;
+      final isCertApproved = clientConfig.validateCertificate!(
+        certificate,
+        uri.host,
+        uri.port,
+      );
+      if (!isCertApproved) {
+        // TODO(EVERYONE): Replace with DioException.badCertificate once upgrade dependencies Dio above 5.4.2.
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.badCertificate,
+          error: certificate,
+          message: 'The certificate of the response is not approved.',
+        );
+      }
+    }
+
+    // Config a ClientTransportConnection and save it
+    final transport = ClientTransportConnection.viaSocket(socket);
+    final transportState = _ClientTransportConnectionState(transport);
+    transport.onActiveStateChanged = (bool isActive) {
+      transportState.isActive = isActive;
+      if (!isActive) {
+        transportState.latestIdleTimeStamp = DateTime.now();
+      }
+    };
+
+    transportState.delayClose(
+      _closed ? const Duration(milliseconds: 50) : _idleTimeout,
+      () {
+        _transportsMap.remove(domain);
+        transportState.transport.finish();
+      },
+    );
+    return transportState;
+  }
+
+  Future<Socket> _createSocket(
+    Uri target,
+    RequestOptions options,
+    ClientSetting clientConfig,
+  ) async {
+    final timeout = (options.connectTimeout ?? Duration.zero) > Duration.zero
+        ? options.connectTimeout!
+        : null;
+    final proxy = clientConfig.proxy;
+
+    if (proxy == null) {
+      if (target.scheme != 'https') {
+        return Socket.connect(
+          target.host,
+          target.port,
+          timeout: timeout,
+        );
+      }
+      final socket = await SecureSocket.connect(
+        target.host,
+        target.port,
+        timeout: timeout,
+        context: clientConfig.context,
+        onBadCertificate: clientConfig.onBadCertificate,
+        supportedProtocols: ['h2'],
+      );
+      _throwIfH2NotSelected(target, socket);
+      return socket;
+    }
+
+    final proxySocket = await Socket.connect(
+      proxy.host,
+      proxy.port,
+      timeout: timeout,
+    );
+
+    final String credentialsProxy = base64Encode(utf8.encode(proxy.userInfo));
+
+    // Create http tunnel proxy https://www.ietf.org/rfc/rfc2817.txt
+
+    // Use CRLF as the end of the line https://www.ietf.org/rfc/rfc2616.txt
+    const crlf = '\r\n';
+
+    // TODO(EVERYONE): Figure out why we can only use an HTTP/1.x proxy here.
+    const proxyProtocol = 'HTTP/1.1';
+    proxySocket.write('CONNECT ${target.host}:${target.port} $proxyProtocol');
+    proxySocket.write(crlf);
+    proxySocket.write('Host: ${target.host}:${target.port}');
+
+    if (credentialsProxy.isNotEmpty) {
+      proxySocket.write(crlf);
+      proxySocket.write('Proxy-Authorization: Basic $credentialsProxy');
+    }
+
+    proxySocket.write(crlf);
+    proxySocket.write(crlf);
+
+    final completerProxyInitialization = Completer<void>();
+
+    Never onProxyError(Object? error, StackTrace stackTrace) {
+      throw DioException(
+        requestOptions: options,
+        error: error,
+        type: DioExceptionType.connectionError,
+        stackTrace: stackTrace,
+      );
+    }
+
+    completerProxyInitialization.future.onError(onProxyError);
+
+    final proxySubscription = proxySocket.listen(
+      (event) {
+        final response = ascii.decode(event);
+        final lines = response.split(crlf);
+        final statusLine = lines.first;
+        if (!completerProxyInitialization.isCompleted) {
+          if (proxyConnectedPredicate(proxyProtocol, statusLine)) {
+            completerProxyInitialization.complete();
+          } else {
+            completerProxyInitialization.completeError(
+              SocketException(
+                'Proxy cannot be initialized with status = [$statusLine], '
+                'host = ${target.host}, port = ${target.port}',
+              ),
+            );
+          }
+        }
+      },
+      onError: (e, s) {
+        if (!completerProxyInitialization.isCompleted) {
+          completerProxyInitialization.completeError(e, s);
+        }
+      },
+    );
+    await completerProxyInitialization.future;
+
+    final socket = await SecureSocket.secure(
+      proxySocket,
+      host: target.host,
+      context: clientConfig.context,
+      onBadCertificate: clientConfig.onBadCertificate,
+      supportedProtocols: ['h2'],
+    );
+    _throwIfH2NotSelected(target, socket);
+
+    proxySubscription.cancel();
+
+    return socket;
+  }
+
+  @override
+  void removeConnection(ClientTransportConnection transport) {
+    _ClientTransportConnectionState? transportState;
+    _transportsMap.removeWhere((_, state) {
+      if (state.transport == transport) {
+        transportState = state;
+        return true;
+      }
+      return false;
+    });
+    transportState?.dispose();
+  }
+
+  @override
+  void close({bool force = false}) {
+    _closed = true;
+    _forceClosed = force;
+    if (force) {
+      _transportsMap.forEach((key, value) => value.dispose());
+    }
+  }
+
+  void _throwIfH2NotSelected(Uri target, SecureSocket socket) {
+    if (socket.selectedProtocol != 'h2') {
+      throw DioH2NotSupportedException(target, socket.selectedProtocol);
+    }
   }
 }
 
-Uint8List _effectiveU8Encoding(List<int> encoded) {
-  return encoded is Uint8List ? encoded : Uint8List.fromList(encoded);
+class _ClientTransportConnectionState {
+  _ClientTransportConnectionState(this.transport);
+
+  ClientTransportConnection transport;
+
+  ClientTransportConnection get activeTransport {
+    isActive = true;
+    latestIdleTimeStamp = DateTime.now();
+    return transport;
+  }
+
+  bool isActive = true;
+  late DateTime latestIdleTimeStamp;
+  Timer? _timer;
+
+  void delayClose(Duration idleTimeout, void Function() callback) {
+    const duration = Duration(milliseconds: 100);
+    idleTimeout = idleTimeout < duration ? duration : idleTimeout;
+    _startTimer(callback, idleTimeout, idleTimeout);
+  }
+
+  void dispose() {
+    _timer?.cancel();
+    transport.finish();
+  }
+
+  void _startTimer(
+    void Function() callback,
+    Duration duration,
+    Duration idleTimeout,
+  ) {
+    _timer = Timer(duration, () {
+      if (!isActive) {
+        final interval = DateTime.now().difference(latestIdleTimeStamp);
+        if (interval >= duration) {
+          return callback();
+        }
+        return _startTimer(callback, duration - interval, idleTimeout);
+      }
+      // if active
+      _startTimer(callback, idleTimeout, idleTimeout);
+    });
+  }
 }

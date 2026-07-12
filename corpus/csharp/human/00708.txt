@@ -1,97 +1,230 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
-using System.IO;
+using System.Text;
 
-namespace NUnit.Framework.Constraints.Comparers
+// Missing XML Docs
+#pragma warning disable 1591
+
+namespace NUnit.Common
 {
-    /// <summary>
-    /// Comparator for two <see cref="Stream"/>s.
-    /// </summary>
-    internal static class StreamsComparer
+    public enum TokenKind
     {
-        private const int BUFFER_SIZE = 4096;
+        Eof,
+        Word,
+        String,
+        Symbol
+    }
 
-        public static EqualMethodResult Equal(object x, object y, ref Tolerance tolerance, ComparisonState state, NUnitEqualityComparer equalityComparer)
+    public class Token
+    {
+        public Token(TokenKind kind) : this(kind, string.Empty)
         {
-            if (x is not Stream xStream || y is not Stream yStream)
-                return EqualMethodResult.TypesNotSupported;
+        }
 
-            if (tolerance.HasVariance)
-                return EqualMethodResult.ToleranceNotSupported;
+        public Token(TokenKind kind, char ch) : this(kind, ch.ToString())
+        {
+        }
 
-            if (xStream == yStream)
-                return EqualMethodResult.ComparedEqual;
+        public Token(TokenKind kind, string text)
+        {
+            Kind = kind;
+            Text = text;
+        }
 
-            if (!xStream.CanRead)
-                throw new ArgumentException("Stream is not readable", "expected");
-            if (!yStream.CanRead)
-                throw new ArgumentException("Stream is not readable", "actual");
+        public TokenKind Kind { get; }
 
-            bool bothSeekable = xStream.CanSeek && yStream.CanSeek;
+        public string Text { get; }
 
-            if (bothSeekable && xStream.Length != yStream.Length)
-                return EqualMethodResult.ComparedNotEqual;
+        public int Pos { get; set; }
 
-            byte[] bufferExpected = new byte[BUFFER_SIZE];
-            byte[] bufferActual = new byte[BUFFER_SIZE];
+        #region Equality Overrides
 
-            BinaryReader binaryReaderExpected = new BinaryReader(xStream);
-            BinaryReader binaryReaderActual = new BinaryReader(yStream);
+        public override bool Equals(object obj)
+        {
+            return obj is Token && this == (Token)obj;
+        }
 
-            long expectedPosition = bothSeekable ? xStream.Position : default;
-            long actualPosition = bothSeekable ? yStream.Position : default;
+        public override int GetHashCode()
+        {
+            return Text.GetHashCode();
+        }
 
-            try
+        public override string ToString()
+        {
+            if (Text is null)
+                return Kind.ToString();
+            return $"{Kind}:{Text}";
+        }
+
+        public static bool operator ==(Token t1, Token t2)
+        {
+            bool t1Null = t1 is null;
+            bool t2Null = t2 is null;
+
+            if (t1Null && t2Null)
+                return true;
+
+            if (t1Null || t2Null)
+                return false;
+
+            return t1.Kind == t2.Kind && t1.Text == t2.Text;
+        }
+
+        public static bool operator !=(Token t1, Token t2)
+        {
+            return !(t1 == t2);
+        }
+
+        #endregion
+    }
+
+    /// <summary>
+    /// Tokenizer class performs lexical analysis for the TestSelectionParser.
+    /// It recognizes a very limited set of tokens: words, symbols and
+    /// quoted strings. This is sufficient for the simple DSL we use to
+    /// select which tests to run.
+    /// </summary>
+    public class Tokenizer
+    {
+        private readonly string _input;
+        private int _index;
+
+        private const char EOF_CHAR = '\0';
+        private const string WORD_BREAK_CHARS = "=!()&|";
+        private static readonly string[] DOUBLE_CHAR_SYMBOLS = new string[] { "==", "=~", "!=", "!~", "&&", "||" };
+
+        private Token _lookahead;
+
+        public Tokenizer(string input)
+        {
+            if (input is null)
+                throw new ArgumentNullException(nameof(input));
+
+            _input = input;
+            _index = 0;
+        }
+
+        public Token LookAhead
+        {
+            get
             {
-                if (xStream.CanSeek)
-                {
-                    binaryReaderExpected.BaseStream.Seek(0, SeekOrigin.Begin);
-                }
-                if (yStream.CanSeek)
-                {
-                    binaryReaderActual.BaseStream.Seek(0, SeekOrigin.Begin);
-                }
+                if (_lookahead is null)
+                    _lookahead = GetNextToken();
 
-                int readExpected = 1;
-                int readActual = 1;
-                long readByte = 0;
+                return _lookahead;
+            }
+        }
 
-                while (readExpected > 0 && readActual > 0)
-                {
-                    readExpected = binaryReaderExpected.Read(bufferExpected, 0, BUFFER_SIZE);
-                    readActual = binaryReaderActual.Read(bufferActual, 0, BUFFER_SIZE);
+        public Token NextToken()
+        {
+            Token result = _lookahead ?? GetNextToken();
+            _lookahead = null;
+            return result;
+        }
 
-                    for (int count = 0; count < BUFFER_SIZE; ++count)
+        private Token GetNextToken()
+        {
+            SkipBlanks();
+
+            var ch = NextChar;
+            int pos = _index;
+
+            switch (ch)
+            {
+                case EOF_CHAR:
+                    return new Token(TokenKind.Eof) { Pos = pos };
+
+                // Single char symbols
+                case '(':
+                case ')':
+                    GetChar();
+                    return new Token(TokenKind.Symbol, ch) { Pos = pos };
+
+                // Possible double char symbols
+                case '&':
+                case '|':
+                case '=':
+                case '!':
+                    GetChar();
+                    foreach (string dbl in DOUBLE_CHAR_SYMBOLS)
                     {
-                        if (bufferExpected[count] != bufferActual[count])
+                        if (ch == dbl[0] && NextChar == dbl[1])
                         {
-                            NUnitEqualityComparer.FailurePoint fp = new NUnitEqualityComparer.FailurePoint();
-                            fp.Position = readByte + count;
-                            fp.ExpectedHasData = true;
-                            fp.ExpectedValue = bufferExpected[count];
-                            fp.ActualHasData = true;
-                            fp.ActualValue = bufferActual[count];
-                            equalityComparer.FailurePoints.Insert(0, fp);
-                            return EqualMethodResult.ComparedNotEqual;
+                            GetChar();
+                            return new Token(TokenKind.Symbol, dbl) { Pos = pos };
                         }
                     }
-                    readByte += BUFFER_SIZE;
-                }
+
+                    return new Token(TokenKind.Symbol, ch);
+
+                case '"':
+                case '\'':
+                case '/':
+                    return GetString();
+
+                default:
+                    return GetWord();
             }
-            finally
+        }
+
+        private bool IsWordChar(char c)
+        {
+            if (char.IsWhiteSpace(c) || c == EOF_CHAR)
+                return false;
+
+            return WORD_BREAK_CHARS.IndexOf(c) < 0;
+        }
+
+        private Token GetWord()
+        {
+            var sb = new StringBuilder();
+            int pos = _index;
+
+            while (IsWordChar(NextChar))
+                sb.Append(GetChar());
+
+            return new Token(TokenKind.Word, sb.ToString()) { Pos = pos };
+        }
+
+        private Token GetString()
+        {
+            var sb = new StringBuilder();
+            int pos = _index;
+
+            char quote = GetChar(); // Save the initial quote char
+
+            while (NextChar != EOF_CHAR)
             {
-                if (xStream.CanSeek)
-                {
-                    xStream.Position = expectedPosition;
-                }
-                if (yStream.CanSeek)
-                {
-                    yStream.Position = actualPosition;
-                }
+                var ch = GetChar();
+                if (ch == '\\')
+                    ch = GetChar();
+                else if (ch == quote)
+                    break;
+                sb.Append(ch);
             }
 
-            return EqualMethodResult.ComparedEqual;
+            return new Token(TokenKind.String, sb.ToString()) { Pos = pos };
+        }
+
+        /// <summary>
+        /// Get the next character in the input, consuming it.
+        /// </summary>
+        /// <returns>The next char</returns>
+        private char GetChar()
+        {
+            return _index < _input.Length ? _input[_index++] : EOF_CHAR;
+        }
+
+        /// <summary>
+        /// Peek ahead at the next character in input
+        /// </summary>
+        private char NextChar => _index < _input.Length ? _input[_index] : EOF_CHAR;
+
+        private void SkipBlanks()
+        {
+            while (char.IsWhiteSpace(NextChar))
+                _index++;
         }
     }
 }

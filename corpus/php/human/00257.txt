@@ -10,168 +10,80 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Repository;
+namespace Composer\Command;
 
-use Composer\Repository\PathRepository;
-use Composer\Test\TestCase;
-use Composer\Util\HttpDownloader;
-use Composer\Util\Loop;
-use Composer\Util\Platform;
-use Composer\Util\ProcessExecutor;
+use Composer\Pcre\Preg;
+use Symfony\Component\Console\Input\InputInterface;
+use Composer\Console\Input\InputOption;
+use Composer\Console\Input\InputArgument;
+use Symfony\Component\Console\Output\OutputInterface;
 
-class PathRepositoryTest extends TestCase
+/**
+ * @author Jordi Boggiano <j.boggiano@seld.be>
+ */
+class ScriptAliasCommand extends BaseCommand
 {
-    public function testLoadPackageFromFileSystemWithIncorrectPath(): void
-    {
-        self::expectException('RuntimeException');
-
-        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', 'missing']);
-        $repository = $this->createPathRepo(['url' => $repositoryUrl]);
-        $repository->getPackages();
-    }
-
-    public function testLoadPackageFromFileSystemWithVersion(): void
-    {
-        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', 'with-version']);
-        $repository = $this->createPathRepo(['url' => $repositoryUrl]);
-        $repository->getPackages();
-
-        self::assertSame(1, $repository->count());
-        self::assertTrue($repository->hasPackage(self::getPackage('test/path-versioned', '0.0.2')));
-    }
-
-    public function testLoadPackageFromFileSystemWithoutVersion(): void
-    {
-        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', 'without-version']);
-        $repository = $this->createPathRepo(['url' => $repositoryUrl]);
-        $packages = $repository->getPackages();
-
-        self::assertGreaterThanOrEqual(1, $repository->count());
-
-        $package = $packages[0];
-        self::assertSame('test/path-unversioned', $package->getName());
-
-        $packageVersion = $package->getVersion();
-        self::assertNotEmpty($packageVersion);
-    }
-
-    public function testLoadPackageFromFileSystemWithWildcard(): void
-    {
-        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', '*']);
-        $repository = $this->createPathRepo(['url' => $repositoryUrl]);
-        $packages = $repository->getPackages();
-        $names = [];
-
-        self::assertGreaterThanOrEqual(2, $repository->count());
-
-        $package = $packages[0];
-        $names[] = $package->getName();
-
-        $package = $packages[1];
-        $names[] = $package->getName();
-
-        sort($names);
-        self::assertEquals(['test/path-unversioned', 'test/path-versioned'], $names);
-    }
-
-    public function testLoadPackageWithExplicitVersions(): void
-    {
-        $options = [
-            'versions' => [
-                'test/path-unversioned' => '4.3.2.1',
-                'test/path-versioned' => '3.2.1.0',
-            ],
-        ];
-        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', '*']);
-        $repository = $this->createPathRepo(['url' => $repositoryUrl, 'options' => $options]);
-        $packages = $repository->getPackages();
-
-        $versions = [];
-
-        self::assertEquals(2, $repository->count());
-
-        $package = $packages[0];
-        $versions[$package->getName()] = $package->getVersion();
-
-        $package = $packages[1];
-        $versions[$package->getName()] = $package->getVersion();
-
-        ksort($versions);
-        self::assertSame(['test/path-unversioned' => '4.3.2.1', 'test/path-versioned' => '3.2.1.0'], $versions);
-    }
+    /** @var string */
+    private $script;
+    /** @var string */
+    private $description;
+    /** @var string[] */
+    private $aliases;
 
     /**
-     * Verify relative repository URLs remain relative, see #4439
+     * @param string[] $aliases
      */
-    public function testUrlRemainsRelative(): void
+    public function __construct(string $script, ?string $description, array $aliases = [])
     {
-        // realpath() does not fully expand the paths
-        // PHP Bug https://bugs.php.net/bug.php?id=72642
-        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [realpath(realpath(__DIR__)), 'Fixtures', 'path', 'with-version']);
-        // getcwd() not necessarily match __DIR__
-        // PHP Bug https://bugs.php.net/bug.php?id=73797
-        $relativeUrl = ltrim(substr($repositoryUrl, strlen(realpath(realpath(Platform::getCwd())))), DIRECTORY_SEPARATOR);
+        $this->script = $script;
+        $this->description = $description ?? 'Runs the '.$script.' script as defined in composer.json';
+        $this->aliases = $aliases;
 
-        $repository = $this->createPathRepo(['url' => $relativeUrl]);
-        $packages = $repository->getPackages();
-
-        self::assertSame(1, $repository->count());
-
-        $package = $packages[0];
-        self::assertSame('test/path-versioned', $package->getName());
-
-        // Convert platform specific separators back to generic URL slashes
-        $relativeUrl = str_replace(DIRECTORY_SEPARATOR, '/', $relativeUrl);
-        self::assertSame($relativeUrl, $package->getDistUrl());
-    }
-
-    public function testReferenceNone(): void
-    {
-        $options = [
-            'reference' => 'none',
-        ];
-        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', '*']);
-        $repository = $this->createPathRepo(['url' => $repositoryUrl, 'options' => $options]);
-        $packages = $repository->getPackages();
-
-        self::assertGreaterThanOrEqual(2, $repository->count());
-
-        foreach ($packages as $package) {
-            self::assertEquals($package->getDistReference(), null);
+        foreach ($this->aliases as $alias) {
+            if (!is_string($alias)) {
+                throw new \InvalidArgumentException('"scripts-aliases" element array values should contain only strings');
+            }
         }
+
+        $this->ignoreValidationErrors();
+
+        parent::__construct();
     }
 
-    public function testReferenceConfig(): void
+    protected function configure(): void
     {
-        $options = [
-            'reference' => 'config',
-            'relative' => true,
-        ];
-        $repositoryUrl = implode(DIRECTORY_SEPARATOR, [__DIR__, 'Fixtures', 'path', '*']);
-        $repository = $this->createPathRepo(['url' => $repositoryUrl, 'options' => $options]);
-        $packages = $repository->getPackages();
+        $this
+            ->setName($this->script)
+            ->setDescription($this->description)
+            ->setAliases($this->aliases)
+            ->setDefinition([
+                new InputOption('dev', null, InputOption::VALUE_NONE, 'Sets the dev mode.'),
+                new InputOption('no-dev', null, InputOption::VALUE_NONE, 'Disables the dev mode.'),
+                new InputArgument('args', InputArgument::IS_ARRAY | InputArgument::OPTIONAL, ''),
+            ])
+            ->setHelp(
+                <<<EOT
+The <info>run-script</info> command runs scripts defined in composer.json:
 
-        self::assertGreaterThanOrEqual(2, $repository->count());
+<info>php composer.phar run-script post-update-cmd</info>
 
-        foreach ($packages as $package) {
-            self::assertEquals(
-                $package->getDistReference(),
-                sha1(file_get_contents($package->getDistUrl() . '/composer.json') . serialize($options))
-            );
+Read more at https://getcomposer.org/doc/03-cli.md#run-script-run
+EOT
+            )
+        ;
+    }
+
+    protected function execute(InputInterface $input, OutputInterface $output): int
+    {
+        $composer = $this->requireComposer();
+
+        $args = $input->getArguments();
+
+        // TODO remove for Symfony 6+ as it is then in the interface
+        if (!method_exists($input, '__toString')) { // @phpstan-ignore-line
+            throw new \LogicException('Expected an Input instance that is stringable, got '.get_class($input));
         }
-    }
 
-    /**
-     * @param array<mixed> $options
-     */
-    private function createPathRepo(array $options): PathRepository
-    {
-        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
-
-        $config = new \Composer\Config();
-        $proc = new ProcessExecutor();
-        $loop = new Loop(new HttpDownloader($io, $config), $proc);
-
-        return new PathRepository($options, $io, $config, null, null, $proc);
+        return $composer->getEventDispatcher()->dispatchScript($this->script, $input->getOption('dev') || !$input->getOption('no-dev'), $args['args'], ['script-alias-input' => Preg::replace('{^\S+ ?}', '', $input->__toString(), 1)]);
     }
 }

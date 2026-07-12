@@ -1,695 +1,502 @@
+//! Store the latest reply to every active client session.
+//!
+//! This allows them to be resent to the corresponding client if the client missed the original
+//! reply message (e.g. dropped packet).
+//!
+//! - Client replies' headers are stored in the `client_sessions` trailer.
+//! - Client replies (header and body) are only stored by ClientReplies in the `client_replies` zone
+//!   when `reply.header.size ≠ sizeOf(Header)` – that is, when the body is non-empty.
+//! - Corrupt client replies can be repaired from other replicas.
+//!
+//! Replies are written asynchronously. Subsequent writes for the same client may be coalesced –
+//! we only care about the last reply to each client session.
+//!
+//! ClientReplies guarantees that the latest replies are durable at checkpoint.
+//!
+//! If the same reply is corrupted by all replicas, the cluster is still available.
+//! If the respective client also never received the reply (due to a network fault), the client may
+//! be "locked out" of the cluster – continually retrying a request which has been executed, but
+//! whose reply has been permanently lost. This can be resolved by the operator restarting the
+//! client to create a new session.
 const std = @import("std");
-const builtin = @import("builtin");
+const assert = std.debug.assert;
+const maybe = stdx.maybe;
+const mem = std.mem;
+const log = std.log.scoped(.client_replies);
 
-/// Must match the `version` in `build.zig.zon`.
-/// Remove `.pre` when tagging a new ZLS release and add it back on the next development cycle.
-const zls_version = std.SemanticVersion{ .major = 0, .minor = 13, .patch = 0 };
+const stdx = @import("../stdx.zig");
+const constants = @import("../constants.zig");
+const RingBuffer = @import("../ring_buffer.zig").RingBuffer;
+const IOPS = @import("../iops.zig").IOPS;
+const vsr = @import("../vsr.zig");
+const Message = @import("../message_pool.zig").MessagePool.Message;
+const MessagePool = @import("../message_pool.zig").MessagePool;
+const Slot = @import("client_sessions.zig").ReplySlot;
+const ClientSessions = @import("client_sessions.zig").ClientSessions;
 
-/// Specify the minimum Zig version that is required to compile and test ZLS:
-/// Release 0.13.0
-///
-/// Must match the `minimum_zig_version` in `build.zig.zon`.
-const minimum_build_zig_version = "0.13.0";
+fn slot_offset(slot: Slot) usize {
+    return slot.index * constants.message_size_max;
+}
 
-/// Specify the minimum Zig version that is required to run ZLS:
-/// Release 0.12.0
-///
-/// Examples of reasons that would cause the minimum runtime version to be bumped are:
-///   - breaking change to the Zig Syntax
-///   - breaking change to AstGen (i.e `zig ast-check`)
-///   - breaking change to the build system (see `src/build_runner`)
-const minimum_runtime_zig_version = "0.12.0";
+// TODO Optimization:
+// Don't always immediately start writing a reply. Instead, hold onto it in the hopes that
+// the same client will queue another request. If they do (within the same checkpoint),
+// then we no longer need to persist the original reply.
+pub fn ClientRepliesType(comptime Storage: type) type {
+    return struct {
+        const ClientReplies = @This();
 
-const release_targets = [_]std.Target.Query{
-    .{ .cpu_arch = .x86_64, .os_tag = .windows },
-    .{ .cpu_arch = .x86_64, .os_tag = .linux },
-    .{ .cpu_arch = .x86_64, .os_tag = .macos },
-    .{ .cpu_arch = .x86, .os_tag = .windows },
-    .{ .cpu_arch = .x86, .os_tag = .linux },
-    .{ .cpu_arch = .aarch64, .os_tag = .linux },
-    .{ .cpu_arch = .aarch64, .os_tag = .macos },
-    .{ .cpu_arch = .wasm32, .os_tag = .wasi },
-};
+        const Read = struct {
+            client_replies: *ClientReplies,
+            completion: Storage.Read,
+            callback: ?*const fn (
+                client_replies: *ClientReplies,
+                reply_header: *const vsr.Header.Reply,
+                reply: ?*Message.Reply,
+                destination_replica: ?u8,
+            ) void,
+            slot: Slot,
+            message: *Message.Reply,
+            /// The header of the expected reply.
+            header: vsr.Header.Reply,
+            destination_replica: ?u8,
+        };
 
-pub fn build(b: *Build) !void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+        const Write = struct {
+            client_replies: *ClientReplies,
+            completion: Storage.Write,
+            slot: Slot,
+            message: *Message.Reply,
+        };
 
-    const single_threaded = b.option(bool, "single-threaded", "Build a single threaded Executable");
-    const pie = b.option(bool, "pie", "Build a Position Independent Executable");
-    const enable_tracy = b.option(bool, "enable_tracy", "Whether tracy should be enabled.") orelse false;
-    const enable_tracy_allocation = b.option(bool, "enable_tracy_allocation", "Enable using TracyAllocator to monitor allocations.") orelse enable_tracy;
-    const enable_tracy_callstack = b.option(bool, "enable_tracy_callstack", "Enable callstack graphs.") orelse enable_tracy;
-    const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match filter") orelse &[0][]const u8{};
-    const data_version = b.option([]const u8, "data_version", "The Zig version your compiler is.");
-    const data_version_path = b.option([]const u8, "version_data_path", "Manually specify zig language reference file");
-    const override_version_data_file_path = b.option([]const u8, "version_data_file_path", "Relative path to version data file (if none, will be named with timestamp)");
-    const use_llvm = b.option(bool, "use_llvm", "Use Zig's llvm code backend");
-
-    const resolved_zls_version = getVersion(b);
-    const resolved_zls_version_string = b.fmt("{}", .{resolved_zls_version});
-
-    const build_options = b.addOptions();
-    build_options.step.name = "ZLS build options";
-    const build_options_module = build_options.createModule();
-    build_options.addOption(std.SemanticVersion, "version", resolved_zls_version);
-    build_options.addOption([]const u8, "version_string", resolved_zls_version_string);
-    build_options.addOption([]const u8, "minimum_runtime_zig_version_string", minimum_runtime_zig_version);
-
-    const exe_options = b.addOptions();
-    exe_options.step.name = "ZLS exe options";
-    const exe_options_module = exe_options.createModule();
-    exe_options.addOption(std.log.Level, "log_level", b.option(std.log.Level, "log_level", "The Log Level to be used.") orelse .info);
-    exe_options.addOption(bool, "enable_failing_allocator", b.option(bool, "enable_failing_allocator", "Whether to use a randomly failing allocator.") orelse false);
-    exe_options.addOption(u32, "enable_failing_allocator_likelihood", b.option(u32, "enable_failing_allocator_likelihood", "The chance that an allocation will fail is `1/likelihood`") orelse 256);
-    exe_options.addOption(bool, "use_gpa", b.option(bool, "use_gpa", "Good for debugging") orelse (optimize == .Debug));
-
-    const global_cache_path = try b.cache_root.join(b.allocator, &.{"zls"});
-    b.cache_root.handle.makePath(global_cache_path) catch |err| {
-        std.debug.panic("unable to make tmp path '{s}': {}", .{ global_cache_path, err });
-    };
-
-    const test_options = b.addOptions();
-    test_options.step.name = "ZLS test options";
-    const test_options_module = test_options.createModule();
-    test_options.addOption([]const u8, "zig_exe_path", b.graph.zig_exe);
-    test_options.addOption([]const u8, "global_cache_path", global_cache_path);
-
-    const known_folders_module = b.dependency("known_folders", .{}).module("known-folders");
-    const diffz_module = b.dependency("diffz", .{}).module("diffz");
-    const tracy_module = getTracyModule(b, .{
-        .target = target,
-        .optimize = optimize,
-        .enable = enable_tracy,
-        .enable_allocation = enable_tracy_allocation,
-        .enable_callstack = enable_tracy_callstack,
-    });
-
-    const gen_exe = b.addExecutable(.{
-        .name = "zls_gen",
-        .root_source_file = b.path("src/config_gen/config_gen.zig"),
-        .target = b.host,
-        .single_threaded = true,
-    });
-
-    const gen_cmd = b.addRunArtifact(gen_exe);
-    gen_cmd.addArgs(&.{
-        "--readme-path",
-        b.pathFromRoot("README.md"),
-        "--generate-config-path",
-        b.pathFromRoot("src/Config.zig"),
-        "--generate-schema-path",
-        b.pathFromRoot("schema.json"),
-    });
-    if (b.args) |args| gen_cmd.addArgs(args);
-
-    const gen_step = b.step("gen", "Regenerate config files");
-    gen_step.dependOn(&gen_cmd.step);
-
-    const gen_version_data_cmd = b.addRunArtifact(gen_exe);
-    const resolved_data_version = data_version orelse if (zls_version.pre == null and zls_version.build == null) b.fmt("{}", .{zls_version}) else "master";
-    gen_version_data_cmd.addArgs(&.{ "--generate-version-data", resolved_data_version });
-    if (data_version_path) |path| {
-        gen_version_data_cmd.addArg("--langref_path");
-        gen_version_data_cmd.addFileArg(.{ .cwd_relative = path });
-    }
-    const version_data_file_name = if (data_version_path != null)
-        b.fmt("version_data_{s}.zig", .{resolved_data_version})
-    else blk: {
-        // invalidate version data periodically from cache because the website content may change
-        // setting `has_side_effects` would also be possible but that would always force a re-run
-        const timestamp = @divFloor(std.time.timestamp(), std.time.s_per_day);
-        break :blk b.fmt("version_data_{s}_{d}.zig", .{ resolved_data_version, timestamp });
-    };
-    gen_version_data_cmd.addArg("--generate-version-data-path");
-    const version_data_path: std.Build.LazyPath = if (override_version_data_file_path) |path|
-        .{ .cwd_relative = path }
-    else
-        gen_version_data_cmd.addOutputFileArg(version_data_file_name);
-    const version_data_module = b.addModule("version_data", .{ .root_source_file = version_data_path });
-
-    const zls_module = b.addModule("zls", .{
-        .root_source_file = b.path("src/zls.zig"),
-        .imports = &.{
-            .{ .name = "known-folders", .module = known_folders_module },
-            .{ .name = "diffz", .module = diffz_module },
-            .{ .name = "tracy", .module = tracy_module },
-            .{ .name = "build_options", .module = build_options_module },
-            .{ .name = "version_data", .module = version_data_module },
-        },
-    });
-
-    var release_artifacts: std.BoundedArray(*Build.Step.Compile, release_targets.len) = .{};
-
-    for (release_targets) |target_query| {
-        const exe = b.addExecutable(.{
-            .name = "zls",
-            .target = b.resolveTargetQuery(target_query),
-            .root_source_file = b.path("src/main.zig"),
-            .version = resolved_zls_version,
-            .optimize = optimize,
-            .max_rss = if (optimize == .Debug and target_query.os_tag == .wasi) 2_000_000_000 else 1_500_000_000,
-            .single_threaded = single_threaded,
-            .pic = pie,
-            .use_llvm = use_llvm,
-            .use_lld = use_llvm,
+        const WriteQueue = RingBuffer(*Write, .{
+            .array = constants.client_replies_iops_write_max,
         });
-        exe.root_module.addImport("exe_options", exe_options_module);
-        exe.root_module.addImport("tracy", tracy_module);
-        exe.root_module.addImport("diffz", diffz_module);
-        exe.root_module.addImport("known-folders", known_folders_module);
-        exe.root_module.addImport("zls", zls_module);
 
-        release_artifacts.appendAssumeCapacity(exe);
-    }
+        storage: *Storage,
+        message_pool: *MessagePool,
+        replica: u8,
 
-    release(b, &release_targets, release_artifacts.constSlice());
+        reads: IOPS(Read, constants.client_replies_iops_read_max) = .{},
+        writes: IOPS(Write, constants.client_replies_iops_write_max) = .{},
 
-    const exe = b.addExecutable(.{
-        .name = "zls",
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .single_threaded = single_threaded,
-        .pic = pie,
-        .use_llvm = use_llvm,
-        .use_lld = use_llvm,
-    });
-    exe.pie = pie;
-    exe.root_module.addImport("exe_options", exe_options_module);
-    exe.root_module.addImport("tracy", tracy_module);
-    exe.root_module.addImport("diffz", diffz_module);
-    exe.root_module.addImport("known-folders", known_folders_module);
-    exe.root_module.addImport("zls", zls_module);
-    b.installArtifact(exe);
+        /// Track which slots have a write currently in progress.
+        writing: std.StaticBitSet(constants.clients_max) =
+            std.StaticBitSet(constants.clients_max).initEmpty(),
+        /// Track which slots hold a corrupt reply, or are otherwise missing the reply
+        /// that ClientSessions believes they should hold.
+        ///
+        /// Invariants:
+        /// - Set bits must correspond to occupied slots in ClientSessions.
+        /// - Set bits must correspond to entries in ClientSessions with
+        ///   `header.size > @sizeOf(vsr.Header)`.
+        faulty: std.StaticBitSet(constants.clients_max) =
+            std.StaticBitSet(constants.clients_max).initEmpty(),
 
-    const test_step = b.step("test", "Run all the tests");
+        /// Guard against multiple concurrent writes to the same slot.
+        /// Pointers are into `writes`.
+        write_queue: WriteQueue = WriteQueue.init(),
 
-    const tests = b.addTest(.{
-        .root_source_file = b.path("tests/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .filters = test_filters,
-        .single_threaded = single_threaded,
-        .pic = pie,
-        .use_llvm = use_llvm,
-        .use_lld = use_llvm,
-    });
+        ready_callback: ?*const fn (*ClientReplies) void = null,
 
-    tests.root_module.addImport("zls", zls_module);
-    tests.root_module.addImport("test_options", test_options_module);
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+        checkpoint_next_tick: Storage.NextTick = undefined,
+        checkpoint_callback: ?*const fn (*ClientReplies) void = null,
 
-    const src_tests = b.addTest(.{
-        .name = "src test",
-        .root_source_file = b.path("src/zls.zig"),
-        .target = target,
-        .optimize = optimize,
-        .filters = test_filters,
-        .single_threaded = single_threaded,
-        .pic = pie,
-        .use_llvm = use_llvm,
-        .use_lld = use_llvm,
-    });
-    src_tests.root_module.addImport("build_options", build_options_module);
-    src_tests.root_module.addImport("test_options", test_options_module);
-    test_step.dependOn(&b.addRunArtifact(src_tests).step);
-
-    const coverage_step = b.step("coverage", "Generate a coverage report with kcov");
-
-    const merge_step = std.Build.Step.Run.create(b, "merge coverage");
-    merge_step.addArgs(&.{ "kcov", "--merge" });
-    merge_step.rename_step_with_output_arg = false;
-    const merged_coverage_output = merge_step.addOutputFileArg(".");
-
-    {
-        const kcov_collect = std.Build.Step.Run.create(b, "collect coverage");
-        kcov_collect.addArgs(&.{ "kcov", "--collect-only" });
-        kcov_collect.addPrefixedDirectoryArg("--include-pattern=", b.path("src"));
-        merge_step.addDirectoryArg(kcov_collect.addOutputFileArg(tests.name));
-        kcov_collect.addArtifactArg(tests);
-        kcov_collect.enableTestRunnerMode();
-    }
-
-    {
-        const kcov_collect = std.Build.Step.Run.create(b, "collect coverage");
-        kcov_collect.addArgs(&.{ "kcov", "--collect-only" });
-        kcov_collect.addPrefixedDirectoryArg("--include-pattern=", b.path("src"));
-        merge_step.addDirectoryArg(kcov_collect.addOutputFileArg(src_tests.name));
-        kcov_collect.addArtifactArg(src_tests);
-        kcov_collect.enableTestRunnerMode();
-    }
-
-    const install_coverage = b.addInstallDirectory(.{
-        .source_dir = merged_coverage_output,
-        .install_dir = .{ .custom = "coverage" },
-        .install_subdir = "",
-    });
-    coverage_step.dependOn(&install_coverage.step);
-}
-
-/// Returns `MAJOR.MINOR.PATCH-dev` when `git describe` failed.
-fn getVersion(b: *Build) std.SemanticVersion {
-    if (zls_version.pre == null and zls_version.build == null) return zls_version;
-
-    var code: u8 = undefined;
-    const git_describe_untrimmed = b.runAllowFail(
-        &.{ "git", "-C", b.pathFromRoot("."), "describe", "--match", "*.*.*", "--tags" },
-        &code,
-        .Ignore,
-    ) catch return zls_version;
-
-    const git_describe = std.mem.trim(u8, git_describe_untrimmed, " \n\r");
-
-    switch (std.mem.count(u8, git_describe, "-")) {
-        0 => {
-            // Tagged release version (e.g. 0.10.0).
-            std.debug.assert(std.mem.eql(u8, git_describe, b.fmt("{}", .{zls_version}))); // tagged release must match version string
-            return zls_version;
-        },
-        2 => {
-            // Untagged development build (e.g. 0.10.0-dev.216+34ce200).
-            var it = std.mem.splitScalar(u8, git_describe, '-');
-            const tagged_ancestor = it.first();
-            const commit_height = it.next().?;
-            const commit_id = it.next().?;
-
-            const ancestor_ver = std.SemanticVersion.parse(tagged_ancestor) catch unreachable;
-            std.debug.assert(zls_version.order(ancestor_ver) == .gt); // ZLS version must be greater than its previous version
-            std.debug.assert(std.mem.startsWith(u8, commit_id, "g")); // commit hash is prefixed with a 'g'
-
-            return std.SemanticVersion{
-                .major = zls_version.major,
-                .minor = zls_version.minor,
-                .patch = zls_version.patch,
-                .pre = b.fmt("dev.{s}", .{commit_height}),
-                .build = commit_id[1..],
+        pub fn init(options: struct {
+            storage: *Storage,
+            message_pool: *MessagePool,
+            replica_index: u8,
+        }) ClientReplies {
+            return .{
+                .storage = options.storage,
+                .message_pool = options.message_pool,
+                .replica = options.replica_index,
             };
-        },
-        else => {
-            std.debug.print("Unexpected 'git describe' output: '{s}'\n", .{git_describe});
-            std.process.exit(1);
-        },
-    }
-}
+        }
 
-fn getTracyModule(
-    b: *Build,
-    options: struct {
-        target: Build.ResolvedTarget,
-        optimize: std.builtin.OptimizeMode,
-        enable: bool,
-        enable_allocation: bool,
-        enable_callstack: bool,
-    },
-) *Build.Module {
-    const tracy_options = b.addOptions();
-    tracy_options.step.name = "tracy options";
-    tracy_options.addOption(bool, "enable", options.enable);
-    tracy_options.addOption(bool, "enable_allocation", options.enable and options.enable_allocation);
-    tracy_options.addOption(bool, "enable_callstack", options.enable and options.enable_callstack);
+        pub fn deinit(client_replies: *ClientReplies) void {
+            {
+                var it = client_replies.reads.iterate();
+                while (it.next()) |read| client_replies.message_pool.unref(read.message);
+            }
+            {
+                var it = client_replies.writes.iterate();
+                while (it.next()) |write| client_replies.message_pool.unref(write.message);
+            }
+            // Don't unref `write_queue`'s Writes — they are a subset of `writes`.
+        }
 
-    const tracy_module = b.addModule("tracy", .{
-        .root_source_file = b.path("src/tracy.zig"),
-        .target = options.target,
-        .optimize = options.optimize,
-    });
-    tracy_module.addImport("options", tracy_options.createModule());
-    if (!options.enable) return tracy_module;
-    tracy_module.link_libc = true;
-    tracy_module.link_libcpp = true;
+        /// Returns true if the reply at the given slot is  durably persisted to disk. The
+        /// difference with `faulty` bit set is that `faulty` is cleared at the start of a write
+        /// when the reply is still in RAM. In contrast, `reply_durable` checks that the
+        /// corresponding reply hit the disk.
+        pub fn reply_durable(
+            client_replies: *const ClientReplies,
+            slot: Slot,
+        ) bool {
+            return !client_replies.faulty.isSet(slot.index) and
+                !client_replies.writing.isSet(slot.index);
+        }
 
-    // On mingw, we need to opt into windows 7+ to get some features required by tracy.
-    const tracy_c_flags: []const []const u8 = if (options.target.result.isMinGW())
-        &[_][]const u8{ "-DTRACY_ENABLE=1", "-fno-sanitize=undefined", "-D_WIN32_WINNT=0x601" }
-    else
-        &[_][]const u8{ "-DTRACY_ENABLE=1", "-fno-sanitize=undefined" };
+        pub fn read_reply_sync(
+            client_replies: *ClientReplies,
+            slot: Slot,
+            session: *const ClientSessions.Entry,
+        ) ?*Message.Reply {
+            const client = session.header.client;
 
-    tracy_module.addIncludePath(b.path("src/tracy"));
-    tracy_module.addCSourceFile(.{
-        .file = b.path("src/tracy/public/TracyClient.cpp"),
-        .flags = tracy_c_flags,
-    });
+            if (!client_replies.writing.isSet(slot.index)) return null;
 
-    if (options.target.result.os.tag == .windows) {
-        tracy_module.linkSystemLibrary("dbghelp", .{});
-        tracy_module.linkSystemLibrary("ws2_32", .{});
-    }
+            var writes = client_replies.writes.iterate();
+            var write_latest: ?*const Write = null;
+            while (writes.next()) |write| {
+                if (write.message.header.client == client) {
+                    if (write_latest == null or
+                        write_latest.?.message.header.request < write.message.header.request)
+                    {
+                        write_latest = write;
+                    }
+                }
+            }
 
-    return tracy_module;
-}
+            if (write_latest.?.message.header.checksum != session.header.checksum) {
+                // We are writing a reply, but that's a wrong reply according to `client_sessions`.
+                // This happens after state sync, where we update `client_sessions` without
+                // waiting for the in-flight write requests to complete.
+                assert(client_replies.faulty.isSet(slot.index));
+                return null;
+            }
 
-/// - compile ZLS binaries with different targets
-/// - compress them (.tar.xz or .zip)
-/// - optionally sign them with minisign (https://github.com/jedisct1/minisign)
-/// - send a http `multipart/form-data` request to a Cloudflare worker at https://github.com/zigtools/release-worker
-fn release(b: *Build, target_queries: []const std.Target.Query, release_artifacts: []const *Build.Step.Compile) void {
-    std.debug.assert(release_artifacts.len > 0);
-    for (release_artifacts) |compile| std.debug.assert(compile.version != null);
+            assert(!client_replies.faulty.isSet(slot.index));
+            return write_latest.?.message;
+        }
 
-    const publish_step = b.step("publish", "Publish release artifacts to releases.zigtools.org");
-    const release_step = b.step("release", "Build all release artifacts. (requires tar and 7z)");
-    const release_minisign = b.option(bool, "release-minisign", "Sign release artifacts with Minisign") orelse false;
+        /// Caller must check read_reply_sync() first.
+        /// (They are split up to avoid complicated NextTick bounds.)
+        pub fn read_reply(
+            client_replies: *ClientReplies,
+            slot: Slot,
+            session: *const ClientSessions.Entry,
+            callback: *const fn (
+                *ClientReplies,
+                *const vsr.Header.Reply,
+                ?*Message.Reply,
+                ?u8,
+            ) void,
+            destination_replica: ?u8,
+        ) error{Busy}!void {
+            assert(client_replies.read_reply_sync(slot, session) == null);
 
-    const uri: std.Uri = if (b.graph.env_map.get("ZLS_WORKER_ENDPOINT")) |endpoint| blk: {
-        var uri = std.Uri.parse(endpoint) catch std.debug.panic("invalid URI: '{s}'", .{endpoint});
-        if (!uri.path.isEmpty()) std.debug.panic("ZLS_WORKER_ENDPOINT URI must have no path component: '{s}'", .{endpoint});
-        uri.path = .{ .raw = "/publish" };
-        break :blk uri;
-    } else .{
-        .scheme = "https",
-        .host = .{ .raw = "releases.zigtools.org" },
-        .path = .{ .raw = "/publish" },
-    };
+            const read = client_replies.reads.acquire() orelse {
+                log.debug("{}: read_reply: busy (client={} reply={})", .{
+                    client_replies.replica,
+                    session.header.client,
+                    session.header.checksum,
+                });
 
-    const authorization: std.http.Client.Request.Headers.Value = blk: {
-        const api_token = b.graph.env_map.get("ZLS_WORKER_API_TOKEN") orelse "amogus";
-        const usename_password = b.fmt("admin:{s}", .{api_token});
-        const buffer = b.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(usename_password.len)) catch @panic("OOM");
-        const auth = std.base64.standard.Encoder.encode(buffer, usename_password);
-        break :blk .{ .override = b.fmt("Basic {s}", .{auth}) };
-    };
+                return error.Busy;
+            };
 
-    var publish_artifacts = PostMultiPartForm.create(b, uri, .{ .authorization = authorization });
-    publish_step.dependOn(&publish_artifacts.step);
-
-    // It is possible for the version to be something like `0.12.0-dev` when `git describe` failed.
-    // Ideally we would want to report a failure about this when running one of the release/publish steps.
-    // The problem is during the configure phase, it is not possible to know which top level steps gets run.
-    // So instead we use rely on the release-worker to reject this version string during the make phase.
-    // One possible alternative would be to use a configuration option (i.e. -Dpublish) to conditionally run an assertion.
-    publish_artifacts.addText("zls-version", b.fmt("{}", .{release_artifacts[0].version.?}));
-    publish_artifacts.addText("compatibility", "full");
-    publish_artifacts.addText("zig-version", builtin.zig_version_string);
-    publish_artifacts.addText("minimum-build-zig-version", minimum_build_zig_version);
-    publish_artifacts.addText("minimum-runtime-zig-version", minimum_runtime_zig_version);
-
-    var compressed_artifacts = std.StringArrayHashMap(std.Build.LazyPath).init(b.allocator);
-
-    for (target_queries, release_artifacts) |target_query, exe| {
-        const resolved_target = exe.root_module.resolved_target.?.result;
-        const is_windows = resolved_target.os.tag == .windows;
-        const exe_name = b.fmt("{s}{s}", .{ exe.name, resolved_target.exeFileExt() });
-
-        const extensions: []const []const u8 = if (is_windows) &.{"zip"} else &.{ "tar.xz", "tar.gz" };
-
-        for (extensions) |extension| {
-            const file_name = b.fmt("zls-{s}-{s}-{}.{s}", .{
-                @tagName(target_query.os_tag.?),
-                @tagName(target_query.cpu_arch.?),
-                exe.version.?,
-                extension,
+            log.debug("{}: read_reply: start (client={} reply={})", .{
+                client_replies.replica,
+                session.header.client,
+                session.header.checksum,
             });
 
-            const compress_cmd = std.Build.Step.Run.create(b, "compress artifact");
-            if (is_windows) {
-                compress_cmd.step.max_rss = 165_000_000;
-                compress_cmd.addArgs(&.{ "7z", "a", "-mx=9" });
-                compressed_artifacts.putNoClobber(file_name, compress_cmd.addOutputFileArg(file_name)) catch @panic("OOM");
-                compress_cmd.addArtifactArg(exe);
-                compress_cmd.addFileArg(exe.getEmittedPdb());
-                compress_cmd.addFileArg(b.path("LICENSE"));
-                compress_cmd.addFileArg(b.path("README.md"));
-            } else {
-                compress_cmd.step.max_rss = 240_000_000;
-                compress_cmd.setEnvironmentVariable("XZ_OPT", "-9");
-                compress_cmd.addArgs(&.{ "tar", "caf" });
-                compressed_artifacts.putNoClobber(file_name, compress_cmd.addOutputFileArg(file_name)) catch @panic("OOM");
-                compress_cmd.addPrefixedDirectoryArg("-C", exe.getEmittedBinDirectory());
-                compress_cmd.addArg(exe_name);
+            const message = client_replies.message_pool.get_message(.reply);
+            defer client_replies.message_pool.unref(message);
 
-                compress_cmd.addPrefixedDirectoryArg("-C", b.path("."));
-                compress_cmd.addArg("LICENSE");
-                compress_cmd.addArg("README.md");
+            read.* = .{
+                .client_replies = client_replies,
+                .completion = undefined,
+                .slot = slot,
+                .message = message.ref(),
+                .callback = callback,
+                .header = session.header,
+                .destination_replica = destination_replica,
+            };
 
-                compress_cmd.addArgs(&.{
-                    "--sort=name",
-                    "--numeric-owner",
-                    "--owner=0",
-                    "--group=0",
-                    "--mtime=1970-01-01",
+            client_replies.storage.read_sectors(
+                read_reply_callback,
+                &read.completion,
+                message.buffer[0..vsr.sector_ceil(session.header.size)],
+                .client_replies,
+                slot_offset(slot),
+            );
+        }
+
+        fn read_reply_callback(completion: *Storage.Read) void {
+            const read: *ClientReplies.Read = @alignCast(@fieldParentPtr("completion", completion));
+            const client_replies = read.client_replies;
+            const header = read.header;
+            const message = read.message;
+            const callback_or_null = read.callback;
+            const destination_replica = read.destination_replica;
+
+            client_replies.reads.release(read);
+
+            defer {
+                client_replies.message_pool.unref(message);
+                client_replies.write_reply_next();
+            }
+
+            const callback = callback_or_null orelse {
+                log.debug("{}: read_reply: already resolved (client={} reply={})", .{
+                    client_replies.replica,
+                    header.client,
+                    header.checksum,
                 });
+                return;
+            };
+
+            if (!message.header.valid_checksum() or
+                !message.header.valid_checksum_body(message.body()))
+            {
+                log.warn("{}: read_reply: corrupt reply (client={} reply={})", .{
+                    client_replies.replica,
+                    header.client,
+                    header.checksum,
+                });
+
+                callback(client_replies, &header, null, destination_replica);
+                return;
             }
+
+            // Possible causes:
+            // - The read targets an older reply.
+            // - The read targets a newer reply (that we haven't seen/written yet).
+            // - The read targets a reply that we wrote, but was misdirected.
+            if (message.header.checksum != header.checksum) {
+                log.warn("{}: read_reply: unexpected header (client={} reply={} found={})", .{
+                    client_replies.replica,
+                    header.client,
+                    header.checksum,
+                    message.header.checksum,
+                });
+
+                callback(client_replies, &header, null, destination_replica);
+                return;
+            }
+
+            assert(message.header.command == .reply);
+            assert(message.header.cluster == header.cluster);
+
+            log.debug("{}: read_reply: done (client={} reply={})", .{
+                client_replies.replica,
+                header.client,
+                header.checksum,
+            });
+
+            callback(client_replies, &header, message, destination_replica);
         }
-    }
 
-    for (compressed_artifacts.keys(), compressed_artifacts.values()) |file_name, file_path| {
-        const install_dir: std.Build.InstallDir = .{ .custom = "artifacts" };
+        pub fn ready_sync(client_replies: *ClientReplies) bool {
+            maybe(client_replies.ready_callback == null);
 
-        const install_tarball = b.addInstallFileWithDir(file_path, install_dir, file_name);
-        release_step.dependOn(&install_tarball.step);
-        publish_artifacts.addFile(file_name, file_path);
-
-        if (release_minisign) {
-            const minisign_basename = b.fmt("{s}.minisig", .{file_name});
-
-            const minising_cmd = b.addSystemCommand(&.{ "minisign", "-Sm" });
-            minising_cmd.addFileArg(file_path);
-            minising_cmd.addPrefixedFileArg("-s", .{ .cwd_relative = "minisign.key" });
-            const minising_file_path = minising_cmd.addPrefixedOutputFileArg("-x", minisign_basename);
-
-            const install_minising = b.addInstallFileWithDir(minising_file_path, install_dir, minisign_basename);
-            release_step.dependOn(&install_minising.step);
-            publish_artifacts.addFile(minisign_basename, minising_file_path);
+            return client_replies.writes.available() > 0;
         }
-    }
-}
 
-const PostMultiPartForm = struct {
-    pub const base_id: Build.Step.Id = .custom;
+        /// Caller must check ready_sync() first.
+        /// Call `callback` when ClientReplies is able to start another write_reply().
+        pub fn ready(
+            client_replies: *ClientReplies,
+            callback: *const fn (client_replies: *ClientReplies) void,
+        ) void {
+            assert(client_replies.ready_callback == null);
+            assert(!client_replies.ready_sync());
+            assert(client_replies.writes.available() == 0);
 
-    step: Build.Step,
-    uri: std.Uri,
-    headers: std.http.Client.Request.Headers,
-    fields: std.ArrayListUnmanaged(Field) = .{},
+            // ready_callback will be called the next time a write completes.
+            client_replies.ready_callback = callback;
+        }
 
-    pub const Field = struct {
-        name: []const u8,
-        value: FieldValue,
-        content_type: std.http.Client.Request.Headers.Value,
-    };
+        pub fn remove_reply(client_replies: *ClientReplies, slot: Slot) void {
+            maybe(client_replies.faulty.isSet(slot.index));
 
-    pub const FieldValue = union(enum) {
-        lazy_path: Build.LazyPath,
-        bytes: []u8,
-    };
+            client_replies.faulty.unset(slot.index);
+        }
 
-    pub fn create(owner: *Build, uri: std.Uri, headers: std.http.Client.Request.Headers) *PostMultiPartForm {
-        const self = owner.allocator.create(PostMultiPartForm) catch @panic("OOM");
-        self.* = .{
-            .step = Build.Step.init(.{
-                .id = base_id,
-                .name = "PostMultiPartForm",
-                .owner = owner,
-                .makeFn = make,
-            }),
-            .uri = std.Uri.parse(owner.fmt("{}", .{uri})) catch unreachable, // super efficent dupe
-            .headers = headers,
-        };
-        return self;
-    }
+        /// The caller is responsible for ensuring that the ClientReplies is able to write
+        /// by calling `write_reply()` after `ready()` finishes.
+        pub fn write_reply(
+            client_replies: *ClientReplies,
+            slot: Slot,
+            message: *Message.Reply,
+            trigger: enum { commit, repair },
+        ) void {
+            assert(client_replies.ready_sync());
+            assert(client_replies.ready_callback == null);
+            assert(client_replies.writes.available() > 0);
+            maybe(client_replies.writing.isSet(slot.index));
+            assert(message.header.command == .reply);
+            // There is never any need to write a body-less message, since the header is
+            // stored safely in the `client_sessions` trailer.
+            assert(message.header.size != @sizeOf(vsr.Header));
 
-    pub fn addText(self: *PostMultiPartForm, name: []const u8, text: []const u8) void {
-        const b = self.step.owner;
-        self.fields.append(b.allocator, .{
-            .name = b.dupe(name),
-            .value = .{ .bytes = b.dupe(text) },
-            .content_type = .omit,
-        }) catch @panic("OOM");
-    }
-
-    pub fn addFile(self: *PostMultiPartForm, name: []const u8, path: Build.LazyPath) void {
-        const b = self.step.owner;
-        path.addStepDependencies(&self.step);
-        self.fields.append(b.allocator, .{
-            .name = b.dupe(name),
-            .value = .{ .lazy_path = path },
-            .content_type = .{ .override = "application/octet-stream" },
-        }) catch @panic("OOM");
-    }
-
-    fn make(step: *Build.Step, prog_node: std.Progress.Node) !void {
-        _ = prog_node;
-        const b = step.owner;
-        const self: *const PostMultiPartForm = @fieldParentPtr("step", step);
-
-        var client = std.http.Client{ .allocator = b.allocator };
-        defer client.deinit();
-        try client.initDefaultProxies(b.allocator);
-
-        var server_header_buffer: [16 * 1024]u8 = undefined;
-        var request_options: std.http.Client.RequestOptions = .{
-            .keep_alive = false,
-            .server_header_buffer = &server_header_buffer,
-            .headers = self.headers,
-        };
-
-        var boundary: [64 + 3]u8 = undefined;
-        std.debug.assert((std.fmt.bufPrint(
-            &boundary,
-            "{x:0>16}-{x:0>16}-{x:0>16}-{x:0>16}",
-            .{ std.crypto.random.int(u64), std.crypto.random.int(u64), std.crypto.random.int(u64), std.crypto.random.int(u64) },
-        ) catch unreachable).len == boundary.len);
-
-        request_options.headers.content_type = .{ .override = b.fmt("multipart/form-data; boundary={s}", .{boundary}) };
-
-        var request = try client.open(.POST, self.uri, request_options);
-        defer request.deinit();
-        request.transfer_encoding = .chunked;
-
-        try request.send();
-
-        var buffered_writer = std.io.bufferedWriter(request.writer());
-        const writer = buffered_writer.writer();
-
-        for (self.fields.items) |field| {
-            try writer.print("--{s}\r\n", .{boundary});
-
-            switch (field.value) {
-                .lazy_path => |lazy_path| try writer.print(
-                    "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\n",
-                    .{ field.name, std.fs.path.basename(lazy_path.getPath2(b, step)) },
-                ),
-                .bytes => try writer.print(
-                    "Content-Disposition: form-data; name=\"{s}\"\r\n",
-                    .{field.name},
-                ),
-            }
-
-            switch (field.content_type) {
-                .omit, .default => {},
-                .override => |content_type| try writer.print("Content-Type: {s}\r\n", .{content_type}),
-            }
-            try writer.writeAll("\r\n");
-
-            switch (field.value) {
-                .lazy_path => |lazy_path| {
-                    const path = lazy_path.getPath2(b, step);
-                    const file = try std.fs.openFileAbsolute(path, .{});
-                    defer file.close();
-
-                    var buffer: [16 * 1024]u8 = undefined;
-                    while (true) {
-                        const amt = try file.read(&buffer);
-                        if (amt == 0) break;
-                        try writer.writeAll(buffer[0..amt]);
-                    }
+            switch (trigger) {
+                .commit => {
+                    assert(client_replies.checkpoint_callback == null);
+                    maybe(client_replies.faulty.isSet(slot.index));
                 },
-                .bytes => |bytes| try writer.writeAll(bytes),
+                .repair => {
+                    maybe(client_replies.checkpoint_callback == null);
+                    assert(client_replies.faulty.isSet(slot.index));
+                },
             }
-            try writer.writeAll("\r\n");
+
+            // Resolve any pending reads for this reply.
+            // If we don't do this, an earlier started read can complete with an error, and
+            // erroneously clobber the faulty bit.
+            // For simplicity, resolve the reads synchronously, instead of going through next tick
+            // machinery.
+            var reads = client_replies.reads.iterate();
+            while (reads.next()) |read| {
+                if (read.callback == null) continue; // Already resolved.
+                if (read.header.checksum == message.header.checksum) {
+                    defer read.callback = null;
+
+                    read.callback.?(
+                        client_replies,
+                        &read.header,
+                        message,
+                        read.destination_replica,
+                    );
+                }
+            }
+
+            // Clear the fault *before* the write completes, not after.
+            // Otherwise, a replica exiting state sync might mark a reply as faulty, then the
+            // ClientReplies clears that bit due to an unrelated write that was already queued.
+            client_replies.faulty.unset(slot.index);
+
+            const write = client_replies.writes.acquire().?;
+            write.* = .{
+                .client_replies = client_replies,
+                .completion = undefined,
+                .message = message.ref(),
+                .slot = slot,
+            };
+
+            // If there is already a write to the same slot queued (but not started), replace it.
+            var write_queue = client_replies.write_queue.iterator_mutable();
+            while (write_queue.next_ptr()) |queued| {
+                if (queued.*.slot.index == slot.index) {
+                    client_replies.message_pool.unref(queued.*.message);
+                    client_replies.writes.release(queued.*);
+
+                    queued.* = write;
+                    break;
+                }
+            } else {
+                client_replies.write_queue.push_assume_capacity(write);
+                client_replies.write_reply_next();
+            }
+
+            assert(client_replies.writing.isSet(write.slot.index));
         }
-        try writer.print("--{s}--\r\n", .{boundary});
 
-        try buffered_writer.flush();
+        fn write_reply_next(client_replies: *ClientReplies) void {
+            while (client_replies.write_queue.head()) |write| {
+                if (client_replies.writing.isSet(write.slot.index)) return;
 
-        try request.finish();
-        try request.wait();
+                const message = write.message;
+                _ = client_replies.write_queue.pop();
 
-        if (request.response.status.class() == .success) return;
+                // Zero sector padding to ensure deterministic storage.
+                const size = message.header.size;
+                const size_ceil = vsr.sector_ceil(size);
+                @memset(message.buffer[size..size_ceil], 0);
 
-        return step.fail("response {s} ({d}): {s}", .{
-            request.response.status.phrase() orelse "",
-            @intFromEnum(request.response.status),
-            try request.reader().readAllAlloc(b.allocator, std.math.maxInt(u32)),
-        });
-    }
-};
-
-const Build = blk: {
-    const min_build_zig = std.SemanticVersion.parse(minimum_build_zig_version) catch unreachable;
-    const min_runtime_zig = std.SemanticVersion.parse(minimum_runtime_zig_version) catch unreachable;
-
-    std.debug.assert(zls_version.pre == null or std.mem.eql(u8, zls_version.pre.?, "dev"));
-    std.debug.assert(zls_version.build == null);
-    const zls_version_is_tagged = zls_version.pre == null and zls_version.build == null;
-
-    if (min_runtime_zig.order(min_build_zig) == .gt) {
-        const message = std.fmt.comptimePrint(
-            \\A Zig version that is able to build ZLS must be compatible with ZLS at runtime.
-            \\
-            \\This means that the minimum runtime Zig version must be less or equal to the minimum build Zig version:
-            \\  minimum build   Zig version: {[min_build_zig]}
-            \\  minimum runtime Zig version: {[min_runtime_zig]}
-            \\
-            \\This is a developer error.
-        , .{ .min_build_zig = min_build_zig, .min_runtime_zig = min_runtime_zig });
-        @compileError(message);
-    }
-
-    // check that the ZLS version and minimum build version make sense
-    if (zls_version_is_tagged) {
-        if (zls_version.order(min_build_zig) != .eq) {
-            const message = std.fmt.comptimePrint(
-                \\A tagged release of ZLS should have the same tagged release of Zig as the minimum build requirement:
-                \\          ZLS version: {[current_version]}
-                \\  minimum Zig version: {[minimum_version]}
-                \\
-                \\This is a developer error. Set `minimum_build_zig_version` in `build.zig` and `minimum_zig_version` in `build.zig.zon` to {[current_version]}.
-            , .{ .current_version = zls_version, .minimum_version = min_build_zig });
-            @compileError(message);
+                client_replies.writing.set(write.slot.index);
+                client_replies.storage.write_sectors(
+                    write_reply_callback,
+                    &write.completion,
+                    message.buffer[0..size_ceil],
+                    .client_replies,
+                    slot_offset(write.slot),
+                );
+            }
         }
-    } else {
-        const min_build_zig_simple = std.SemanticVersion{ .major = min_build_zig.major, .minor = min_build_zig.minor, .patch = 0 };
-        const zls_version_simple = std.SemanticVersion{ .major = zls_version.major, .minor = zls_version.minor, .patch = 0 };
-        const min_zig_is_tagged = min_build_zig.build == null and min_build_zig.pre == null;
-        if (!min_zig_is_tagged and zls_version_simple.order(min_build_zig_simple) != .eq) {
-            const message = std.fmt.comptimePrint(
-                \\A development build of ZLS should have a tagged release of Zig as the minimum build requirement or
-                \\have a development build of Zig as the minimum build requirement with the same major and minor version.
-                \\          ZLS version: {d}.{d}.*
-                \\  minimum Zig version: {}
-                \\
-                \\
-                \\This is a developer error.
-            , .{ zls_version.major, zls_version.minor, min_build_zig });
-            @compileError(message);
-        }
-    }
 
-    // check minimum build version
-    const is_current_zig_tagged_release = builtin.zig_version.pre == null and builtin.zig_version.build == null;
-    const is_min_build_zig_tagged_release = min_build_zig.pre == null and min_build_zig.build == null;
-    const min_build_zig_simple = std.SemanticVersion{ .major = min_build_zig.major, .minor = min_build_zig.minor, .patch = 0 };
-    const current_zig_simple = std.SemanticVersion{ .major = builtin.zig_version.major, .minor = builtin.zig_version.minor, .patch = 0 };
-    if (switch (builtin.zig_version.order(min_build_zig)) {
-        .lt => true,
-        .eq => false,
-        .gt => (is_current_zig_tagged_release and !is_min_build_zig_tagged_release) or
-            // a tagged release of ZLS must be build with a tagged release of Zig that has the same major and minor version.
-            (zls_version_is_tagged and (min_build_zig_simple.order(current_zig_simple) != .eq)),
-    }) {
-        const message = std.fmt.comptimePrint(
-            \\Your Zig version does not meet the minimum build requirement:
-            \\  required Zig version: {[minimum_version]} {[required_zig_version_note]s}
-            \\  actual   Zig version: {[current_version]}
-            \\
-            \\
-        ++ if (is_min_build_zig_tagged_release)
-            std.fmt.comptimePrint(
-                \\Please download the {[minimum_version]} release of Zig. (https://ziglang.org/download/)
-                \\
-                \\Tagged releases of ZLS are also available.
-                \\  -> https://github.com/zigtools/zls/releases
-                \\  -> https://github.com/zigtools/zls/releases/tag/{[minimum_version_simple]} (may not exist yet)
-            , .{
-                .minimum_version = min_build_zig,
-                .minimum_version_simple = min_build_zig_simple,
-            })
-        else if (is_current_zig_tagged_release)
-            \\Please download or compile a tagged release of ZLS.
-            \\  -> https://github.com/zigtools/zls/releases
-            \\  -> https://github.com/zigtools/zls/releases/tag/{[current_version]} (may not exist yet)
-        else
-            \\You can take one of the following actions to resolve this issue:
-            \\  - Download the latest nightly of Zig (https://ziglang.org/download/)
-            \\  - Compile an older version of ZLS that is compatible with your Zig version
-        , .{
-            .current_version = builtin.zig_version,
-            .minimum_version = min_build_zig,
-            .required_zig_version_note = if (!zls_version_is_tagged) "(or greater)" else "",
-        });
-        @compileError(message);
-    }
-    break :blk std.Build;
-};
+        fn write_reply_callback(completion: *Storage.Write) void {
+            const write: *ClientReplies.Write = @fieldParentPtr("completion", completion);
+            const client_replies = write.client_replies;
+            const message = write.message;
+            assert(client_replies.writing.isSet(write.slot.index));
+            maybe(client_replies.faulty.isSet(write.slot.index));
+
+            var reads = client_replies.reads.iterate();
+            while (reads.next()) |read| {
+                if (read.slot.index == write.slot.index) {
+                    if (read.header.checksum == message.header.checksum) {
+                        assert(read.callback == null);
+                    } else {
+                        // A read and a write can race on the slot if:
+                        // - the write is from before the latest state sync (outdated write)
+                        // - the read is from before the write (outdated read)
+                    }
+                }
+            }
+
+            log.debug("{}: write_reply: wrote (client={} request={})", .{
+                client_replies.replica,
+                message.header.client,
+                message.header.request,
+            });
+
+            // Release the write *before* invoking the callback, so that if the callback
+            // checks .writes.available() we doesn't appear busy when we're not.
+            client_replies.writing.unset(write.slot.index);
+            client_replies.writes.release(write);
+
+            client_replies.message_pool.unref(message);
+            client_replies.write_reply_next();
+
+            if (client_replies.ready_callback) |ready_callback| {
+                client_replies.ready_callback = null;
+                ready_callback(client_replies);
+            }
+
+            if (client_replies.checkpoint_callback != null and
+                client_replies.writes.executing() == 0)
+            {
+                client_replies.checkpoint_done();
+            }
+        }
+
+        pub fn checkpoint(
+            client_replies: *ClientReplies,
+            callback: *const fn (*ClientReplies) void,
+        ) void {
+            assert(client_replies.checkpoint_callback == null);
+            client_replies.checkpoint_callback = callback;
+
+            if (client_replies.writes.executing() == 0) {
+                assert(client_replies.writing.count() == 0);
+                assert(client_replies.write_queue.count == 0);
+                client_replies.storage.on_next_tick(
+                    .vsr,
+                    checkpoint_next_tick_callback,
+                    &client_replies.checkpoint_next_tick,
+                );
+            }
+        }
+
+        fn checkpoint_next_tick_callback(next_tick: *Storage.NextTick) void {
+            const client_replies: *ClientReplies =
+                @alignCast(@fieldParentPtr("checkpoint_next_tick", next_tick));
+            client_replies.checkpoint_done();
+        }
+
+        fn checkpoint_done(client_replies: *ClientReplies) void {
+            assert(client_replies.writes.executing() == 0);
+            assert(client_replies.writing.count() == 0);
+            assert(client_replies.write_queue.count == 0);
+
+            const callback = client_replies.checkpoint_callback.?;
+            client_replies.checkpoint_callback = null;
+
+            callback(client_replies);
+        }
+    };
+}

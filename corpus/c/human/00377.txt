@@ -21,212 +21,165 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-#include "curlcheck.h"
+
+#include "curl_setup.h"
+
+#if !defined(CURL_DISABLE_HTTP) && !defined(CURL_DISABLE_DIGEST_AUTH)
 
 #include "urldata.h"
-#include "curl/urlapi.h"
-#include "urlapi-int.h"
+#include "strcase.h"
+#include "vauth/vauth.h"
+#include "http_digest.h"
 
+/* The last 3 #include files should be in this order */
+#include "curl_printf.h"
+#include "curl_memory.h"
+#include "memdebug.h"
 
-static CURLU *u;
+/* Test example headers:
 
-static CURLcode
-unit_setup(void)
+WWW-Authenticate: Digest realm="testrealm", nonce="1053604598"
+Proxy-Authenticate: Digest realm="testrealm", nonce="1053604598"
+
+*/
+
+CURLcode Curl_input_digest(struct Curl_easy *data,
+                           bool proxy,
+                           const char *header) /* rest of the *-authenticate:
+                                                  header */
 {
+  /* Point to the correct struct with this */
+  struct digestdata *digest;
+
+  if(proxy) {
+    digest = &data->state.proxydigest;
+  }
+  else {
+    digest = &data->state.digest;
+  }
+
+  if(!checkprefix("Digest", header) || !ISBLANK(header[6]))
+    return CURLE_BAD_CONTENT_ENCODING;
+
+  header += strlen("Digest");
+  while(*header && ISBLANK(*header))
+    header++;
+
+  return Curl_auth_decode_digest_http_message(header, digest);
+}
+
+CURLcode Curl_output_digest(struct Curl_easy *data,
+                            bool proxy,
+                            const unsigned char *request,
+                            const unsigned char *uripath)
+{
+  CURLcode result;
+  unsigned char *path = NULL;
+  char *tmp = NULL;
+  char *response;
+  size_t len;
+  bool have_chlg;
+
+  /* Point to the address of the pointer that holds the string to send to the
+     server, which is for a plain host or for an HTTP proxy */
+  char **allocuserpwd;
+
+  /* Point to the name and password for this */
+  const char *userp;
+  const char *passwdp;
+
+  /* Point to the correct struct with this */
+  struct digestdata *digest;
+  struct auth *authp;
+
+  if(proxy) {
+#ifdef CURL_DISABLE_PROXY
+    return CURLE_NOT_BUILT_IN;
+#else
+    digest = &data->state.proxydigest;
+    allocuserpwd = &data->state.aptr.proxyuserpwd;
+    userp = data->state.aptr.proxyuser;
+    passwdp = data->state.aptr.proxypasswd;
+    authp = &data->state.authproxy;
+#endif
+  }
+  else {
+    digest = &data->state.digest;
+    allocuserpwd = &data->state.aptr.userpwd;
+    userp = data->state.aptr.user;
+    passwdp = data->state.aptr.passwd;
+    authp = &data->state.authhost;
+  }
+
+  Curl_safefree(*allocuserpwd);
+
+  /* not set means empty */
+  if(!userp)
+    userp = "";
+
+  if(!passwdp)
+    passwdp = "";
+
+#if defined(USE_WINDOWS_SSPI)
+  have_chlg = digest->input_token ? TRUE : FALSE;
+#else
+  have_chlg = digest->nonce ? TRUE : FALSE;
+#endif
+
+  if(!have_chlg) {
+    authp->done = FALSE;
+    return CURLE_OK;
+  }
+
+  /* So IE browsers < v7 cut off the URI part at the query part when they
+     evaluate the MD5 and some (IIS?) servers work with them so we may need to
+     do the Digest IE-style. Note that the different ways cause different MD5
+     sums to get sent.
+
+     Apache servers can be set to do the Digest IE-style automatically using
+     the BrowserMatch feature:
+     https://httpd.apache.org/docs/2.2/mod/mod_auth_digest.html#msie
+
+     Further details on Digest implementation differences:
+     http://www.fngtps.com/2006/09/http-authentication
+  */
+
+  if(authp->iestyle) {
+    tmp = strchr((char *)uripath, '?');
+    if(tmp) {
+      size_t urilen = tmp - (char *)uripath;
+      /* typecast is fine here since the value is always less than 32 bits */
+      path = (unsigned char *) aprintf("%.*s", (int)urilen, uripath);
+    }
+  }
+  if(!tmp)
+    path = (unsigned char *) strdup((char *) uripath);
+
+  if(!path)
+    return CURLE_OUT_OF_MEMORY;
+
+  result = Curl_auth_create_digest_http_message(data, userp, passwdp, request,
+                                                path, digest, &response, &len);
+  free(path);
+  if(result)
+    return result;
+
+  *allocuserpwd = aprintf("%sAuthorization: Digest %s\r\n",
+                          proxy ? "Proxy-" : "",
+                          response);
+  free(response);
+  if(!*allocuserpwd)
+    return CURLE_OUT_OF_MEMORY;
+
+  authp->done = TRUE;
+
   return CURLE_OK;
 }
 
-static void
-unit_stop(void)
+void Curl_http_auth_cleanup_digest(struct Curl_easy *data)
 {
-  curl_global_cleanup();
+  Curl_auth_digest_cleanup(&data->state.digest);
+  Curl_auth_digest_cleanup(&data->state.proxydigest);
 }
 
-#define free_and_clear(x) free(x); x = NULL
-
-static CURLUcode parse_port(CURLU *url,
-                           char *h, bool has_scheme)
-{
-  struct dynbuf host;
-  CURLUcode ret;
-  Curl_dyn_init(&host, 10000);
-  if(Curl_dyn_add(&host, h))
-    return CURLUE_OUT_OF_MEMORY;
-  ret = Curl_parse_port(url, &host, has_scheme);
-  Curl_dyn_free(&host);
-  return ret;
-}
-
-UNITTEST_START
-{
-  CURLUcode ret;
-  char *ipv6port = NULL;
-  char *portnum;
-
-  /* Valid IPv6 */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15]");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret == CURLUE_OK, "parse_port returned error");
-  ret = curl_url_get(u, CURLUPART_PORT, &portnum, CURLU_NO_DEFAULT_PORT);
-  fail_unless(ret != CURLUE_OK, "curl_url_get portnum returned something");
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  /* Invalid IPv6 */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15|");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret != CURLUE_OK, "parse_port true on error");
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff;fea7:da15]:808");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret == CURLUE_OK, "parse_port returned error");
-  ret = curl_url_get(u, CURLUPART_PORT, &portnum, 0);
-  fail_unless(ret == CURLUE_OK, "curl_url_get portnum returned error");
-  fail_unless(portnum && !strcmp(portnum, "808"), "Check portnumber");
-
-  curl_free(portnum);
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  /* Valid IPv6 with zone index and port number */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15%25eth3]:80");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret == CURLUE_OK, "parse_port returned error");
-  ret = curl_url_get(u, CURLUPART_PORT, &portnum, 0);
-  fail_unless(ret == CURLUE_OK, "curl_url_get portnum returned error");
-  fail_unless(portnum && !strcmp(portnum, "80"), "Check portnumber");
-  curl_free(portnum);
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  /* Valid IPv6 with zone index without port number */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15%25eth3]");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret == CURLUE_OK, "parse_port returned error");
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  /* Valid IPv6 with port number */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15]:81");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret == CURLUE_OK, "parse_port returned error");
-  ret = curl_url_get(u, CURLUPART_PORT, &portnum, 0);
-  fail_unless(ret == CURLUE_OK, "curl_url_get portnum returned error");
-  fail_unless(portnum && !strcmp(portnum, "81"), "Check portnumber");
-  curl_free(portnum);
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  /* Valid IPv6 with syntax error in the port number */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15];81");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret != CURLUE_OK, "parse_port true on error");
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15]80");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret != CURLUE_OK, "parse_port true on error");
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  /* Valid IPv6 with no port after the colon, should use default if a scheme
-     was used in the URL */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15]:");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, TRUE);
-  fail_unless(ret == CURLUE_OK, "parse_port returned error");
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  /* Incorrect zone index syntax, but the port extractor doesn't care */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15!25eth3]:180");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret == CURLUE_OK, "parse_port returned error");
-  ret = curl_url_get(u, CURLUPART_PORT, &portnum, 0);
-  fail_unless(ret == CURLUE_OK, "curl_url_get portnum returned error");
-  fail_unless(portnum && !strcmp(portnum, "180"), "Check portnumber");
-  curl_free(portnum);
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  /* Non percent-encoded zone index */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("[fe80::250:56ff:fea7:da15%eth3]:80");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret == CURLUE_OK, "parse_port returned error");
-  free_and_clear(ipv6port);
-  curl_url_cleanup(u);
-
-  /* No scheme and no digits following the colon - not accepted. Because that
-     makes (a*50):// that looks like a scheme be an acceptable input. */
-  u = curl_url();
-  if(!u)
-    goto fail;
-  ipv6port = strdup("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    "aaaaaaaaaaaaaaaaaaaaaa:");
-  if(!ipv6port)
-    goto fail;
-  ret = parse_port(u, ipv6port, FALSE);
-  fail_unless(ret == CURLUE_BAD_PORT_NUMBER, "parse_port did wrong");
-fail:
-  free(ipv6port);
-  curl_url_cleanup(u);
-
-}
-UNITTEST_STOP
+#endif

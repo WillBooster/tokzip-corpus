@@ -10,411 +10,414 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Repository;
+namespace Composer\Package\Version;
 
-use Composer\DependencyResolver\PoolOptimizer;
-use Composer\DependencyResolver\Pool;
-use Composer\DependencyResolver\PoolBuilder;
-use Composer\DependencyResolver\Request;
-use Composer\EventDispatcher\EventDispatcher;
-use Composer\Advisory\SecurityAdvisory;
-use Composer\Advisory\PartialSecurityAdvisory;
-use Composer\IO\IOInterface;
+use Composer\Config;
+use Composer\Pcre\Preg;
+use Composer\Repository\Vcs\HgDriver;
 use Composer\IO\NullIO;
-use Composer\Package\BasePackage;
-use Composer\Package\AliasPackage;
-use Composer\Package\CompleteAliasPackage;
-use Composer\Package\CompletePackage;
-use Composer\Package\PackageInterface;
-use Composer\Semver\Constraint\Constraint;
-use Composer\Semver\Constraint\ConstraintInterface;
-use Composer\Package\Version\StabilityFilter;
-use Composer\Semver\Constraint\MatchAllConstraint;
-use Composer\Semver\Constraint\MultiConstraint;
+use Composer\Semver\VersionParser as SemverVersionParser;
+use Composer\Util\Git as GitUtil;
+use Composer\Util\HttpDownloader;
+use Composer\Util\Platform;
+use Composer\Util\ProcessExecutor;
+use Composer\Util\Svn as SvnUtil;
+use React\Promise\CancellablePromiseInterface;
+use Symfony\Component\Process\Process;
 
 /**
- * @author Nils Adermann <naderman@naderman.de>
+ * Try to guess the current version number based on different VCS configuration.
  *
- * @see RepositoryUtils for ways to work with single repos
+ * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @author Samuel Roze <samuel.roze@gmail.com>
+ *
+ * @phpstan-type Version array{version: string, commit: string|null, pretty_version: string|null}|array{version: string, commit: string|null, pretty_version: string|null, feature_version: string|null, feature_pretty_version: string|null}
  */
-class RepositorySet
+class VersionGuesser
 {
     /**
-     * Packages are returned even though their stability does not match the required stability
+     * @var Config
      */
-    public const ALLOW_UNACCEPTABLE_STABILITIES = 1;
-    /**
-     * Packages will be looked up in all repositories, even after they have been found in a higher prio one
-     */
-    public const ALLOW_SHADOWED_REPOSITORIES = 2;
+    private $config;
 
     /**
-     * @var array[]
-     * @phpstan-var array<string, array<string, array{alias: string, alias_normalized: string}>>
+     * @var ProcessExecutor
      */
-    private $rootAliases;
+    private $process;
 
     /**
-     * @var string[]
-     * @phpstan-var array<string, string>
+     * @var SemverVersionParser
      */
-    private $rootReferences;
+    private $versionParser;
 
-    /** @var RepositoryInterface[] */
-    private $repositories = [];
+    public function __construct(Config $config, ProcessExecutor $process, SemverVersionParser $versionParser)
+    {
+        $this->config = $config;
+        $this->process = $process;
+        $this->versionParser = $versionParser;
+    }
 
     /**
-     * @var int[] array of stability => BasePackage::STABILITY_* value
-     * @phpstan-var array<string, BasePackage::STABILITY_*>
-     */
-    private $acceptableStabilities;
-
-    /**
-     * @var int[] array of package name => BasePackage::STABILITY_* value
-     * @phpstan-var array<string, BasePackage::STABILITY_*>
-     */
-    private $stabilityFlags;
-
-    /**
-     * @var ConstraintInterface[]
-     * @phpstan-var array<string, ConstraintInterface>
-     */
-    private $rootRequires;
-
-    /**
-     * @var array<string, ConstraintInterface>
-     */
-    private $temporaryConstraints;
-
-    /** @var bool */
-    private $locked = false;
-    /** @var bool */
-    private $allowInstalledRepositories = false;
-
-    /**
-     * In most cases if you are looking to use this class as a way to find packages from repositories
-     * passing minimumStability is all you need to worry about. The rest is for advanced pool creation including
-     * aliases, pinned references and other special cases.
+     * @param array<string, mixed> $packageConfig
+     * @param string               $path Path to guess into
      *
-     * @param int[]  $stabilityFlags   an array of package name => BasePackage::STABILITY_* value
-     * @phpstan-param array<string, BasePackage::STABILITY_*> $stabilityFlags
-     * @param array[] $rootAliases
-     * @phpstan-param list<array{package: string, version: string, alias: string, alias_normalized: string}> $rootAliases
-     * @param string[] $rootReferences an array of package name => source reference
-     * @phpstan-param array<string, string> $rootReferences
-     * @param ConstraintInterface[] $rootRequires an array of package name => constraint from the root package
-     * @phpstan-param array<string, ConstraintInterface> $rootRequires
-     * @param array<string, ConstraintInterface> $temporaryConstraints Runtime temporary constraints that will be used to filter packages
+     * @phpstan-return Version|null
      */
-    public function __construct(string $minimumStability = 'stable', array $stabilityFlags = [], array $rootAliases = [], array $rootReferences = [], array $rootRequires = [], array $temporaryConstraints = [])
+    public function guessVersion(array $packageConfig, string $path): ?array
     {
-        $this->rootAliases = self::getRootAliasesPerPackage($rootAliases);
-        $this->rootReferences = $rootReferences;
-
-        $this->acceptableStabilities = [];
-        foreach (BasePackage::$stabilities as $stability => $value) {
-            if ($value <= BasePackage::$stabilities[$minimumStability]) {
-                $this->acceptableStabilities[$stability] = $value;
-            }
-        }
-        $this->stabilityFlags = $stabilityFlags;
-        $this->rootRequires = $rootRequires;
-        foreach ($rootRequires as $name => $constraint) {
-            if (PlatformRepository::isPlatformPackage($name)) {
-                unset($this->rootRequires[$name]);
-            }
+        if (!function_exists('proc_open')) {
+            return null;
         }
 
-        $this->temporaryConstraints = $temporaryConstraints;
-    }
+        // bypass version guessing in bash completions as it takes time to create
+        // new processes and the root version is usually not that important
+        if (Platform::isInputCompletionProcess()) {
+            return null;
+        }
 
-    public function allowInstalledRepositories(bool $allow = true): void
-    {
-        $this->allowInstalledRepositories = $allow;
+        $versionData = $this->guessGitVersion($packageConfig, $path);
+        if (null !== $versionData['version']) {
+            return $this->postprocess($versionData);
+        }
+
+        $versionData = $this->guessHgVersion($packageConfig, $path);
+        if (null !== $versionData && null !== $versionData['version']) {
+            return $this->postprocess($versionData);
+        }
+
+        $versionData = $this->guessFossilVersion($path);
+        if (null !== $versionData['version']) {
+            return $this->postprocess($versionData);
+        }
+
+        $versionData = $this->guessSvnVersion($packageConfig, $path);
+        if (null !== $versionData && null !== $versionData['version']) {
+            return $this->postprocess($versionData);
+        }
+
+        return null;
     }
 
     /**
-     * @return ConstraintInterface[] an array of package name => constraint from the root package, platform requirements excluded
-     * @phpstan-return array<string, ConstraintInterface>
-     */
-    public function getRootRequires(): array
-    {
-        return $this->rootRequires;
-    }
-
-    /**
-     * @return array<string, ConstraintInterface> Runtime temporary constraints that will be used to filter packages
-     */
-    public function getTemporaryConstraints(): array
-    {
-        return $this->temporaryConstraints;
-    }
-
-    /**
-     * Adds a repository to this repository set
+     * @phpstan-param Version $versionData
      *
-     * The first repos added have a higher priority. As soon as a package is found in any
-     * repository the search for that package ends, and following repos will not be consulted.
+     * @phpstan-return Version
+     */
+    private function postprocess(array $versionData): array
+    {
+        if (!empty($versionData['feature_version']) && $versionData['feature_version'] === $versionData['version'] && $versionData['feature_pretty_version'] === $versionData['pretty_version']) {
+            unset($versionData['feature_version'], $versionData['feature_pretty_version']);
+        }
+
+        if ('-dev' === substr($versionData['version'], -4) && Preg::isMatch('{\.9{7}}', $versionData['version'])) {
+            $versionData['pretty_version'] = Preg::replace('{(\.9{7})+}', '.x', $versionData['version']);
+        }
+
+        if (!empty($versionData['feature_version']) && '-dev' === substr($versionData['feature_version'], -4) && Preg::isMatch('{\.9{7}}', $versionData['feature_version'])) {
+            $versionData['feature_pretty_version'] = Preg::replace('{(\.9{7})+}', '.x', $versionData['feature_version']);
+        }
+
+        return $versionData;
+    }
+
+    /**
+     * @param array<string, mixed> $packageConfig
      *
-     * @param RepositoryInterface $repo A package repository
+     * @return array{version: string|null, commit: string|null, pretty_version: string|null, feature_version?: string|null, feature_pretty_version?: string|null}
      */
-    public function addRepository(RepositoryInterface $repo): void
+    private function guessGitVersion(array $packageConfig, string $path): array
     {
-        if ($this->locked) {
-            throw new \RuntimeException("Pool has already been created from this repository set, it cannot be modified anymore.");
-        }
+        GitUtil::cleanEnv();
+        $commit = null;
+        $version = null;
+        $prettyVersion = null;
+        $featureVersion = null;
+        $featurePrettyVersion = null;
+        $isDetached = false;
 
-        if ($repo instanceof CompositeRepository) {
-            $repos = $repo->getRepositories();
-        } else {
-            $repos = [$repo];
-        }
+        // try to fetch current version from git branch
+        if (0 === $this->process->execute(['git', 'branch', '-a', '--no-color', '--no-abbrev', '-v'], $output, $path)) {
+            $branches = [];
+            $isFeatureBranch = false;
 
-        foreach ($repos as $repo) {
-            $this->repositories[] = $repo;
-        }
-    }
-
-    /**
-     * Find packages providing or matching a name and optionally meeting a constraint in all repositories
-     *
-     * Returned in the order of repositories, matching priority
-     *
-     * @param  int                      $flags      any of the ALLOW_* constants from this class to tweak what is returned
-     * @return BasePackage[]
-     */
-    public function findPackages(string $name, ?ConstraintInterface $constraint = null, int $flags = 0): array
-    {
-        $ignoreStability = ($flags & self::ALLOW_UNACCEPTABLE_STABILITIES) !== 0;
-        $loadFromAllRepos = ($flags & self::ALLOW_SHADOWED_REPOSITORIES) !== 0;
-
-        $packages = [];
-        if ($loadFromAllRepos) {
-            foreach ($this->repositories as $repository) {
-                $packages[] = $repository->findPackages($name, $constraint) ?: [];
-            }
-        } else {
-            foreach ($this->repositories as $repository) {
-                $result = $repository->loadPackages([$name => $constraint], $ignoreStability ? BasePackage::$stabilities : $this->acceptableStabilities, $ignoreStability ? [] : $this->stabilityFlags);
-
-                $packages[] = $result['packages'];
-                foreach ($result['namesFound'] as $nameFound) {
-                    // avoid loading the same package again from other repositories once it has been found
-                    if ($name === $nameFound) {
-                        break 2;
-                    }
-                }
-            }
-        }
-
-        $candidates = $packages ? array_merge(...$packages) : [];
-
-        // when using loadPackages above (!$loadFromAllRepos) the repos already filter for stability so no need to do it again
-        if ($ignoreStability || !$loadFromAllRepos) {
-            return $candidates;
-        }
-
-        $result = [];
-        foreach ($candidates as $candidate) {
-            if ($this->isPackageAcceptable($candidate->getNames(), $candidate->getStability())) {
-                $result[] = $candidate;
-            }
-        }
-
-        return $result;
-    }
-
-    /**
-     * @param string[] $packageNames
-     * @return ($allowPartialAdvisories is true ? array<string, array<PartialSecurityAdvisory|SecurityAdvisory>> : array<string, array<SecurityAdvisory>>)
-     */
-    public function getSecurityAdvisories(array $packageNames, bool $allowPartialAdvisories = false): array
-    {
-        $map = [];
-        foreach ($packageNames as $name) {
-            $map[$name] = new MatchAllConstraint();
-        }
-
-        return $this->getSecurityAdvisoriesForConstraints($map, $allowPartialAdvisories);
-    }
-
-    /**
-     * @param PackageInterface[] $packages
-     * @return ($allowPartialAdvisories is true ? array<string, array<PartialSecurityAdvisory|SecurityAdvisory>> : array<string, array<SecurityAdvisory>>)
-     */
-    public function getMatchingSecurityAdvisories(array $packages, bool $allowPartialAdvisories = false): array
-    {
-        $map = [];
-        foreach ($packages as $package) {
-            // ignore root alias versions as they are not actual package versions and should not matter when it comes to vulnerabilities
-            if ($package instanceof AliasPackage && $package->isRootPackageAlias()) {
-                continue;
-            }
-            if (isset($map[$package->getName()])) {
-                $map[$package->getName()] = new MultiConstraint([new Constraint('=', $package->getVersion()), $map[$package->getName()]], false);
-            } else {
-                $map[$package->getName()] = new Constraint('=', $package->getVersion());
-            }
-        }
-
-        return $this->getSecurityAdvisoriesForConstraints($map, $allowPartialAdvisories);
-    }
-
-    /**
-     * @param array<string, ConstraintInterface> $packageConstraintMap
-     * @return ($allowPartialAdvisories is true ? array<string, array<PartialSecurityAdvisory|SecurityAdvisory>> : array<string, array<SecurityAdvisory>>)
-     */
-    private function getSecurityAdvisoriesForConstraints(array $packageConstraintMap, bool $allowPartialAdvisories): array
-    {
-        $repoAdvisories = [];
-        foreach ($this->repositories as $repository) {
-            if (!$repository instanceof AdvisoryProviderInterface || !$repository->hasSecurityAdvisories()) {
-                continue;
-            }
-
-            $repoAdvisories[] = $repository->getSecurityAdvisories($packageConstraintMap, $allowPartialAdvisories)['advisories'];
-        }
-
-        $advisories = array_merge_recursive([], ...$repoAdvisories);
-        ksort($advisories);
-
-        return $advisories;
-    }
-
-    /**
-     * @return array[] an array with the provider name as key and value of array('name' => '...', 'description' => '...', 'type' => '...')
-     * @phpstan-return array<string, array{name: string, description: string, type: string}>
-     */
-    public function getProviders(string $packageName): array
-    {
-        $providers = [];
-        foreach ($this->repositories as $repository) {
-            if ($repoProviders = $repository->getProviders($packageName)) {
-                $providers = array_merge($providers, $repoProviders);
-            }
-        }
-
-        return $providers;
-    }
-
-    /**
-     * Check for each given package name whether it would be accepted by this RepositorySet in the given $stability
-     *
-     * @param  string[] $names
-     * @param  string   $stability one of 'stable', 'RC', 'beta', 'alpha' or 'dev'
-     */
-    public function isPackageAcceptable(array $names, string $stability): bool
-    {
-        return StabilityFilter::isPackageAcceptable($this->acceptableStabilities, $this->stabilityFlags, $names, $stability);
-    }
-
-    /**
-     * Create a pool for dependency resolution from the packages in this repository set.
-     *
-     * @param list<string>      $ignoredTypes Packages of those types are ignored
-     * @param list<string>|null $allowedTypes Only packages of those types are allowed if set to non-null
-     */
-    public function createPool(Request $request, IOInterface $io, ?EventDispatcher $eventDispatcher = null, ?PoolOptimizer $poolOptimizer = null, array $ignoredTypes = [], ?array $allowedTypes = null): Pool
-    {
-        $poolBuilder = new PoolBuilder($this->acceptableStabilities, $this->stabilityFlags, $this->rootAliases, $this->rootReferences, $io, $eventDispatcher, $poolOptimizer, $this->temporaryConstraints);
-        $poolBuilder->setIgnoredTypes($ignoredTypes);
-        $poolBuilder->setAllowedTypes($allowedTypes);
-
-        foreach ($this->repositories as $repo) {
-            if (($repo instanceof InstalledRepositoryInterface || $repo instanceof InstalledRepository) && !$this->allowInstalledRepositories) {
-                throw new \LogicException('The pool can not accept packages from an installed repository');
-            }
-        }
-
-        $this->locked = true;
-
-        return $poolBuilder->buildPool($this->repositories, $request);
-    }
-
-    /**
-     * Create a pool for dependency resolution from the packages in this repository set.
-     */
-    public function createPoolWithAllPackages(): Pool
-    {
-        foreach ($this->repositories as $repo) {
-            if (($repo instanceof InstalledRepositoryInterface || $repo instanceof InstalledRepository) && !$this->allowInstalledRepositories) {
-                throw new \LogicException('The pool can not accept packages from an installed repository');
-            }
-        }
-
-        $this->locked = true;
-
-        $packages = [];
-        foreach ($this->repositories as $repository) {
-            foreach ($repository->getPackages() as $package) {
-                $packages[] = $package;
-
-                if (isset($this->rootAliases[$package->getName()][$package->getVersion()])) {
-                    $alias = $this->rootAliases[$package->getName()][$package->getVersion()];
-                    while ($package instanceof AliasPackage) {
-                        $package = $package->getAliasOf();
-                    }
-                    if ($package instanceof CompletePackage) {
-                        $aliasPackage = new CompleteAliasPackage($package, $alias['alias_normalized'], $alias['alias']);
+            // find current branch and collect all branch names
+            foreach ($this->process->splitLines($output) as $branch) {
+                if ($branch && Preg::isMatchStrictGroups('{^(?:\* ) *(\(no branch\)|\(detached from \S+\)|\(HEAD detached at \S+\)|\S+) *([a-f0-9]+) .*$}', $branch, $match)) {
+                    if (
+                        $match[1] === '(no branch)'
+                        || strpos($match[1], '(detached ') === 0
+                        || strpos($match[1], '(HEAD detached at') === 0
+                    ) {
+                        $version = 'dev-' . $match[2];
+                        $prettyVersion = $version;
+                        $isFeatureBranch = true;
+                        $isDetached = true;
                     } else {
-                        $aliasPackage = new AliasPackage($package, $alias['alias_normalized'], $alias['alias']);
+                        $version = $this->versionParser->normalizeBranch($match[1]);
+                        $prettyVersion = 'dev-' . $match[1];
+                        $isFeatureBranch = $this->isFeatureBranch($packageConfig, $match[1]);
                     }
-                    $aliasPackage->setRootPackageAlias(true);
-                    $packages[] = $aliasPackage;
+
+                    $commit = $match[2];
+                }
+
+                if ($branch && !Preg::isMatchStrictGroups('{^ *.+/HEAD }', $branch)) {
+                    if (Preg::isMatchStrictGroups('{^(?:\* )? *((?:remotes/(?:origin|upstream)/)?[^\s/]+) *([a-f0-9]+) .*$}', $branch, $match)) {
+                        $branches[] = $match[1];
+                    }
                 }
             }
+
+            if ($isFeatureBranch) {
+                $featureVersion = $version;
+                $featurePrettyVersion = $prettyVersion;
+
+                // try to find the best (nearest) version branch to assume this feature's version
+                $result = $this->guessFeatureVersion($packageConfig, $version, $branches, ['git', 'rev-list', '%candidate%..%branch%'], $path);
+                $version = $result['version'];
+                $prettyVersion = $result['pretty_version'];
+            }
         }
 
-        return new Pool($packages);
-    }
+        if (!$version || $isDetached) {
+            $result = $this->versionFromGitTags($path);
+            if ($result) {
+                $version = $result['version'];
+                $prettyVersion = $result['pretty_version'];
+                $featureVersion = null;
+                $featurePrettyVersion = null;
+            }
+        }
 
-    public function createPoolForPackage(string $packageName, ?LockArrayRepository $lockedRepo = null): Pool
-    {
-        // TODO unify this with above in some simpler version without "request"?
-        return $this->createPoolForPackages([$packageName], $lockedRepo);
+        if (null === $commit) {
+            $command = 'git log --pretty="%H" -n1 HEAD'.GitUtil::getNoShowSignatureFlag($this->process);
+            if (0 === $this->process->execute($command, $output, $path)) {
+                $commit = trim($output) ?: null;
+            }
+        }
+
+        if ($featureVersion) {
+            return ['version' => $version, 'commit' => $commit, 'pretty_version' => $prettyVersion, 'feature_version' => $featureVersion, 'feature_pretty_version' => $featurePrettyVersion];
+        }
+
+        return ['version' => $version, 'commit' => $commit, 'pretty_version' => $prettyVersion];
     }
 
     /**
-     * @param string[] $packageNames
+     * @return array{version: string, pretty_version: string}|null
      */
-    public function createPoolForPackages(array $packageNames, ?LockArrayRepository $lockedRepo = null): Pool
+    private function versionFromGitTags(string $path): ?array
     {
-        $request = new Request($lockedRepo);
+        // try to fetch current version from git tags
+        if (0 === $this->process->execute('git describe --exact-match --tags', $output, $path)) {
+            try {
+                $version = $this->versionParser->normalize(trim($output));
 
-        $allowedPackages = [];
-        foreach ($packageNames as $packageName) {
-            if (PlatformRepository::isPlatformPackage($packageName)) {
-                throw new \LogicException('createPoolForPackage(s) can not be used for platform packages, as they are never loaded by the PoolBuilder which expects them to be fixed. Use createPoolWithAllPackages or pass in a proper request with the platform packages you need fixed in it.');
+                return ['version' => $version, 'pretty_version' => trim($output)];
+            } catch (\Exception $e) {
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string, mixed> $packageConfig
+     *
+     * @return array{version: string|null, commit: ''|null, pretty_version: string|null, feature_version?: string|null, feature_pretty_version?: string|null}|null
+     */
+    private function guessHgVersion(array $packageConfig, string $path): ?array
+    {
+        // try to fetch current version from hg branch
+        if (0 === $this->process->execute('hg branch', $output, $path)) {
+            $branch = trim($output);
+            $version = $this->versionParser->normalizeBranch($branch);
+            $isFeatureBranch = 0 === strpos($version, 'dev-');
+
+            if (VersionParser::DEFAULT_BRANCH_ALIAS === $version) {
+                return ['version' => $version, 'commit' => null, 'pretty_version' => 'dev-'.$branch];
             }
 
-            $request->requireName($packageName);
-            $allowedPackages[] = strtolower($packageName);
+            if (!$isFeatureBranch) {
+                return ['version' => $version, 'commit' => null, 'pretty_version' => $version];
+            }
+
+            // re-use the HgDriver to fetch branches (this properly includes bookmarks)
+            $io = new NullIO();
+            $driver = new HgDriver(['url' => $path], $io, $this->config, new HttpDownloader($io, $this->config), $this->process);
+            $branches = array_map('strval', array_keys($driver->getBranches()));
+
+            // try to find the best (nearest) version branch to assume this feature's version
+            $result = $this->guessFeatureVersion($packageConfig, $version, $branches, ['hg', 'log', '-r', 'not ancestors(\'%candidate%\') and ancestors(\'%branch%\')', '--template', '"{node}\\n"'], $path);
+            $result['commit'] = '';
+            $result['feature_version'] = $version;
+            $result['feature_pretty_version'] = $version;
+
+            return $result;
         }
 
-        if (count($allowedPackages) > 0) {
-            $request->restrictPackages($allowedPackages);
-        }
-
-        return $this->createPool($request, new NullIO());
+        return null;
     }
 
     /**
-     * @param array[] $aliases
-     * @phpstan-param list<array{package: string, version: string, alias: string, alias_normalized: string}> $aliases
+     * @param array<string, mixed>     $packageConfig
+     * @param list<string>             $branches
+     * @param list<string>             $scmCmdline
      *
-     * @return array<string, array<string, array{alias: string, alias_normalized: string}>>
+     * @return array{version: string|null, pretty_version: string|null}
      */
-    private static function getRootAliasesPerPackage(array $aliases): array
+    private function guessFeatureVersion(array $packageConfig, ?string $version, array $branches, array $scmCmdline, string $path): array
     {
-        $normalizedAliases = [];
+        $prettyVersion = $version;
 
-        foreach ($aliases as $alias) {
-            $normalizedAliases[$alias['package']][$alias['version']] = [
-                'alias' => $alias['alias'],
-                'alias_normalized' => $alias['alias_normalized'],
-            ];
+        // ignore feature branches if they have no branch-alias or self.version is used
+        // and find the branch they came from to use as a version instead
+        if (!isset($packageConfig['extra']['branch-alias'][$version])
+            || strpos(json_encode($packageConfig), '"self.version"')
+        ) {
+            $branch = Preg::replace('{^dev-}', '', $version);
+            $length = PHP_INT_MAX;
+
+            // return directly, if branch is configured to be non-feature branch
+            if (!$this->isFeatureBranch($packageConfig, $branch)) {
+                return ['version' => $version, 'pretty_version' => $prettyVersion];
+            }
+
+            // sort local branches first then remote ones
+            // and sort numeric branches below named ones, to make sure if the branch has the same distance from main and 1.10 and 1.9 for example, main is picked
+            // and sort using natural sort so that 1.10 will appear before 1.9
+            usort($branches, static function ($a, $b): int {
+                $aRemote = 0 === strpos($a, 'remotes/');
+                $bRemote = 0 === strpos($b, 'remotes/');
+
+                if ($aRemote !== $bRemote) {
+                    return $aRemote ? 1 : -1;
+                }
+
+                return strnatcasecmp($b, $a);
+            });
+
+            $promises = [];
+            $this->process->setMaxJobs(30);
+            try {
+                foreach ($branches as $candidate) {
+                    $candidateVersion = Preg::replace('{^remotes/\S+/}', '', $candidate);
+
+                    // do not compare against itself or other feature branches
+                    if ($candidate === $branch || $this->isFeatureBranch($packageConfig, $candidateVersion)) {
+                        continue;
+                    }
+
+                    $cmdLine = array_map(static function (string $component) use ($candidate, $branch) {
+                        return str_replace(['%candidate%', '%branch%'], [$candidate, $branch], $component);
+                    }, $scmCmdline);
+                    $promises[] = $this->process->executeAsync($cmdLine, $path)->then(function (Process $process) use (&$length, &$version, &$prettyVersion, $candidateVersion, &$promises): void {
+                        if (!$process->isSuccessful()) {
+                            return;
+                        }
+
+                        $output = $process->getOutput();
+                        if (strlen($output) < $length) {
+                            $length = strlen($output);
+                            $version = $this->versionParser->normalizeBranch($candidateVersion);
+                            $prettyVersion = 'dev-' . $candidateVersion;
+                            if ($length === 0) {
+                                foreach ($promises as $promise) {
+                                    // to support react/promise 2.x we wrap the promise in a resolve() call for safety
+                                    \React\Promise\resolve($promise)->cancel();
+                                }
+                            }
+                        }
+                    });
+                }
+
+                $this->process->wait();
+            } finally {
+                $this->process->resetMaxJobs();
+            }
         }
 
-        return $normalizedAliases;
+        return ['version' => $version, 'pretty_version' => $prettyVersion];
+    }
+
+    /**
+     * @param array<string, mixed> $packageConfig
+     */
+    private function isFeatureBranch(array $packageConfig, ?string $branchName): bool
+    {
+        $nonFeatureBranches = '';
+        if (!empty($packageConfig['non-feature-branches'])) {
+            $nonFeatureBranches = implode('|', $packageConfig['non-feature-branches']);
+        }
+
+        return !Preg::isMatch('{^(' . $nonFeatureBranches . '|master|main|latest|next|current|support|tip|trunk|default|develop|\d+\..+)$}', $branchName, $match);
+    }
+
+    /**
+     * @return array{version: string|null, commit: '', pretty_version: string|null}
+     */
+    private function guessFossilVersion(string $path): array
+    {
+        $version = null;
+        $prettyVersion = null;
+
+        // try to fetch current version from fossil
+        if (0 === $this->process->execute('fossil branch list', $output, $path)) {
+            $branch = trim($output);
+            $version = $this->versionParser->normalizeBranch($branch);
+            $prettyVersion = 'dev-' . $branch;
+        }
+
+        // try to fetch current version from fossil tags
+        if (0 === $this->process->execute('fossil tag list', $output, $path)) {
+            try {
+                $version = $this->versionParser->normalize(trim($output));
+                $prettyVersion = trim($output);
+            } catch (\Exception $e) {
+            }
+        }
+
+        return ['version' => $version, 'commit' => '', 'pretty_version' => $prettyVersion];
+    }
+
+    /**
+     * @param array<string, mixed> $packageConfig
+     *
+     * @return array{version: string, commit: '', pretty_version: string}|null
+     */
+    private function guessSvnVersion(array $packageConfig, string $path): ?array
+    {
+        SvnUtil::cleanEnv();
+
+        // try to fetch current version from svn
+        if (0 === $this->process->execute('svn info --xml', $output, $path)) {
+            $trunkPath = isset($packageConfig['trunk-path']) ? preg_quote($packageConfig['trunk-path'], '#') : 'trunk';
+            $branchesPath = isset($packageConfig['branches-path']) ? preg_quote($packageConfig['branches-path'], '#') : 'branches';
+            $tagsPath = isset($packageConfig['tags-path']) ? preg_quote($packageConfig['tags-path'], '#') : 'tags';
+
+            $urlPattern = '#<url>.*/(' . $trunkPath . '|(' . $branchesPath . '|' . $tagsPath . ')/(.*))</url>#';
+
+            if (Preg::isMatch($urlPattern, $output, $matches)) {
+                if (isset($matches[2], $matches[3]) && ($branchesPath === $matches[2] || $tagsPath === $matches[2])) {
+                    // we are in a branches path
+                    $version = $this->versionParser->normalizeBranch($matches[3]);
+                    $prettyVersion = 'dev-' . $matches[3];
+
+                    return ['version' => $version, 'commit' => '', 'pretty_version' => $prettyVersion];
+                }
+
+                assert(is_string($matches[1]));
+                $prettyVersion = trim($matches[1]);
+                if ($prettyVersion === 'trunk') {
+                    $version = 'dev-trunk';
+                } else {
+                    $version = $this->versionParser->normalize($prettyVersion);
+                }
+
+                return ['version' => $version, 'commit' => '', 'pretty_version' => $prettyVersion];
+            }
+        }
+
+        return null;
     }
 }

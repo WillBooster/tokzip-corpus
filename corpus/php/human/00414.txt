@@ -10,332 +10,60 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Repository;
+namespace Composer\Console\Input;
 
-use Composer\Package\AliasPackage;
-use Composer\Package\BasePackage;
-use Composer\Package\CompleteAliasPackage;
-use Composer\Package\CompletePackage;
-use Composer\Package\PackageInterface;
-use Composer\Package\CompletePackageInterface;
-use Composer\Package\Version\VersionParser;
-use Composer\Package\Version\StabilityFilter;
-use Composer\Pcre\Preg;
-use Composer\Semver\Constraint\ConstraintInterface;
-use Composer\Semver\Constraint\Constraint;
+use Symfony\Component\Console\Completion\CompletionInput;
+use Symfony\Component\Console\Completion\CompletionSuggestions;
+use Symfony\Component\Console\Completion\Suggestion;
+use Symfony\Component\Console\Exception\InvalidArgumentException;
+use Symfony\Component\Console\Exception\LogicException;
+use Symfony\Component\Console\Input\InputArgument as BaseInputArgument;
 
 /**
- * A repository implementation that simply stores packages in an array
+ * Backport suggested values definition from symfony/console 6.1+
  *
- * @author Nils Adermann <naderman@naderman.de>
+ * @author Jérôme Tamarelle <jerome@tamarelle.net>
+ *
+ * @internal
+ *
+ * TODO drop when PHP 8.1 / symfony 6.1+ can be required
  */
-class ArrayRepository implements RepositoryInterface
+class InputArgument extends BaseInputArgument
 {
-    /** @var ?array<BasePackage> */
-    protected $packages = null;
-
     /**
-     * @var ?array<BasePackage> indexed by package unique name and used to cache hasPackage calls
+     * @var list<string>|\Closure(CompletionInput,CompletionSuggestions):list<string|Suggestion>
      */
-    protected $packageMap = null;
+    private $suggestedValues;
 
     /**
-     * @param array<PackageInterface> $packages
-     */
-    public function __construct(array $packages = [])
-    {
-        foreach ($packages as $package) {
-            $this->addPackage($package);
-        }
-    }
-
-    public function getRepoName()
-    {
-        return 'array repo (defining '.$this->count().' package'.($this->count() > 1 ? 's' : '').')';
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function loadPackages(array $packageNameMap, array $acceptableStabilities, array $stabilityFlags, array $alreadyLoaded = [])
-    {
-        $packages = $this->getPackages();
-
-        $result = [];
-        $namesFound = [];
-        foreach ($packages as $package) {
-            if (array_key_exists($package->getName(), $packageNameMap)) {
-                if (
-                    (!$packageNameMap[$package->getName()] || $packageNameMap[$package->getName()]->matches(new Constraint('==', $package->getVersion())))
-                    && StabilityFilter::isPackageAcceptable($acceptableStabilities, $stabilityFlags, $package->getNames(), $package->getStability())
-                    && !isset($alreadyLoaded[$package->getName()][$package->getVersion()])
-                ) {
-                    // add selected packages which match stability requirements
-                    $result[spl_object_hash($package)] = $package;
-                    // add the aliased package for packages where the alias matches
-                    if ($package instanceof AliasPackage && !isset($result[spl_object_hash($package->getAliasOf())])) {
-                        $result[spl_object_hash($package->getAliasOf())] = $package->getAliasOf();
-                    }
-                }
-
-                $namesFound[$package->getName()] = true;
-            }
-        }
-
-        // add aliases of packages that were selected, even if the aliases did not match
-        foreach ($packages as $package) {
-            if ($package instanceof AliasPackage) {
-                if (isset($result[spl_object_hash($package->getAliasOf())])) {
-                    $result[spl_object_hash($package)] = $package;
-                }
-            }
-        }
-
-        return ['namesFound' => array_keys($namesFound), 'packages' => $result];
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function findPackage(string $name, $constraint)
-    {
-        $name = strtolower($name);
-
-        if (!$constraint instanceof ConstraintInterface) {
-            $versionParser = new VersionParser();
-            $constraint = $versionParser->parseConstraints($constraint);
-        }
-
-        foreach ($this->getPackages() as $package) {
-            if ($name === $package->getName()) {
-                $pkgConstraint = new Constraint('==', $package->getVersion());
-                if ($constraint->matches($pkgConstraint)) {
-                    return $package;
-                }
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function findPackages(string $name, $constraint = null)
-    {
-        // normalize name
-        $name = strtolower($name);
-        $packages = [];
-
-        if (null !== $constraint && !$constraint instanceof ConstraintInterface) {
-            $versionParser = new VersionParser();
-            $constraint = $versionParser->parseConstraints($constraint);
-        }
-
-        foreach ($this->getPackages() as $package) {
-            if ($name === $package->getName()) {
-                if (null === $constraint || $constraint->matches(new Constraint('==', $package->getVersion()))) {
-                    $packages[] = $package;
-                }
-            }
-        }
-
-        return $packages;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function search(string $query, int $mode = 0, ?string $type = null)
-    {
-        if ($mode === self::SEARCH_FULLTEXT) {
-            $regex = '{(?:'.implode('|', Preg::split('{\s+}', preg_quote($query))).')}i';
-        } else {
-            // vendor/name searches expect the caller to have preg_quoted the query
-            $regex = '{(?:'.implode('|', Preg::split('{\s+}', $query)).')}i';
-        }
-
-        $matches = [];
-        foreach ($this->getPackages() as $package) {
-            $name = $package->getName();
-            if ($mode === self::SEARCH_VENDOR) {
-                [$name] = explode('/', $name);
-            }
-            if (isset($matches[$name])) {
-                continue;
-            }
-            if (null !== $type && $package->getType() !== $type) {
-                continue;
-            }
-
-            if (Preg::isMatch($regex, $name)
-                || ($mode === self::SEARCH_FULLTEXT && $package instanceof CompletePackageInterface && Preg::isMatch($regex, implode(' ', (array) $package->getKeywords()) . ' ' . $package->getDescription()))
-            ) {
-                if ($mode === self::SEARCH_VENDOR) {
-                    $matches[$name] = [
-                        'name' => $name,
-                        'description' => null,
-                    ];
-                } else {
-                    $matches[$name] = [
-                        'name' => $package->getPrettyName(),
-                        'description' => $package instanceof CompletePackageInterface ? $package->getDescription() : null,
-                    ];
-
-                    if ($package instanceof CompletePackageInterface && $package->isAbandoned()) {
-                        $matches[$name]['abandoned'] = $package->getReplacementPackage() ?: true;
-                    }
-                }
-            }
-        }
-
-        return array_values($matches);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function hasPackage(PackageInterface $package)
-    {
-        if ($this->packageMap === null) {
-            $this->packageMap = [];
-            foreach ($this->getPackages() as $repoPackage) {
-                $this->packageMap[$repoPackage->getUniqueName()] = $repoPackage;
-            }
-        }
-
-        return isset($this->packageMap[$package->getUniqueName()]);
-    }
-
-    /**
-     * Adds a new package to the repository
+     * @param string                              $name        The argument name
+     * @param int|null                            $mode        The argument mode: self::REQUIRED or self::OPTIONAL
+     * @param string                              $description A description text
+     * @param string|bool|int|float|string[]|null $default     The default value (for self::OPTIONAL mode only)
+     * @param list<string>|\Closure(CompletionInput,CompletionSuggestions):list<string|Suggestion> $suggestedValues The values used for input completion
      *
-     * @return void
+     * @throws InvalidArgumentException When argument mode is not valid
      */
-    public function addPackage(PackageInterface $package)
+    public function __construct(string $name, ?int $mode = null, string $description = '', $default = null, $suggestedValues = [])
     {
-        if (!$package instanceof BasePackage) {
-            throw new \InvalidArgumentException('Only subclasses of BasePackage are supported');
-        }
-        if (null === $this->packages) {
-            $this->initialize();
-        }
-        $package->setRepository($this);
-        $this->packages[] = $package;
+        parent::__construct($name, $mode, $description, $default);
 
-        if ($package instanceof AliasPackage) {
-            $aliasedPackage = $package->getAliasOf();
-            if (null === $aliasedPackage->getRepository()) {
-                $this->addPackage($aliasedPackage);
-            }
-        }
-
-        // invalidate package map cache
-        $this->packageMap = null;
+        $this->suggestedValues = $suggestedValues;
     }
 
     /**
-     * @inheritDoc
-     */
-    public function getProviders(string $packageName)
-    {
-        $result = [];
-
-        foreach ($this->getPackages() as $candidate) {
-            if (isset($result[$candidate->getName()])) {
-                continue;
-            }
-            foreach ($candidate->getProvides() as $link) {
-                if ($packageName === $link->getTarget()) {
-                    $result[$candidate->getName()] = [
-                        'name' => $candidate->getName(),
-                        'description' => $candidate instanceof CompletePackageInterface ? $candidate->getDescription() : null,
-                        'type' => $candidate->getType(),
-                    ];
-                    continue 2;
-                }
-            }
-        }
-
-        return $result;
-    }
-
-    /**
-     * @return AliasPackage|CompleteAliasPackage
-     */
-    protected function createAliasPackage(BasePackage $package, string $alias, string $prettyAlias)
-    {
-        while ($package instanceof AliasPackage) {
-            $package = $package->getAliasOf();
-        }
-
-        if ($package instanceof CompletePackage) {
-            return new CompleteAliasPackage($package, $alias, $prettyAlias);
-        }
-
-        return new AliasPackage($package, $alias, $prettyAlias);
-    }
-
-    /**
-     * Removes package from repository.
+     * Adds suggestions to $suggestions for the current completion input.
      *
-     * @param PackageInterface $package package instance
-     *
-     * @return void
+     * @see Command::complete()
      */
-    public function removePackage(PackageInterface $package)
+    public function complete(CompletionInput $input, CompletionSuggestions $suggestions): void
     {
-        $packageId = $package->getUniqueName();
-
-        foreach ($this->getPackages() as $key => $repoPackage) {
-            if ($packageId === $repoPackage->getUniqueName()) {
-                array_splice($this->packages, $key, 1);
-
-                // invalidate package map cache
-                $this->packageMap = null;
-
-                return;
-            }
+        $values = $this->suggestedValues;
+        if ($values instanceof \Closure && !\is_array($values = $values($input, $suggestions))) { // @phpstan-ignore function.impossibleType
+            throw new LogicException(sprintf('Closure for option "%s" must return an array. Got "%s".', $this->getName(), get_debug_type($values)));
         }
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getPackages()
-    {
-        if (null === $this->packages) {
-            $this->initialize();
+        if ([] !== $values) {
+            $suggestions->suggestValues($values);
         }
-
-        if (null === $this->packages) {
-            throw new \LogicException('initialize failed to initialize the packages array');
-        }
-
-        return $this->packages;
-    }
-
-    /**
-     * Returns the number of packages in this repository
-     *
-     * @return 0|positive-int Number of packages
-     */
-    public function count(): int
-    {
-        if (null === $this->packages) {
-            $this->initialize();
-        }
-
-        return count($this->packages);
-    }
-
-    /**
-     * Initializes the packages array. Mostly meant as an extension point.
-     *
-     * @return void
-     */
-    protected function initialize()
-    {
-        $this->packages = [];
     }
 }

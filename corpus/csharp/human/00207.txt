@@ -2,77 +2,264 @@
 
 using System;
 using NUnit.Framework.Interfaces;
+using NUnit.Framework.Internal.Filters;
 
 namespace NUnit.Framework.Internal
 {
     /// <summary>
-    /// TestFixture is a surrogate for a user test fixture class,
-    /// containing one or more tests.
+    /// Interface to be implemented by filters applied to tests.
+    /// The filter applies when running the test, after it has been
+    /// loaded, since this is the only time an ITest exists.
     /// </summary>
-    public class TestFixture : TestSuite, IDisposableFixture
+    public abstract class TestFilter : ITestFilter
     {
         /// <summary>
-        /// The life cycle specified for the current test fixture.
+        /// Unique Empty filter.
         /// </summary>
-        public LifeCycle LifeCycle { get; set; }
-
-        #region Constructor
+        public static readonly TestFilter Empty = new EmptyFilter();
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="TestFixture"/> class.
+        /// Indicates whether this is the EmptyFilter
         /// </summary>
-        /// <param name="fixtureType">Type of the fixture.</param>
-        /// <param name="arguments">Arguments used to instantiate the test fixture, or null if none used</param>
-        public TestFixture(ITypeInfo fixtureType, object?[]? arguments = null) : base(fixtureType, arguments)
-        {
-            SetUpMethods = TypeInfo.GetMethodsWithAttribute<SetUpAttribute>(true);
-            TearDownMethods = TypeInfo.GetMethodsWithAttribute<TearDownAttribute>(true);
-            OneTimeSetUpMethods = TypeInfo.GetMethodsWithAttribute<OneTimeSetUpAttribute>(true);
-            OneTimeTearDownMethods = TypeInfo.GetMethodsWithAttribute<OneTimeTearDownAttribute>(true);
+        public bool IsEmpty => this is EmptyFilter;
 
-            CheckSetUpTearDownMethods(OneTimeSetUpMethods);
-            CheckSetUpTearDownMethods(OneTimeTearDownMethods);
-            CheckSetUpTearDownMethods(SetUpMethods);
-            CheckSetUpTearDownMethods(TearDownMethods);
+        /// <summary>
+        /// Determine if a particular test passes the filter criteria. The default
+        /// implementation checks the test itself, its parents and any descendants.
+        ///
+        /// Derived classes may override this method or any of the Match methods
+        /// to change the behavior of the filter.
+        /// </summary>
+        /// <param name="test">The test to which the filter is applied</param>
+        /// <returns>True if the test passes the filter, otherwise false</returns>
+        public virtual bool Pass(ITest test)
+        {
+            return Pass(test, false);
         }
 
         /// <summary>
-        /// Creates a copy of the given suite with only the descendants that pass the specified filter.
+        /// Determine if a particular test passes the filter criteria. The default
+        /// implementation checks the test itself, its parents and any descendants.
+        ///
+        /// Derived classes may override this method or any of the Match methods
+        /// to change the behavior of the filter.
         /// </summary>
-        /// <param name="fixture">The <see cref="TestFixture"/> to copy.</param>
-        /// <param name="filter">Determines which descendants are copied.</param>
-        private TestFixture(TestFixture fixture, ITestFilter filter)
-            : base(fixture, filter)
+        /// <param name="test">The test to which the filter is applied</param>
+        /// <param name="negated">If set to <see langword="true"/> we are carrying a negation through</param>
+        /// <returns>True if the test passes the filter, otherwise false</returns>
+        public virtual bool Pass(ITest test, bool negated)
         {
+            if (negated)
+                return !Match(test) && !MatchParent(test);
+
+            return Match(test) || MatchParent(test) || MatchDescendant(test);
         }
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="TestFixture"/> class that failed to load.
+        /// Determine if a test matches the filter explicitly. That is, it must
+        /// be a direct match of the test itself or one of its children.
         /// </summary>
-        /// <param name="fixtureType">Type of the fixture.</param>
-        /// <param name="ex">Exception that was thrown during test discovery.</param>
-        public TestFixture(ITypeInfo fixtureType, Exception ex) : base(fixtureType, null)
+        /// <param name="test">The test to which the filter is applied</param>
+        /// <returns>True if the test matches the filter explicitly, otherwise false</returns>
+        public virtual bool IsExplicitMatch(ITest test)
         {
-            MakeInvalid(ex, "Failure building TestFixture");
+            return Match(test) || MatchDescendant(test);
         }
 
-        #endregion
-
-        #region Test Suite Overrides
+        /// <summary>
+        /// Determine whether the test itself matches the filter criteria, without
+        /// examining either parents or descendants. This is overridden by each
+        /// different type of filter to perform the necessary tests.
+        /// </summary>
+        /// <param name="test">The test to which the filter is applied</param>
+        /// <returns>True if the filter matches the any parent of the test</returns>
+        public abstract bool Match(ITest test);
 
         /// <summary>
-        /// Gets the TypeInfo of the fixture used in running this test.
+        /// Determine whether any ancestor of the test matches the filter criteria
         /// </summary>
-        public new ITypeInfo TypeInfo => base.TypeInfo!;
-
-        /// <summary>
-        /// Creates a filtered copy of the test suite.
-        /// </summary>
-        /// <param name="filter">Determines which descendants are copied.</param>
-        public override TestSuite Copy(ITestFilter filter)
+        /// <param name="test">The test to which the filter is applied</param>
+        /// <returns>True if the filter matches the an ancestor of the test</returns>
+        public bool MatchParent(ITest test)
         {
-            return new TestFixture(this, filter);
+            return test.Parent is not null && (Match(test.Parent) || MatchParent(test.Parent));
         }
+
+        /// <summary>
+        /// Determine whether any descendant of the test matches the filter criteria.
+        /// </summary>
+        /// <param name="test">The test to be matched</param>
+        /// <returns>True if at least one descendant matches the filter criteria</returns>
+        protected virtual bool MatchDescendant(ITest test)
+        {
+            var tests = test.Tests;
+            // Use for-loop to avoid allocating the enumerator
+            int count = tests.Count;
+            for (var index = 0; index < count; index++)
+            {
+                ITest child = tests[index];
+                if (Match(child) || MatchDescendant(child))
+                    return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Create a TestFilter instance from an XML representation.
+        /// </summary>
+        public static TestFilter FromXml(string? xmlText)
+        {
+            const string emptyFilterXmlWithSpace = "<filter />";
+            const string emptyFilterWithoutSpace = "<filter/>";
+
+            // check for fast cases
+            if (string.IsNullOrEmpty(xmlText) || xmlText.Length < 11 && xmlText is emptyFilterXmlWithSpace or emptyFilterWithoutSpace)
+            {
+                return Empty;
+            }
+
+            TNode topNode = TNode.FromXml(xmlText);
+
+            if (topNode.Name != "filter")
+                throw new Exception("Expected filter element at top level");
+
+            int count = topNode.ChildNodes.Count;
+
+            TestFilter filter = count == 0
+                ? Empty
+                : count == 1
+                    ? FromXml(topNode.FirstChild)
+                    : FromXml(topNode);
+
+            return filter;
+        }
+
+        /// <summary>
+        /// Create a TestFilter from its TNode representation
+        /// </summary>
+        public static TestFilter FromXml(TNode? node)
+        {
+            Guard.ArgumentNotNull(node, nameof(node));
+
+            static bool IsRegex(TNode node) => node.Attributes["re"] == "1";
+
+            switch (node.Name)
+            {
+                case "filter":
+                case "and":
+                    return new AndFilter(GetChildNodeFilters(node));
+
+                case "or":
+                    var orFilter = new OrFilter(GetChildNodeFilters(node));
+                    if (InFilter.TryOptimize(orFilter, out var optimized))
+                    {
+                        return optimized;
+                    }
+                    return orFilter;
+
+                case "not":
+                    return new NotFilter(FromXml(node.FirstChild));
+
+                case "id":
+                    return new IdFilter(NodeValue(node));
+
+                case "test":
+                    return new FullNameFilter(NodeValue(node), IsRegex(node));
+
+                case "name":
+                    return new TestNameFilter(NodeValue(node), IsRegex(node));
+
+                case "method":
+                    return new MethodNameFilter(NodeValue(node), IsRegex(node));
+
+                case "class":
+                    return new ClassNameFilter(NodeValue(node), IsRegex(node));
+
+                case "namespace":
+                    return new NamespaceFilter(NodeValue(node), IsRegex(node));
+
+                case "cat":
+                    return new CategoryFilter(NodeValue(node), IsRegex(node));
+
+                case "prop":
+                    string? name = node.Attributes["name"];
+                    if (name is not null)
+                        return new PropertyFilter(name, NodeValue(node), IsRegex(node));
+                    break;
+
+                case "partition":
+                    if (PartitionFilter.TryCreate(NodeValue(node), out var partitionFilter))
+                        return partitionFilter!;
+                    break;
+            }
+
+            throw new ArgumentException("Invalid filter element: " + node.Name, "xmlNode");
+        }
+
+        private static string NodeValue(TNode node)
+        {
+            return node.Value ?? throw new InvalidOperationException("Value is null");
+        }
+
+        private static TestFilter[] GetChildNodeFilters(TNode node)
+        {
+            var count = node.ChildNodes.Count;
+            var childFilters = new TestFilter[count];
+
+            for (var i = 0; i < count; i++)
+                childFilters[i] = FromXml(node.ChildNodes[i]);
+
+            return childFilters;
+        }
+
+        /// <summary>
+        /// Nested class provides an empty filter - one that always
+        /// returns true when called. It never matches explicitly.
+        /// </summary>
+        [Serializable]
+        private sealed class EmptyFilter : TestFilter
+        {
+            public override bool Match(ITest test)
+            {
+                return true;
+            }
+
+            public override bool Pass(ITest test, bool negated)
+            {
+                return true;
+            }
+
+            public override bool IsExplicitMatch(ITest test)
+            {
+                return false;
+            }
+
+            public override TNode AddToXml(TNode parentNode, bool recursive)
+            {
+                return parentNode.AddElement("filter");
+            }
+        }
+
+        #region IXmlNodeBuilder Implementation
+
+        /// <summary>
+        /// Adds an XML node
+        /// </summary>
+        /// <param name="recursive">True if recursive</param>
+        /// <returns>The added XML node</returns>
+        public TNode ToXml(bool recursive)
+        {
+            return AddToXml(new TNode("dummy"), recursive);
+        }
+
+        /// <summary>
+        /// Adds an XML node
+        /// </summary>
+        /// <param name="parentNode">Parent node</param>
+        /// <param name="recursive">True if recursive</param>
+        /// <returns>The added XML node</returns>
+        public abstract TNode AddToXml(TNode parentNode, bool recursive);
 
         #endregion
     }
