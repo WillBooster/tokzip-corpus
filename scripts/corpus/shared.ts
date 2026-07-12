@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -221,9 +222,17 @@ export function syncNoticeFiles(checkout: string, repo: string): void {
   const noticeDir = join(import.meta.dir, "../..", noticePathFor(repo));
   rmSync(noticeDir, { recursive: true, force: true });
   mkdirSync(noticeDir, { recursive: true });
-  const files = readdirSync(checkout, { withFileTypes: true }).filter(
-    (entry) => entry.isFile() && isNoticeFile(entry.name),
-  );
+  // Some upstreams ship their root LICENSE as a symlink; resolve it instead of skipping,
+  // which would otherwise abort the fetch with "no root-level license or notice files".
+  const files = readdirSync(checkout, { withFileTypes: true }).filter((entry) => {
+    if (!isNoticeFile(entry.name)) return false;
+    if (entry.isFile()) return true;
+    try {
+      return entry.isSymbolicLink() && statSync(join(checkout, entry.name)).isFile();
+    } catch {
+      return false;
+    }
+  });
   if (files.length === 0) throw new Error(`${repo}: no root-level license or notice files`);
   for (const file of files) {
     const name = /licen[cs]e/i.test(file.name) && !/^licen[cs]e/i.test(file.name)

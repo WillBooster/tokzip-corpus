@@ -62,13 +62,14 @@ function fetchGitDocs(locale: string, entries: GitDocsSource[]): void {
         ) {
           continue;
         }
-        let size;
+        let stat;
         try {
-          size = statSync(path).size; // Broken symlinks in upstream checkouts must not abort the fetch.
+          stat = statSync(path); // Broken symlinks in upstream checkouts must not abort the fetch.
         } catch {
           continue;
         }
-        if (!dirent.name.endsWith(".md") || size < 500) continue;
+        // Symlinks to directories pass the extension check but would crash readFileSync.
+        if (!stat.isFile() || !dirent.name.endsWith(".md") || stat.size < 500) continue;
         bytes += saveChunks(
           locale,
           readFileSync(path, "utf8"),

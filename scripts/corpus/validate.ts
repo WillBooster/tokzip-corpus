@@ -1,6 +1,6 @@
 /** Fails when committed corpus bytes lack approved provenance or redistribution notices. */
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import nlSources from "./nl-sources.json";
 import ossSources from "./oss-sources.json";
@@ -75,7 +75,7 @@ function main(): void {
       }
       validateEntry(dir, label, entry, errors);
       const samplePath = join(dir, entry.file);
-      if (existsSync(samplePath)) {
+      if (isContainedFile(dir, samplePath)) {
         const languageSamples = samplesByLanguage.get(language.name) ?? [];
         languageSamples.push({
           content: readFileSync(samplePath, "utf8"),
@@ -138,8 +138,11 @@ function validateEntry(dir: string, label: string, entry: ManifestEntry, errors:
   if (entry.trainable !== true)
     errors.push(`${label}: sample is not explicitly approved for training`);
   if (entry.split !== "train" && entry.split !== "bench") errors.push(`${label}: invalid split`);
-  if (!existsSync(samplePath)) {
-    errors.push(`${label}: missing ${entry.file}`);
+  // A manifest is data, so its `file` must be confined to the language directory and name a
+  // regular file: an escaping path would hash bytes from outside the corpus, and a directory
+  // would crash readFileSync with EISDIR instead of failing validation.
+  if (!isContainedFile(dir, samplePath)) {
+    errors.push(`${label}: missing, unsafe, or non-file sample path ${entry.file}`);
     return;
   }
   const content = readFileSync(samplePath);
@@ -163,6 +166,17 @@ function validateEntry(dir: string, label: string, entry: ManifestEntry, errors:
   const policy = sourcePolicyFor(entry.source);
   for (const required of policy?.requiredNoticeFiles ?? []) {
     if (!noticeFiles.includes(required)) errors.push(`${label}: ${entry.notice} omits ${required}`);
+  }
+}
+
+/** Whether `path` is a regular file inside `dir`, so manifest data cannot escape the corpus. */
+function isContainedFile(dir: string, path: string): boolean {
+  const resolvedPath = resolve(path);
+  if (!resolvedPath.startsWith(`${resolve(dir)}/`)) return false;
+  try {
+    return statSync(resolvedPath).isFile();
+  } catch {
+    return false;
   }
 }
 
@@ -221,7 +235,7 @@ function sourcePolicies(): Map<string, SourcePolicy> {
     }
   }
   for (const locale of Object.values(nlSources.locales)) {
-    for (const entry of locale.gitDocs) add(entry.repo, entry);
+    for (const entry of locale.gitDocs ?? []) add(entry.repo, entry);
   }
   return policies;
 }

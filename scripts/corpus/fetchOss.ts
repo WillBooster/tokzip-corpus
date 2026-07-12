@@ -330,6 +330,9 @@ function sampleFiles(
       } catch {
         continue;
       }
+      // Dirents never report symlinks as directories, so a link to a directory would reach
+      // readFileSync and crash with EISDIR.
+      if (!stat.isFile()) continue;
       if (stat.size === 0 || (stat.size > MAX_SAMPLE_BYTES && !chunkOversized)) continue;
       const buffer = readFileSync(path);
       let content: string;
