@@ -155,7 +155,10 @@ function validateEntry(dir: string, label: string, entry: ManifestEntry, errors:
     errors.push(`${label}: size bucket ${entry.sizeBucket} does not match ${actualSizeBucket}`);
   validateSourcePolicy(label, entry, samplePath, errors);
   const noticeDir = resolve(ROOT, entry.notice);
-  if (!noticeDir.startsWith(join(ROOT, "THIRD_PARTY_NOTICES/")) || !existsSync(noticeDir)) {
+  // Same contract as the sample path: a real directory, never a symlink whose target supplies
+  // the notice names, and never a plain file (which would throw ENOTDIR out of readdirSync
+  // instead of failing as a compliance error).
+  if (!noticeDir.startsWith(join(ROOT, "THIRD_PARTY_NOTICES/")) || !isRealDirectory(noticeDir)) {
     errors.push(`${label}: missing or unsafe notice path ${entry.notice}`);
     return;
   }
@@ -180,6 +183,15 @@ function isContainedFile(dir: string, path: string): boolean {
   if (!resolvedPath.startsWith(`${resolve(dir)}/`)) return false;
   try {
     return lstatSync(resolvedPath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `path` is a real directory, so a symlink cannot substitute another tree's contents. */
+function isRealDirectory(path: string): boolean {
+  try {
+    return lstatSync(path).isDirectory();
   } catch {
     return false;
   }
