@@ -1,6 +1,6 @@
 /** Fetches pinned, permissively licensed natural-language documentation. */
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import sources from "./nl-sources.json";
 import {
   appendManifest,
@@ -55,7 +55,10 @@ function fetchGitDocs(locale: string, entries: GitDocsSource[]): void {
           walk(path);
           continue;
         }
-        const sourcePath = relative(dir, path);
+        // Manifest sources are POSIX paths on every platform: validate splits them on "/" to check
+        // notice files and excluded prefixes, so a backslash from a Windows fetch would slip past
+        // both checks and make the manifest unportable.
+        const sourcePath = relative(dir, path).split(sep).join("/");
         if (
           entry.excludePrefixes?.some(
             (excluded) => sourcePath === excluded || sourcePath.startsWith(`${excluded}/`),
