@@ -1,6 +1,6 @@
 /** Fails when committed corpus bytes lack approved provenance or redistribution notices. */
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import nlSources from "./nl-sources.json";
 import ossSources from "./oss-sources.json";
@@ -169,12 +169,17 @@ function validateEntry(dir: string, label: string, entry: ManifestEntry, errors:
   }
 }
 
-/** Whether `path` is a regular file inside `dir`, so manifest data cannot escape the corpus. */
+/**
+ * Whether `path` is a regular file inside `dir`, so manifest data cannot escape the corpus.
+ * `lstat` deliberately rejects symlinks rather than following them: a committed symlink keeps
+ * the path string contained while its bytes — the ones hashed and license-checked — come from
+ * wherever it points, so containment of the path would not mean containment of the content.
+ */
 function isContainedFile(dir: string, path: string): boolean {
   const resolvedPath = resolve(path);
   if (!resolvedPath.startsWith(`${resolve(dir)}/`)) return false;
   try {
-    return statSync(resolvedPath).isFile();
+    return lstatSync(resolvedPath).isFile();
   } catch {
     return false;
   }
