@@ -149,8 +149,11 @@ function shinglesOf(content: string): Set<number> {
     // oxlint-disable-next-line unicorn/prefer-math-trunc -- >>> 0 coerces to uint32, Math.trunc does not
     hashes.push(hash >>> 0);
   }
-  hashes.sort((a, b) => a - b);
-  return new Set(hashes.slice(0, SHINGLES_PER_DOC));
+  // Deduplicate before truncating: a repeated window (boilerplate, padding) would otherwise
+  // spend sketch slots on the same hash, leaving fewer distinct shingles to match on and
+  // under-estimating the overlap between two documents.
+  const distinct = [...new Set(hashes)].sort((a, b) => a - b);
+  return new Set(distinct.slice(0, SHINGLES_PER_DOC));
 }
 
 const CHUNK_TARGETS = [512, 2048, 8192, 24_576];
