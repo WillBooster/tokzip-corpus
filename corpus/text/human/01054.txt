@@ -1,88 +1,124 @@
-# Custom Type Converters
+You may have types that are not `BaseModel`s that you want to validate data against.
+Or you may want to validate a `list[SomeModel]`, or dump it to JSON.
 
-Sometimes, you need to take complete control over the conversion of one type to another.  This is typically when one type looks nothing like the other, a conversion function already exists, and you would like to go from a "looser" type to a stronger type, such as a source type of string to a destination type of Int32.
+??? api "API Documentation"
+    [`pydantic.type_adapter.TypeAdapter`][pydantic.type_adapter.TypeAdapter]<br>
 
-For example, suppose we have a source type of:
+For use cases like this, Pydantic provides [`TypeAdapter`][pydantic.type_adapter.TypeAdapter],
+which can be used for type validation, serialization, and JSON schema generation without needing to create a
+[`BaseModel`][pydantic.main.BaseModel].
 
-```c#
-public class Source
-{
-	public string Value1 { get; set; }
-	public string Value2 { get; set; }
-	public string Value3 { get; set; }
-}
+A [`TypeAdapter`][pydantic.type_adapter.TypeAdapter] instance exposes some of the functionality from
+[`BaseModel`][pydantic.main.BaseModel] instance methods for types that do not have such methods
+(such as dataclasses, primitive types, and more):
+
+```python
+from typing_extensions import TypedDict
+
+from pydantic import TypeAdapter, ValidationError
+
+
+class User(TypedDict):
+    name: str
+    id: int
+
+
+user_list_adapter = TypeAdapter(list[User])
+user_list = user_list_adapter.validate_python([{'name': 'Fred', 'id': '3'}])
+print(repr(user_list))
+#> [{'name': 'Fred', 'id': 3}]
+
+try:
+    user_list_adapter.validate_python(
+        [{'name': 'Fred', 'id': 'wrong', 'other': 'no'}]
+    )
+except ValidationError as e:
+    print(e)
+    """
+    1 validation error for list[User]
+    0.id
+      Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='wrong', input_type=str]
+    """
+
+print(repr(user_list_adapter.dump_json(user_list)))
+#> b'[{"name":"Fred","id":3}]'
 ```
 
-But you would like to map it to:
+!!! info "`dump_json` returns `bytes`"
+    `TypeAdapter`'s `dump_json` methods returns a `bytes` object, unlike the corresponding method for `BaseModel`, `model_dump_json`, which returns a `str`.
+    The reason for this discrepancy is that in V1, model dumping returned a str type, so this behavior is retained in V2 for backwards compatibility.
+    For the `BaseModel` case, `bytes` are coerced to `str` types, but `bytes` are often the desired end type.
+    Hence, for the new `TypeAdapter` class in V2, the return type is simply `bytes`, which can easily be coerced to a `str` type if desired.
 
-```c#
-public class Destination
-{
-	public int Value1 { get; set; }
-	public DateTime Value2 { get; set; }
-	public Type Value3 { get; set; }
-}
+!!! note
+    Despite some overlap in use cases with [`RootModel`][pydantic.root_model.RootModel],
+    [`TypeAdapter`][pydantic.type_adapter.TypeAdapter] should not be used as a type annotation for
+    specifying fields of a `BaseModel`, etc.
+
+## Parsing data into a specified type
+
+[`TypeAdapter`][pydantic.type_adapter.TypeAdapter] can be used to apply the parsing logic to populate Pydantic models
+in a more ad-hoc way. This function behaves similarly to
+[`BaseModel.model_validate`][pydantic.main.BaseModel.model_validate],
+but works with arbitrary Pydantic-compatible types.
+
+This is especially useful when you want to parse results into a type that is not a direct subclass of
+[`BaseModel`][pydantic.main.BaseModel]. For example:
+
+```python
+from pydantic import BaseModel, TypeAdapter
+
+
+class Item(BaseModel):
+    id: int
+    name: str
+
+
+# `item_data` could come from an API call, eg., via something like:
+# item_data = requests.get('https://my-api.com/items').json()
+item_data = [{'id': 1, 'name': 'My Item'}]
+
+items = TypeAdapter(list[Item]).validate_python(item_data)
+print(items)
+#> [Item(id=1, name='My Item')]
 ```
 
-If we were to try and map these two types as-is, AutoMapper would throw an exception (at map time and configuration-checking time), as AutoMapper does not know about any mapping from string to int, DateTime or Type.  To create maps for these types, we must supply a custom type converter, and we have three ways of doing so:
+[`TypeAdapter`][pydantic.type_adapter.TypeAdapter] is capable of parsing data into any of the types Pydantic can
+handle as fields of a [`BaseModel`][pydantic.main.BaseModel].
 
-```c#
-void ConvertUsing(Func<TSource, TDestination> mappingFunction);
-void ConvertUsing(ITypeConverter<TSource, TDestination> converter);
-void ConvertUsing<TTypeConverter>() where TTypeConverter : ITypeConverter<TSource, TDestination>;
+!!! info "Performance considerations"
+    When creating an instance of [`TypeAdapter`][pydantic.type_adapter.TypeAdapter], the provided type must be analyzed and converted into a pydantic-core
+    schema. This comes with some non-trivial overhead, so it is recommended to create a `TypeAdapter` for a given type
+    just once and reuse it in loops or other performance-critical code.
+
+## Rebuilding a `TypeAdapter`'s schema
+
+/// version-added | v2.10
+///
+
+[`TypeAdapter`][pydantic.type_adapter.TypeAdapter]'s support deferred schema building and manual rebuilds. This is helpful for the case of:
+
+* Types with forward references
+* Types for which core schema builds are expensive
+
+When you initialize a [`TypeAdapter`][pydantic.type_adapter.TypeAdapter] with a type, Pydantic analyzes the type and creates a core schema for it.
+This core schema contains the information needed to validate and serialize data for that type.
+See the [architecture documentation](../internals/architecture.md) for more information on core schemas.
+
+If you set [`defer_build`][pydantic.config.ConfigDict.defer_build] to `True` when initializing a `TypeAdapter`,
+Pydantic will defer building the core schema until the first time it is needed (for validation or serialization).
+
+In order to manually trigger the building of the core schema, you can call the
+[`rebuild`][pydantic.type_adapter.TypeAdapter.rebuild] method on the [`TypeAdapter`][pydantic.type_adapter.TypeAdapter] instance:
+
+```python
+from pydantic import ConfigDict, TypeAdapter
+
+ta = TypeAdapter('MyInt', config=ConfigDict(defer_build=True))
+
+# some time later, the forward reference is defined
+MyInt = int
+
+ta.rebuild()
+assert ta.validate_python(1) == 1
 ```
-
-The first option is simply any function that takes a source and returns a destination (there are several overloads too). This works for simple cases, but becomes unwieldy for larger ones.  In more difficult cases, we can create a custom ITypeConverter\<TSource, TDestination\>:
-
-```c#
-public interface ITypeConverter<in TSource, TDestination>
-{
-	TDestination Convert(TSource source, TDestination destination, ResolutionContext context);
-}
-```
-
-And supply AutoMapper with either an instance of a custom type converter, or simply the type, which AutoMapper will instantiate at run time.  The mapping configuration for our above source/destination types then becomes:
-
-```c#
-[Test]
-public void Example()
-{
-    var configuration = new MapperConfiguration(cfg => {
-      cfg.CreateMap<string, int>().ConvertUsing(s => Convert.ToInt32(s));
-      cfg.CreateMap<string, DateTime>().ConvertUsing(new DateTimeTypeConverter());
-      cfg.CreateMap<string, Type>().ConvertUsing<TypeTypeConverter>();
-      cfg.CreateMap<Source, Destination>();
-    });
-    configuration.AssertConfigurationIsValid();
-
-    var source = new Source
-    {
-        Value1 = "5",
-        Value2 = "01/01/2000",
-        Value3 = "AutoMapperSamples.GlobalTypeConverters.GlobalTypeConverters+Destination"
-    };
-
-    Destination result = mapper.Map<Source, Destination>(source);
-    result.Value3.ShouldEqual(typeof(Destination));
-}
-
-public class DateTimeTypeConverter : ITypeConverter<string, DateTime>
-{
-    public DateTime Convert(string source, DateTime destination, ResolutionContext context)
-    {
-        return System.Convert.ToDateTime(source);
-    }
-}
-
-public class TypeTypeConverter : ITypeConverter<string, Type>
-{
-    public Type Convert(string source, Type destination, ResolutionContext context)
-    {
-          return Assembly.GetExecutingAssembly().GetType(source);
-    }
-}
-```
-
-In the first mapping, from string to Int32, we simply use the built-in Convert.ToInt32 function (supplied as a method group).  The next two use custom ITypeConverter implementations.
-
-The real power of custom type converters is that they are used any time AutoMapper finds the source/destination pairs on any mapped types.  We can build a set of custom type converters, on top of which other mapping configurations use, without needing any extra configuration.  In the above example, we never have to specify the string/int conversion again.  Where as [Custom Value Resolvers](Custom-value-resolvers.html) have to be configured at a type member level, custom type converters are global in scope.

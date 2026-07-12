@@ -1,747 +1,443 @@
-if(WINDOWS_STORE)
-  set(CURL_DISABLE_TELNET ON)  # telnet code needs fixing to compile for UWP.
-endif()
-
-option(ENABLE_IPV6 "Define if you want to enable IPv6 support" ON)
-mark_as_advanced(ENABLE_IPV6)
-if(ENABLE_IPV6 AND NOT WIN32)
-  include(CheckStructHasMember)
-  check_struct_has_member("struct sockaddr_in6" sin6_addr "netinet/in.h"
-                          HAVE_SOCKADDR_IN6_SIN6_ADDR)
-  check_struct_has_member("struct sockaddr_in6" sin6_scope_id "netinet/in.h"
-                          HAVE_SOCKADDR_IN6_SIN6_SCOPE_ID)
-  if(NOT HAVE_SOCKADDR_IN6_SIN6_ADDR)
-    message(WARNING "struct sockaddr_in6 not available, disabling IPv6 support")
-    # Force the feature off as this name is used as guard macro...
-    set(ENABLE_IPV6 OFF
-        CACHE BOOL "Define if you want to enable IPv6 support" FORCE)
-  endif()
-
-  if(APPLE AND NOT ENABLE_ARES)
-    set(use_core_foundation_and_core_services ON)
-
-    find_library(SYSTEMCONFIGURATION_FRAMEWORK "SystemConfiguration")
-    if(NOT SYSTEMCONFIGURATION_FRAMEWORK)
-      message(FATAL_ERROR "SystemConfiguration framework not found")
-    endif()
-
-    list(APPEND CURL_LIBS "-framework SystemConfiguration")
-  endif()
-endif()
-if(ENABLE_IPV6)
-  set(USE_IPV6 ON)
-endif()
-
-find_package(Perl)
-
-option(BUILD_LIBCURL_DOCS "to build libcurl man pages" ON)
-option(BUILD_MISC_DOCS "to build misc man pages (e.g. curl-config and mk-ca-bundle)" ON)
-option(ENABLE_CURL_MANUAL "to build the man page for curl and enable its -M/--manual option" ON)
-
-if(ENABLE_CURL_MANUAL OR BUILD_LIBCURL_DOCS)
-  if(PERL_FOUND)
-    set(HAVE_MANUAL_TOOLS ON)
-  endif()
-  if(NOT HAVE_MANUAL_TOOLS)
-    message(WARNING "Perl not found. Will not build manuals.")
-  endif()
-endif()
-
-if(CURL_STATIC_CRT)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /MT")
-  set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} /MTd")
-endif()
-
-# Disable warnings on Borland to avoid changing 3rd party code.
-if(BORLAND)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w-")
-endif()
-
-# If we are on AIX, do the _ALL_SOURCE magic
-if(${CMAKE_SYSTEM_NAME} MATCHES AIX)
-  set(_ALL_SOURCE 1)
-endif()
-
-# If we are on Haiku, make sure that the network library is brought in.
-if(${CMAKE_SYSTEM_NAME} MATCHES Haiku)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -lnetwork")
-endif()
-
-# Include all the necessary files for macros
-include(CMakePushCheckState)
-include(CheckFunctionExists)
-include(CheckIncludeFile)
-include(CheckIncludeFiles)
-include(CheckLibraryExists)
-include(CheckSymbolExists)
-include(CheckTypeSize)
-include(CheckCSourceCompiles)
-
-# On windows preload settings
-if(WIN32)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/CMake/Platforms/WindowsCache.cmake)
-endif()
-
-if(ENABLE_THREADED_RESOLVER)
-  if(WIN32)
-    set(USE_THREADS_WIN32 ON)
-  else()
-    find_package(Threads REQUIRED)
-    set(USE_THREADS_POSIX ${CMAKE_USE_PTHREADS_INIT})
-    set(HAVE_PTHREAD_H ${CMAKE_USE_PTHREADS_INIT})
-    set(CURL_LIBS ${CURL_LIBS} ${CMAKE_THREAD_LIBS_INIT})
-  endif()
-endif()
-
-# Check for all needed libraries
-check_library_exists("socket" "connect" "" HAVE_LIBSOCKET)
-if(HAVE_LIBSOCKET)
-  set(CURL_LIBS "socket;${CURL_LIBS}")
-endif()
-
-check_function_exists(gethostname HAVE_GETHOSTNAME)
-
-if(WIN32)
-  list(APPEND CURL_LIBS "ws2_32" "bcrypt")
-endif()
-
-# check SSL libraries
-option(CURL_ENABLE_SSL "Enable SSL support" ON)
-
-if(CURL_DEFAULT_SSL_BACKEND)
-  set(valid_default_ssl_backend FALSE)
-endif()
-
-if(APPLE)
-  cmake_dependent_option(CURL_USE_SECTRANSP "Enable Apple OS native SSL/TLS" OFF CURL_ENABLE_SSL OFF)
-endif()
-if(WIN32)
-  cmake_dependent_option(CURL_USE_SCHANNEL "Enable Windows native SSL/TLS" OFF CURL_ENABLE_SSL OFF)
-  option(CURL_WINDOWS_SSPI "Enable SSPI on Windows" ${CURL_USE_SCHANNEL})
-endif()
-cmake_dependent_option(CURL_USE_MBEDTLS "Enable mbedTLS for SSL/TLS" OFF CURL_ENABLE_SSL OFF)
-cmake_dependent_option(CURL_USE_BEARSSL "Enable BearSSL for SSL/TLS" OFF CURL_ENABLE_SSL OFF)
-cmake_dependent_option(CURL_USE_WOLFSSL "Enable wolfSSL for SSL/TLS" OFF CURL_ENABLE_SSL OFF)
-cmake_dependent_option(CURL_USE_GNUTLS "Enable GnuTLS for SSL/TLS" OFF CURL_ENABLE_SSL OFF)
-
-set(openssl_default ON)
-if(WIN32 OR CURL_USE_SECTRANSP OR CURL_USE_SCHANNEL OR CURL_USE_MBEDTLS OR CURL_USE_WOLFSSL)
-  set(openssl_default OFF)
-endif()
-cmake_dependent_option(CURL_USE_OPENSSL "Enable OpenSSL for SSL/TLS" ${openssl_default} CURL_ENABLE_SSL OFF)
-option(CURL_DISABLE_OPENSSL_AUTO_LOAD_CONFIG "Disable automatic loading of OpenSSL configuration" OFF)
-
-count_true(enabled_ssl_options_count
-  CURL_USE_SCHANNEL
-  CURL_USE_SECTRANSP
-  CURL_USE_OPENSSL
-  CURL_USE_MBEDTLS
-  CURL_USE_BEARSSL
-  CURL_USE_WOLFSSL
-)
-if(enabled_ssl_options_count GREATER "1")
-  set(CURL_WITH_MULTI_SSL ON)
-endif()
-
-if(CURL_USE_SCHANNEL)
-  set(SSL_ENABLED ON)
-  set(USE_SCHANNEL ON)  # Windows native SSL/TLS support
-  set(USE_WINDOWS_SSPI ON)  # CURL_USE_SCHANNEL implies CURL_WINDOWS_SSPI
-
-  if(CURL_DEFAULT_SSL_BACKEND AND CURL_DEFAULT_SSL_BACKEND STREQUAL "schannel")
-    set(valid_default_ssl_backend TRUE)
-  endif()
-endif()
-if(CURL_WINDOWS_SSPI)
-  set(USE_WINDOWS_SSPI ON)
-endif()
-
-if(CURL_USE_SECTRANSP)
-  set(use_core_foundation_and_core_services ON)
-
-  find_library(SECURITY_FRAMEWORK "Security")
-  if(NOT SECURITY_FRAMEWORK)
-    message(FATAL_ERROR "Security framework not found")
-  endif()
-
-  set(SSL_ENABLED ON)
-  set(USE_SECTRANSP ON)
-  list(APPEND CURL_LIBS "-framework Security")
-
-  if(CURL_DEFAULT_SSL_BACKEND AND CURL_DEFAULT_SSL_BACKEND STREQUAL "secure-transport")
-    set(valid_default_ssl_backend TRUE)
-  endif()
-endif()
-
-if(use_core_foundation_and_core_services)
-  find_library(COREFOUNDATION_FRAMEWORK "CoreFoundation")
-  find_library(CORESERVICES_FRAMEWORK "CoreServices")
-
-  if(NOT COREFOUNDATION_FRAMEWORK)
-    message(FATAL_ERROR "CoreFoundation framework not found")
-  endif()
-  if(NOT CORESERVICES_FRAMEWORK)
-    message(FATAL_ERROR "CoreServices framework not found")
-  endif()
-
-  list(APPEND CURL_LIBS "-framework CoreFoundation" "-framework CoreServices")
-endif()
-
-if(CURL_USE_OPENSSL)
-  find_package(OpenSSL REQUIRED)
-  set(SSL_ENABLED ON)
-  set(USE_OPENSSL ON)
-
-  # Depend on OpenSSL via imported targets if supported by the running
-  # version of CMake. This allows our dependents to get our dependencies
-  # transitively.
-  if(NOT CMAKE_VERSION VERSION_LESS 3.4)
-    list(APPEND CURL_LIBS OpenSSL::SSL OpenSSL::Crypto)
-  else()
-    list(APPEND CURL_LIBS ${OPENSSL_LIBRARIES})
-    include_directories(${OPENSSL_INCLUDE_DIR})
-  endif()
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "openssl")
-
-  if(CURL_DEFAULT_SSL_BACKEND AND CURL_DEFAULT_SSL_BACKEND STREQUAL "openssl")
-    set(valid_default_ssl_backend TRUE)
-  endif()
-  set(curl_ca_bundle_supported TRUE)
-
-  set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
-  if(NOT DEFINED HAVE_BORINGSSL)
-    check_symbol_exists(OPENSSL_IS_BORINGSSL "openssl/base.h" HAVE_BORINGSSL)
-  endif()
-  if(NOT DEFINED HAVE_AWSLC)
-    check_symbol_exists(OPENSSL_IS_AWSLC "openssl/base.h" HAVE_AWSLC)
-  endif()
-endif()
-
-if(CURL_USE_MBEDTLS)
-  find_package(MbedTLS REQUIRED)
-  set(SSL_ENABLED ON)
-  set(USE_MBEDTLS ON)
-  list(APPEND CURL_LIBS ${MBEDTLS_LIBRARIES})
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "mbedtls")
-  include_directories(${MBEDTLS_INCLUDE_DIRS})
-
-  if(CURL_DEFAULT_SSL_BACKEND AND CURL_DEFAULT_SSL_BACKEND STREQUAL "mbedtls")
-    set(valid_default_ssl_backend TRUE)
-  endif()
-  set(curl_ca_bundle_supported TRUE)
-endif()
-
-if(CURL_USE_BEARSSL)
-  find_package(BearSSL REQUIRED)
-  set(SSL_ENABLED ON)
-  set(USE_BEARSSL ON)
-  list(APPEND CURL_LIBS ${BEARSSL_LIBRARY})
-  include_directories(${BEARSSL_INCLUDE_DIRS})
-
-  if(CURL_DEFAULT_SSL_BACKEND AND CURL_DEFAULT_SSL_BACKEND STREQUAL "bearssl")
-    set(valid_default_ssl_backend TRUE)
-  endif()
-  set(curl_ca_bundle_supported TRUE)
-endif()
-
-if(CURL_USE_WOLFSSL)
-  find_package(WolfSSL REQUIRED)
-  set(SSL_ENABLED ON)
-  set(USE_WOLFSSL ON)
-  list(APPEND CURL_LIBS ${WolfSSL_LIBRARIES})
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "wolfssl")
-  include_directories(${WolfSSL_INCLUDE_DIRS})
-
-  if(CURL_DEFAULT_SSL_BACKEND AND CURL_DEFAULT_SSL_BACKEND STREQUAL "wolfssl")
-    set(valid_default_ssl_backend TRUE)
-  endif()
-  set(curl_ca_bundle_supported TRUE)
-endif()
-
-if(CURL_USE_GNUTLS)
-  find_package(GnuTLS REQUIRED)
-  find_package(nettle REQUIRED)
-  set(SSL_ENABLED ON)
-  set(USE_GNUTLS ON)
-  list(APPEND CURL_LIBS ${GNUTLS_LIBRARIES} ${NETTLE_LIBRARIES})
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "gnutls" "nettle")
-  include_directories(${GNUTLS_INCLUDE_DIRS} ${NETTLE_INCLUDE_DIRS})
-
-  if(CURL_DEFAULT_SSL_BACKEND AND CURL_DEFAULT_SSL_BACKEND STREQUAL "gnutls")
-    set(valid_default_ssl_backend TRUE)
-  endif()
-  set(curl_ca_bundle_supported TRUE)
-
-  if(NOT DEFINED HAVE_GNUTLS_SRP AND NOT CURL_DISABLE_SRP)
-    cmake_push_check_state()
-    set(CMAKE_REQUIRED_INCLUDES ${GNUTLS_INCLUDE_DIRS})
-    set(CMAKE_REQUIRED_LIBRARIES ${GNUTLS_LIBRARIES})
-    check_symbol_exists(gnutls_srp_verifier "gnutls/gnutls.h" HAVE_GNUTLS_SRP)
-    cmake_pop_check_state()
-  endif()
-endif()
-
-if(CURL_DEFAULT_SSL_BACKEND AND NOT valid_default_ssl_backend)
-  message(FATAL_ERROR "CURL_DEFAULT_SSL_BACKEND '${CURL_DEFAULT_SSL_BACKEND}' not enabled.")
-endif()
-
-# Keep ZLIB detection after TLS detection,
-# and before calling openssl_check_symbol_exists().
-
-set(HAVE_LIBZ OFF)
-set(USE_ZLIB OFF)
-optional_dependency(ZLIB)
-if(ZLIB_FOUND)
-  set(HAVE_LIBZ ON)
-  set(USE_ZLIB ON)
-
-  # Depend on ZLIB via imported targets if supported by the running
-  # version of CMake.  This allows our dependents to get our dependencies
-  # transitively.
-  if(NOT CMAKE_VERSION VERSION_LESS 3.4)
-    list(APPEND CURL_LIBS ZLIB::ZLIB)
-  else()
-    list(APPEND CURL_LIBS ${ZLIB_LIBRARIES})
-    include_directories(${ZLIB_INCLUDE_DIRS})
-  endif()
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "zlib")
-  list(APPEND CMAKE_REQUIRED_INCLUDES ${ZLIB_INCLUDE_DIRS})
-endif()
-
-option(CURL_BROTLI "Set to ON to enable building curl with brotli support." OFF)
-set(HAVE_BROTLI OFF)
-if(CURL_BROTLI)
-  find_package(Brotli REQUIRED)
-  if(BROTLI_FOUND)
-    set(HAVE_BROTLI ON)
-    list(APPEND CURL_LIBS ${BROTLI_LIBRARIES})
-    list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libbrotlidec")
-    include_directories(${BROTLI_INCLUDE_DIRS})
-    list(APPEND CMAKE_REQUIRED_INCLUDES ${BROTLI_INCLUDE_DIRS})
-  endif()
-endif()
-
-option(CURL_ZSTD "Set to ON to enable building curl with zstd support." OFF)
-set(HAVE_ZSTD OFF)
-if(CURL_ZSTD)
-  find_package(Zstd REQUIRED)
-  if(Zstd_FOUND AND NOT Zstd_VERSION VERSION_LESS "1.0.0")
-    set(HAVE_ZSTD ON)
-    list(APPEND CURL_LIBS ${Zstd_LIBRARIES})
-    list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libzstd")
-    include_directories(${Zstd_INCLUDE_DIRS})
-  else()
-    message(WARNING "zstd v1.0.0 or newer is required, disabling zstd support.")
-  endif()
-endif()
-
-# Check symbol in an OpenSSL-like TLS backend, or in EXTRA_LIBS depending on it.
-macro(openssl_check_symbol_exists SYMBOL FILES VARIABLE EXTRA_LIBS)
-  cmake_push_check_state()
-  if(USE_OPENSSL)
-    set(CMAKE_REQUIRED_INCLUDES   "${OPENSSL_INCLUDE_DIR}")
-    set(CMAKE_REQUIRED_LIBRARIES  "${OPENSSL_LIBRARIES}")
-    if(HAVE_LIBZ)
-      list(APPEND CMAKE_REQUIRED_LIBRARIES "${ZLIB_LIBRARIES}")
-    endif()
-    if(WIN32)
-      list(APPEND CMAKE_REQUIRED_LIBRARIES "ws2_32")
-      list(APPEND CMAKE_REQUIRED_LIBRARIES "bcrypt")  # for OpenSSL/LibreSSL
-    endif()
-  elseif(USE_WOLFSSL)
-    set(CMAKE_REQUIRED_INCLUDES   "${WolfSSL_INCLUDE_DIRS}")
-    set(CMAKE_REQUIRED_LIBRARIES  "${WolfSSL_LIBRARIES}")
-    if(HAVE_LIBZ)
-      list(APPEND CMAKE_REQUIRED_INCLUDES  "${ZLIB_INCLUDE_DIRS}")  # Public wolfSSL headers require zlib headers
-      list(APPEND CMAKE_REQUIRED_LIBRARIES "${ZLIB_LIBRARIES}")
-    endif()
-    if(WIN32)
-      list(APPEND CMAKE_REQUIRED_LIBRARIES "ws2_32" "crypt32")
-    endif()
-    list(APPEND CMAKE_REQUIRED_DEFINITIONS -DHAVE_UINTPTR_T)  # to pull in stdint.h (as of wolfSSL v5.5.4)
-  endif()
-  if(NOT "${EXTRA_LIBS}" STREQUAL "")
-    list(APPEND CMAKE_REQUIRED_LIBRARIES "${EXTRA_LIBS}")
-  endif()
-  check_symbol_exists("${SYMBOL}" "${FILES}" "${VARIABLE}")
-  cmake_pop_check_state()
-endmacro()
-
-# Ensure that the OpenSSL fork actually supports QUIC.
-macro(openssl_check_quic)
-  if(NOT DEFINED HAVE_SSL_CTX_SET_QUIC_METHOD)
-    if(USE_OPENSSL)
-      openssl_check_symbol_exists(SSL_CTX_set_quic_method "openssl/ssl.h" HAVE_SSL_CTX_SET_QUIC_METHOD "")
-    elseif(USE_WOLFSSL)
-      openssl_check_symbol_exists(wolfSSL_set_quic_method "wolfssl/options.h;wolfssl/openssl/ssl.h" HAVE_SSL_CTX_SET_QUIC_METHOD "")
-    endif()
-  endif()
-  if(NOT HAVE_SSL_CTX_SET_QUIC_METHOD)
-    message(FATAL_ERROR "QUIC support is missing in OpenSSL fork. Try setting -DOPENSSL_ROOT_DIR")
-  endif()
-endmacro()
-
-if(USE_WOLFSSL)
-  openssl_check_symbol_exists(wolfSSL_DES_ecb_encrypt "wolfssl/openssl/des.h" HAVE_WOLFSSL_DES_ECB_ENCRYPT "")
-  openssl_check_symbol_exists(wolfSSL_BIO_set_shutdown "wolfssl/ssl.h" HAVE_WOLFSSL_FULL_BIO "")
-endif()
-
-if(USE_OPENSSL OR USE_WOLFSSL)
-  if(NOT DEFINED HAVE_SSL_SET0_WBIO)
-    openssl_check_symbol_exists(SSL_set0_wbio "openssl/ssl.h" HAVE_SSL_SET0_WBIO "")
-  endif()
-  if(NOT DEFINED HAVE_OPENSSL_SRP AND NOT CURL_DISABLE_SRP)
-    openssl_check_symbol_exists(SSL_CTX_set_srp_username "openssl/ssl.h" HAVE_OPENSSL_SRP "")
-  endif()
-endif()
-
-option(USE_HTTPSRR "Enable HTTPS RR support for ECH (experimental)" OFF)
-option(USE_ECH "Enable ECH support" OFF)
-if(USE_ECH)
-  if(USE_OPENSSL OR USE_WOLFSSL)
-    # Be sure that the TLS library actually supports ECH.
-    if(NOT DEFINED HAVE_ECH)
-      if(USE_OPENSSL AND HAVE_BORINGSSL)
-        openssl_check_symbol_exists(SSL_set1_ech_config_list "openssl/ssl.h" HAVE_ECH "")
-      elseif(USE_OPENSSL)
-        openssl_check_symbol_exists(SSL_ech_set1_echconfig "openssl/ech.h" HAVE_ECH "")
-      elseif(USE_WOLFSSL)
-        openssl_check_symbol_exists(wolfSSL_CTX_GenerateEchConfig "wolfssl/options.h;wolfssl/ssl.h" HAVE_ECH "")
-      endif()
-    endif()
-    if(NOT HAVE_ECH)
-      message(FATAL_ERROR "ECH support missing in OpenSSL/BoringSSL/wolfSSL")
-    else()
-      message(STATUS "ECH enabled.")
-    endif()
-  else()
-    message(FATAL_ERROR "ECH requires ECH-enablded OpenSSL, BoringSSL or wolfSSL")
-  endif()
-endif()
-
-option(USE_NGHTTP2 "Use nghttp2 library" OFF)
-if(USE_NGHTTP2)
-  find_package(NGHTTP2 REQUIRED)
-  include_directories(${NGHTTP2_INCLUDE_DIRS})
-  list(APPEND CURL_LIBS ${NGHTTP2_LIBRARIES})
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libnghttp2")
-endif()
-
-option(USE_NGTCP2 "Use ngtcp2 and nghttp3 libraries for HTTP/3 support" OFF)
-if(USE_NGTCP2)
-  if(USE_OPENSSL OR USE_WOLFSSL)
-    if(USE_WOLFSSL)
-      find_package(NGTCP2 REQUIRED wolfSSL)
-      list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libngtcp2_crypto_wolfssl")
-    elseif(HAVE_BORINGSSL OR HAVE_AWSLC)
-      find_package(NGTCP2 REQUIRED BoringSSL)
-      list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libngtcp2_crypto_boringssl")
-    else()
-      find_package(NGTCP2 REQUIRED quictls)
-      list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libngtcp2_crypto_quictls")
-    endif()
-    openssl_check_quic()
-  elseif(USE_GNUTLS)
-    find_package(NGTCP2 REQUIRED GnuTLS)
-    list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libngtcp2_crypto_gnutls")
-  else()
-    message(FATAL_ERROR "ngtcp2 requires OpenSSL, wolfSSL or GnuTLS")
-  endif()
-  set(USE_NGTCP2 ON)
-  include_directories(${NGTCP2_INCLUDE_DIRS})
-  list(APPEND CURL_LIBS ${NGTCP2_LIBRARIES})
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libngtcp2")
-
-  find_package(NGHTTP3 REQUIRED)
-  set(USE_NGHTTP3 ON)
-  include_directories(${NGHTTP3_INCLUDE_DIRS})
-  list(APPEND CURL_LIBS ${NGHTTP3_LIBRARIES})
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libnghttp3")
-endif()
-
-option(USE_QUICHE "Use quiche library for HTTP/3 support" OFF)
-if(USE_QUICHE)
-  if(USE_NGTCP2)
-    message(FATAL_ERROR "Only one HTTP/3 backend can be selected!")
-  endif()
-  find_package(QUICHE REQUIRED)
-  if(NOT HAVE_BORINGSSL)
-    message(FATAL_ERROR "quiche requires BoringSSL")
-  endif()
-  openssl_check_quic()
-  set(USE_QUICHE ON)
-  include_directories(${QUICHE_INCLUDE_DIRS})
-  list(APPEND CURL_LIBS ${QUICHE_LIBRARIES})
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "quiche")
-  if(NOT DEFINED HAVE_QUICHE_CONN_SET_QLOG_FD)
-    cmake_push_check_state()
-    set(CMAKE_REQUIRED_INCLUDES   "${QUICHE_INCLUDE_DIRS}")
-    set(CMAKE_REQUIRED_LIBRARIES  "${QUICHE_LIBRARIES}")
-    check_symbol_exists(quiche_conn_set_qlog_fd "quiche.h" HAVE_QUICHE_CONN_SET_QLOG_FD)
-    cmake_pop_check_state()
-  endif()
-endif()
-
-option(USE_MSH3 "Use msquic library for HTTP/3 support" OFF)
-if(USE_MSH3)
-  if(USE_NGTCP2 OR USE_QUICHE)
-    message(FATAL_ERROR "Only one HTTP/3 backend can be selected!")
-  endif()
-  set(USE_MSH3 ON)
-  include_directories(${MSH3_INCLUDE_DIRS})
-  list(APPEND CURL_LIBS ${MSH3_LIBRARIES})
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libmsh3")
-endif()
-
-option(USE_OPENSSL_QUIC "Use openssl and nghttp3 libraries for HTTP/3 support" OFF)
-if(USE_OPENSSL_QUIC)
-  if(USE_NGTCP2 OR USE_QUICHE OR USE_MSH3)
-    message(FATAL_ERROR "Only one HTTP/3 backend can be selected!")
-  endif()
-  find_package(OpenSSL 3.3.0 REQUIRED)
-
-  find_package(NGHTTP3 REQUIRED)
-  set(USE_NGHTTP3 ON)
-  include_directories(${NGHTTP3_INCLUDE_DIRS})
-  list(APPEND CURL_LIBS ${NGHTTP3_LIBRARIES})
-  list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libnghttp3")
-endif()
-
-if(USE_MBEDTLS OR
-   USE_BEARSSL OR
-   USE_SECTRANSP)
-  message(WARNING "A selected TLS library does not support TLS 1.3.")
-endif()
-
-if(CURL_WITH_MULTI_SSL AND (USE_NGTCP2 OR USE_QUICHE OR USE_MSH3 OR USE_OPENSSL_QUIC))
-  message(FATAL_ERROR "MultiSSL cannot be enabled with HTTP/3 and vice versa.")
-endif()
-
-if(NOT CURL_DISABLE_SRP AND (HAVE_GNUTLS_SRP OR HAVE_OPENSSL_SRP))
-  set(USE_TLS_SRP 1)
-endif()
-
-if(NOT CURL_DISABLE_LDAP)
-  if(WIN32 AND NOT WINDOWS_STORE)
-    option(USE_WIN32_LDAP "Use Windows LDAP implementation" ON)
-    if(USE_WIN32_LDAP)
-      list(APPEND CURL_LIBS "wldap32")
-      if(NOT CURL_DISABLE_LDAPS)
-        set(HAVE_LDAP_SSL ON)
-      endif()
-    endif()
-  endif()
-
-  set(CMAKE_LDAP_LIB "ldap" CACHE STRING "Name or full path to ldap library")
-  set(CMAKE_LBER_LIB "lber" CACHE STRING "Name or full path to lber library")
-
-  # Now that we know, we're not using windows LDAP...
-  if(NOT USE_WIN32_LDAP)
-    # Check for LDAP
-    set(CMAKE_REQUIRED_LIBRARIES ${OPENSSL_LIBRARIES})
-    check_library_exists("${CMAKE_LDAP_LIB}" "ldap_init" "" HAVE_LIBLDAP)
-    if(HAVE_LIBLDAP)
-      check_library_exists("${CMAKE_LDAP_LIB};${CMAKE_LBER_LIB}" "ber_init" "" HAVE_LIBLBER)
-    else()
-      check_library_exists("${CMAKE_LBER_LIB}" "ber_init" "" HAVE_LIBLBER)
-    endif()
-
-    set(CMAKE_REQUIRED_INCLUDES_BAK ${CMAKE_REQUIRED_INCLUDES})
-    set(CMAKE_LDAP_INCLUDE_DIR "" CACHE STRING "Path to LDAP include directory")
-    if(CMAKE_LDAP_INCLUDE_DIR)
-      list(APPEND CMAKE_REQUIRED_INCLUDES ${CMAKE_LDAP_INCLUDE_DIR})
-    endif()
-    check_include_file_concat("ldap.h"           HAVE_LDAP_H)
-    check_include_file_concat("lber.h"           HAVE_LBER_H)
-
-    if(NOT HAVE_LDAP_H)
-      message(STATUS "LDAP_H not found CURL_DISABLE_LDAP set ON")
-      set(CURL_DISABLE_LDAP ON CACHE BOOL "" FORCE)
-      set(CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES_BAK}) #LDAP includes won't be used
-    elseif(NOT HAVE_LIBLDAP)
-      message(STATUS "LDAP library '${CMAKE_LDAP_LIB}' not found CURL_DISABLE_LDAP set ON")
-      set(CURL_DISABLE_LDAP ON CACHE BOOL "" FORCE)
-      set(CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES_BAK}) #LDAP includes won't be used
-    else()
-      if(CMAKE_LDAP_INCLUDE_DIR)
-        include_directories(${CMAKE_LDAP_INCLUDE_DIR})
-      endif()
-      set(NEED_LBER_H ON)
-      set(_HEADER_LIST)
-      if(WIN32)
-        list(APPEND _HEADER_LIST "windows.h")
-      endif()
-      if(HAVE_SYS_TYPES_H)
-        list(APPEND _HEADER_LIST "sys/types.h")
-      endif()
-      list(APPEND _HEADER_LIST "ldap.h")
-
-      set(_INCLUDE_STRING "")
-      foreach(_HEADER ${_HEADER_LIST})
-        set(_INCLUDE_STRING "${_INCLUDE_STRING}#include <${_HEADER}>\n")
-      endforeach()
-
-      list(APPEND CMAKE_REQUIRED_DEFINITIONS -DLDAP_DEPRECATED=1)
-      list(APPEND CMAKE_REQUIRED_LIBRARIES ${CMAKE_LDAP_LIB})
-      set(CURL_LIBS "${CMAKE_LDAP_LIB};${CURL_LIBS}")
-      if(HAVE_LIBLBER)
-        list(APPEND CMAKE_REQUIRED_LIBRARIES ${CMAKE_LBER_LIB})
-        set(CURL_LIBS "${CMAKE_LBER_LIB};${CURL_LIBS}")
-      endif()
-
-      check_c_source_compiles("
-        ${_INCLUDE_STRING}
-        int main(int argc, char ** argv)
-        {
-          BerValue *bvp = NULL;
-          BerElement *bep = ber_init(bvp);
-          ber_free(bep, 1);
-          return 0;
-        }" NOT_NEED_LBER_H)
-      if(NOT_NEED_LBER_H)
-        set(NEED_LBER_H OFF)
-      else()
-        set(CURL_TEST_DEFINES "${CURL_TEST_DEFINES} -DNEED_LBER_H")
-      endif()
-
-      check_function_exists(ldap_url_parse HAVE_LDAP_URL_PARSE)
-      check_function_exists(ldap_init_fd HAVE_LDAP_INIT_FD)
-
-      unset(CMAKE_REQUIRED_LIBRARIES)
-
-      check_include_file("ldap_ssl.h" HAVE_LDAP_SSL_H)
-
-      if(HAVE_LDAP_INIT_FD)
-        set(USE_OPENLDAP ON)
-        add_definitions("-DLDAP_DEPRECATED=1")
-      endif()
-      if(NOT CURL_DISABLE_LDAPS)
-        set(HAVE_LDAP_SSL ON)
-      endif()
-    endif()
-  endif()
-endif()
-
-# No ldap, no ldaps.
-if(CURL_DISABLE_LDAP)
-  if(NOT CURL_DISABLE_LDAPS)
-    message(STATUS "LDAP needs to be enabled to support LDAPS")
-    set(CURL_DISABLE_LDAPS ON CACHE BOOL "" FORCE)
-  endif()
-endif()
-
-# Check for idn2
-option(USE_LIBIDN2 "Use libidn2 for IDN support" ON)
-if(USE_LIBIDN2)
-  check_library_exists("idn2" "idn2_lookup_ul" "" HAVE_LIBIDN2)
-  if(HAVE_LIBIDN2)
-    set(LIBIDN2_LINK_LIBRARIES "idn2")
-    check_include_file_concat("idn2.h" HAVE_IDN2_H)
-  endif()
-  if(NOT HAVE_LIBIDN2 OR NOT HAVE_IDN2_H)
-    find_package(PkgConfig QUIET)
-    pkg_check_modules(LIBIDN2 "libidn2")
-    if(LIBIDN2_FOUND)
-      include_directories(${LIBIDN2_INCLUDE_DIRS})
-      set(HAVE_LIBIDN2 ON)
-      set(HAVE_IDN2_H ON)
-    endif()
-  endif()
-  if(HAVE_LIBIDN2 AND HAVE_IDN2_H)
-    set(CURL_LIBS "${LIBIDN2_LINK_LIBRARIES};${CURL_LIBS}")
-    set(LIBCURL_PC_REQUIRES_PRIVATE "libidn2;${LIBCURL_PC_REQUIRES_PRIVATE}")
-  endif()
-else()
-  set(HAVE_LIBIDN2 OFF)
-endif()
-
-if(WIN32)
-  option(USE_WIN32_IDN "Use WinIDN for IDN support" OFF)
-  if(USE_WIN32_IDN)
-    list(APPEND CURL_LIBS "normaliz")
-  endif()
-endif()
-
-if(APPLE)
-  option(USE_APPLE_IDN "Use Apple built-in IDN support" OFF)
-  if(USE_APPLE_IDN)
-    cmake_push_check_state()
-    set(CMAKE_REQUIRED_LIBRARIES "icucore")
-    check_symbol_exists("uidna_openUTS46" "unicode/uidna.h" HAVE_APPLE_IDN)
-    cmake_pop_check_state()
-    if(HAVE_APPLE_IDN)
-      list(APPEND CURL_LIBS "icucore")
-    else()
-      set(USE_APPLE_IDN OFF)
-    endif()
-  endif()
-endif()
-
-# libpsl
-option(CURL_USE_LIBPSL "Use libpsl" ON)
-mark_as_advanced(CURL_USE_LIBPSL)
-set(USE_LIBPSL OFF)
-
-if(CURL_USE_LIBPSL)
-  find_package(LibPSL)
-  if(LIBPSL_FOUND)
-    list(APPEND CURL_LIBS ${LIBPSL_LIBRARY})
-    list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libpsl")
-    list(APPEND CMAKE_REQUIRED_INCLUDES "${LIBPSL_INCLUDE_DIR}")
-    include_directories("${LIBPSL_INCLUDE_DIR}")
-    set(USE_LIBPSL ON)
-  endif()
-endif()
-
-# libssh2
-option(CURL_USE_LIBSSH2 "Use libssh2" ON)
-mark_as_advanced(CURL_USE_LIBSSH2)
-set(USE_LIBSSH2 OFF)
-
-if(CURL_USE_LIBSSH2)
-  find_package(LibSSH2)
-  if(LIBSSH2_FOUND)
-    list(APPEND CURL_LIBS ${LIBSSH2_LIBRARY})
-    list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libssh2")
-    list(APPEND CMAKE_REQUIRED_INCLUDES "${LIBSSH2_INCLUDE_DIR}")
-    include_directories("${LIBSSH2_INCLUDE_DIR}")
-    set(USE_LIBSSH2 ON)
-  endif()
-endif()
-
-# libssh
-option(CURL_USE_LIBSSH "Use libssh" OFF)
-mark_as_advanced(CURL_USE_LIBSSH)
-if(NOT USE_LIBSSH2 AND CURL_USE_LIBSSH)
-  find_package(libssh CONFIG QUIET)
-  if(libssh_FOUND)
-    message(STATUS "Found libssh ${libssh_VERSION}")
-  else()
-    find_package(PkgConfig QUIET)
-    pkg_check_modules(LIBSSH "libssh")
-    if(LIBSSH_FOUND)
-      include_directories(${LIBSSH_INCLUDE_DIRS})
-    endif()
-  endif()
-  if(libssh_FOUND OR LIBSSH_FOUND)
-    if(NOT DEFINED LIBSSH_LINK_LIBRARIES)
-      set(LIBSSH_LINK_LIBRARIES "ssh")  # for find_package() with broken pkg-config (e.g. linux-old CI workflow)
-    endif()
-    list(APPEND CURL_LIBS ${LIBSSH_LINK_LIBRARIES})
-    list(APPEND LIBCURL_PC_REQUIRES_PRIVATE "libssh")
-    set(USE_LIBSSH ON)
-  endif()
-endif()
-
-option(CURL_USE_GSASL "Use GSASL implementation" OFF)
-mark_as_advanced(CURL_USE_GSASL)
-if(CURL_USE_GSASL)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(GSASL REQUIRED libgsasl)
-  list(APPEND CURL_LIBS ${GSASL_LINK_LIBRARIES})
-  set(USE_GSASL ON)
-endif()
-
-option(CURL_USE_GSSAPI "Use GSSAPI implementation (right now only Heimdal is supported with CMake build)" OFF)
-mark_as_advanced(CURL_USE_GSSAPI)
+- [#1373](https://github.com/tigerbeetle/tigerbeetle/pull/1373)
+
+  Added value count to `TableInfo`, allowing future optimizations for paced compaction.
+
+### Safety And Performance
+
+- [#1346](https://github.com/tigerbeetle/tigerbeetle/pull/1346)
+
+  The simulator found a failure when the WAL gets corrupted near a checkpoint boundary, leading us
+  to also consider scenarios where corrupted blocks in the grid end up "intersecting" with
+  corruption in the WAL, making the state unrecoverable where it should be. We fixed it by
+  extending the durability of "prepares", evicting them from the WAL only when there's a quorum of
+  checkpoints covering this "prepare".
+
+- [#1366](https://github.com/tigerbeetle/tigerbeetle/pull/1366)
+
+  Fix a unit test that regressed after we changed an undesirable behavior that allowed `prefetch`
+  to invoke its callback synchronously.
+
+- [#1381](https://github.com/tigerbeetle/tigerbeetle/pull/1381)
+
+  Relaxed a simulator's verification, allowing replicas of the core cluster to be missing some
+  prepares, as long as they are from a past checkpoint.
+
+### Features
+
+- [#1054](https://github.com/tigerbeetle/tigerbeetle/pull/1054)
+
+  A highly anticipated feature lands on TigerBeetle: it's now possible to retrieve the transfers
+  involved with a given account by using the new operation `get_account_transfers`.
+
+  Note that this feature itself is an ad-hoc API intended to be replaced once we have a proper
+  Querying API. The real improvement of this PR is the implementation of range queries, enabling
+  us to land exciting new features on the next releases.
+
+- [#1368](https://github.com/tigerbeetle/tigerbeetle/pull/1368)
+
+  Bump the client's maximum limit and the default value of `concurrency_max` to fully take
+  advantage of the batching logic.
+
+### TigerTracks 🎧
+
+- [Everybody needs somebody](https://www.youtube.com/watch?v=m1M5Tc7eLCo)
+
+## 2023-12-18
+
+*As the last release of the year 2023, the TigerBeetle team wishes everyone happy holidays!* 🎁
+
+### Internals
+
+- [#1359](https://github.com/tigerbeetle/tigerbeetle/pull/1359)
+
+  We've established a rotation between the team for handling releases. As the one writing these
+  release notes, I am now quite aware.
+
+- [#1357](https://github.com/tigerbeetle/tigerbeetle/pull/1357)
+
+  Fix panic in JVM unit test on Java 21. We test JNI functions even if they're not used by the Java
+  client and the semantics have changed a bit since Java 11.
+
+- [#1351](https://github.com/tigerbeetle/tigerbeetle/pull/1351),
+  [#1356](https://github.com/tigerbeetle/tigerbeetle/pull/1356),
+  [#1360](https://github.com/tigerbeetle/tigerbeetle/pull/1360)
+
+  Move client sessions from the Superblock (database metadata) into the Grid (general storage). This
+  simplifies control flow for various sub-components like Superblock checkpointing and Replica state
+  sync.
+
+### Safety And Performance
+
+- [#1352](https://github.com/tigerbeetle/tigerbeetle/pull/1352)
+
+  An optimization for removes on secondary indexes makes a return. Now tombstone values in the LSM
+  can avoid being compacted all the way down to the lowest level if they can be cancelled out by
+  inserts.
+
+- [#1257](https://github.com/tigerbeetle/tigerbeetle/pull/1257)
+
+  Clients automatically batch pending similar requests 🎉! If a tigerbeetle client submits a
+  request, and one with the same operation is currently in-flight, they will be grouped and
+  processed together where possible (currently, only for `CreateAccount` and `CreateTransfers`).
+  This should [greatly improve the performance](https://github.com/tigerbeetle/tigerbeetle/pull/1257#issuecomment-1812648270)
+  of workloads which submit a single operation at a time.
+
+### TigerTracks 🎧
+
+- [Carouselambra](https://open.spotify.com/track/0YZKbKo9i91i7LD0m1KASq)
+
+## 2023-12-11
+
+### Safety And Performance
+
+- [#1339](https://github.com/tigerbeetle/tigerbeetle/pull/1339)
+
+  Defense in depth: add checkpoint ID to prepare messages. Checkpoint ID is a hash that covers, via
+  hash chaining, the entire state stored in the data file. Verifying that checkpoint IDs match
+  provides a direct strong cryptographic guarantee that the state is the same across replicas, on
+  top of existing guarantee that the sequence of events leading to the state is identical.
+
+### Internals
+
+- [#1343](https://github.com/tigerbeetle/tigerbeetle/pull/1343),
+  [#1341](https://github.com/tigerbeetle/tigerbeetle/pull/1341),
+  [#1340](https://github.com/tigerbeetle/tigerbeetle/pull/1340)
+
+  Gate the main branch on more checks: unit-tests for NodeJS and even more fuzzers.
+
+- [#1332](https://github.com/tigerbeetle/tigerbeetle/pull/1332),
+  [#1348](https://github.com/tigerbeetle/tigerbeetle/pull/1348)
+
+  Code cleanups after removal of storage size limit.
+
+### TigerTracks 🎧
+
+- [Concrete Reservation](https://open.spotify.com/track/1Li9HBLXG2LJSeD4fEhtcd?si=64611215922a4436)
+
+## 2023-12-04
+
+### Safety And Performance
+
+- [#1330](https://github.com/tigerbeetle/tigerbeetle/pull/1330),
+  [#1319](https://github.com/tigerbeetle/tigerbeetle/pull/1319)
+
+  Fix free set index. The free set is a bitset of free blocks in the grid. To speed up block
+  allocation, the free set also maintains an index --- a coarser-grained bitset where a single bit
+  corresponds to 1024 blocks. Maintaining consistency between a data structure and its index is
+  hard, and thorough assertions are crucial. When moving free set to the grid, we discovered that,
+  in fact, we don't have enough assertions in this area and, as a result, even have a bug!
+  Assertions added, bug removed!
+
+- [#1323](https://github.com/tigerbeetle/tigerbeetle/pull/1323),
+  [#1336](https://github.com/tigerbeetle/tigerbeetle/pull/1336),
+  [#1324](https://github.com/tigerbeetle/tigerbeetle/pull/1324)
+
+  LSM tree fuzzer found a couple of bugs in its own code.
+
+### Features
+
+- [#1331](https://github.com/tigerbeetle/tigerbeetle/pull/1331),
+  [#1322](https://github.com/tigerbeetle/tigerbeetle/pull/1322),
+  [#1328](https://github.com/tigerbeetle/tigerbeetle/pull/1328)
+
+  Remove format-time limit on the size of the data file. Before, the maximum size of the data file
+  affected the layout of the superblock, and there wasn't any good way to increase this limit, short
+  of recreating the cluster from scratch. Now, this limit only applies to the in-memory data
+  structures: when a data files grows large, it is sufficient to just restart its replica with a
+  larger amount of RAM.
+
+- [#1321](https://github.com/tigerbeetle/tigerbeetle/pull/1321).
+
+  We finally have the "installation" page in our docs!
+
+### Internals
+
+- [#1334](https://github.com/tigerbeetle/tigerbeetle/pull/1334)
+
+  Use Zig's new `if (@inComptime())` builtin to compute checksum of an empty byte slice at compile
+  time.
+
+- [#1315](https://github.com/tigerbeetle/tigerbeetle/pull/1315)
+
+  Fix unit tests for the Go client and add them to
+  [not rocket science](https://graydon2.dreamwidth.org/1597.html)
+  set of checks.
+
+### TigerTracks 🎧
+
+- [Times Like These](https://www.youtube.com/watch?v=cvCUXXsP5WE)
+
+## 2023-11-27
+
+### Internals
+
+- [#1306](https://github.com/tigerbeetle/tigerbeetle/pull/1306),
+  [#1308](https://github.com/tigerbeetle/tigerbeetle/pull/1308)
+
+  When validating our releases, use the `release` branch instead of `main` to ensure everything is
+  in sync, and give the Java validation some retry logic to allow for delays in publishing to
+  Central.
+
+- [#1310](https://github.com/tigerbeetle/tigerbeetle/pull/1310)
+
+  Pad storage checksums from 128-bit to 256-bit. These are currently unused, but we're reserving
+  the space for AEAD tags in future.
+
+- [#1312](https://github.com/tigerbeetle/tigerbeetle/pull/1312)
+
+  Remove a trailing comma in our Java client sample code.
+
+- [#1313](https://github.com/tigerbeetle/tigerbeetle/pull/1313)
+
+  Switch `bootstrap.sh` to use spaces only for indentation and ensure it's checked by our
+  shellcheck lint.
+
+- [#1314](https://github.com/tigerbeetle/tigerbeetle/pull/1314)
+
+  Update our `DESIGN.md` to better reflect storage fault probabilities and add in a reference.
+
+- [#1316](https://github.com/tigerbeetle/tigerbeetle/pull/1316)
+
+  Add `CHANGELOG.md` validation to our tidy lint script. We now check line length limits and
+  trailing whitespace.
+
+- [#1317](https://github.com/tigerbeetle/tigerbeetle/pull/1317)
+
+  In keeping with TigerStyle rename `reserved_nonce` to `nonce_reserved`.
+
+- [#1318](https://github.com/tigerbeetle/tigerbeetle/pull/1318)
+
+  Note in TigerStyle that callbacks go last in the list of parameters.
+
+- [#1325](https://github.com/tigerbeetle/tigerbeetle/pull/1325)
+
+  Add an exception for line length limits if there's a link in said line.
+
+### TigerTracks 🎧
+
+- [Space Trash](https://www.youtube.com/watch?v=tmcVAJd87Wk)
+
+## 2023-11-20
+
+### Safety And Performance
+
+- [#1300](https://github.com/tigerbeetle/tigerbeetle/pull/1300)
+
+  Recursively check for padding in structs used for data serialization, ensuring that no
+  uninitialized bytes can be stored or transmitted over the network. Previously, we checked only
+  if the struct had no padding, but not its fields.
+
+### Internals
+
+- [#1299](https://github.com/tigerbeetle/tigerbeetle/pull/1299)
+
+  Minor adjustments in the release process, making it easier to track updates in the documentation
+  website when a new version is released, even if there are no changes in the documentation itself.
+
+- [#1301](https://github.com/tigerbeetle/tigerbeetle/pull/1301)
+
+  Fix outdated documentation regarding 128-bit balances.
+
+- [#1302](https://github.com/tigerbeetle/tigerbeetle/pull/1302)
+
+  Fix a [bug](https://github.com/tigerbeetle/tigerbeetle/issues/1290) discovered and reported
+  during the [Hackathon 2023](https://github.com/tigerbeetle/hackathon-2023), where the Node.js
+  client's error messages were truncated due to an incorrect string concatenation adding a null
+  byte `0x00` in the middle of the string.
+
+- [#1291](https://github.com/tigerbeetle/tigerbeetle/pull/1291)
+
+  Update the Node.js samples instructions, guiding the user to install all dependencies before
+  the sample project.
+
+- [#1295](https://github.com/tigerbeetle/tigerbeetle/pull/1295)
+
+  We've doubled the `Header`s size to 256 bytes, paving the way for future improvements that will
+  require extra space. Concurrently, this change also refactors a great deal of code.
+  Some of the `Header`'s fields are shared by all messages, however, each `Command` also requires
+  specific pieces of information that are only used by its kind of message, and it was necessary to
+  repurpose and reinterpret fields so that the same header could hold different data depending on
+  the context. Now, commands have their own specialized data type containing the fields that are
+  only pertinent to the context, making the API much safer and intent-clear.
+
+- [#1304](https://github.com/tigerbeetle/tigerbeetle/pull/1304)
+
+  With larger headers (see #1295) we have enough room to make the cluster ID a 128-bit integer,
+  allowing operators to generate random cluster IDs without the cost of having a centralized ID
+  coordinator. Also updates the documentation and sample programs to reflect the new maximum batch
+  size, which was reduced from 8191 to 8190 items after we doubled the header.
+
+### TigerTracks 🎧
+
+- [She smiled sweetly](https://www.youtube.com/watch?v=fB1EpEFz6Lg)
+
+## 2023-11-13
+
+### Safety And Performance
+
+- [#1264](https://github.com/tigerbeetle/tigerbeetle/pull/1264)
+
+  Implement last-mile release artifact verification in CI.
+
+- [#1268](https://github.com/tigerbeetle/tigerbeetle/pull/1268)
+
+  Bump the simulator's safety phase max-ticks to avoid false positives from the liveness check.
+
+- [#1270](https://github.com/tigerbeetle/tigerbeetle/pull/1270)
+
+  Fix a crash caused by a race between a commit and a repair acquiring a client-reply `Write`.
+
+- [#1278](https://github.com/tigerbeetle/tigerbeetle/pull/1278)
+
+  Fix a crash caused by a race between state (table) sync and a move-table compaction.
+
+  Both bugs didn't stand a chance in the [Line of Fire](https://www.youtube.com/watch?v=pq-G3EWO9XM)
+  of our deterministic simulator!
+
+### Internals
+
+- [#1244](https://github.com/tigerbeetle/tigerbeetle/pull/1244)
+
+  Specify which CPU features are supported in builds.
+
+- [#1275](https://github.com/tigerbeetle/tigerbeetle/pull/1275)
+
+  Improve `shell.zig`'s directory handling, to guard against mistakes with respect to the current
+  working directory.
+
+- [#1277](https://github.com/tigerbeetle/tigerbeetle/pull/1277)
+
+  Interpret a git hash as a VOPR seed, to enable reproducible simulator smoke tests in CI.
+
+- [#1288](https://github.com/tigerbeetle/tigerbeetle/pull/1288)
+
+  Explicitly target glibc 2.7 when building client libraries, to make sure TigerBeetle clients are
+  compatible with older distributions.
+
+## 2023-11-06
+
+### Safety And Performance
+
+- [#1263](https://github.com/tigerbeetle/tigerbeetle/pull/1263)
+
+  Revive the TigerBeetle [VOPRHub](https://github.com/tigerbeetle-vopr)! Some previous changes left
+  it on it's [Last Stand](https://open.spotify.com/track/1ibHApXtb0pgplmNDRLHrJ), but the bot is
+  back in business finding liveness bugs:
+  [#1266](https://github.com/tigerbeetle/tigerbeetle/issues/1266)
+
+### Features
+
+- [#1260](https://github.com/tigerbeetle/tigerbeetle/pull/1260)
+
+  Set the latest Docker image to track the latest release. Avoids language clients going out of sync
+  with your default docker replica installations.
+
+### Internals
+
+- [#1261](https://github.com/tigerbeetle/tigerbeetle/pull/1261)
+
+  Move website doc generation for https://docs.tigerbeetle.com/ into the main repo.
+
+- [#1265](https://github.com/tigerbeetle/tigerbeetle/pull/1265),
+  [#1243](https://github.com/tigerbeetle/tigerbeetle/pull/1243)
+
+  Addressed some release quirks with the .NET and Go client builds.
+
+## 2023-10-30
+
+### Safety And Performance
+
+- [#1251](https://github.com/tigerbeetle/tigerbeetle/pull/1251)
+
+  Prove a tighter upper bound for the size of manifest log. With this new bound, manifest log is
+  guaranteed to fit in allocated memory and is smaller. Additionally, manifest log compaction is
+  paced depending on the current length of the log, balancing throughput and time-to-recovery.
+
+- [#1198](https://github.com/tigerbeetle/tigerbeetle/pull/1198)
+
+  Recommend using [ULID](https://github.com/ulid/spec) for event IDs. ULIDs are approximately
+  sorted, which significantly improves common-case performance.
+
+### Internals
+
+- [#1218](https://github.com/tigerbeetle/tigerbeetle/pull/1218)
+
+  Rewrite Node.js client implementation to use the common C client underneath. While clients for
+  other languages already use the underlying C library, the Node.js client duplicated some code for
+  historical reasons, but now we can leave that duplication in the past. [This Is A
+  Photograph](https://www.youtube.com/watch?v=X0i7whWLW8M).
+
+## 2023-10-25
+
+### Safety And Performance
+
+- [#1240](https://github.com/tigerbeetle/tigerbeetle/pull/1240)
+
+  Increase block size to reduce latencies due to compaction work. Today, we use a simplistic
+  schedule for compaction, which causes latency spikes at the end of the bar. While the future
+  solution will implement a smarter compaction pacing to distribute the work more evenly, we can
+  get a quick win by tweaking the block and the bar size, which naturally evens out latency spikes.
+
+- [#1246](https://github.com/tigerbeetle/tigerbeetle/pull/1246)
+
+  The new release process changed the names of the published artifacts (the version is no longer
+  included in the name). This broke our quick start scripts, which we have fixed. Note that we are
+  in the process of rolling out the new release process, so some unexpected breakage is expected.
+
+- [#1239](https://github.com/tigerbeetle/tigerbeetle/pull/1239),
+  [#1243](https://github.com/tigerbeetle/tigerbeetle/pull/1243)
+
+  Speed up secondary index maintenance by statically distinguishing between insertions and
+  updates. [Faster than the speed of night!](https://open.spotify.com/track/30oZqbcUROFLSru3WcN3bx)
+
+### Features
+
+- [#1245](https://github.com/tigerbeetle/tigerbeetle/pull/1245)
+
+  Include Docker images in the release.
+
+### Internals
+
+- [#1234](https://github.com/tigerbeetle/tigerbeetle/pull/1234)
+
+  Simplify superblock layout by using a linked list of blocks for manifest log, so that the
+  superblock needs to store only two block references.
+
+  P.S. Note the PR number!
+
+## 2023-10-23
+
+This is the start of the changelog. A lot happened before this point and is lost in the mist of git
+history, but any notable change from this point on shall be captured by this document.
+
+### Safety And Performance
+
+- [#1225](https://github.com/tigerbeetle/tigerbeetle/pull/1225)
+
+  Remove bloom filters. TigerBeetle implements more targeted optimizations for
+  both positive and negative lookups, making bloom filters a net loss.
+
+### Features
+
+- [#1228](https://github.com/tigerbeetle/tigerbeetle/pull/1228)
+
+  Increase alignment of data blocks to 128KiB (from 512 bytes). Larger alignment gives operators
+  better control over physical layout of data on disk.
+
+### Internals
+
+- [#1201](https://github.com/tigerbeetle/tigerbeetle/pull/1201),
+  [#1232](https://github.com/tigerbeetle/tigerbeetle/pull/1232)
+
+  Overhaul of CI and release infrastructure. CI and releases are now driven by Zig code. The main
+  branch is gated on integration tests for all clients.
+
+  This is done in preparation for the first TigerBeetle release.
+
+## Prehistory
+
+For archeological inquiries, check out the state of the repository at the time of the first
+changelog:
+
+[https://github.com/tigerbeetle/tigerbeetle/](
+https://github.com/tigerbeetle/tigerbeetle/tree/d2d6484188ecc57680e8bde446b5d09b6f2d83ca)

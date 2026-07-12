@@ -47,6 +47,26 @@ const EXTENSIONS: Record<string, string[]> = {
   typescript: [".ts", ".tsx"],
   zig: [".zig"],
 };
+/**
+ * Dropped from the text corpus only. The code corpora deliberately keep tests — real projects are
+ * full of them — but a test tree's prose is machine output (compiler baselines, parser dumps,
+ * dependency pins), not documentation.
+ */
+/** `.txt` files that are configuration or tool input, not documentation. Text corpus only. */
+const NON_PROSE_TXT =
+  /^(cmakelists|conanfile|robots|requirements(-[\w.]+)?|constraints|\.?[\w.-]*supp(ressions)?|package-list|\.?gitattributes)\.txt$/i;
+const PROSE_EXCLUDED_DIRS = new Set([
+  "test",
+  "tests",
+  "testing",
+  "fixtures",
+  "fixture",
+  "baselines",
+  "requirements",
+  "testdata",
+  "spec",
+  "specs",
+]);
 const EXCLUDED_DIRS = new Set([
   "node_modules",
   "vendor",
@@ -220,7 +240,14 @@ function harvestText(quick: boolean): void {
     if (quick && !repoFlags.quick) continue;
     repos.push({
       dir,
-      files: sampleFiles(dir, EXTENSIONS.text!, repoFlags.license, repoFlags.excludePrefixes, true),
+      files: sampleFiles(
+        dir,
+        EXTENSIONS.text!,
+        repoFlags.license,
+        repoFlags.excludePrefixes,
+        true,
+        true,
+      ),
       flags: repoFlags,
       next: 0,
       repoDir,
@@ -290,13 +317,21 @@ interface SampledFile {
   content?: string;
 }
 
-/** Sampling rules: language extensions only; skip vendored/generated/minified; keep tests; whole files. */
+/**
+ * Sampling rules: language extensions only; skip vendored/generated/minified; keep tests; whole
+ * files. `proseOnly` additionally drops test/fixture/baseline trees and accepts `.txt` only at the
+ * repository root or under `docs/`: the text corpus is meant to be documentation, and a repo's
+ * `tests/baselines/**.txt` (compiler diagnostics, parser dumps) or `requirements/*.txt` (pip pins)
+ * are machine output that would otherwise dominate it — TypeScript contributed 48 baseline files
+ * and zero prose.
+ */
 function sampleFiles(
   root: string,
   extensions: string[],
   license: string,
   excludedPrefixes: string[] = [],
   chunkOversized = false,
+  proseOnly = false,
 ): SampledFile[] {
   const files: SampledFile[] = [];
   const walk = (dir: string, prefix: string): void => {
@@ -318,13 +353,23 @@ function sampleFiles(
         continue;
       }
       if (entry.isDirectory()) {
-        if (!EXCLUDED_DIRS.has(entry.name.toLowerCase()) && !isNoticeFile(entry.name))
-          walk(path, relative);
+        const excluded =
+          EXCLUDED_DIRS.has(entry.name.toLowerCase()) ||
+          (proseOnly && PROSE_EXCLUDED_DIRS.has(entry.name.toLowerCase()));
+        if (!excluded && !isNoticeFile(entry.name)) walk(path, relative);
         continue;
       }
       if (!extensions.some((ext) => entry.name.endsWith(ext))) continue;
       if (entry.name.includes(".min.")) continue;
       if (isNoticeFile(entry.name)) continue;
+      // A `.txt` is prose only where documentation lives; elsewhere it is data (fixtures, pins).
+      if (proseOnly && entry.name.endsWith(".txt")) {
+        if (prefix !== "" && !relative.startsWith("docs/")) continue;
+        // Even at the root or under docs/, some .txt files are build or tool configuration
+        // (CMakeLists.txt, requirements.txt, robots.txt) rather than documentation. Prose files
+        // that happen to live beside them (BUILDING.txt, RUNNING.txt) are kept.
+        if (NON_PROSE_TXT.test(entry.name)) continue;
+      }
       // Dirents never report symlinks as directories, so a link to a directory would reach
       // readFileSync and crash with EISDIR; a link out of the checkout would read a host file.
       if (!isContainedFile(root, path)) continue;

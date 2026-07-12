@@ -1,62 +1,93 @@
-Debug Logging
-=============
+# Reverse Mapping and Unflattening
 
-OkHttp has internal APIs to enable debug logging. It uses the `java.util.logging` API which can be
-tricky to configure. As a shortcut, you can paste [OkHttpDebugLogging.kt]. Then enable debug logging
-for whichever features you need:
+Starting with 6.1.0, AutoMapper now supports richer reverse mapping support. Given our entities:
 
-```
-OkHttpDebugLogging.enableHttp2()
-OkHttpDebugLogging.enableTaskRunner()
-```
+```c#
+public class Order {
+  public decimal Total { get; set; }
+  public Customer Customer { get; set; }
+}
 
-### Activating on Android
-
-```
-$ adb shell setprop log.tag.okhttp.Http2 DEBUG
-$ adb shell setprop log.tag.okhttp.TaskRunner DEBUG
-$ adb logcat '*:E' 'okhttp.Http2:D' 'okhttp.TaskRunner:D'
+public class Customer {
+  public string Name { get; set; }
+}
 ```
 
-### HTTP/2 Frame Logging
+We can flatten this into a DTO:
 
-This logs inbound (`<<`) and outbound (`>>`) frames for HTTP/2 connections.
-
-```
-[2020-01-01 00:00:00] >> CONNECTION 505249202a20485454502f322e300d0a0d0a534d0d0a0d0a
-[2020-01-01 00:00:00] >> 0x00000000     6 SETTINGS
-[2020-01-01 00:00:00] >> 0x00000000     4 WINDOW_UPDATE
-[2020-01-01 00:00:00] >> 0x00000003    47 HEADERS       END_STREAM|END_HEADERS
-[2020-01-01 00:00:00] << 0x00000000     6 SETTINGS
-[2020-01-01 00:00:00] << 0x00000000     0 SETTINGS      ACK
-[2020-01-01 00:00:00] << 0x00000000     4 WINDOW_UPDATE
-[2020-01-01 00:00:00] >> 0x00000000     0 SETTINGS      ACK
-[2020-01-01 00:00:00] << 0x00000003   322 HEADERS       END_HEADERS
-[2020-01-01 00:00:00] << 0x00000003   288 DATA
-[2020-01-01 00:00:00] << 0x00000003     0 DATA          END_STREAM
-[2020-01-01 00:00:00] << 0x00000000     8 GOAWAY
-[2020-01-01 00:00:05] << 0x00000000     8 GOAWAY
+```c#
+public class OrderDto {
+  public decimal Total { get; set; }
+  public string CustomerName { get; set; }
+}
 ```
 
-### Task Runner Logging 
+We can map both directions, including unflattening:
 
-This logs task enqueues, starts, and finishes.
-
-```
-[2020-01-01 00:00:00] Q10000 scheduled after   0 µs: OkHttp ConnectionPool
-[2020-01-01 00:00:00] Q10000 starting              : OkHttp ConnectionPool
-[2020-01-01 00:00:00] Q10000 run again after 300 s : OkHttp ConnectionPool
-[2020-01-01 00:00:00] Q10000 finished run in   1 ms: OkHttp ConnectionPool
-[2020-01-01 00:00:00] Q10001 scheduled after   0 µs: OkHttp squareup.com applyAndAckSettings
-[2020-01-01 00:00:00] Q10001 starting              : OkHttp squareup.com applyAndAckSettings
-[2020-01-01 00:00:00] Q10003 scheduled after   0 µs: OkHttp squareup.com onSettings
-[2020-01-01 00:00:00] Q10003 starting              : OkHttp squareup.com onSettings
-[2020-01-01 00:00:00] Q10001 finished run in   3 ms: OkHttp squareup.com applyAndAckSettings
-[2020-01-01 00:00:00] Q10003 finished run in 528 µs: OkHttp squareup.com onSettings
-[2020-01-01 00:00:00] Q10000 scheduled after   0 µs: OkHttp ConnectionPool
-[2020-01-01 00:00:00] Q10000 starting              : OkHttp ConnectionPool
-[2020-01-01 00:00:00] Q10000 run again after 300 s : OkHttp ConnectionPool
-[2020-01-01 00:00:00] Q10000 finished run in 739 µs: OkHttp ConnectionPool
+```c#
+var configuration = new MapperConfiguration(cfg => {
+  cfg.CreateMap<Order, OrderDto>()
+     .ReverseMap();
+});
 ```
 
-[OkHttpDebugLogging.kt]: https://github.com/square/okhttp/blob/master/okhttp-testing-support/src/main/kotlin/okhttp3/OkHttpDebugLogging.kt
+By calling `ReverseMap`, AutoMapper creates a reverse mapping configuration that includes unflattening:
+
+```c#
+var customer = new Customer {
+  Name = "Bob"
+};
+
+var order = new Order {
+  Customer = customer,
+  Total = 15.8m
+};
+
+var orderDto = mapper.Map<Order, OrderDto>(order);
+
+orderDto.CustomerName = "Joe";
+
+mapper.Map(orderDto, order);
+
+order.Customer.Name.ShouldEqual("Joe");
+```
+
+Unflattening is only configured for `ReverseMap`. If you want unflattening, you must configure `Entity` -> `Dto` then call `ReverseMap` to create an unflattening type map configuration from the `Dto` -> `Entity`.
+
+### Customizing reverse mapping
+
+AutoMapper will automatically reverse map "Customer.Name" from "CustomerName" based on the original flattening. If you use MapFrom, AutoMapper will attempt to reverse the map:
+
+```c#
+cfg.CreateMap<Order, OrderDto>()
+  .ForMember(d => d.CustomerName, opt => opt.MapFrom(src => src.Customer.Name))
+  .ReverseMap();
+```
+
+As long as the `MapFrom` path are member accessors, AutoMapper will unflatten from the same path (`CustomerName` => `Customer.Name`).
+
+If you need to customize this, for a reverse map you can use `ForPath`:
+
+```c#
+cfg.CreateMap<Order, OrderDto>()
+  .ForMember(d => d.CustomerName, opt => opt.MapFrom(src => src.Customer.Name))
+  .ReverseMap()
+  .ForPath(s => s.Customer.Name, opt => opt.MapFrom(src => src.CustomerName));
+```
+
+For most cases you shouldn't need this, as the original MapFrom will be reversed for you. Use ForPath when the path to get and set the values are different.
+
+If you do not want unflattening behavior, you can remove the call to `ReverseMap` and create two separate maps. Or, you can use Ignore:
+
+```c#
+cfg.CreateMap<Order, OrderDto>()
+  .ForMember(d => d.CustomerName, opt => opt.MapFrom(src => src.Customer.Name))
+  .ReverseMap()
+  .ForPath(s => s.Customer.Name, opt => opt.Ignore());
+```
+### IncludeMembers
+
+`ReverseMap` also integrates with [`IncludeMembers`](Flattening.html#includemembers) and configuration like 
+```c#
+ForMember(destination => destination.IncludedMember, member => member.MapFrom(source => source))
+```
