@@ -7,11 +7,12 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 export const CORPUS_DIR = join(import.meta.dir, "../../corpus");
 export const CACHE_DIR = join(import.meta.dir, "../../.cache");
@@ -224,23 +225,41 @@ export function syncNoticeFiles(checkout: string, repo: string): void {
   const noticeDir = join(import.meta.dir, "../..", noticePathFor(repo));
   rmSync(noticeDir, { recursive: true, force: true });
   mkdirSync(noticeDir, { recursive: true });
-  // Some upstreams ship their root LICENSE as a symlink; resolve it instead of skipping,
-  // which would otherwise abort the fetch with "no root-level license or notice files".
-  const files = readdirSync(checkout, { withFileTypes: true }).filter((entry) => {
-    if (!isNoticeFile(entry.name)) return false;
-    if (entry.isFile()) return true;
-    try {
-      return entry.isSymbolicLink() && statSync(join(checkout, entry.name)).isFile();
-    } catch {
-      return false;
-    }
-  });
+  // Some upstreams ship their root LICENSE as a symlink; resolve it instead of skipping, which
+  // would otherwise abort the fetch with "no root-level license or notice files" — but only when
+  // it stays inside the checkout, so a pin cannot link a notice at a host file.
+  const files = readdirSync(checkout, { withFileTypes: true }).filter(
+    (entry) => isNoticeFile(entry.name) && isContainedFile(checkout, join(checkout, entry.name)),
+  );
   if (files.length === 0) throw new Error(`${repo}: no root-level license or notice files`);
   for (const file of files) {
     const name = /licen[cs]e/i.test(file.name) && !/^licen[cs]e/i.test(file.name)
       ? `LICENSE-${file.name}`
       : file.name;
     copyFileSync(join(checkout, file.name), join(noticeDir, name));
+  }
+}
+
+/**
+ * Whether `path` resolves to a regular file that really lives inside `root`. Pins are untrusted
+ * third-party trees: a `120000` entry pointing at an absolute or `../`-escaping path would
+ * otherwise make the fetchers read a host file and commit its bytes to this public corpus, so
+ * every candidate is resolved through the symlink before it is read. In-repo links still work.
+ */
+export function isContainedFile(root: string, path: string): boolean {
+  let realPath: string;
+  let realRoot: string;
+  try {
+    realPath = realpathSync(path);
+    realRoot = realpathSync(root);
+  } catch {
+    return false; // Broken links in upstream checkouts are skipped, not fatal.
+  }
+  if (realPath !== realRoot && !realPath.startsWith(realRoot + sep)) return false;
+  try {
+    return statSync(realPath).isFile();
+  } catch {
+    return false;
   }
 }
 

@@ -6,6 +6,7 @@ import {
   appendManifest,
   chunkDocument,
   cloneAtRef,
+  isContainedFile,
   noticePathFor,
   resetOrigin,
   resolvedSha,
@@ -62,14 +63,16 @@ function fetchGitDocs(locale: string, entries: GitDocsSource[]): void {
         ) {
           continue;
         }
+        // Symlinks to directories pass the extension check but would crash readFileSync, and a
+        // link out of the checkout would read a host file. Broken links are skipped, not fatal.
+        if (!isContainedFile(dir, path)) continue;
         let stat;
         try {
-          stat = statSync(path); // Broken symlinks in upstream checkouts must not abort the fetch.
+          stat = statSync(path);
         } catch {
           continue;
         }
-        // Symlinks to directories pass the extension check but would crash readFileSync.
-        if (!stat.isFile() || !dirent.name.endsWith(".md") || stat.size < 500) continue;
+        if (!dirent.name.endsWith(".md") || stat.size < 500) continue;
         bytes += saveChunks(
           locale,
           readFileSync(path, "utf8"),
