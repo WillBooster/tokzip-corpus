@@ -5,7 +5,7 @@
  * License policy: non-trainable (copyleft/share-alike) samples are forced into the benchmark
  * split, which also guarantees they can never leak into shipped dictionaries.
  *
- * The resulting benchmark split is versioned (`bench-v1`): re-running with the same corpus
+ * The resulting benchmark split is versioned (`bench-v2`): re-running with the same corpus
  * and seed reproduces it exactly.
  *
  * Usage: bun scripts/corpus/split.ts [<language> ...]
@@ -230,7 +230,7 @@ function printCounts(languages: Iterable<string>): void {
     const entries = readManifest(join(CORPUS_DIR, language, "manifest.jsonl"));
     const trainCount = entries.filter((entry) => entry.split === "train").length;
     console.log(
-      `${language}: ${trainCount} train / ${entries.length - trainCount} bench (bench-v1, seed ${SPLIT_SEED})`,
+      `${language}: ${trainCount} train / ${entries.length - trainCount} bench (bench-v2, seed ${SPLIT_SEED})`,
     );
   }
 }

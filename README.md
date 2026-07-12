@@ -9,7 +9,7 @@ Public, versioned corpus data and generation tooling for training and evaluating
   `manifest.jsonl` per language or locale.
 - `scripts/corpus/`: pinned permissive-source definitions, fetchers, compliance
   validation, near-duplicate clustering, and the deterministic, source- and size-stratified
-  `bench-v1` split.
+  `bench-v2` split.
 - `THIRD_PARTY_NOTICES/`: exact license, copyright, attribution, and NOTICE material
   shipped by every upstream repository represented in the corpus.
 

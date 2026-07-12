@@ -130,24 +130,26 @@ export function nearDuplicatePairs(contents: string[]): [number, number][] {
   return pairs;
 }
 
+/**
+ * Bottom-k min-hash: hash every window and keep the k smallest. Which windows survive depends on
+ * their content, not their offset, so the sampler is shift-invariant. Sampling at a positional
+ * stride instead would slide every later window off the grid when a single character is inserted,
+ * so two copies of a file differing only in length shared no shingles at all — and near-duplicate
+ * upstream files (vendored copies, generated variants) then straddled the train/bench boundary,
+ * which is exactly what the split exists to prevent.
+ */
 function shinglesOf(content: string): Set<number> {
-  const shingles = new Set<number>();
-  if (content.length < SHINGLE_LENGTH) return shingles;
-  // Ceil spreads the shingle budget across the whole document; floor would leave the tail of
-  // documents shorter than SHINGLE_LENGTH + 2 * SHINGLES_PER_DOC entirely unsampled.
-  const step = Math.max(1, Math.ceil((content.length - SHINGLE_LENGTH) / SHINGLES_PER_DOC));
-  for (
-    let index = 0;
-    index + SHINGLE_LENGTH <= content.length && shingles.size < SHINGLES_PER_DOC;
-    index += step
-  ) {
+  if (content.length < SHINGLE_LENGTH) return new Set();
+  const hashes: number[] = [];
+  for (let index = 0; index + SHINGLE_LENGTH <= content.length; index++) {
     let hash = 0x81_1c_9d_c5;
     for (let offset = 0; offset < SHINGLE_LENGTH; offset++)
       hash = Math.imul(hash ^ content.codePointAt(index + offset)!, 0x01_00_01_93);
     // oxlint-disable-next-line unicorn/prefer-math-trunc -- >>> 0 coerces to uint32, Math.trunc does not
-    shingles.add(hash >>> 0);
+    hashes.push(hash >>> 0);
   }
-  return shingles;
+  hashes.sort((a, b) => a - b);
+  return new Set(hashes.slice(0, SHINGLES_PER_DOC));
 }
 
 const CHUNK_TARGETS = [512, 2048, 8192, 24_576];
