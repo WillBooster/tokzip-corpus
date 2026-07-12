@@ -1,76 +1,805 @@
-# Value Converters
+### Updating an Object
 
-Value converters are a cross between [Type Converters](Custom-type-converters.html) and [Value Resolvers](Custom-value-resolvers.html). Type converters are globally scoped, so that any time you map from type `Foo` to type `Bar` in any mapping, the type converter will be used. Value converters are scoped to a single map, and receive the source and destination objects to resolve to a value to map to the destination member. Optionally value converters can receive the source member as well.
+Update callbacks are triggered whenever an **existing** record is persisted
+(i.e. "saved") to the underlying database. They are called before, after and
+around the object is updated.
 
-In simplified syntax:
+* [`before_validation`][]
+* [`after_validation`][]
+* [`before_save`][]
+* [`around_save`][]
+* [`before_update`][]
+* [`around_update`][]
+* [`after_update`][]
+* [`after_save`][]
+* [`after_commit`][] / [`after_rollback`][]
 
- - Type converter = `Func<TSource, TDestination, TDestination>`
- - Value resolver = `Func<TSource, TDestination, TDestinationMember>`
- - Member value resolver = `Func<TSource, TDestination, TSourceMember, TDestinationMember>`
- - Value converter = `Func<TSourceMember, TDestinationMember>`
+[`after_update`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_update
+[`around_update`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-around_update
+[`before_update`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-before_update
 
- To configure a value converter, use at the member level:
+WARNING: The `after_save` callback is triggered on both create and update
+operations. However, it consistently executes after the more specific callbacks
+`after_create` and `after_update`, regardless of the sequence in which the macro
+calls were made. Similarly, before and around save callbacks follow the same
+rule: `before_save` runs before create/update, and `around_save` runs around
+create/update operations. It's important to note that save callbacks will always
+run before/around/after the more specific create/update callbacks.
 
- ```c#
- public class CurrencyFormatter : IValueConverter<decimal, string> {
-     public string Convert(decimal source, ResolutionContext context)
-         => source.ToString("c");
- }
+We've already covered [validation](#validation-callbacks) and
+[save](#save-callbacks) callbacks. See the [`after_commit` /
+`after_rollback` section](#after-commit-and-after-rollback) for examples using
+these two callbacks.
 
- var configuration = new MapperConfiguration(cfg => {
-    cfg.CreateMap<Order, OrderDto>()
-        .ForMember(d => d.Amount, opt => opt.ConvertUsing(new CurrencyFormatter()));
-    cfg.CreateMap<OrderLineItem, OrderLineItemDto>()
-        .ForMember(d => d.Total, opt => opt.ConvertUsing(new CurrencyFormatter()));
- });
- ```
+#### Update Callbacks
 
-You can customize the source member when the source member name does not match:
+```ruby
+class User < ApplicationRecord
+  before_update :check_role_change
+  around_update :log_updating
+  after_update :send_update_email
 
- ```c#
- public class CurrencyFormatter : IValueConverter<decimal, string> {
-     public string Convert(decimal source, ResolutionContext context)
-         => source.ToString("c");
- }
+  private
+    def check_role_change
+      if role_changed?
+        Rails.logger.info("User role changed to #{role}")
+      end
+    end
 
- var configuration = new MapperConfiguration(cfg => {
-    cfg.CreateMap<Order, OrderDto>()
-        .ForMember(d => d.Amount, opt => opt.ConvertUsing(new CurrencyFormatter(), src => src.OrderAmount));
-    cfg.CreateMap<OrderLineItem, OrderLineItemDto>()
-        .ForMember(d => d.Total, opt => opt.ConvertUsing(new CurrencyFormatter(), src => src.LITotal));
- });
- ```
+    def log_updating
+      Rails.logger.info("Updating user with email: #{email}")
+      yield
+      Rails.logger.info("User updated with email: #{email}")
+    end
 
-If you need the value converters instantiated by the [service locator](Dependency-injection.html), you can specify the type instead:
+    def send_update_email
+      UserMailer.update_email(self).deliver_later
+      Rails.logger.info("Update email sent to: #{email}")
+    end
+end
+```
 
- ```c#
- public class CurrencyFormatter : IValueConverter<decimal, string> {
-     public string Convert(decimal source, ResolutionContext context)
-         => source.ToString("c");
- }
+```irb
+irb> user = User.find(1)
+=> #<User id: 1, email: "john.doe@example.com", created_at: "2024-03-20 16:19:52.405195000 +0000", updated_at: "2024-03-20 16:19:52.405195000 +0000", name: "John Doe", role: "user" >
 
- var configuration = new MapperConfiguration(cfg => {
-    cfg.CreateMap<Order, OrderDto>()
-        .ForMember(d => d.Amount, opt => opt.ConvertUsing<CurrencyFormatter, decimal>());
-    cfg.CreateMap<OrderLineItem, OrderLineItemDto>()
-        .ForMember(d => d.Total, opt => opt.ConvertUsing<CurrencyFormatter, decimal>());
- });
- ```
+irb> user.update(role: "admin")
+User role changed to admin
+Updating user with email: john.doe@example.com
+User updated with email: john.doe@example.com
+Update email sent to: john.doe@example.com
+```
 
-If you do not know the types or member names at runtime, use the various overloads that accept `System.Type` and `string`-based members:
+#### Using a Combination of Callbacks
 
- ```c#
- public class CurrencyFormatter : IValueConverter<decimal, string> {
-     public string Convert(decimal source, ResolutionContext context)
-         => source.ToString("c");
- }
+Often, you will need to use a combination of callbacks to achieve the desired
+behavior. For example, you may want to send a confirmation email after a user is
+created, but only if the user is new and not being updated. When a user is
+updated, you may want to notify an admin if critical information is changed. In
+this case, you can use `after_create` and `after_update` callbacks together.
 
- var configuration = new MapperConfiguration(cfg => {
-    cfg.CreateMap(typeof(Order), typeof(OrderDto))
-        .ForMember("Amount", opt => opt.ConvertUsing(new CurrencyFormatter(), "OrderAmount"));
-    cfg.CreateMap(typeof(OrderLineItem), typeof(OrderLineItemDto))
-        .ForMember("Total", opt => opt.ConvertUsing(new CurrencyFormatter(), "LITotal"));
- });
- ```
+```ruby
+class User < ApplicationRecord
+  after_create :send_confirmation_email
+  after_update :notify_admin_if_critical_info_updated
 
- Value converters are only used for in-memory mapping execution. They will not work for [`ProjectTo`](Queryable-Extensions.html).
+  private
+    def send_confirmation_email
+      UserMailer.confirmation_email(self).deliver_later
+      Rails.logger.info("Confirmation email sent to: #{email}")
+    end
+
+    def notify_admin_if_critical_info_updated
+      if saved_change_to_email? || saved_change_to_phone_number?
+        AdminMailer.user_critical_info_updated(self).deliver_later
+        Rails.logger.info("Notification sent to admin about critical info update for: #{email}")
+      end
+    end
+end
+```
+
+```irb
+irb> user = User.create(name: "John Doe", email: "john.doe@example.com")
+Confirmation email sent to: john.doe@example.com
+=> #<User id: 1, email: "john.doe@example.com", ...>
+
+irb> user.update(email: "john.doe.new@example.com")
+Notification sent to admin about critical info update for: john.doe.new@example.com
+=> true
+```
+
+### Destroying an Object
+
+Destroy callbacks are triggered whenever a record is destroyed, but ignored when
+a record is deleted. They are called before, after and around the object is
+destroyed.
+
+* [`before_destroy`][]
+* [`around_destroy`][]
+* [`after_destroy`][]
+* [`after_commit`][] / [`after_rollback`][]
+
+[`after_destroy`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_destroy
+[`around_destroy`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-around_destroy
+[`before_destroy`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-before_destroy
+
+Find [examples for using `after_commit` /
+`after_rollback`](#after-commit-and-after-rollback).
+
+#### Destroy Callbacks
+
+```ruby
+class User < ApplicationRecord
+  before_destroy :check_admin_count
+  around_destroy :log_destroy_operation
+  after_destroy :notify_users
+
+  private
+    def check_admin_count
+      if admin? && User.where(role: "admin").count == 1
+        throw :abort
+      end
+      Rails.logger.info("Checked the admin count")
+    end
+
+    def log_destroy_operation
+      Rails.logger.info("About to destroy user with ID #{id}")
+      yield
+      Rails.logger.info("User with ID #{id} destroyed successfully")
+    end
+
+    def notify_users
+      UserMailer.deletion_email(self).deliver_later
+      Rails.logger.info("Notification sent to other users about user deletion")
+    end
+end
+```
+
+```irb
+irb> user = User.find(1)
+=> #<User id: 1, email: "john.doe@example.com", created_at: "2024-03-20 16:19:52.405195000 +0000", updated_at: "2024-03-20 16:19:52.405195000 +0000", name: "John Doe", role: "admin">
+
+irb> user.destroy
+Checked the admin count
+About to destroy user with ID 1
+User with ID 1 destroyed successfully
+Notification sent to other users about user deletion
+```
+
+### `after_initialize` and `after_find`
+
+Whenever an Active Record object is instantiated, either by directly using `new`
+or when a record is loaded from the database, the [`after_initialize`][]
+callback will be called. It can be useful to avoid the need to directly override
+your Active Record `initialize` method.
+
+When loading a record from the database the [`after_find`][] callback will be
+called. `after_find` is called before `after_initialize` if both are defined.
+
+NOTE: The `after_initialize` and `after_find` callbacks have no `before_*`
+counterparts.
+
+They can be registered just like the other Active Record callbacks.
+
+```ruby
+class User < ApplicationRecord
+  after_initialize do |user|
+    Rails.logger.info("You have initialized an object!")
+  end
+
+  after_find do |user|
+    Rails.logger.info("You have found an object!")
+  end
+end
+```
+
+```irb
+irb> User.new
+You have initialized an object!
+=> #<User id: nil>
+
+irb> User.first
+You have found an object!
+You have initialized an object!
+=> #<User id: 1>
+```
+
+[`after_find`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_find
+[`after_initialize`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_initialize
+
+### `after_touch`
+
+The [`after_touch`][] callback will be called whenever an Active Record object
+is touched. You can [read more about `touch` in the API
+docs](https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-touch).
+
+```ruby
+class User < ApplicationRecord
+  after_touch do |user|
+    Rails.logger.info("You have touched an object")
+  end
+end
+```
+
+```irb
+irb> user = User.create(name: "Kuldeep")
+=> #<User id: 1, name: "Kuldeep", created_at: "2013-11-25 12:17:49", updated_at: "2013-11-25 12:17:49">
+
+irb> user.touch
+You have touched an object
+=> true
+```
+
+It can be used along with `belongs_to`:
+
+```ruby
+class Book < ApplicationRecord
+  belongs_to :library, touch: true
+  after_touch do
+    Rails.logger.info("A Book was touched")
+  end
+end
+
+class Library < ApplicationRecord
+  has_many :books
+  after_touch :log_when_books_or_library_touched
+
+  private
+    def log_when_books_or_library_touched
+      Rails.logger.info("Book/Library was touched")
+    end
+end
+```
+
+```irb
+irb> book = Book.last
+=> #<Book id: 1, library_id: 1, created_at: "2013-11-25 17:04:22", updated_at: "2013-11-25 17:05:05">
+
+irb> book.touch # triggers book.library.touch
+A Book was touched
+Book/Library was touched
+=> true
+```
+
+[`after_touch`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Callbacks/ClassMethods.html#method-i-after_touch
+
+Running Callbacks
+-----------------
+
+The following methods trigger callbacks:
+
+* `create`
+* `create!`
+* `destroy`
+* `destroy!`
+* `destroy_all`
+* `destroy_by`
+* `save`
+* `save!`
+* `save(validate: false)`
+* `save!(validate: false)`
+* `toggle!`
+* `touch`
+* `update_attribute`
+* `update_attribute!`
+* `update`
+* `update!`
+* `valid?`
+* `validate`
+
+Additionally, the `after_find` callback is triggered by the following finder
+methods:
+
+* `all`
+* `first`
+* `find`
+* `find_by`
+* `find_by!`
+* `find_by_*`
+* `find_by_*!`
+* `find_by_sql`
+* `last`
+* `sole`
+* `take`
+
+The `after_initialize` callback is triggered every time a new object of the
+class is initialized.
+
+NOTE: The `find_by_*` and `find_by_*!` methods are dynamic finders generated
+automatically for every attribute. Learn more about them in the [Dynamic finders
+section](active_record_querying.html#dynamic-finders).
+
+Conditional Callbacks
+---------------------
+
+As with [validations](active_record_validations.html), we can also make the
+calling of a callback method conditional on the satisfaction of a given
+predicate. We can do this using the `:if` and `:unless` options, which can take
+a symbol, a `Proc` or an `Array`.
+
+You may use the `:if` option when you want to specify under which conditions the
+callback **should** be called. If you want to specify the conditions under which
+the callback **should not** be called, then you may use the `:unless` option.
+
+### Using `:if` and `:unless` with a `Symbol`
+
+You can associate the `:if` and `:unless` options with a symbol corresponding to
+the name of a predicate method that will get called right before the callback.
+
+When using the `:if` option, the callback **won't** be executed if the predicate
+method returns **false**; when using the `:unless` option, the callback
+**won't** be executed if the predicate method returns **true**. This is the most
+common option.
+
+```ruby
+class Order < ApplicationRecord
+  before_save :normalize_card_number, if: :paid_with_card?
+end
+```
+
+Using this form of registration it is also possible to register several
+different predicates that should be called to check if the callback should be
+executed. We will cover this in the [Multiple Callback Conditions
+section](#multiple-callback-conditions).
+
+### Using `:if` and `:unless` with a `Proc`
+
+It is possible to associate `:if` and `:unless` with a `Proc` object. This
+option is best suited when writing short validation methods, usually one-liners:
+
+```ruby
+class Order < ApplicationRecord
+  before_save :normalize_card_number,
+    if: ->(order) { order.paid_with_card? }
+end
+```
+
+Since the proc is evaluated in the context of the object, it is also possible to
+write this as:
+
+```ruby
+class Order < ApplicationRecord
+  before_save :normalize_card_number, if: -> { paid_with_card? }
+end
+```
+
+### Multiple Callback Conditions
+
+The `:if` and `:unless` options also accept an array of procs or method names as
+symbols:
+
+```ruby
+class Comment < ApplicationRecord
+  before_save :filter_content,
+    if: [:subject_to_parental_control?, :untrusted_author?]
+end
+```
+
+You can easily include a proc in the list of conditions:
+
+```ruby
+class Comment < ApplicationRecord
+  before_save :filter_content,
+    if: [:subject_to_parental_control?, -> { untrusted_author? }]
+end
+```
+
+### Using Both `:if` and `:unless`
+
+Callbacks can mix both `:if` and `:unless` in the same declaration:
+
+```ruby
+class Comment < ApplicationRecord
+  before_save :filter_content,
+    if: -> { forum.parental_control? },
+    unless: -> { author.trusted? }
+end
+```
+
+The callback only runs when all the `:if` conditions and none of the `:unless`
+conditions are evaluated to `true`.
+
+Skipping Callbacks
+------------------
+
+Just as with [validations](active_record_validations.html), it is also possible
+to skip callbacks by using the following methods:
+
+* [`decrement!`][]
+* [`decrement_counter`][]
+* [`delete`][]
+* [`delete_all`][]
+* [`delete_by`][]
+* [`increment!`][]
+* [`increment_counter`][]
+* [`insert`][]
+* [`insert!`][]
+* [`insert_all`][]
+* [`insert_all!`][]
+* [`touch_all`][]
+* [`update_column`][]
+* [`update_columns`][]
+* [`update_all`][]
+* [`update_counters`][]
+* [`upsert`][]
+* [`upsert_all`][]
+
+Let's consider a `User` model where the `before_save` callback logs any changes
+to the user's email address:
+
+```ruby
+class User < ApplicationRecord
+  before_save :log_email_change
+
+  private
+    def log_email_change
+      if email_changed?
+        Rails.logger.info("Email changed from #{email_was} to #{email}")
+      end
+    end
+end
+```
+
+Now, suppose there's a scenario where you want to update the user's email
+address without triggering the `before_save` callback to log the email change.
+You can use the `update_columns` method for this purpose:
+
+```irb
+irb> user = User.find(1)
+irb> user.update_columns(email: 'new_email@example.com')
+```
+
+The above will update the user's email address without triggering the
+`before_save` callback.
+
+WARNING. These methods should be used with caution because there may be
+important business rules and application logic in callbacks that you do not want
+to bypass. Bypassing them without understanding the potential implications may
+lead to invalid data.
+
+[`decrement!`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-decrement-21
+[`decrement_counter`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/CounterCache/ClassMethods.html#method-i-decrement_counter
+[`delete`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-delete
+[`delete_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-delete_all
+[`delete_by`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-delete_by
+[`increment!`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-increment-21
+[`increment_counter`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/CounterCache/ClassMethods.html#method-i-increment_counter
+[`insert`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-insert
+[`insert!`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-insert-21
+[`insert_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-insert_all
+[`insert_all!`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-insert_all-21
+[`touch_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-touch_all
+[`update_column`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-update_column
+[`update_columns`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence.html#method-i-update_columns
+[`update_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-update_all
+[`update_counters`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-update_counters
+[`upsert`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-upsert
+[`upsert_all`]:
+    https://api.rubyonrails.org/classes/ActiveRecord/Persistence/ClassMethods.html#method-i-upsert_all
+
+Suppressing Callbacks
+---------------------
+
+In certain scenarios, you may need to temporarily prevent certain callbacks from
+being executed within your Rails application. This can be useful when you want
+to skip specific actions during certain operations without permanently disabling
+the callbacks.
+
+Rails provides a mechanism for suppressing callbacks using the
+[`ActiveRecord::Suppressor`
+module](https://api.rubyonrails.org/classes/ActiveRecord/Suppressor.html). By
+using this module, you can wrap a block of code where you want to suppress
+callbacks, ensuring that they are not executed during that specific operation.
+
+Let's consider a scenario where we have a `User` model with a callback that
+sends a welcome email to new users after they sign up. However, there might be
+cases where we want to create a user without sending the welcome email, such as
+during seeding the database with test data.
+
+```ruby
+class User < ApplicationRecord
+  after_create :send_welcome_email
+
+  def send_welcome_email
+    puts "Welcome email sent to #{self.email}"
+  end
+end
+```
+
+In this example, the `after_create` callback triggers the `send_welcome_email`
+method every time a new user is created.
+
+To create a user without sending the welcome email, we can use the
+`ActiveRecord::Suppressor` module as follows:
+
+```ruby
+User.suppress do
+  User.create(name: "Jane", email: "jane@example.com")
+end
+```
+
+In the above code, the `User.suppress` block ensures that the
+`send_welcome_email` callback is not executed during the creation of the "Jane"
+user, allowing us to create the user without sending the welcome email.
+
+WARNING: Using the Active Record Suppressor, while potentially beneficial for
+selectively controlling callback execution, can introduce complexity and
+unexpected behavior. Suppressing callbacks can obscure the intended flow of your
+application, leading to difficulties in understanding and maintaining the
+codebase over time. Carefully consider the implications of suppressing
+callbacks, ensuring thorough documentation and thoughtful testing to mitigate
+risks of unintended side effects, performance issues, and test failures.
+
+Halting Execution
+-----------------
+
+As you start registering new callbacks for your models, they will be queued for
+execution. This queue will include all of your model's validations, the
+registered callbacks, and the database operation to be executed.
+
+The whole callback chain is wrapped in a transaction. If any callback raises an
+exception, the execution chain gets halted and a **rollback** is issued, and the
+error will be re-raised.
+
+```ruby
+class Product < ActiveRecord::Base
+  before_validation do
+    raise "Price can't be negative" if total_price < 0
+  end
+end
+
+Product.create # raises "Price can't be negative"
+```
+
+This unexpectedly breaks code that does not expect methods like `create` and
+`save` to raise exceptions.
+
+NOTE: If an exception occurs during the callback chain, Rails will re-raise it
+unless it is an `ActiveRecord::Rollback` or `ActiveRecord::RecordInvalid`
+exception. Instead, you should use `throw :abort` to intentionally halt the
+chain. If any callback throws `:abort`, the process will be aborted and `create`
+will return false.
+
+```ruby
+class Product < ActiveRecord::Base
+  before_validation do
+    throw :abort if total_price < 0
+  end
+end
+
+Product.create # => false
+```
+
+However, it will raise an `ActiveRecord::RecordNotSaved` when calling `create!`.
+This exception indicates that the record was not saved due to the callback's
+interruption.
+
+```ruby
+User.create! # => raises an ActiveRecord::RecordNotSaved
+```
+
+
+When `throw :abort` is called in any destroy callback, `destroy` will return
+false:
+
+```ruby
+class User < ActiveRecord::Base
+  before_destroy do
+    throw :abort if still_active?
+  end
+end
+
+User.first.destroy # => false
+```
+
+However, it will raise an `ActiveRecord::RecordNotDestroyed` when calling
+`destroy!`.
+
+```ruby
+User.first.destroy! # => raises an ActiveRecord::RecordNotDestroyed
+```
+
+Association Callbacks
+---------------------
+
+Association callbacks are similar to normal callbacks, but they are triggered by
+events in the life cycle of the associated collection. There are four available
+association callbacks:
+
+* `before_add`
+* `after_add`
+* `before_remove`
+* `after_remove`
+
+You can define association callbacks by adding options to the association.
+
+Suppose you have an example where an author can have many books. However, before
+adding a book to the authors collection, you want to ensure that the author has
+not reached their book limit. You can do this by adding a `before_add` callback
+to check the limit.
+
+```ruby
+class Author < ApplicationRecord
+  has_many :books, before_add: :check_limit
+
+  private
+    def check_limit
+      if books.count >= 5
+        errors.add(:base, "Cannot add more than 5 books for this author")
+        throw(:abort)
+      end
+    end
+end
+```
+
+If a `before_add` callback throws `:abort`, the object does not get added to the
+collection.
+
+At times you may want to perform multiple actions on the associated object. In
+this case, you can stack callbacks on a single event by passing them as an
+array. Additionally, Rails passes the object being added or removed to the
+callback for you to use.
+
+```ruby
+class Author < ApplicationRecord
+  has_many :books, before_add: [:check_limit, :calculate_shipping_charges]
+
+  def check_limit
+    if books.count >= 5
+      errors.add(:base, "Cannot add more than 5 books for this author")
+      throw(:abort)
+    end
+  end
+
+  def calculate_shipping_charges(book)
+    weight_in_pounds = book.weight_in_pounds || 1
+    shipping_charges = weight_in_pounds * 2
+
+    shipping_charges
+  end
+end
+```
+
+Similarly, if a `before_remove` callback throws `:abort`, the object does not
+get removed from the collection.
+
+NOTE: These callbacks are called only when the associated objects are added or
+removed through the association collection.
+
+```ruby
+# Triggers `before_add` callback
+author.books << book
+author.books = [book, book2]
+
+# Does not trigger the `before_add` callback
+book.update(author_id: 1)
+```
+
+Cascading Association Callbacks
+-------------------------------
+
+Callbacks can be performed when associated objects are changed. They work
+through the model associations whereby life cycle events can cascade on
+associations and fire callbacks.
+
+Suppose an example where a user has many articles. A user's articles should be
+destroyed if the user is destroyed. Let's add an `after_destroy` callback to the
+`User` model by way of its association to the `Article` model:
+
+```ruby
+class User < ApplicationRecord
+  has_many :articles, dependent: :destroy
+end
+
+class Article < ApplicationRecord
+  after_destroy :log_destroy_action
+
+  def log_destroy_action
+    Rails.logger.info("Article destroyed")
+  end
+end
+```
+
+```irb
+irb> user = User.first
+=> #<User id: 1>
+irb> user.articles.create!
+=> #<Article id: 1, user_id: 1>
+irb> user.destroy
+Article destroyed
+=> #<User id: 1>
+```
+
+WARNING: When using a `before_destroy` callback, it should be placed before
+`dependent: :destroy` associations (or use the `prepend: true` option), to
+ensure they execute before the records are deleted by `dependent: :destroy`.
+
+Transaction Callbacks
+---------------------
+
+### `after_commit` and `after_rollback`
+
+Two additional callbacks are triggered by the completion of a database
+transaction: [`after_commit`][] and [`after_rollback`][]. These callbacks are
+very similar to the `after_save` callback except that they don't execute until
+after database changes have either been committed or rolled back. They are most
+useful when your Active Record models need to interact with external systems
+that are not part of the database transaction.
+
+Consider a `PictureFile` model that needs to delete a file after the
+corresponding record is destroyed.
+
+```ruby
+class PictureFile < ApplicationRecord
+  after_destroy :delete_picture_file_from_disk
+
+  def delete_picture_file_from_disk
+    if File.exist?(filepath)
+      File.delete(filepath)
+    end
+  end
+end
+```
+
+If anything raises an exception after the `after_destroy` callback is called and
+the transaction rolls back, then the file will have been deleted and the model
+will be left in an inconsistent state. For example, suppose that
+`picture_file_2` in the code below is not valid and the `save!` method raises an
+error.
+
+```ruby
+PictureFile.transaction do
+  picture_file_1.destroy
+  picture_file_2.save!
+end
+```
+
+By using the `after_commit` callback we can account for this case.
+
+```ruby
+class PictureFile < ApplicationRecord
+  after_commit :delete_picture_file_from_disk, on: :destroy
+
+  def delete_picture_file_from_disk
+    if File.exist?(filepath)
+      File.delete(filepath)
+    end
+  end
+end
+```
+
+NOTE: The `:on` option specifies when a callback will be fired. If you don't
+supply the `:on` option the callback will fire for every life cycle event. [Read
+more about `:on`](#registering-callbacks-to-fire-on-life-cycle-events).
+
+When a transaction completes, the `after_commit` or `after_rollback` callbacks
+are called for all models created, updated, or destroyed within that
+transaction. However, if an exception is raised within one of these callbacks,
+the exception will bubble up and any remaining `after_commit` or
+`after_rollback` methods will _not_ be executed.

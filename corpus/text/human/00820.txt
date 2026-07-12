@@ -1,91 +1,87 @@
-UndefinedType = ForwardRef('UndefinedType')
+# Before and After Map Action
 
+Occasionally, you might need to perform custom logic before or after a map occurs. These should be a rarity, as it's more obvious to do this work outside of AutoMapper. You can create global before/after map actions:
 
-class Foobar(BaseModel):
-    a: UndefinedType
-
-
-try:
-    Foobar(a=1)
-except PydanticUserError as exc_info:
-    assert exc_info.code == 'class-not-fully-defined'
+```c#
+var configuration = new MapperConfiguration(cfg => {
+  cfg.CreateMap<Source, Dest>()
+    .BeforeMap((src, dest) => src.Value = src.Value + 10)
+    .AfterMap((src, dest) => dest.Name = "John");
+});
 ```
 
-Or when the type has been defined after usage:
+Or you can create before/after map callbacks during mapping:
 
-```python
-from typing import Optional
-
-from pydantic import BaseModel, PydanticUserError
-
-
-class Foo(BaseModel):
-    a: Optional['Bar'] = None
-
-
-try:
-    # this doesn't work, see raised error
-    foo = Foo(a={'b': {'a': None}})
-except PydanticUserError as exc_info:
-    assert exc_info.code == 'class-not-fully-defined'
-
-
-class Bar(BaseModel):
-    b: 'Foo'
-
-
-# this works, though
-foo = Foo(a={'b': {'a': None}})
+```c#
+int i = 10;
+mapper.Map<Source, Dest>(src, opt => {
+    opt.BeforeMap((src, dest) => src.Value = src.Value + i);
+    opt.AfterMap((src, dest) => dest.Name = HttpContext.Current.Identity.Name);
+});
 ```
 
-For BaseModel subclasses, it can be fixed by defining the type and then calling `.model_rebuild()`:
+The latter configuration is helpful when you need contextual information fed into before/after map actions.
 
-```python
-from typing import Optional
+## Using `IMappingAction`
+You can encapsulate Before and After Map Actions into small reusable classes. Those classes need to implement the `IMappingAction<in TSource, in TDestination>` interface.
 
-from pydantic import BaseModel
+Using the previous example, here is an encapsulation of naming some objects "John":
 
+``` csharp
+public class NameMeJohnAction : IMappingAction<SomePersonObject, SomeOtherPersonObject>
+{
+    public void Process(SomePersonObject source, SomeOtherPersonObject destination, ResolutionContext context)
+    {
+        destination.Name = "John";
+    }
+}
 
-class Foo(BaseModel):
-    a: Optional['Bar'] = None
-
-
-class Bar(BaseModel):
-    b: 'Foo'
-
-
-Foo.model_rebuild()
-
-foo = Foo(a={'b': {'a': None}})
+var configuration = new MapperConfiguration(cfg => {
+  cfg.CreateMap<SomePersonObject, SomeOtherPersonObject>()
+    .AfterMap<NameMeJohnAction>();
+});
 ```
 
-In other cases, the error message should indicate how to rebuild the class with the appropriate type defined.
+### Dependency Injection
+You can't inject dependencies into `Profile` classes, but you can do it in `IMappingAction` implementations.
 
-## Custom JSON Schema {#custom-json-schema}
+The following example shows how to connect an `IMappingAction` accessing the current `HttpContext` to a `Profile` after map action, leveraging dependency injection:
 
-The `__modify_schema__` method is no longer supported in V2. You should use the `__get_pydantic_json_schema__` method instead.
+``` csharp
+public class SetTraceIdentifierAction : IMappingAction<SomeModel, SomeOtherModel>
+{
+    private readonly IHttpContextAccessor _httpContextAccessor;
 
-The `__modify_schema__` used to receive a single argument representing the JSON schema. See the example below:
+    public SetTraceIdentifierAction(IHttpContextAccessor httpContextAccessor)
+    {
+        _httpContextAccessor = httpContextAccessor ?? throw new ArgumentNullException(nameof(httpContextAccessor));
+    }
 
-```python {title="Old way"}
-from pydantic import BaseModel, PydanticUserError
+    public void Process(SomeModel source, SomeOtherModel destination, ResolutionContext context)
+    {
+        destination.TraceIdentifier = _httpContextAccessor.HttpContext.TraceIdentifier;
+    }
+}
 
-try:
-
-    class Model(BaseModel):
-        @classmethod
-        def __modify_schema__(cls, field_schema):
-            field_schema.update(examples=['example'])
-
-except PydanticUserError as exc_info:
-    assert exc_info.code == 'custom-json-schema'
+public class SomeProfile : Profile
+{
+    public SomeProfile()
+    {
+        CreateMap<SomeModel, SomeOtherModel>()
+            .AfterMap<SetTraceIdentifierAction>();
+    }
+}
 ```
 
-The new method `__get_pydantic_json_schema__` receives two arguments: the first is a dictionary denoted as `CoreSchema`,
-and the second a callable `handler` that receives a `CoreSchema` as parameter, and returns a JSON schema. See the example
-below:
+Everything is connected together by:
 
-```python {title="New way"}
-from typing import Any
-
-from pydantic_core import CoreSchema
+``` csharp
+public class Startup
+{
+    public void ConfigureServices(IServiceCollection services)
+    {
+        services.AddAutoMapper(typeof(Startup).Assembly);
+    }
+    //..
+}
+```

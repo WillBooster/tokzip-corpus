@@ -1,69 +1,350 @@
----
-c: Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
-SPDX-License-Identifier: curl
-Title: CURLMOPT_MAX_TOTAL_CONNECTIONS
-Section: 3
-Source: libcurl
-See-also:
-  - CURLMOPT_MAXCONNECTS (3)
-  - CURLMOPT_MAX_HOST_CONNECTIONS (3)
-Protocol:
-  - All
-Added-in: 7.30.0
----
+# 算出プロパティとウォッチ
 
-# NAME
+> この章では、[単一ファイルコンポーネント](../guide/single-file-component.html)記法を例として使用します。
 
-CURLMOPT_MAX_TOTAL_CONNECTIONS - max simultaneously open connections
+## 算出プロパティ
 
-# SYNOPSIS
+開発中に、他の状態に依存した状態が必要となることがあります。Vue では、これをコンポーネントの [算出プロパティ](computed.html#算出プロパティ) として処理します。算出プロパティの作成には、getter 関数を受け取り、関数の返り値に対して、イミュータブルでリアクティブな [ref](./reactivity-fundamentals.html#独立したリアクティブな値を-ref-として作成する) オブジェクトを返却する `computed` 関数を利用します。
 
-~~~c
-#include <curl/curl.h>
+```js
+const count = ref(1)
+const plusOne = computed(() => count.value + 1)
 
-CURLMcode curl_multi_setopt(CURLM *handle, CURLMOPT_MAX_TOTAL_CONNECTIONS,
-                            long amount);
-~~~
+console.log(plusOne.value) // 2
 
-# DESCRIPTION
+plusOne.value++ // error
+```
 
-Pass a long for the **amount**. The set number is used as the maximum number
-of simultaneously open connections in total using this multi handle. For each
-new session, libcurl might open a new connection up to the limit set by
-CURLMOPT_MAX_TOTAL_CONNECTIONS(3). When the limit is reached, new
-sessions are held pending until there are available connections. If
-CURLMOPT_PIPELINING(3) is enabled, libcurl can try multiplexing if the
-host is capable of it.
+または、`get` ならびに `set` 関数を用意することで、書き込み可能なオブジェクトを作成できます。
 
-When more transfers are added to the multi handle than what can be performed
-due to the set limit, they get queued up waiting for their chance. When that
-happens, the CURLOPT_TIMEOUT_MS(3) timeout is counted inclusive of the
-waiting time, meaning that if you set a too narrow timeout in such a case the
-transfer might never even start before it times out.
+```js
+const count = ref(1)
+const plusOne = computed({
+  get: () => count.value + 1,
+  set: val => {
+    count.value = val - 1
+  }
+})
 
-Even in the queued up situation, the CURLOPT_CONNECTTIMEOUT_MS(3)
-timeout is however treated as a per-connect timeout.
+plusOne.value = 1
+console.log(count.value) // 0
+```
 
-# DEFAULT
+### 算出プロパティのデバッグ <Badge text="3.2+" />
 
-0, which means that there is no limit. It is then simply controlled by the
-number of easy handles added.
+`computed` は 2 つ目の引数及び `onTrack` と `onTrigger` オプションにアクセスする:
 
-# %PROTOCOLS%
+- `onTrack` はリアクティブプロパティまた ref が依存関係として追跡する時に呼び出される。
+- `onTrigger` はウォッチャのコールバックが依存関係の変更上でトリガーされた時に呼び出される。
 
-# EXAMPLE
+両方のコールバックは依存情報を持つデバッグイベントを受け取ります。このコールバックにはインタラクティブに依存を確認ため `debugger` と言う表現を使う推奨します:
 
-~~~c
-int main(void)
-{
-  CURLM *m = curl_multi_init();
-  /* never do more than 15 connections */
-  curl_multi_setopt(m, CURLMOPT_MAX_TOTAL_CONNECTIONS, 15L);
+```js
+const plusOne = computed(() => count.value + 1, {
+  onTrack(e) {
+    // count.value を依存関係として追跡する場合にトリガーする
+    debugger
+  },
+  onTrigger(e) {
+    // count.value を変更される場合にトリガーする
+    debugger
+  }
+})
+
+// plusOne にアクセスされる場合に onTrack がトリガーする
+console.log(plusOne.value)
+
+// count.value を変更される場合に onTrigger がトリガーする
+count.value++
+```
+
+`onTrack` と `onTrigger` は開発モードのみに動作します。
+
+## `watchEffect`
+
+リアクティブの状態に応じて、作用を *自動的に適用しなおす* ために、`watchEffect` 関数を利用できます。これは依存関係をリアクティブにトラッキングし、変更されるたびに即座に関数を再実行します。
+
+```js
+const count = ref(0)
+
+watchEffect(() => console.log(count.value))
+// -> logs 0
+
+setTimeout(() => {
+  count.value++
+  // -> logs 1
+}, 100)
+```
+
+### 監視の停止
+
+`watchEffect` をコンポーネントの [setup()](composition-api-setup.html) 関数または [ライフサイクルフック](composition-api-lifecycle-hooks.html) の中で呼び出すと、ウォッチャはコンポーネントのライフサイクルにリンクされ、コンポーネントのアンマウント時に自動的に監視が停止します。
+
+その他のケースのため、明示的にウォッチャによる監視を停止するための stop ハンドルが返されます:
+
+```js
+const stop = watchEffect(() => {
+  /* ... */
+})
+
+// 処理後
+stop()
+```
+
+### 副作用の無効化
+
+ウォッチされている関数は、それが無効化された時（つまりは、該当の作用が完了する前に状態が変化した時）にクリーンアップする必要のある非同期の関数を実行することがあります。 watchEffect による関数は、コールバックを無効化するための `onInvalidate` 関数を受け取ることができます。この関数は以下の場合に呼び出されます:
+
+- 該当の作用が再度実行された場合
+- ウォッチャが停止した場合（例: `setup()` またはライフサイクルフックの中で `watchEffect` が使用されているコンポーネントがアンマウントされた時）
+
+```js
+watchEffect(onInvalidate => {
+  const token = performAsyncOperation(id.value)
+  onInvalidate(() => {
+    // ID が変更されたまたはウォッチャが停止した
+    // 以前に pending となった非同期の処理を無効にする
+    token.cancel()
+  })
+})
+```
+
+無効化するコールバックを直接返すのではなく、 `onInvalidate` 関数のコールバックを経由して登録しているのは、非同期のエラー処理では、返り値が非常に重要だからです。データ取得を行う時、作用となる関数が非同期であることは非常に一般的なことです:
+
+```js
+const data = ref(null)
+watchEffect(async onInvalidate => {
+  onInvalidate(() => {
+    /* ... */
+  }) // Promise の解決前にクリーンアップする関数を登録
+  data.value = await fetchData(props.id)
+})
+```
+
+非同期関数は暗黙的に Promise を返却しますが、 Promise が resolve される前にクリーンアップ関数を登録する必要があります。Vue は、 Promise チェーンにおける潜在的なエラーを自動的に処理するため、返却される Promise に依存しています。
+
+### 作用フラッシュのタイミング
+
+Vue のリアクティブシステムは、無効になった変更をバッファリングし、非同期に処理することによって、おなじ "tick" の中での複数の状態の変化に対して、不要な重複の呼び出しを避けることができています。内部的には、コンポーネントの `update` 関数も、監視されている作用の 1 つです。ユーザーによる作用がキューに入っている場合、デフォルトではすべてのコンポーネントの更新の **前に** 呼び出されます:
+
+```vue
+<template>
+  <div>{{ count }}</div>
+</template>
+
+<script>
+export default {
+  setup() {
+    const count = ref(0)
+
+    watchEffect(() => {
+      console.log(count.value)
+    })
+
+    return {
+      count
+    }
+  }
 }
-~~~
+</script>
+```
 
-# %AVAILABILITY%
+この例では:
 
-# RETURN VALUE
+- count は最初の実行時に同期的に記録されます。
+- `count` が変化した時、コンポーネントの **変更前** にコールバック関数が実行されます。
 
-Returns CURLM_OK if the option is supported, and CURLM_UNKNOWN_OPTION if not.
+コンポーネントの **更新後に** ウォッチャの作用を再実行する必要がある場合（例: [テンプレート参照](./composition-api-template-refs.md#テンプレート参照の監視) を使っている場合など）、追加の `options` オブジェクトを `flush` オプション（デフォルトは `'pre'`）と一緒に渡すことができます:
+
+```js
+// コンポーネントが更新された後に発火、更新された DOM にアクセスできる
+// Note: これにより、コンポーネントの最初のレンダリングが終了するまで、
+// 作用の初期実行も延期される。
+watchEffect(
+  () => {
+    /* ... */
+  },
+  {
+    flush: 'post'
+  }
+)
+```
+
+`flush` オプションは `'sync'` も指定できます。これは作用をいつも同期的に発火することを強制します。しかし、これは非効率的であって、ほとんど必要ないでしょう。
+
+Vue >= 3.2.0 では、`watchPostEffect` と `watchSyncEffect` のエイリアスを使って、コードの意図をより明確にすることもできます。
+
+### Watcher のデバッグ
+
+`onTrack` および `onTrigger` オプションは、ウォッチャの振る舞いのデバッグに利用できます。
+
+- `onTrack` はリアクティブプロパティもしくは ref が依存関係として追跡されているときに実行されます。
+- `onTrigger` は、依存関係の変更によって、ウォッチャコールバック関数がトリガされているときに実行されます。
+
+どちらのコールバックについても、問題の依存関係に関する情報を含むデバッガイベントを受け取ります。対話的に依存性を検査するために、これらのコールバックに `debugger` 文を記述することを推奨します:
+
+```js
+watchEffect(
+  () => {
+    /* 副作用を持つ処理 */
+  },
+  {
+    onTrigger(e) {
+      debugger
+    }
+  }
+)
+```
+
+`onTrack` および `onTrigger` は、開発モードでのみ動作します。
+
+## `watch`
+
+`watch` API は、コンポーネントの [watch](computed.html#ウォッチャ) プロパティと完全に同じものです。`watch` は特定のデータソースを監視し、別のコールバック関数内で副作用を適用する必要があります。また、デフォルトでは lazy となっています（つまり、監視しているデータソースが変更された場合に限り、コールバック関数が実行されます）。
+
+- [watchEffect](#watcheffect) と比較して、 `watch` は以下を可能とします:
+
+  - 作用の効率的な実行
+  - ウォッチャの再実行条件の明文化
+  - ウォッチされている状態に対しての、変更前後の値両方へのアクセス
+
+### 単一のデータソースの監視
+
+ウォッチャのデータソースは、 値を返す gettter 関数か、そのまま `ref` を渡すかになります:
+
+```js
+// watching a getter
+const state = reactive({ count: 0 })
+watch(
+  () => state.count,
+  (count, prevCount) => {
+    /* ... */
+  }
+)
+
+// directly watching a ref
+const count = ref(0)
+watch(count, (count, prevCount) => {
+  /* ... */
+})
+```
+
+### 複数のデータソースの監視
+
+ウォッチャは、配列を利用することで、複数のデータソースを同時に監視できます:
+
+```js
+const firstName = ref('')
+const lastName = ref('')
+
+watch([firstName, lastName], (newValues, prevValues) => {
+  console.log(newValues, prevValues)
+})
+
+firstName.value = 'John' // logs: ["John", ""] ["", ""]
+lastName.value = 'Smith' // logs: ["John", "Smith"] ["John", ""]
+```
+
+ただし、同じ関数内で監視しているソースの両方を同時に変更している場合には、ウォッチャは一度だけ実行されます:
+
+```js{9-13}
+setup() {
+  const firstName = ref('')
+  const lastName = ref('')
+
+  watch([firstName, lastName], (newValues, prevValues) => {
+    console.log(newValues, prevValues)
+  })
+
+  const changeValues = () => {
+    firstName.value = 'John'
+    lastName.value = 'Smith'
+    // logs: ["John", "Smith"] ["", ""]
+  }
+
+  return { changeValues }
+}
+```
+
+複数の同期的な変更は、ウォッチャを一度しか実行しないことには気をつけてください。
+
+`flush: 'sync'` 設定を使うことで、変更後に毎回実行するようウォッチャを強制することはできますが、通常はおすすめできません。代わりに、[nextTick](/api/global-api.html#nexttick) を使って、それ以上の変更をする前にウォッチャの実行を待つこともできます。例えば:
+
+```js
+const changeValues = async () => {
+  firstName.value = 'John' // logs: ["John", ""] ["", ""]
+  await nextTick()
+  lastName.value = 'Smith' // logs: ["John", "Smith"] ["John", ""]
+}
+```
+
+### リアクティブなオブジェクトの監視
+
+ウォッチャを使って、リアクティブな配列やオブジェクトの値を比較するには、値だけのコピーを作っておく必要があります。
+
+```js
+const numbers = reactive([1, 2, 3, 4])
+
+watch(
+  () => [...numbers],
+  (numbers, prevNumbers) => {
+    console.log(numbers, prevNumbers)
+  }
+)
+
+numbers.push(5) // logs: [1,2,3,4,5] [1,2,3,4]
+```
+
+深くネストしたオブジェクトや配列のプロパティの変更をチェックするには、やはり `deep` オプションを true にする必要があります:
+
+```js
+const state = reactive({
+  id: 1,
+  attributes: {
+    name: ''
+  }
+})
+
+watch(
+  () => state,
+  (state, prevState) => {
+    console.log('not deep', state.attributes.name, prevState.attributes.name)
+  }
+)
+
+watch(
+  () => state,
+  (state, prevState) => {
+    console.log('deep', state.attributes.name, prevState.attributes.name)
+  },
+  { deep: true }
+)
+
+state.attributes.name = 'Alex' // Logs: "deep" "Alex" "Alex"
+```
+
+しかし、リアクティブなオブジェクトや配列を監視すると、そのオブジェクトの状態の現在値と前回値の両方について参照が常に返されます。深くネストされたオブジェクトや配列を完全に監視するためには、値のディープコピーが必要な場合があります。これは [lodash.cloneDeep](https://lodash.com/docs/4.17.15#cloneDeep) のようなユーティリティで実現できます。
+
+```js
+import _ from 'lodash'
+
+const state = reactive({
+  id: 1,
+  attributes: {
+    name: ''
+  }
+})
+
+watch(
+  () => _.cloneDeep(state),
+  (state, prevState) => {
+    console.log(state.attributes.name, prevState.attributes.name)
+  }
+)
+
+state.attributes.name = 'Alex'; // Logs: "Alex" ""
+```
+
+### `watchEffect` との振る舞いの共有
+
+`watch` は [明示的な停止](#監視の停止)、[副作用の無効化](#副作用の無効化)（代わりに第三引数に `onInvalidate` を渡すことになります）、[作用フラッシュのタイミング](#作用フラッシュのタイミング) ならびに [デバッグ手法](#watcher-のデバッグ) についての挙動を [`watchEffect`](#watcheffect) と共有しています。

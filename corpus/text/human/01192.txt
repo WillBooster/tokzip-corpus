@@ -1,180 +1,164 @@
-<div class="hidden-warning"><a href="https://docs.haskellstack.org/"><img src="https://cdn.jsdelivr.net/gh/commercialhaskell/stack/doc/img/hidden-warning.svg"></a></div>
+---
+sidebar_position: 1
+---
 
-# Docker images
+# Built for OLTP
 
-Each Stackage LTS release has two corresponding docker images in the
-[fpco/stack-build](https://hub.docker.com/r/fpco/stack-build/) and
-[fpco/stack-build-small](https://hub.docker.com/r/fpco/stack-build-small/)
-repositories. The former contains every system library needed to build any
-package in the snapshot, while the latter only contains a minimal set of system
-libraries for basic programs.
+Online Transaction Processing (OLTP) is about recording business transactions in real-time. This
+could be payments, sales, car sharing rides, or API usage.
 
-The Dockerfiles for building these images are in
-[stackage/automated/dockerfiles](https://github.com/commercialhaskell/stackage/tree/master/automated/dockerfiles/).
-There is also a
-[build.sh](https://github.com/commercialhaskell/stackage/tree/master/automated/dockerfiles/build.sh)
-script to help with building and pushing the images (see the
-[README](https://github.com/commercialhaskell/stackage/tree/master/automated/dockerfiles/README.md)
-for usage instructions).
+For the last 20-30 years, OLTP has been handled by general purpose databases like PostgreSQL, MySQL,
+and SQLite, which we refer to as Online General Purpose (OLGP) databases. However, general purpose
+databases struggle to keep up with the extreme write contention of growing OLTP workloads today,
+which have increased by 3-4 orders of magnitude in the last 10 years alone.
 
-## Build images for new minor LTS snapshot
+For example:
 
-In most cases, a new minor LTS snapshot just needs the previous LTS image to be
-re-tagged and pushed. If the image needs a patch for the new minor LTS snapshot,
-see the next section.
+- In 2019, the UPI real-time payments switch in India processed 10 billion payments. In the month of
+  January 2024 alone, the switch processed 12 billion payments.
+- With the moves to cleaner energy and smart metering, energy is being traded by the Kilowatt-hour
+  and billed to customers every 15 or 30 minutes rather than at the end of the month.
+- Serverless APIs charge for usage by the second or per-request, rather than per month. (Today,
+  serverless billing at scale is often implemented using MapReduce, which makes it difficult or
+  impossible to offer customers real-time spending caps.)
 
-Below, replace `<N>.<M>` with the minor LTS snapshot version.
+**TigerBeetle is built to handle the scale of OLTP workloads today and for the decades to come.** It
+works well alongside a general purpose database. The latter holds data that isn't updated very
+frequently, such as account metadata, while TigerBeetle can race ahead processing transactions and
+giving your system unparalleled latency and throughput.
 
-- Check out the `stable` branch of the
-  [Stack repository](https://github.com/commercialhaskell/stack/).
+## OLTP Requires High Performance
 
-- Build and push the images (both standard and `small` variants) using the
-  [build.sh](https://github.com/commercialhaskell/stackage/tree/master/automated/dockerfiles/build.sh)
-  script:
+Transaction processing is the core of most business' software, which makes it the bottleneck for
+increasing sales, processing payments, or serving API requests faster.
 
-    ~~~text
-    ./build.sh --push lts-<N>.<M>
-    ./build.sh --push --small lts-<N>.<M>
-    ~~~
+Because performance is so critical, it is common for companies to put caches like Redis in front of
+a general purpose database to try to offload and speed up some types of queries. However, caching
+brings its own set of headaches and does not help for write-heavy workloads.
 
-## Patch images for new minor LTS snapshot
+At their core, the majority of general purpose databases use a B-Tree data structure, which is meant
+for a combination of reads and writes. But OLTP is write-heavy. Each transaction coming in needs to
+be inserted and update state such as an account balance.
 
-Below, replace `<N>.<M>` with the minor LTS snapshot version. and `<N>.<M-1>`
-with the previous minor LTS snapshot version.
+Log-Structured Merge (LSM) Trees are optimized for write-heavy workloads. TigerBeetle uses LSM
+Trees, along with a number of other building blocks, to create a database that can handle the scale
+of OLTP today and for the next decades.
 
-- Check out the `stable` branch of the
-  [Stack repository](https://github.com/commercialhaskell/stack/).
+Read more about [TigerBeetle's performance](./performance.md).
 
-- In `stackage/automated/dockerfiles`, create a new `lts-<N>.<M>` directory.
+### Business Transactions Don't Shard Well
 
-- Create `lts-<N>.<M>/Dockerfile`, starting with:
+Two of the main ways of scaling OLTP and billing systems today are sharding and MapReduce. However,
+both of these present problems.
 
-    ~~~dockerfile
-    FROM $DOCKER_REPO:lts-<N>.<M-1>
-    ~~~
+You could try to separate different groups of accounts into separate database clusters.
+Unfortunately, most accounting systems tend to have a few very hot accounts that are involved in a
+large number of transactions. For example, those representing the service operator's assets,
+liabilities, or income. You can shard accounts, but contention and row locks on the hot accounts
+become the bottleneck.
 
-- Add layers for any changes that need to be made to the image.
+Alternatively, certain types of very high-volume transaction systems like billing for serverless
+usage might use MapReduce to total the balances after the fact. However, this makes it extremely
+difficult to implement anything like real-time spending caps or live account balance views for
+users.
 
-- Build the new image using the
-  [build.sh](https://github.com/commercialhaskell/stackage/tree/master/automated/dockerfiles/build.sh)
-  script:
+TigerBeetle is designed to squeeze the maximum amount of transaction processing power out of the
+leader node, giving you financial consistency at massive scale.
 
-    ~~~text
-    ./build.sh lts-<N>.<M>
-    ./build.sh --small lts-<N>.<M>
-    ~~~
+## OLTP Requires Strong Safety and Availability Guarantees
 
-- Test the new image. For example, command:
+Transaction processing also requires strong safety guarantees to ensure that data cannot be lost,
+and high availability to ensure that money is not lost due to database downtime.
 
-    ~~~text
-    stack --snapshot=lts-<N>.<M> new image-test
-    cd image-test
-    stack --docker build
-    ~~~
+TigerBeetle takes a unique approach to safety and availability. It is designed to be run in a
+fault-tolerant cluster by default -- without needing a separate add-on or proprietary
+implementation. It supports automatic failover in the same package to keep your service running
+smoothly.
 
-  This should use the image you just built. Make sure you test that the new
-  image actually contains the desired changes.
+TigerBeetle is also built in a unique way that sets it apart from other OLTP databases. It is
+[written in Zig](./zig.md) instead of C or C++, uses
+[static memory allocation](https://tigerbeetle.com/blog/a-database-without-dynamic-memory), imposes
+strict limits on everything it does, and makes heavy use of
+[assertions](https://tigerbeetle.com/blog/2023-12-27-it-takes-two-to-contract) and
+[simulation testing](https://tigerbeetle.com/blog/2023-07-06-simulation-testing-for-liveness) to
+check that code behaves exactly as expected.
 
-- Follow the process in the previous section to push the images.
+Importantly, TigerBeetle is one of the only OLTP databases that was designed to handle storage
+faults. Research on how storage faults affect databases only came out in 2018
+(["fsyncgate 2018"](https://danluu.com/fsyncgate/)), and TigerBeetle was built from the ground up
+with these lessons in mind. TigerBeetle uses cryptographic hash chains to detect storage faults, it
+supports [Protocol-Aware Recovery](https://www.usenix.org/conference/fast18/presentation/alagappan),
+and uses a deterministic on-disk format to speed up the cluster's recovery.
 
-## Build images for new major LTS snapshot release
+Read more about TigerBeetle's approach to [safety](./safety.md).
 
-### Test a Dockerfile prior to new major LTS snapshot release
+## The "Who, What, When, Where, Why, and How Much" of OLTP
 
-Replace `<N>` with major version of new LTS snapshot, and `<N-1>` with previous
-major LTS snapshot version.
+OLTP and business transactions tend to record the same types of information:
 
-- Check out the `stable` branch of the
-  [Stack repository](https://github.com/commercialhaskell/stack/).
+- **Who**: which accounts are transacting?
+- **What**: what type of asset or value is moving?
+- **When**: when was the transaction initiated or when was it finalized?
+- **Where**: where in the world did the transaction take place?
+- **Why**: what type of transaction is this or why is it happening?
+- **How Much**: what quantity of the asset or items was moved?
 
-- In `stackage/automated/dockerfiles`, create a new `lts-<N>.0` directory.
+While SQL is a great query language for getting data out, OLTP is primarily about getting data in
+and this is where SQL falls short. It is **very common for a single business transaction to require
+multiple SQL queries (on the order of 10 SQL queries per transaction)** and potentially even
+multiple round-trips from the application to the database.
 
-- Copy `lts-<N-1>.0/Dockerfile` to `lts-<N>.0/Dockerfile`.
+With TigerBeetle, these fields are already built into the schema and ready for you to use:
 
-- Check the `FROM` statement, make sure the Ubuntu version matches the Ubuntu
-  version used in the
-  [Stackage Dockerfile](https://github.com/commercialhaskell/stackage/blob/master/Dockerfile).
+- **Who**: the [`debit_account_id`](../reference/transfer.md#debit_account_id) and
+  [`credit_account_id`](../reference/transfer.md#credit_account_id) indicate which accounts are
+  transacting.
+- **What**: each asset or type of value in TigerBeetle is tracked on a separate
+  [ledger](../coding/data-modeling.md#ledgers). The [`ledger`](../reference/transfer.md#ledger)
+  field indicates what is being transferred.
+- **When**: each transfer has a unique [`timestamp`](../reference/transfer.md#timestamp) for when it
+  is processed by the cluster, but you can add another timestamp representing when the transaction
+  happened in the real world in the [`user_data_64`](../reference/transfer.md#user_data_64) field.
+- **Where**: the [`user_data_32`](../reference/transfer.md#user_data_32) can be used to store the
+  locale where the transfer occurred.
+- **Why**: the [`code`](../reference/transfer.md#code) field stores the reason a transfer occurred
+  and should map to an enum or table of all the possible business events.
+- **How Much**: the [`amount`](../reference/transfer.md#amount) indicates how much of the asset or
+  item is being transferred.
 
-- Update `GHC_VERSION` to match the version used by the
-  [latest nightly snapshot](https://www.stackage.org/nightly).
+For centuries, this information has been modeled as debits and credits, and double-entry bookkeeping
+has been the language of business since it was invented over 1000 years ago. TigerBeetle takes this
+tried-and-true schema and adds the performance and safety we need for OLTP in the 21st century.
 
-- Set `LTS_SLUG` to the
-  [latest nightly snapshot](https://www.stackage.org/nightly) (this will be
-  temporary until the major LTS snapshot is actually released, at which point it
-  will be updated to `lts-<N>.0`).
+By implementing double-entry accounting primitives directly in the database, TigerBeetle gives you
+unmatched financial consistency (on top of data consistency). Every transaction comes from one
+account and goes to another, ensuring that money is always accounted for. Furthermore, TigerBeetle
+keeps an immutable record of business events and entities, ensuring that transactions and balances
+are fully auditable.
 
-- Update `PID1_VERSION` and `STACK_VERSION` to the latest versions of those
-  tools.
+## TigerBeetle in the Hot Path
 
-- Make sure `CUDA_VERSION` and `JVM_PATH` match what
-  [debian-bootstrap.sh](https://github.com/commercialhaskell/stackage/blob/master/debian-bootstrap.sh)
-  uses.
+You can think about the relationship between TigerBeetle and a general purpose database as the
+difference between the _data plane_ and _control plane_.
 
-- Update `LLVM_PATH` to the version required for the GHC version. This will be
-  shown on the download page for the GHC version, which you can reach from
-  https://www.haskell.org/ghc/. It should match the base directory used in
-  `CLANG_PURE_LLVM_INCLUDE_DIR` in
-  [debian-bootstrap.sh](https://github.com/commercialhaskell/stackage/blob/master/debian-bootstrap.sh)
-  (leaving off the `/include` suffix).
+In routing internet packets, the data plane refers to everything involved in moving IP packets in
+real-time. The control plane determines the network topology and makes decisions for how packets
+should be routed. The data plane must be as fast and efficient as possible, whereas the control
+plane does not need to be touched as frequently.
 
-- Update `BOOTSTRAP_COMMIT` to the Git commit ID of the latest
-  [debian-bootstrap.sh](https://github.com/commercialhaskell/stackage/blob/master/debian-bootstrap.sh).
+TigerBeetle is designed to be in the hot path of your system, processing every transaction in
+real-time. You can have a [stateless API service](../coding/system-architecture.md) construct and
+batch transfers to send to TigerBeetle.
 
-- Check for any other `lts-<N>.*/Dockerfile`s and make sure
-  `lts-<N>.0/Dockerfile` includes anything that was updated in those, if they're
-  still relevant for LTS-15 (note that a newer
-  [debian-bootstrap.sh](https://github.com/commercialhaskell/stackage/blob/master/debian-bootstrap.sh)
-  may already include those changes, so check there first).
+Metadata, such as account details or infrequently changed ledger details, can be stored in a general
+purpose database. Note, however, that it is important not to build your system such that it loads
+the metadata on every transfer, because that would put the slower-moving general purpose database
+back in the hot path.
 
-### Perform basic tests
+## Conclusion: Accelerating OLTP for the Next Decades
 
-- Build the image: `docker build -t local/stack-build lts-<N>.0/`.
-
-- Ensure that all the directories listed in `PATH`, `CUDA_PATH`, and `CPATH` and
-  any other path-like environment variables actually exist in the image.
-
-- Try building a test package with the new image. Command:
-
-    ~~~text
-    stack --snapshot=nightly new image-test`
-    cd image-test
-    stack --docker --docker-image=local/stack-build build
-    ~~~
-
-  This should build without needing to install GHC.
-
-- Build the "small" variant. Command:
-
-    ~~~text
-    docker build -t local/stack-build-small --build-arg "VARIANT=small" lts-<N>.0/
-    ~~~
-
-- Try building a test package with the new small image. Command:
-
-    ~~~text
-    stack --snapshot=nightly new small-image-test
-    cd small-image-test
-    stack --docker --docker-image=local/stack-build-small build
-    ~~~
-
-  This should build without needing to install GHC.
-
-### Build real image once major LTS snapshot has been released
-
-- Update `LTS_SLUG` to `lts-<N>.0`
-
-- Update `BOOTSTRAP_COMMIT` to the git commit ID of the latest
-  [debian-bootstrap.sh](https://github.com/commercialhaskell/stackage/blob/master/debian-bootstrap.sh).
-
-- Repeat the tests above, except use `lts-<N>.0` instead of `nightly`.
-
-- Build and push the real images (both standard and `small` variants) using the
-  [build.sh](https://github.com/commercialhaskell/stackage/tree/master/automated/dockerfiles/build.sh)
-  script:
-
-    ~~~text
-    ./build.sh --push lts-<N>.0
-    ./build.sh --push --small lts-<N>.0
-    ~~~
-
-- Commit and push the new Dockerfile to the `stable` branch.
+Building your application on TigerBeetle gives you unmatched transaction processing power.
+TigerBeetle provides a fixed schema that maps naturally on to the who, what, when, where, why, and
+how much of business transactions. And it is built to handle write-heavy and high-contention
+workloads at high performance and with strong safety guarantees. TigerBeetle can help you build your
+application correctly today, and it can handle the scale as your business grows.
