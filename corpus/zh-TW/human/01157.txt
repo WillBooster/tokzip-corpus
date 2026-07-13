@@ -1,0 +1,223 @@
+In Express, the middleware that manages Session is [express-session](https://github.com/expressjs/session), and the sample code looks like this (rewritten from the official website example):
+
+``` js
+const express = require('express')
+const session = require('express-session')
+  
+const app = express()
+const port = 5001
+  
+// 使用 session middleware
+app.use(session({
+  secret: 'keyboard cat'
+}))
+   
+app.get('/', function(req, res, next) {
+  
+  // 可以用 req.session 拿取存在 session 的值
+  // 這邊判斷有沒有 req.session.views
+  // 如果有的話就 +1，反之初始化成 1
+  // 所以 req.session 可讀也可寫
+  if (req.session.views) {
+    req.session.views++
+    res.write('views: ' + req.session.views)
+    res.end()
+  } else {
+    req.session.views = 1
+    res.end('welcome to the session demo. refresh!')
+  }
+})
+  
+app.listen(port, () => {
+  console.log(`Example app listening on port ${port}!`)
+})
+```
+
+After using the session middleware, you can directly use `req.session.key` to access the information you want. The same variable can be written and read, which is similar to PHP's $_SESSION.
+
+Next, let's take a look at the express-session code! The main code is in [index.js](https://github.com/expressjs/session/blob/master/index.js), which is about 700 lines long and is unlikely to be explained line by line.
+
+And well-written libraries will spend a lot of effort on backward compatibility and data validity checks, which are some more trivial and less helpful things for understanding mechanisms.
+
+So I will simply organize the code, remove less important parts, and reorganize the code, and only select relevant paragraphs.
+
+We will focus on three key points:
+
+1. How sessionID is generated
+2. How sessionID is stored
+3. How session information is stored
+
+Let's take a look at where sessionID is generated first:
+
+``` js
+// get the session id generate function
+var generateId = opts.genid || generateSessionId
+  
+// generates the new session
+store.generate = function(req){
+  req.sessionID = generateId(req);
+  req.session = new Session(req);
+  req.session.cookie = new Cookie(cookieOptions);
+  
+  if (cookieOptions.secure === 'auto') {
+    req.session.cookie.secure = issecure(req, trustProxy);
+  }
+};
+  
+function generateSessionId(sess) {
+  return uid(24);
+}
+```
+
+The customizability of `express-session` is high, as you can pass in your own function to generate the sessionID. If not passed, it defaults to using `uid(24)`, where `uid` refers to the [uid-safe](https://github.com/crypto-utils/uid-safe) library, which generates a random ID of length 24 bytes.
+
+The documentation specifically mentions this length:
+
+> Asynchronously create a UID with a specific byte length. Because base64 encoding is used underneath, this is not the string length. For example, to create a UID of length 24, you want a byte length of 18.
+
+So if you input 24, the resulting string will have a length of 32 characters.
+
+So how is this sessionID stored in a cookie?
+
+``` js
+var cookie = require('cookie')
+var signature = require('cookie-signature')
+  
+// get the session cookie name
+var name = opts.name || opts.key || 'connect.sid'
+  
+// get the cookie signing secret
+var secret = opts.secret
+  
+if (secret && !Array.isArray(secret)) {
+  secret = [secret];
+}
+  
+// set-cookie
+onHeaders(res, function(){
+  
+  // set cookie
+  setcookie(res, name, req.sessionID, secrets[0], req.session.cookie.data);
+});
+  
+function setcookie(res, name, val, secret, options) {
+  var signed = 's:' + signature.sign(val, secret);
+  var data = cookie.serialize(name, signed, options);
+  
+  debug('set-cookie %s', data);
+  
+  var prev = res.getHeader('Set-Cookie') || []
+  var header = Array.isArray(prev) ? prev.concat(data) : [prev, data];
+  
+  res.setHeader('Set-Cookie', header)
+}
+```
+
+The key for the sessionID stored in the cookie can also be specified, but the default is `connect.sid`, so when you see this key, you know it is the default sessionID name for `express-session`.
+
+The content is a bit special, starting with `s:` followed by the result of `signature.sign(sessionID, secret)`.
+
+Here, we need to look at the [cookie-signature](https://github.com/tj/node-cookie-signature) library, with a simple example below:
+
+``` js
+var cookie = require('cookie-signature');
+  
+var val = cookie.sign('hello', 'tobiiscool');
+val.should.equal('hello.DGDUkGlIkCzPz+C0B064FNgHdEjox7ch8tOBGslZ5QI');
+```
+
+What does the `sign` function do? The source code is simple:
+
+``` js
+var crypto = require('crypto');
+  
+/**
+ * Sign the given `val` with `secret`.
+ *
+ * @param {String} val
+ * @param {String} secret
+ * @return {String}
+ * @api private
+ */
+  
+exports.sign = function(val, secret){
+  if ('string' != typeof val) throw new TypeError("Cookie value must be provided as a string.");
+  if ('string' != typeof secret) throw new TypeError("Secret string must be provided.");
+  return val + '.' + crypto
+    .createHmac('sha256', secret)
+    .update(val)
+    .digest('base64')
+    .replace(/\=+$/, '');
+};
+```
+
+It simply generates a [digest](https://en.wikipedia.org/wiki/Cryptographic_hash_function) using hmac-sha256 for the content to be signed, and appends it to the end of the string, with `.` used to separate the data.
+
+If you don't know what hmac is, it is simply a way to generate a digest for a message, to ensure data integrity and prevent tampering. You can think of it as a unique code corresponding to the message. If the message is changed, the code will also be different.
+
+In the example above, `hello` is signed using the `tobiiscool` secret, resulting in `DGDUkGlIkCzPz+C0B064FNgHdEjox7ch8tOBGslZ5QI`. The complete string becomes `hello.DGDUkGlIkCzPz+C0B064FNgHdEjox7ch8tOBGslZ5QI`, with my data in front and the digest at the end.
+
+If someone tries to tamper with the data, such as changing the front to `hello2`, the digest will not match the new data, and I will know that someone has tampered with the data. Therefore, this method is used to ensure data integrity, and the principle is similar to [JWT](https://jwt.io/). You can see the data, but you cannot change it, because any changes will be detected.
+
+You may wonder: why not encrypt the entire sessionID? Why use this method? I guess it's because the original data is not afraid of being seen by others, but only afraid of being changed. If the original data is sensitive information, encryption will be used. However, since the original data is only the sessionID, it doesn't matter if it is seen by others, as long as data integrity is ensured. Moreover, encryption requires more system resources than this message verification, so this method is used.
+
+So, going back to the beginning, `express-session` stores the sessionID in a cookie, with the key being `connect.sid`, and the value being `s:{sessionID}.{hmac-sha256(sessionID, secret)}`.
+
+If you are curious, you can go to any website that uses Express and check the cookie content to find the actual data (or run one yourself). Here's an example using my own: my `connect.sid` is `s%3AfZZVCDHefchle2LDK4PzghaR3Ao9NruG.J%2BsOPkTubkeMJ4EMBcnunPXW0Y7TWTucRSKIPNVgnRM`, which becomes `s:fZZVCDHefchle2LDK4PzghaR3Ao9NruG.J+sOPkTubkeMJ4EMBcnunPXW0Y7TWTucRSKIPNVgnRM` after decoding special characters.
+
+In other words, my sessionID is `fZZVCDHefchle2LDK4PzghaR3Ao9NruG`, and the authentication code is `J+sOPkTubkeMJ4EMBcnunPXW0Y7TWTucRSKIPNVgnRM`.
+
+After knowing how to store the sessionID, it should be easy to understand how to retrieve it from the cookie by simply reversing the process:
+
+``` js
+// get the session ID from the cookie
+var cookieId = req.sessionID = getcookie(req, name, secrets);
+  
+function getcookie(req, name, secrets) {
+  var header = req.headers.cookie;
+  var raw;
+  var val;
+  
+  // read from cookie header
+  if (header) {
+    var cookies = cookie.parse(header);
+  
+    raw = cookies[name];
+  
+    if (raw) {
+      if (raw.substr(0, 2) === 's:') {
+        val = unsigncookie(raw.slice(2), secrets);
+
+        if (val === false) {
+          debug('cookie signature invalid');
+          val = undefined;
+        }
+      } else {
+        debug('cookie unsigned')
+      }
+    }
+  }
+  
+  return val;
+}
+  
+/**
+ * Verify and decode the given `val` with `secrets`.
+ *
+ * @param {String} val
+ * @param {Array} secrets
+ * @returns {String|Boolean}
+ * @private
+ */
+function unsigncookie(val, secrets) {
+  for (var i = 0; i < secrets.length; i++) {
+    var result = signature.unsign(val, secrets[i]);
+  
+    if (result !== false) {
+      return result;
+    }
+  }
+  
+  return false;
+}
+```

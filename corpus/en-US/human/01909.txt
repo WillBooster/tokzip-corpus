@@ -1,0 +1,552 @@
+These templates are what the `Character` class will use to instantiate each
+character with their unique traits. The LLM will use these traits to generate
+responses that are consistent with each character's personality and backstory.
+
+## Build the Game Manager
+
+The Game Manager coordinates characters and maintains game state. Create
+`src/game/GameManager.ts`:
+
+```typescript title="src/game/GameManager.ts"
+import { Character } from "./Character.ts";
+import { LLMProvider } from "../llm/LLMProvider.ts";
+
+export interface GameState {
+  id: string;
+  gmPrompt: string;
+  characters: Character[];
+  messages: GameMessage[];
+  currentTurn: number;
+  isActive: boolean;
+  createdAt: Date;
+}
+
+export interface GameMessage {
+  id: string;
+  speaker: string;
+  message: string;
+  timestamp: Date;
+  type: "gm" | "character" | "system";
+}
+
+export interface StartGameRequest {
+  gmPrompt: string;
+  characters: Array<{
+    name: string;
+    class: string;
+    personality: string;
+  }>;
+}
+
+export class GameManager {
+  private games: Map<string, GameState> = new Map();
+  private llmProvider: LLMProvider;
+
+  constructor() {
+    this.llmProvider = new LLMProvider();
+  }
+
+  async startNewGame(
+    gmPrompt: string,
+    characterConfigs: StartGameRequest["characters"],
+  ): Promise<string> {
+    const gameId = crypto.randomUUID();
+
+    // Create characters with their LLM personalities
+    const characters = characterConfigs.map((config) =>
+      new Character(
+        config.name,
+        config.class,
+        config.personality,
+        this.llmProvider,
+      )
+    );
+
+    const gameState: GameState = {
+      id: gameId,
+      gmPrompt,
+      characters,
+      messages: [],
+      currentTurn: 0,
+      isActive: true,
+      createdAt: new Date(),
+    };
+
+    this.games.set(gameId, gameState);
+
+    // Add initial system message
+    this.addMessage(gameId, {
+      speaker: "System",
+      message: `Game started! Players: ${
+        characters.map((c) => c.name).join(", ")
+      }`,
+      type: "system",
+    });
+
+    console.log(`New game started: ${gameId}`);
+    return gameId;
+  }
+
+  async handlePlayerMessage(
+    gameId: string,
+    message: string,
+  ): Promise<GameMessage[]> {
+    const game = this.games.get(gameId);
+    if (!game || !game.isActive) {
+      throw new Error("Game not found or inactive");
+    }
+
+    // Add player message
+    this.addMessage(gameId, {
+      speaker: "Player",
+      message,
+      type: "gm",
+    });
+
+    // Generate responses from each character
+    const responses: GameMessage[] = [];
+
+    for (const character of game.characters) {
+      try {
+        const context = this.buildContext(game);
+        const response = await character.generateResponse(context, message);
+
+        const characterMessage = this.addMessage(gameId, {
+          speaker: character.name,
+          message: response,
+          type: "character",
+        });
+
+        responses.push(characterMessage);
+
+        // Small delay between character responses for realism
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      } catch (error) {
+        console.error(`Error getting response from ${character.name}:`, error);
+      }
+    }
+
+    game.currentTurn++;
+    return responses;
+  }
+
+  private buildContext(game: GameState): string {
+    const recentMessages = game.messages.slice(-5);
+    const context = [
+      `Scenario: ${game.gmPrompt}`,
+      `Current turn: ${game.currentTurn}`,
+      "Recent events:",
+      ...recentMessages.map((m) => `${m.speaker}: ${m.message}`),
+    ].join("\n");
+
+    return context;
+  }
+
+  private addMessage(
+    gameId: string,
+    messageData: Omit<GameMessage, "id" | "timestamp">,
+  ): GameMessage {
+    const game = this.games.get(gameId);
+    if (!game) throw new Error("Game not found");
+
+    const message: GameMessage = {
+      id: crypto.randomUUID(),
+      timestamp: new Date(),
+      ...messageData,
+    };
+
+    game.messages.push(message);
+    return message;
+  }
+
+  getGame(gameId: string): GameState | undefined {
+    return this.games.get(gameId);
+  }
+
+  getActiveGames(): string[] {
+    return Array.from(this.games.entries())
+      .filter(([_, game]) => game.isActive)
+      .map(([id, _]) => id);
+  }
+
+  endGame(gameId: string): boolean {
+    const game = this.games.get(gameId);
+    if (game) {
+      game.isActive = false;
+      console.log(`Game ended: ${gameId}`);
+      return true;
+    }
+    return false;
+  }
+}
+```
+
+The game manager will handle all game-related logic, including starting new
+games, processing player messages, and managing game state. When a player sends
+a message, the game manager will route it to the appropriate character for
+response generation.
+
+## Add WebSocket Support
+
+Real-time communication makes the roleplay experience more engaging. Create
+`src/server/WebSocketHandler.ts`:
+
+```typescript title="src/server/WebSocketHandler.ts"
+import { GameManager } from "../game/GameManager.ts";
+
+export interface WebSocketMessage {
+  type: "start_game" | "send_message" | "join_game" | "get_game_state";
+  gameId?: string;
+  data?: any;
+}
+
+export class WebSocketHandler {
+  private gameManager: GameManager;
+  private connections: Map<string, WebSocket> = new Map();
+
+  constructor(gameManager: GameManager) {
+    this.gameManager = gameManager;
+  }
+
+  handleConnection(request: Request): Response {
+    const { socket, response } = Deno.upgradeWebSocket(request);
+
+    const connectionId = crypto.randomUUID();
+    this.connections.set(connectionId, socket);
+
+    socket.onopen = () => {
+      console.log(`WebSocket connection opened: ${connectionId}`);
+      this.sendMessage(socket, {
+        type: "connection",
+        data: { connectionId, message: "Connected to LLM Chat server" },
+      });
+    };
+
+    socket.onmessage = async (event) => {
+      try {
+        const message: WebSocketMessage = JSON.parse(event.data);
+        await this.handleMessage(socket, message);
+      } catch (error) {
+        console.error("Error handling WebSocket message:", error);
+        this.sendError(socket, "Invalid message format");
+      }
+    };
+
+    socket.onclose = () => {
+      console.log(`WebSocket connection closed: ${connectionId}`);
+      this.connections.delete(connectionId);
+    };
+
+    socket.onerror = (error) => {
+      console.error(`WebSocket error for ${connectionId}:`, error);
+    };
+
+    return response;
+  }
+
+  private async handleMessage(socket: WebSocket, message: WebSocketMessage) {
+    switch (message.type) {
+      case "start_game":
+        await this.handleStartGame(socket, message.data);
+        break;
+      case "send_message":
+        await this.handleSendMessage(socket, message);
+        break;
+      case "get_game_state":
+        await this.handleGetGameState(socket, message.gameId!);
+        break;
+      default:
+        this.sendError(socket, `Unknown message type: ${message.type}`);
+    }
+  }
+
+  private async handleStartGame(socket: WebSocket, data: any) {
+    try {
+      const { gmPrompt, characters } = data;
+      const gameId = await this.gameManager.startNewGame(gmPrompt, characters);
+
+      this.sendMessage(socket, {
+        type: "game_started",
+        data: {
+          gameId,
+          message:
+            "Game started successfully! You can now send messages to interact with your characters.",
+        },
+      });
+    } catch (error) {
+      this.sendError(socket, `Failed to start game: ${error.message}`);
+    }
+  }
+
+  private async handleSendMessage(
+    socket: WebSocket,
+    message: WebSocketMessage,
+  ) {
+    try {
+      const { gameId, data } = message;
+      if (!gameId) {
+        this.sendError(socket, "Game ID required");
+        return;
+      }
+
+      const responses = await this.gameManager.handlePlayerMessage(
+        gameId,
+        data.message,
+      );
+
+      this.sendMessage(socket, {
+        type: "character_responses",
+        data: { gameId, responses },
+      });
+    } catch (error) {
+      this.sendError(socket, `Failed to process message: ${error.message}`);
+    }
+  }
+
+  private async handleGetGameState(socket: WebSocket, gameId: string) {
+    try {
+      const game = this.gameManager.getGame(gameId);
+      if (!game) {
+        this.sendError(socket, "Game not found");
+        return;
+      }
+
+      this.sendMessage(socket, {
+        type: "game_state",
+        data: {
+          gameId,
+          characters: game.characters.map((c) => c.getCharacterInfo()),
+          messages: game.messages.slice(-10), // Last 10 messages
+          isActive: game.isActive,
+        },
+      });
+    } catch (error) {
+      this.sendError(socket, `Failed to get game state: ${error.message}`);
+    }
+  }
+
+  private sendMessage(socket: WebSocket, message: any) {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(message));
+    }
+  }
+
+  private sendError(socket: WebSocket, error: string) {
+    this.sendMessage(socket, {
+      type: "error",
+      data: { error },
+    });
+  }
+}
+```
+
+Here we set up the WebSocket server to handle connections and messages.
+Websockets allow for real-time communication between the client and server,
+making them ideal for interactive applications like a chat app, or game. We send
+messages back and forth between the client and server to keep the game state in
+sync.
+
+## Create the main server
+
+Now let's tie everything together in `main.ts`:
+
+```typescript title="main.ts"
+import { GameManager } from "./src/game/GameManager.ts";
+import { WebSocketHandler } from "./src/server/WebSocketHandler.ts";
+import { defaultCharacters } from "./src/config/characters.ts";
+
+const gameManager = new GameManager();
+const wsHandler = new WebSocketHandler(gameManager);
+
+async function handler(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+
+  // Handle WebSocket connections
+  if (req.headers.get("upgrade") === "websocket") {
+    return wsHandler.handleConnection(req);
+  }
+
+  // Serve static files and API endpoints
+  switch (url.pathname) {
+    case "/":
+      return new Response(await getIndexHTML(), {
+        headers: { "content-type": "text/html" },
+      });
+
+    case "/api/characters":
+      return new Response(JSON.stringify(defaultCharacters), {
+        headers: { "content-type": "application/json" },
+      });
+
+    case "/api/game/start":
+      if (req.method === "POST") {
+        try {
+          const body = await req.json();
+          const gameId = await gameManager.startNewGame(
+            body.gmPrompt,
+            body.characters,
+          );
+          return new Response(JSON.stringify({ gameId }), {
+            headers: { "content-type": "application/json" },
+          });
+        } catch (error) {
+          return new Response(
+            JSON.stringify({ error: error.message }),
+            {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            },
+          );
+        }
+      }
+      break;
+
+    case "/api/game/message":
+      if (req.method === "POST") {
+        try {
+          const body = await req.json();
+          const responses = await gameManager.handlePlayerMessage(
+            body.gameId,
+            body.message,
+          );
+          return new Response(JSON.stringify({ responses }), {
+            headers: { "content-type": "application/json" },
+          });
+        } catch (error) {
+          return new Response(
+            JSON.stringify({ error: error.message }),
+            {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            },
+          );
+        }
+      }
+      break;
+
+    default:
+      return new Response("Not Found", { status: 404 });
+  }
+
+  return new Response("Method Not Allowed", { status: 405 });
+}
+
+async function getIndexHTML(): Promise<string> {
+  try {
+    return await Deno.readTextFile("./static/index.html");
+  } catch {
+    // Return a basic HTML template if file doesn't exist
+    return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>LLM Roleplay Chat</title>
+</head>
+<body>
+   <h1>Oops! Something went wrong.</h1>
+</body>
+</html>
+    `;
+  }
+}
+
+const port = parseInt(Deno.env.get("PORT") || "8000");
+console.log(`🎭 LLM Chat server starting on http://localhost:${port}`);
+
+Deno.serve({ port }, handler);
+```
+
+In the `main.ts` file we set up an HTTP server and a WebSocket server to handle
+real-time communication. We use the HTTP server to serve static files and
+provide API endpoints, while the WebSocket server manages real-time interactions
+between clients.
+
+## Add a frontend
+
+The frontend of our app will live in the `static` directory. Create an
+`index.html`, `app.js` and a `style.css` file in the `static` directory.
+
+### `index.html`
+
+We'll create a very basic layout with a textarea to collect the user's scenario
+input and a section to show the response messages with a text input to send
+messages. Copy the content from
+[this html file](https://github.com/denoland/tutorial-with-llm/blob/main/static/index.html)
+into your `index.html`.
+
+### `app.js`
+
+In `app.js`, we'll add the JavaScript to handle user input and display
+responses. Copy the content from
+[this js file](https://github.com/denoland/tutorial-with-llm/blob/main/static/app.js)
+into your `app.js`.
+
+### `style.css`
+
+We'll add some basic styles to make our app look nicer. Copy the content from
+[this css file](https://github.com/denoland/tutorial-with-llm/blob/main/static/style.css)
+into your `style.css`.
+
+## Run your application
+
+Start your development server:
+
+```bash
+deno task dev
+```
+
+Your LLM chat application will be available at `http://localhost:8000`. The
+application will:
+
+1. **Auto-detect your LLM provider** based on available API keys
+2. **Fall back to mock responses** if no API keys are configured
+3. **Handle rate limiting** gracefully with retries and fallbacks
+4. **Provide real-time interaction** through WebSockets
+
+## Deploy your application to the cloud
+
+Now that you have your working LLM chat application, you can deploy it to the
+cloud with Deno Deploy.
+
+For the best experience, you can deploy your app directly from GitHub, which
+will set up automated deployments. Create a GitHub repository and push your app
+there.
+
+[Create a new GitHub repository](https://github.com/new), then initialize and
+push your app to GitHub:
+
+```sh
+git init -b main
+git remote add origin https://github.com/<your_github_username>/<your_repo_name>.git
+git add .
+git commit -am 'initial commit'
+git push -u origin main
+```
+
+Once your app is on GitHub, you can
+[deploy it to Deno Deploy](https://console.deno.com/).
+
+Don't forget to add your `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` environment
+variables in the project "Settings".
+
+For a walkthrough of deploying your app, check out the
+[Deno Deploy tutorial](/examples/deno_deploy_tutorial/).
+
+## Testing
+
+We've provided tests to verify your setup, copy the
+[`main.test.ts`](https://github.com/denoland/tutorial-with-llm/blob/main/tests/main.test.ts)
+file to your project directory and run the included tests to verify your setup:
+
+```bash
+deno task test
+```
+
+🦕 You now have a working LLM chat application, with realtime interaction, rate
+limiting and error handling. Next you can customise it to your own play style!
+Consider giving the LLM instructions on how to behave in different scenarios, or
+how to respond to specific user inputs. You can add these into the character
+configuration files.
+
+You could also consider adding a database to store the conversation history for
+long-term character and story development.

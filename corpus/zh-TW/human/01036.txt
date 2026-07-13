@@ -1,0 +1,267 @@
+``` php
+<?php
+
+/*
+                  _     ___   ___  _  __                
+ __   __ __   __ | |   / _ \ / _ \| |/ / __   __ __   __
+ \ \ / / \ \ / / | |  | | | | | | | ' /  \ \ / / \ \ / /
+  \ V /   \ V /  | |__| |_| | |_| | . \   \ V /   \ V / 
+   \_/     \_/   |_____\___/ \___/|_|\_\   \_/     \_/  
+                                                        
+
+   DEVCORE{no.1_path_traverse_to_the_m00n}
+
+ */
+
+
+define('IMAGE_PATH', '/usr/share/nginx/images/');
+
+define('MYSQL_HOST', 'mysql');
+define('MYSQL_USER', 'web_user');
+define('MYSQL_PASSWORD', 'n%6GZgt*hH[+p7vJ');
+define('MYSQL_DATABASE', 'web');
+
+define('ORDER_STATUS_PICKING', 'PICKING');
+define('ORDER_STATUS_PACKING', 'PACKING');
+define('ORDER_STATUS_SENDING', 'SENDING');
+define('ORDER_STATUS_DELIVERING', 'DELIVERING');
+define('ORDER_STATUS_ARRIVED', 'ARRIVED');
+define('ORDER_STATUS_FINISH', 'FINISH');
+
+define('DEFAULT_LANGUAGE', 'zh-tw');
+define('ALLOWED_LANGUAGE', 'zh-tw');
+
+function session_start_once() {
+    if (!isset($_SESSION)) { 
+        session_start();
+    }
+}
+
+session_start_once();
+
+
+if (!isset($_SESSION['lang'])) {
+    $_SESSION['lang'] = DEFAULT_LANGUAGE;
+}
+
+require_once('langs/' . $_SESSION['lang'] . '.php');
+
+require_once('qrcode.php');
+
+function base64_urlsafe_encode($input) {
+    return strtr(base64_encode($input), '+/', '._');
+}
+
+function base64_urlsafe_decode($input) {
+    return base64_decode(strtr($input, '._', '+/'));
+}
+
+
+$GLOBALS['_pdo'] = false;
+
+function get_pdo() {
+    if ($GLOBALS['_pdo']) {
+        return $GLOBALS['_pdo'];
+    }
+    try {
+        $pdo = new PDO(
+                    'mysql:host='.MYSQL_HOST.';dbname='.MYSQL_DATABASE.';charset=utf8mb4',
+                    MYSQL_USER, MYSQL_PASSWORD,
+                    array(
+                        PDO::MYSQL_ATTR_INIT_COMMAND => 'SET NAMES \'utf8mb4\' COLLATE \'utf8mb4_unicode_ci\';',
+                        PDO::ATTR_TIMEOUT => 2
+                    ));
+        $GLOBALS['_pdo'] = $pdo;
+    } catch (Exception $e) {
+        http_response_code(500);
+        die("Failed to connect database. Please contact the administrtor.");
+    }
+    return $pdo;
+}
+
+function get_post_param($key, $default=null) {
+    if (isset($_POST[$key])) {
+        return $_POST[$key];
+    } else {
+        return $default;
+    }
+}
+
+function get_get_param($key, $default=null) {
+    if (isset($_GET[$key])) {
+        return $_GET[$key];
+    } else {
+        return $default;
+    }
+}
+
+function get_client_ip() {
+    if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
+        $ip = $_SERVER['HTTP_CLIENT_IP'];
+    } else if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $ip = $_SERVER['HTTP_X_FORWARDED_FOR'];
+    } else {
+        $ip = $_SERVER['REMOTE_ADDR'];
+    }
+    return $ip;
+}
+
+function random_str(
+    int $length = 64,
+    string $keyspace = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+): string {
+    if ($length < 1) {
+        throw new \RangeException("Length must be a positive integer");
+    }
+    $pieces = [];
+    $max = mb_strlen($keyspace, '8bit') - 1;
+    for ($i = 0; $i < $length; ++$i) {
+        $pieces []= $keyspace[random_int(0, $max)];
+    }
+    return implode('', $pieces);
+}
+
+function get_sig_hash($data) {
+    $pdo = get_pdo();
+    $res = $pdo->query("SELECT `value` FROM options WHERE `key` = 'sig_secret' LIMIT 1", PDO::FETCH_ASSOC);
+    $row = $res->fetch();
+    if (!$row) {
+        $secret = random_str(64);
+        $pdo->exec("INSERT INTO options VALUES ('sig_secret', '".$secret."'), ('sig_algorithm', 'sha256')");
+    } else {
+        $secret = $row['value'];
+    }
+    $res = $pdo->query("SELECT `value` FROM options WHERE `key` = 'sig_algorithm' LIMIT 1", PDO::FETCH_ASSOC);
+    $algo = $res->fetch()['value'];
+    return hash_hmac($algo, $data, $secret);
+}
+
+function get_timezone() {
+    $pdo = get_pdo();
+    $res = $pdo->query("SELECT `value` FROM options WHERE `key` = 'timezone' LIMIT 1", PDO::FETCH_ASSOC);
+    $row = $res->fetch();
+    if (!$row) {
+        $pdo->exec("INSERT INTO options VALUES ('timezone', 'Asia/Taipei')");
+        $timezone = 'Asia/Taipei';
+    } else {
+        $timezone = $row['value'];
+    }
+    return $timezone;
+}
+
+define('TIMEZONE', get_timezone());
+date_default_timezone_set(TIMEZONE);
+
+function endsWith( $haystack, $needle ) {
+    $length = strlen( $needle );
+    if( !$length ) {
+        return true;
+    }
+    return substr( $haystack, -$length ) === $needle;
+}
+
+
+function order_status_to_text($status) {
+    $text_arr = [
+        ORDER_STATUS_PICKING => '撿貨',
+        ORDER_STATUS_PACKING => '包裝中',
+        ORDER_STATUS_SENDING => '等待貨運士取貨',
+        ORDER_STATUS_DELIVERING => '配送中',
+        ORDER_STATUS_ARRIVED => '貨物已送達',
+        ORDER_STATUS_FINISH => '完成'
+    ];
+    return $text_arr[$status];
+}
+```
+
+Next, I looked at each file and found that `print.php` had an obvious SQL Injection:
+
+``` php
+<?php
+
+require_once('include.php');
+require_once('third_party/vendor/autoload.php');
+
+//require_once('rate_limit.php');
+// rate limit is not working, use random sleep as a workaround
+sleep(random_int(0, 2));
+
+$is_from_print = true;
+
+$id = get_get_param('id', '');
+$sig = get_get_param('sig', '');
+$sig_hash = get_sig_hash($sig);
+$pdo = get_pdo();
+$res = $pdo->query("
+    SELECT *
+    FROM orders 
+    WHERE sig_hash = '$sig_hash' AND id = $id
+    LIMIT 1
+", PDO::FETCH_ASSOC);
+
+try {
+    $order = $res->fetch();
+} catch (Error $e) {
+    $order = [];
+}
+
+ob_start();
+include('pdf.php');
+$html = ob_get_clean();
+
+$mpdf = new \Mpdf\Mpdf([
+    'tempDir' => '/tmp',
+    'autoScriptToLang' => true,
+    'autoLangToFont' => true,
+    'mode' => 'utf-8'
+]);
+$mpdf->SetTitle('收據明細');
+$mpdf->SetSubject('收據明細');
+$mpdf->SetAuthor(random_str((random_int(1, 256))));
+$mpdf->SetCreator(random_str((random_int(1, 256))));
+$mpdf->WriteHTML($html);
+$mpdf->Output();
+```
+
+After manually injecting, the following information was obtained:
+
+```
+table: rate_limit
+ip,last_visit,visit_times
+
+table: items
+id,title,description
+
+table: options
+key,value
+
+table: backend_users
+id,username,password,description
+admin u=479_p5jV:Fsq(2
+
+table: orders
+id,name,email,phone,status,sig_hash,order_date,address,note
+```
+
+Since only one row of data can be obtained, `GROUP_CONCAT` can be used to dump data, like this: `SELECT 1,GROUP_CONCAT(note),GROUP_CONCAT(name),GROUP_CONCAT(email),5,6,7,8,9 FROM orders
+`
+The third flag (yes, the third, not the second) and a set of credentials were found in the `backend_users` section of the database, which may be useful later.
+
+According to `include.php`, we got this path: `third_party/vendor/autoload.php`. It was obvious that composer was used, so we could read `/proc/self/cwd/third_party/composer.json` to find out that only one package called `mpdf` was used.
+
+Next, let's search for known vulnerabilities. We found an issue reported by DEVCORE on the official website: [phar:// deserialization and weak randomness of temporary file name may lead to RCE](https://github.com/mpdf/mpdf/issues/1381)
+
+From this issue, we can learn two things:
+
+1. We can write files to `/tmp/mpf/_tempCSSidataX_0.jpeg`
+2. We can use `<img src="#1.jpeg" ORIG_SRC="phar://../vendor/mpdf/mpdf/tmp/mpdf/_tempCSSidata1_0.jpeg/a.jpg"></img>` to perform deserialization
+
+However, the problem is that we need to find a gadget that can be used to trigger the attack by deserialization. After installing the same package locally, I directly searched for methods starting with `__` in the `third_party` folder, but only found some useless things. I couldn't think of a POP attack chain.
+
+So I got stuck.
+
+I thought and looked at it repeatedly, except for the possibility of exploiting the phar vulnerability, the only other thing is the part in `include.php` that imports `$_SESSION['lang']`. If we can control `lang`, we can import any file, but the problem is that there is no vulnerability in `lang.php` that can be exploited to control parameters, unless we can directly modify `/tmp/sess_XXX`, otherwise we can't get in.
+
+But the only vulnerability that can write files is in mpdf, but the file name is restricted and cannot be written anywhere, otherwise the two can be combined.
+
+There is also a strange place that I can't figure out. I hacked into a set of backend account passwords in the DB, but there should be a backend, where is it?

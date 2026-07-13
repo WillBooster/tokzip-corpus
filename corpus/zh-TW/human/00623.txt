@@ -1,0 +1,147 @@
+You will find that the last two requests remain in a pending state and cannot be sent:
+
+![Exceeding the queue limit will keep it pending](/img/navigator-sendbeacon-64kib-and-source-code/p2.png)
+
+This is because the first six `sendBeacon` calls have already filled the queue to 60000, so the last two cannot fit, and thus cannot accept new requests, remaining in a pending state without actively trying to push new ones in when the queue is empty.
+
+However, strictly speaking, this is not actually a problem with `sendBeacon`, but rather a limitation that comes with fetch combined with keepalive. In fact, the underlying implementation of `navigator.sendBeacon` is fetch combined with keepalive.
+
+## The Specification of navigator.sendBeacon and a Short Story about Sentry
+
+In the specification section [3.2 Processing Model](https://w3c.github.io/beacon/#sec-processing-model), step six mentions the queue we just discussed:
+
+![Queue in the spec](/img/navigator-sendbeacon-64kib-and-source-code/p3.png)
+
+If it is determined that the request cannot fit into the queue, `sendBeacon` will return false.
+
+This is actually the solution when the payload encounters a problem. After calling `sendBeacon`, check if the return value is false. If it is, proceed to handle it, deciding whether to fallback to a regular fetch or implement a retry mechanism.
+
+The seventh step is what `sendBeacon` primarily does: it creates a keepalive request and sends it out:
+
+![keepalive section](/img/navigator-sendbeacon-64kib-and-source-code/p4.png)
+
+The payload limit for fetch + keepalive is 64 KiB, which is stated in the [spec](https://fetch.spec.whatwg.org/#http-network-or-cache-fetch):
+
+![fetch spec](/img/navigator-sendbeacon-64kib-and-source-code/fetch-spec.png)
+
+The error tracking service Sentry actually encountered this issue in the past. In 2018, it was discovered that Sentry had keepalive enabled by default when using fetch, causing some requests over 65536 bytes to fail to send. As a result, this flag was removed:
+
+![Sentry issue](/img/navigator-sendbeacon-64kib-and-source-code/p5.png)
+
+Source: [When fetch is used keepalive is the default, and Chrome only allows a POST body <= 65536 bytes in that scenario #1464](https://github.com/getsentry/sentry-javascript/issues/1464), the removed PR: [ref: Remove keepalive:true as a default and document payload size #1496](https://github.com/getsentry/sentry-javascript/pull/1496)
+
+Two years later, in 2020, someone discovered the specifications and correct usage of keepalive: [Fetch KeepAlive #2547](https://github.com/getsentry/sentry-javascript/issues/2547), proposing to use keepalive under the payload allowance, and not to use it if exceeded, rather than not using it at all as was the case then.
+
+However, no action was taken at that time. It was another two years later, in 2022, when someone found that Chrome cancels all requests during navigation, causing some requests to fail to send, leading to the idea of using keepalive to solve this.
+
+Thus, in September 2022, it was added back with insightful comments:
+
+[feat(browser): Use fetch keepalive flag #5697](https://github.com/getsentry/sentry-javascript/issues/2547)
+
+``` js
+// Outgoing requests are usually cancelled when navigating to a different page, causing a "TypeError: Failed to
+// fetch" error and sending a "network_error" client-outcome - in Chrome, the request status shows "(cancelled)".
+// The `keepalive` flag keeps outgoing requests alive, even when switching pages. We want this since we're
+// frequently sending events right before the user is switching pages (eg. whenfinishing navigation transactions).
+// Gotchas:
+// - `keepalive` isn't supported by Firefox
+// - As per spec (https://fetch.spec.whatwg.org/#http-network-or-cache-fetch), a request with `keepalive: true`
+//   and a content length of > 64 kibibytes returns a network error. We will therefore only activate the flag when
+//   we're below that limit.
+keepalive: request.body.length <= 65536,
+```
+
+Machine translation from Chinese:
+
+> When switching to a different page, unfinished requests are often canceled, leading to a "TypeError: Failed to fetch" error and a "network_error" message. In Chrome, the request status shows "(cancelled)".
+The keepalive flag allows unfinished requests to remain active during page transitions. Since we often send events before users switch pages, this functionality is necessary.
+> 
+> Important to note:
+>
+> 1. Firefox does not support keepalive.
+> 2. According to the specification, if a request is set with keepalive: true and the content length exceeds 64 KiB, a network error will be returned. Therefore, we will only enable this flag when the request content length is below that limit.
+
+But the story doesn't end here. As I mentioned earlier, this 65536 limit is not just for a single request, but there is a queue, so this approach is insufficient. Six months later, Sentry also noticed this issue and added logic to calculate the queue size, making the entire mechanism more robust: [fix(browser): Ensure keepalive flag is correctly set for parallel requests #7553](https://github.com/getsentry/sentry-javascript/pull/7553)
+
+![Issue screenshot](/img/navigator-sendbeacon-64kib-and-source-code/p6.png)
+
+If you want to implement something similar in the future, you can directly refer to the above Sentry PR.
+
+## Implementation of sendBeacon
+
+### Implementation of sendBeacon in Chromium
+
+Finally, let's take a look at the underlying implementation of sendBeacon, starting with Chromium. I will use the latest stable version 131.0.6778.205 at the time of writing this article as an example. The relevant code can be found at: [third_party/blink/renderer/modules/beacon/navigator_beacon.cc](https://source.chromium.org/chromium/chromium/src/+/refs/tags/131.0.6778.205:third_party/blink/renderer/modules/beacon/navigator_beacon.cc;l=93)
+
+I have extracted a small segment of the core code:
+
+``` c
+bool NavigatorBeacon::SendBeaconImpl(
+    ScriptState* script_state,
+    const String& url_string,
+    const V8UnionReadableStreamOrXMLHttpRequestBodyInit* data,
+    ExceptionState& exception_state) {
+  ExecutionContext* execution_context = ExecutionContext::From(script_state);
+  KURL url = execution_context->CompleteURL(url_string);
+  if (!CanSendBeacon(execution_context, url, exception_state)) {
+    return false;
+  }
+
+  bool allowed;
+  LocalFrame* frame = GetSupplementable()->DomWindow()->GetFrame();
+  if (data) {
+    switch (data->GetContentType()) {
+      // [...]
+      case V8UnionReadableStreamOrXMLHttpRequestBodyInit::ContentType::
+          kUSVString:
+        UseCounter::Count(execution_context,
+                          WebFeature::kSendBeaconWithUSVString);
+        allowed = PingLoader::SendBeacon(*script_state, frame, url,
+                                         data->GetAsUSVString());
+        break;
+    }
+  } else {
+    allowed = PingLoader::SendBeacon(*script_state, frame, url, String());
+  }
+
+  if (!allowed) {
+    UseCounter::Count(execution_context, WebFeature::kSendBeaconQuotaExceeded);
+  }
+
+  return allowed;
+}
+```
+
+The beginning of `CanSendBeacon` basically checks whether the URL is valid. If it is valid, it continues to check the content type of the payload to be sent, and the actual sending occurs in the `PingLoader::SendBeacon` method.
+
+In addition, you can see `UseCounter::Count` in the code, which is used by Chromium to track the usage frequency of certain features.
+
+The implementation of `PingLoader::SendBeacon` can be found at [third_party/blink/renderer/core/loader/ping_loader.cc](https://source.chromium.org/chromium/chromium/src/+/refs/tags/131.0.6778.205:third_party/blink/renderer/core/loader/ping_loader.cc):
+
+``` c
+bool SendBeaconCommon(const ScriptState& state,
+                      LocalFrame* frame,
+                      const KURL& url,
+                      const BeaconData& beacon) {
+  if (!frame->DomWindow()
+           ->GetContentSecurityPolicyForWorld(&state.World())
+           ->AllowConnectToSource(url, url, RedirectStatus::kNoRedirect)) {
+    // We're simulating a network failure here, so we return 'true'.
+    return true;
+  }
+
+  ResourceRequest request(url);
+  request.SetHttpMethod(http_names::kPOST);
+  request.SetKeepalive(true);
+  request.SetRequestContext(mojom::blink::RequestContextType::BEACON);
+  beacon.Serialize(request);
+  FetchParameters params(std::move(request),
+                         ResourceLoaderOptions(&state.World()));
+  // The spec says:
+  //  - If mimeType is not null:
+  //   - If mimeType value is a CORS-safelisted request-header value for the
+  //     Content-Type header, set corsMode to "no-cors".
+  // As we don't support requests with non CORS-safelisted Content-Type, the
+  // mode should always be "no-cors".
+  params.MutableOptions().initiator_info.name =
+      fetch_initiator_type_names::kBeacon;

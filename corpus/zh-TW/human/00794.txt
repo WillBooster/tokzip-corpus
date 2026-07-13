@@ -1,0 +1,95 @@
+Another way is to restrict the location of the iframe src, which can be done at different levels. For example, filtering src in the code and only allowing specific domains, or using `CSP:frame-src` to let the browser block domains that do not comply.
+
+## The second issue: Unfiltered HTML
+
+The first issue can cause the biggest danger, probably just a redirect (the codimd article says that XSS can be done in Safari, but I can't do it QQ). However, there is a bigger problem besides this, which is here:
+
+``` js
+<>
+  <div
+    className={classNames({ 'u-content': true, translating })}
+    dangerouslySetInnerHTML={{
+      __html: optimizeEmbed(translation || article.content),
+    }}
+    onClick={captureClicks}
+    ref={contentContainer}
+  />
+
+  <style jsx>{styles}</style>
+</>
+```
+
+`article.content` is an HTML string filtered by js-xss, so it is safe. However, here it goes through an `optimizeEmbed` to do custom conversion, which is a more dangerous thing to do after filtering, because if there is negligence in the process, it will cause an XSS vulnerability.
+
+In the conversion, there is a piece of code:
+
+``` html
+<source
+  type="image/webp"
+  media="(min-width: 768px)"
+  srcSet=${toSizedImageURL({ url: src, size: '1080w', ext: 'webp' })}
+  onerror="this.srcset='${src}'"
+/>
+```
+
+Looking closely at this code, if `${toSizedImageURL({ url: src, size: '1080w', ext: 'webp' })}` or `src` can be controlled, there is a chance to change the content of the attribute or add a new attribute.
+
+I originally wanted to insert a malicious src to make onerror become `onerror="this.srcset='test';alert(1)"` and other code, but I later found that the onerror event of the source under the picture seems to be invalid, even if there is an error in srcset, it will not trigger, so it is useless.
+
+Therefore, I focused on srcSet and inserting new attributes. Here, `onanimationstart` can be used, which is an event that will be triggered when the animation starts, and the name of the animation can be found in CSS. Fortunately, I found a keyframe called `spinning`.
+
+So if the img src is: `https://assets.matters.news/processed/1080w/embed/test style=animation-name:spinning onanimationstart=console.log(1337)`
+
+The combined code is:
+
+``` html
+<source
+  type="image/webp"
+  media="(min-width: 768px)"   
+  srcSet=https://assets.matters.news/processed/1080w/embed/test 
+  style=animation-name:spinning 
+  onanimationstart=console.log(1337)
+  onerror="this.srcset='${src}'"
+/>
+```
+
+In this way, an XSS vulnerability is created:
+
+![](/img/prevent-xss/xss1.png)
+![](/img/prevent-xss/xss2.png)
+
+There are several ways to fix it:
+
+1. Add a CSP header to prevent the execution of inline scripts (this is more difficult to achieve because it may conflict with existing things and requires more time to process).
+2. Filter the img url passed in (there is still a risk if the filtering is not done well).
+3. Change the HTML first and then call js-xss to filter out the attributes that should not exist.
+
+## Summary
+
+We found two vulnerabilities:
+
+1. Redirect users to any location through `<iframe>`
+2. Execute an XSS attack on the article page through `<source>`
+
+What kind of attack can actually be done?
+
+First, use the second vulnerability to publish an article with an XSS attack, and then write a bot to leave a message under all articles, using `<iframe>` to redirect users to the article with XSS. In this way, as long as the user clicks on any article, they will be attacked.
+
+However, the defense of other parts of the website itself is well done. Although there is XSS, the Cookie is HttpOnly, so it cannot be stolen, and the password modification is sent by email, so the password cannot be modified. It seems that it is not possible to do really serious things.
+
+Many libraries that filter XSS are safe (although sometimes there are still vulnerabilities found, such as [bypassing DOMPurify](https://portswigger.net/research/bypassing-dompurify-again-with-mutation-xss)), but people who use the library may ignore some settings or do extra things, resulting in HTML that is still unsafe.
+
+When dealing with user input, every step should be carefully reviewed to avoid negligence.
+
+It is also recommended to set up CSP headers as a last line of defense against XSS attacks. Although some CSP rules can be bypassed, it is still better than having nothing.
+
+Matters has its own Bug Bounty Program, which offers rewards for finding vulnerabilities that can prove harmful. The XSS vulnerability found in this article is classified as High, with a value of $150 USD. The team believes that open source can benefit technical professionals and make websites more secure, so they hope everyone knows about this program.
+
+Finally, thanks to the Matters team for their quick response and handling, and thanks to the colleagues at Cymetrics.
+
+Timeline:
+
+- May 7, 2021: Vulnerability reported
+- May 12, 2021: Received confirmation from the Matters team that they are fixing the vulnerability
+- May 12, 2021: Asked for permission to publish the article after the fix, received permission
+- May 13, 2021: Fix completed

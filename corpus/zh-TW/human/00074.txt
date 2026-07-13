@@ -1,0 +1,317 @@
+如上所述，我們可以自己偷加東西進去，並且讓 csp 不要被渲染。
+
+而前端的部分有一個地方要繞：
+
+``` js
+constructor(url) {
+  const clean = (path) => {
+    try {
+      if (!path) throw new Error("no path");
+      let re = new RegExp(/^[A-z0-9\s_-]+$/i);
+      if (re.test(path)) {
+        // normalize
+        let cleaned = path.replaceAll(/\s/g, "");
+        return cleaned;
+      } else {
+        throw new Error("regex fail");
+      }
+    } catch (e) {
+      console.log(e);
+      return "dfv";
+    }
+    };
+  url = clean(url);
+  this.url = new URL(url, 'https://grandprixheaven-web.2024.ctfcompetition.com/api/get-car/');
+}
+```
+
+這裡的檢查 `A-z` 是重點，因為中間有些符號被加進去了，如 `\`，因此可以讓 url 是 `\test`，就可以蓋掉原本的 `/api/get-car`，把路徑改掉。
+
+上面只是簡單記錄一下，想看更詳細的步驟跟題目，可以直接看作者的 writeup：https://github.com/google/google-ctf/tree/main/2024/quals/web-grandprixheaven/solution
+
+## SAPPY (64 solves)
+
+這題一樣我還沒看的時候隊友就解掉了，大概講一下核心以及記錄一下 Discord 的討論。
+
+核心程式碼如下：
+
+``` js
+const Uri = goog.require("goog.Uri");
+
+function validate(host) {
+  const h = Uri.parse(host);
+  if (h.hasQuery()) {
+    throw "invalid host";
+  }
+  if (h.getDomain() !== "sappy-web.2024.ctfcompetition.com") {
+    throw "invalid host";
+  }
+  return host;
+}
+```
+
+基本上就是要繞過這個檢查，讓傳入的網址可以發送請求到自己的 server。
+
+有看到兩種繞過方式，一種是用 data URI：`data://sappy-web.2024.ctfcompetition.com/;base64,...`，對這個 lib 來說，domain 會被解析為 `sappy-web.2024.ctfcompetition.com`。
+
+另一種是 `\\\\www%2eURL%2ex://sappy-web.2024.ctfcompetition.com`，讓 parser 認為前面的 `\\\\www%2eURL%2ex` 是 scheme，但對瀏覽器來說會把 `\\` 解析成 `//`，因此就是 `https://www.URL.ex//sappy-web.2024.ctfcompetition.com`。
+
+更詳細的過程可以參考這篇： [googleCTF 2024 sappy](https://zimzi.substack.com/p/googlectf-2024-sappy)
+
+## POSTVIEWER V3 (19 solves)
+
+2022 年的 [v1](https://blog.huli.tw/2022/07/09/google-ctf-2022-writeup/) 沒解出來，2023 年的 [v2](https://blog.huli.tw/2023/07/28/google-zer0pts-imaginary-ctf-2023-writeup/) 也沒解出來，到了今年出了 v3，終於解出來了。
+
+今年的版本核心概念跟之前一樣，都是想做出一個有 sandbox 的 preview file 機制。介面很簡單，就一個讓你可以新增檔案的功能而已：
+
+![upload file](/img/google-ctf-2024-writeup/p1.png)
+
+點擊檔案以後，會更新 URL 上的 hash，這個 hash 的值是 `sha1(filename)`，接著根據檔案名稱去 IndexedDB 裡面取得內容，然後才是重點。
+
+取得內容以後，會先產生一個 sandbox domain，這個 domain 的名稱取決於：`calculateHash(body, product, window.origin, location.href)`，body 是一個固定的 HTML，product 也是固定的。
+
+再來會用 iframe 載入這個 sandbox domain，並且在 query string 帶上：`?o=${window.origin}`，底下是範例：
+
+```
+https://sbx-0wguyijf8lspklnc3724kqvia43l62tu7v1l2gdelcy503m2cd.
+  postviewer3-web.2024.ctfcompetition.com/postviewer/shim.html
+  ?o=https%3A%2F%2Fpostviewer3-web.2024.ctfcompetition.com
+```
+
+那這個 shim.html 裡面在幹嘛呢？內容很簡單，我只擷取 JavaScript 相關的段落：
+
+``` js
+const HASH_REGEXP = /^sbx-([a-z0-9]{50})[.]/;
+const PRODUCT_REGEXP = /[/]([a-z0-9_-]*)[/]shim.html/;
+let FILE_HASH, PRODUCT
+
+function _throw(err){
+  document.body.innerText = err;
+  throw Error(err);
+}
+
+try{
+  FILE_HASH = HASH_REGEXP.exec(location.host)[1];
+}catch(e){
+  _throw("Incorrect hash");
+}
+
+try{
+  PRODUCT = PRODUCT_REGEXP.exec(location.pathname)[1];
+}catch(e){
+  _throw("Incorrect product");
+}
+
+const TRUSTED_ORIGIN = new URL(location.href).searchParams.get('o');
+if(!/^https?:\/\//.test(TRUSTED_ORIGIN)) {
+    _throw("Untrusted Origin");
+}
+
+function arrayToBase36(arr) {
+  return arr
+    .reduce((a, b) => BigInt(256) * a + BigInt(b), BigInt(0))
+    .toString(36);
+}
+
+async function calculateHash(...strings){
+  const encoder = new TextEncoder();
+  const string = strings.join('');
+  const hash = await crypto.subtle.digest('SHA-256', encoder.encode(string));
+  return arrayToBase36(new Uint8Array(hash)).padStart(50, '0').slice(0, 50);
+}
+
+window.onmessage = async (e) => {
+    if(e.origin !== TRUSTED_ORIGIN){
+        _throw("Wrong origin");
+    }
+    if (e.data.body === undefined || !e.data.mimeType) {
+        _throw("No content to render");
+    };
+
+    const {body, salt, mimeType} = e.data;
+    [body, salt, mimeType, PRODUCT, TRUSTED_ORIGIN].forEach(e=>{
+      if (typeof e !== 'string') {
+        _throw(`Expected '${e}' to be a string.`);
+      }
+    });
+    const hash = await calculateHash(body, PRODUCT, TRUSTED_ORIGIN, salt);
+    if (hash !== FILE_HASH) {
+      _throw(`Expected hash: ${hash}`);
+    }
+
+    const blob = new Blob([body], { type: mimeType });
+    window.onmessage = null;
+    e.source.postMessage('blob loaded', e.origin);
+    location.replace(URL.createObjectURL(blob));
+};
+```
+
+基本上就是檢查幾個東西：
+
+1. onmessage 的 origin 是不是網址列上的 origin
+2. 傳入的資料 hash 過後，是不是與 domain name 相等
+
+如果以上都符合，那就把傳入的 body 變成 blob，然後載入這個 blob。
+
+接著讓我們回來看剛剛提到的 iframe，在這個 shim.html 的 iframe 載入完成後，會向這個 iframe postMessage，傳入剛剛講的固定的 HTML，內容為：
+
+``` html
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Evaluator</title>
+
+    <script>
+      onmessage = e => {
+        if(e.source !== parent) {
+          throw /not parent/;
+        };
+        if(e.data.eval){
+          eval(e.data.eval);
+        }
+      }
+      onload = () => {
+        parent.postMessage('loader ready','*');
+      }
+    </script>
+
+    <style>
+      body{
+        padding: 0px;
+        margin: 0px;
+      }
+      iframe{
+        width: 100vw;
+        height: 100vh;
+        border: 0;
+      }
+      .spinner {
+        background: url(https://storage.googleapis.com/gctf-postviewer/spinner.svg) center no-repeat;
+      }
+      .spinner iframe{
+        opacity: 0.2
+      }
+    </style>
+  </head>
+  <body>
+    <div id="container" class="spinner"></div>
+  </body>
+</html>
+```
+
+因此，這時 iframe 的內容會變成上面的 HTML，就只是 eval 傳入的參數而已。
+
+而最後一步，會向這個 iframe postMessage，把檔案的內容跟 mimeType 帶上，然後 eval 底下這一段程式碼：
+
+``` js
+const container = document.querySelector("#container");
+container.textContent = '';
+const iframe = document.createElement('iframe');
+iframe.src = URL.createObjectURL(new Blob([e.data.body], {type: e.data.type}));
+if(e.data.sandbox) {
+  iframe.sandbox = e.data.sandbox;
+}
+container.appendChild(iframe);
+setTimeout(()=>{
+  container.classList.remove('spinner');
+}, 5000);
+iframe.onload = () => {
+  setTimeout(()=>{
+    container.classList.remove('spinner');
+  }, 500);
+};
+```
+
+所以最後在這個 iframe 裡面又會有一個 sandboxed iframe，檔案的內容就在裡面。
+
+是不是很複雜？我當初反反覆覆看了幾遍才搞懂整個流程在幹嘛，還順手畫了一張示意圖：
+
+![flow](/img/google-ctf-2024-writeup/p2.png)
+
+在解這題的時候，我一開始在想這些 onmessage 能不能被攻破，但想了一下之後發現沒辦法。
+
+因為所有的 iframe 都有對 source.origin 做驗證，因此沒有辦法從不合法的 origin 傳訊息進去。而另一方面，很明顯的我們可以拿到某些 sandbox 的 XSS，只要拿自己的 origin 算出 hash 即可。
+
+但是拿一個隨機的 sandbox XSS 是沒用的，我們有沒有可能拿到含有 flag 的 sandbox domain 的 XSS？
+
+產生 domain 的 hash 由底下四個元素組成：
+
+1. body（固定）
+2. product（固定）
+3. window.origin（固定）
+4. location.href（會包含 hash，但我們不知道 hash 內容）
+
+我第一個想法是，能不能讓程式碼執行到這一段時，讓 location.hash 變回空的，這樣所有的內容都已知，就可以算出 hash。
+
+處理 hash 的程式碼如下：
+
+``` js
+const processHash = async () => {
+  safeFrameModal.hide();
+  if (location.hash.length <= 1) return;
+  const hash = location.hash.slice(1);
+  if (hash.length < 5) {
+    const id = parseInt(hash);
+    location.hash = filesList.querySelectorAll('a')[id].id;
+    return;
+  }
+  const fileDiv = document.getElementById(hash);
+  if (fileDiv === null || !fileDiv.dataset.name) return;
+  previewIframeDiv.textContent = '';
+  await sleep(0);
+  previewFile(db.getFile(fileDiv.dataset.name), previewIframeDiv);
+  /* If modal is not shown remove hash */
+  setTimeout(() => {
+    if (!previewModalDiv.classList.contains('show')) {
+      location.hash = '';
+    }
+  }, 2000);
+}
+
+window.addEventListener('hashchange', processHash, true);
+```
+
+中間有一個 `await sleep(0)` 讓後續的操作變成非同步，所以理論上可以 race condition 一下，讓這一段拿到的 hash 是 `#0` 然後變成 flag file id，但之後跑到 `previewFile` 時，`location.hash` 變成 `#`。
+
+不過後來我想了想，這樣也是沒用的，因為 trust origin 還是題目的 domain，就算知道了 hash，我也沒辦法做任何事。
+
+但過不久我重新看了一次產生 hash 的程式碼：
+
+``` js
+async function calculateHash(...strings) {
+  const encoder = new TextEncoder();
+  const string = strings.join("");
+  const hash = await crypto.subtle.digest("SHA-256", encoder.encode(string));
+  return arrayToBase36(new Uint8Array(hash)).padStart(50, "0").slice(0, 50);
+}
+```
+
+這邊就只是將傳入的四個參數拼在一起而已，因此以題目來說，每個參數如下：
+
+```
+body: BODY
+product: postviewer
+origin: https://postviewer3-web.2024.ctfcompetition.com
+href: https://postviewer3-web.2024.ctfcompetition.com/#file-sha1-hash
+```
+
+拼出來的結果是：
+
+```
+BODYpostviewer{CHALL_ORIGIN}{CHALL_ORIGIN}/#file-sha1-hash
+```
+
+假如我們真的可以控制 hash 的話，可以變成這樣：
+
+```
+BODYpostviewer{CHALL_ORIGIN}{CHALL_ORIGIN}/#postviewerhttps://example.com
+```
+
+如此一來，底下的輸出就會算出一個相同的結果：
+
+```
+body: BODYpostviewer{CHALL_ORIGIN}{CHALL_ORIGIN}/#
+product: postviewer
+origin: https://example.com
+href: ''
+```

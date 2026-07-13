@@ -1,0 +1,294 @@
+而且寫得好的 library，會花很多精力在向後相容以及資料合法性的檢查，這些都是一些比較瑣碎而且對於想要理解機制比較沒幫助的東西。
+
+所以我會直接把程式碼稍微整理一下，去除掉比較不重要的部分並且重新組織程式碼，只挑出相關的段落。
+
+我們會關注三個重點：
+
+1. sessionID 如何產生
+2. sessionID 儲存方式
+2. session 資訊儲存方式
+
+可以先來看產生 sessionID 的地方：
+
+``` js
+// get the session id generate function
+var generateId = opts.genid || generateSessionId
+  
+// generates the new session
+store.generate = function(req){
+  req.sessionID = generateId(req);
+  req.session = new Session(req);
+  req.session.cookie = new Cookie(cookieOptions);
+  
+  if (cookieOptions.secure === 'auto') {
+    req.session.cookie.secure = issecure(req, trustProxy);
+  }
+};
+  
+function generateSessionId(sess) {
+  return uid(24);
+}
+```
+
+express-session 的客製化程度很高，可以自己傳進去產生 sessionID 的函式。若是沒有傳，預設會使用 `uid(24)`，這邊的 uid 指的是 [uid-safe](https://github.com/crypto-utils/uid-safe) 這個 library，會產生一個長度為 24 bytes 的隨機 ID。
+
+文件上有特別說明這個長度：
+
+> Asynchronously create a UID with a specific byte length. Because base64 encoding is used underneath, this is not the string length. For example, to create a UID of length 24, you want a byte length of 18.
+
+所以填入 24，最後產生出來的會是長度為 32 個字元的字串。
+
+那這個 sessionID 是以什麼樣的形式存進 Cookie 的呢？
+
+``` js
+var cookie = require('cookie')
+var signature = require('cookie-signature')
+  
+// get the session cookie name
+var name = opts.name || opts.key || 'connect.sid'
+  
+// get the cookie signing secret
+var secret = opts.secret
+  
+if (secret && !Array.isArray(secret)) {
+  secret = [secret];
+}
+  
+// set-cookie
+onHeaders(res, function(){
+  
+  // set cookie
+  setcookie(res, name, req.sessionID, secrets[0], req.session.cookie.data);
+});
+  
+function setcookie(res, name, val, secret, options) {
+  var signed = 's:' + signature.sign(val, secret);
+  var data = cookie.serialize(name, signed, options);
+  
+  debug('set-cookie %s', data);
+  
+  var prev = res.getHeader('Set-Cookie') || []
+  var header = Array.isArray(prev) ? prev.concat(data) : [prev, data];
+  
+  res.setHeader('Set-Cookie', header)
+}
+```
+
+存在 cookie 裡面的 sessionID 的 key 一樣可以自己指定，但預設會是 `connect.sid`，所以以後一看到這個 key 就知道這是 express-session 預設的 sessionID 名稱。
+
+內容的部分比較特別一點，會以 `s:` 開頭，後面接上 `signature.sign(sessionID, secret)` 的結果。
+
+這邊要再看到 [cookie-signature](https://github.com/tj/node-cookie-signature) 這個 library，底下是一個簡單範例：
+
+``` js
+var cookie = require('cookie-signature');
+  
+var val = cookie.sign('hello', 'tobiiscool');
+val.should.equal('hello.DGDUkGlIkCzPz+C0B064FNgHdEjox7ch8tOBGslZ5QI');
+```
+
+這邊的 sign 到底做了什麼呢？原始碼很簡單，可以稍微看一下：
+
+``` js
+var crypto = require('crypto');
+  
+/**
+ * Sign the given `val` with `secret`.
+ *
+ * @param {String} val
+ * @param {String} secret
+ * @return {String}
+ * @api private
+ */
+  
+exports.sign = function(val, secret){
+  if ('string' != typeof val) throw new TypeError("Cookie value must be provided as a string.");
+  if ('string' != typeof secret) throw new TypeError("Secret string must be provided.");
+  return val + '.' + crypto
+    .createHmac('sha256', secret)
+    .update(val)
+    .digest('base64')
+    .replace(/\=+$/, '');
+};
+```
+
+就只是把你要 sign 的內容用 hmac-sha256 產生一個[鑑別碼](https://zh.wikipedia.org/wiki/%E9%87%91%E9%91%B0%E9%9B%9C%E6%B9%8A%E8%A8%8A%E6%81%AF%E9%91%91%E5%88%A5%E7%A2%BC)，並且加在字串後面而已，中間會用`.`來分割資料。
+
+若是你不知道什麼是 hmac 的話我稍微提一下，簡單來說就是可以對一串訊息產生鑑別碼，目的是為了保持資料的完整性讓它不被竄改。你可以想成它就是訊息對應到的一組獨一無二的代碼，如果訊息被改掉了，代碼也會不一樣。
+
+以上面的範例來說，`hello` 利用 `tobiiscool` 這個 secret，得到的結果為：`DGDUkGlIkCzPz+C0B064FNgHdEjox7ch8tOBGslZ5QI`，於是完整字串就變為：`hello.DGDUkGlIkCzPz+C0B064FNgHdEjox7ch8tOBGslZ5QI`，前面是我的資料，後面是資料的鑑別碼。
+
+如果有人想竄改資料，例如說把前面改成 hello2，那這個資料的鑑別碼就不會是後面那一串，我就知道有人篡改資料了。所以藉由這樣的方式來保持資料完整性，其實原理跟 [JWT](https://jwt.io/) 是差不多的，你看得到資料但沒辦法改它，因為改了會被發現。
+
+你可能會疑惑說：那我幹嘛不把整個 sessionID 加密就好？為什麼要多此一舉用這種方式？我自己猜測是因為原始資料其實不怕別人看，只是怕人改而已；若是原始資料是敏感資訊，會用加密的方式。但因為原始資料只是 sessionID 而已，被別人看到也沒什麼關係，只要保障資料完整性即可。而且加密需要的系統資源應該比這種訊息驗證還多，因此才採用這種方式。
+
+好，我們再講回來前面，所以 express-session 會把 sessionID 存在 cookie 裡面，key 是 `connect.sid`，value 則是 `s:{sessionID}.{hmac-sha256(sessionID, secret)}`。
+
+好奇的話你可以去任何使用 Express 的網站然後看一下 cookie 內容，就可以找到實際的資料（或是自己隨便執行一個也行），這邊我用我的當作範例，我的 connect.sid 是： s%3AfZZVCDHefchle2LDK4PzghaR3Ao9NruG.J%2BsOPkTubkeMJ4EMBcnunPXW0Y7TWTucRSKIPNVgnRM，把特殊字元 decode 之後變成： `s:fZZVCDHefchle2LDK4PzghaR3Ao9NruG.J+sOPkTubkeMJ4EMBcnunPXW0Y7TWTucRSKIPNVgnRM`。
+
+也就是說我的 sessionID 是`fZZVCDHefchle2LDK4PzghaR3Ao9NruG`，鑑別碼是`J+sOPkTubkeMJ4EMBcnunPXW0Y7TWTucRSKIPNVgnRM`。
+
+知道儲存 sessionID 的方式以後，從 cookie 裡面取得 sessionID 的方式應該也能看懂，就是把事情反過來做而已：
+
+``` js
+// get the session ID from the cookie
+var cookieId = req.sessionID = getcookie(req, name, secrets);
+  
+function getcookie(req, name, secrets) {
+  var header = req.headers.cookie;
+  var raw;
+  var val;
+  
+  // read from cookie header
+  if (header) {
+    var cookies = cookie.parse(header);
+  
+    raw = cookies[name];
+  
+    if (raw) {
+      if (raw.substr(0, 2) === 's:') {
+        val = unsigncookie(raw.slice(2), secrets);
+
+        if (val === false) {
+          debug('cookie signature invalid');
+          val = undefined;
+        }
+      } else {
+        debug('cookie unsigned')
+      }
+    }
+  }
+  
+  return val;
+}
+  
+/**
+ * Verify and decode the given `val` with `secrets`.
+ *
+ * @param {String} val
+ * @param {Array} secrets
+ * @returns {String|Boolean}
+ * @private
+ */
+function unsigncookie(val, secrets) {
+  for (var i = 0; i < secrets.length; i++) {
+    var result = signature.unsign(val, secrets[i]);
+  
+    if (result !== false) {
+      return result;
+    }
+  }
+  
+  return false;
+}
+```
+
+接下來就剩最後一個了，session 資訊到底存在哪裡？是存在記憶體、檔案，還是其他地方？
+
+其實這個在程式碼裡面寫得很清楚了，預設是存在記憶體裡面的：
+
+``` js
+var warning = 'Warning: connect.session() MemoryStore is not\n'
+  + 'designed for a production environment, as it will leak\n'
+  + 'memory, and will not scale past a single process.';
+  
+// get the session store
+var store = opts.store || new MemoryStore()
+  
+// notify user that this store is not
+// meant for a production environment
+/* istanbul ignore next: not tested */
+if (env === 'production' && store instanceof MemoryStore) {
+  console.warn(warning);
+}
+```
+
+那到底是怎麼存呢？可以參考 [session/memory.js](https://github.com/expressjs/session/blob/master/session/memory.js)：
+
+``` js
+function MemoryStore() {
+  Store.call(this)
+  this.sessions = Object.create(null)
+}
+  
+MemoryStore.prototype.get = function get(sessionId, callback) {
+  defer(callback, null, getSession.call(this, sessionId))
+}
+  
+MemoryStore.prototype.set = function set(sessionId, session, callback) {
+  this.sessions[sessionId] = JSON.stringify(session)
+  callback && defer(callback)
+}
+  
+function getSession(sessionId) {
+  var sess = this.sessions[sessionId]
+  
+  if (!sess) {
+    return
+  }
+  
+  // parse
+  sess = JSON.parse(sess)
+  
+  return sess
+}
+```
+
+首先用 `Object.create(null)` 創造出一個乾淨的 Object（這是很常用的一個方法，沒看過的可以參考：[詳解 Object.create(null)](https://juejin.im/post/5acd8ced6fb9a028d444ee4e)），然後以 sessionID 作為 key，`JSON.stringigy(session)`作為 value，存到這個 object 裡面。
+
+所以說穿了其實 express-session 的 session information 預設就是存在一個變數裡面而已啦，因此你只要一把 process 結束掉重開，session 的資料就都全部不見了。而且會有 memory leak 的問題，所以官方也不推薦用在 production 上面。
+
+如果要用在 production 上面，必須額外再找`store`來用，例如說 [connect-redis](https://github.com/tj/connect-redis#readme) 就可以跟 express-session 搭配，把 session information 存在 redis 裡。
+
+以上就是 Express 常用的 middleware：express-session 的原始碼分析。從上面的段落我們清楚知道了 sessionID 的產生方式以及如何存在 cookie，還有 session information 所儲存的地方。
+
+## PHP（7.2 版本）
+
+PHP 內建就有 session 機制，不必使用任何的 framework，而使用的方法也很簡單：
+
+``` php
+<?php
+session_start();
+  
+if (empty($_SESSION['views'])) {
+  $_SESSION['views'] = 1;
+} else {
+  $_SESSION['views']++;
+}
+  
+echo $_SESSION['views'];
+?>
+```
+
+其實跟 express-session 的用法有點像，只是一個是 `req.session`，一個是`$_SESSION`。
+
+我原本也想跟剛剛看 express-session 一樣，直接去看 PHP 的原始碼，然後從中發現如何實作。但因為 PHP 的原始碼全部都是 C，對我這種幾乎沒寫過 C 的人來說很難看懂，因此我也只能反過來。先跟大家介紹 PHP 的 Session 機制是如何實作的，再從原始碼裡面去找證據支援。
+
+首先呢，PHP 的 Session 機制與 express-session 差不多，都會在 Cookie 裡存放一個 sessionID，並且把 session information 存在伺服器。express-session 預設是存在記憶體，PHP 預設則是存在檔案裡面。
+
+以上這些都可以在 PHP 的設定檔調整，都寫在 `php.ini` 裡面，底下以我的為例，列出一些相關的設定：
+
+``` ini
+[Session]
+; Handler used to store/retrieve data.
+; http://php.net/session.save-handler
+session.save_handler=files
+  
+; Argument passed to save_handler.  In the case of files, this is the path
+; where data files are stored. Note: Windows users have to change this
+; variable in order to use PHP's session functions.
+;
+; The path can be defined as:
+;
+;     session.save_path = "N;/path"
+  
+session.save_path="/opt/lampp/temp/"
+  
+; Name of the session (used as cookie name).
+; http://php.net/session.name
+session.name=PHPSESSID
+  
+; Handler used to serialize data.  php is the standard serializer of PHP.
+; http://php.net/session.serialize-handler
+session.serialize_handler=php
+```

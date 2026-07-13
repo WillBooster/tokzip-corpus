@@ -1,0 +1,97 @@
+開頭先聲明一下，雖然標題叫做「從 React 中學習 JavaScript 底層運作」，只有最後一個比較底層，第一個更是與底層沒什麼關係。只是我沒想到比這個更好的標題，因此就用這個了。
+
+<!-- more -->
+
+## React 舊版的 XSS 漏洞
+
+請問底下這段程式碼有什麼資安問題？
+
+``` js
+function Test() {
+  const name = qs.parse(location.search).name;
+  return (
+    <div className="text-red">
+      <h1>{name}</h1>
+    </div>
+  )
+}
+```
+
+看一看好像沒什麼問題？不就 render 一個 name 嗎，在 React 裡面會自動做 encode，所以就算插入一個 `<img>` 也不會被當作標籤解析，而是會被轉換成純文字，看起來沒問題。
+
+若是我們繼續把這段程式碼展開，從 JSX 變成 JavaScript，大概會類似於這樣：
+
+``` js
+function Test() {
+  const name = qs.parse(location.search).name;
+  return createElement(
+    'div',
+    { className: 'text-red' },
+    createElement(
+      'h1',
+      {},
+      name
+    )
+  )
+}
+```
+
+JSX 語法會在 compile 的時候變回 JavaScript，舊版會用 `React.createElement`，新版改成 `_jsx` 了，但不管 API 長怎樣，總之就是一段建立 element 的 JavaScript。
+
+而這些 function 執行完以後就會產生所謂的 virtual DOM，再次展開成 object 的話會類似於：
+
+``` js
+function Test() {
+  const name = qs.parse(location.search).name;
+  return ({
+    type: 'div',
+    props: {
+      className: 'text-red',
+      children: {
+        type: 'h1',
+        props: {
+          children: name
+        }
+      }
+    }
+  })
+}
+```
+
+而 React 在 render 的時候，就會根據這個 object 去 render，並且展示出我們所傳入的 name。
+
+但問題來了，像是 `qs` 這種 library，其實是支援物件的，例如說 `?name[test]=1`，name 會變成 `{"test": 1}`，因此這個 name 雖然你怎麼看都應該是字串，但實際上可以是個物件。
+
+儘管通常傳物件會被 React 擋掉，但你有沒有想過這些 component 其實也是個物件？那 React 是怎麼決定一個 object 到底是不是 component 的呢？
+
+在舊版的 React 中，這個檢查非常簡單：
+
+``` js
+ReactElement.isValidElement = function(object) {
+  return !!(
+    typeof object === 'object' &&
+    object !== null &&
+    'type' in object &&
+    'props' in object
+  )
+}
+```
+
+只要有 type 有 props，就把它看作是一個 React component。因此，如果我們的 name 是底下這樣，就會被當作是 React component 被渲染出來：
+
+``` js
+{
+  type: "div",
+  props: {
+    dangerouslySetInnerHTML: {
+      __html: "<img src=x onerror=alert()>"
+    }
+  }
+}
+```
+
+如此一來，就成功利用了這個特性，假裝是 React component 並且 render 出任意的 HTML，構造出了一個 XSS 漏洞。
+
+這個漏洞最早在 2015 年時被 Daniel LeCheminan 發現，還寫了一篇文章：[XSS via a spoofed React element](http://danlec.com/blog/xss-via-a-spoofed-react-element)，不過原文的情境稍微不同就是了。
+
+總之呢，這個問題被 React 關注到，開了一個 issue 進行討論：[How Much XSS Vulnerability Protection is React Responsible For? #3473](https://github.com/facebook/react/issues/3473)，而最後的 fix 在這：[Use a Symbol to tag every ReactElement #4832](https://github.com/facebook/react/pull/4832)。

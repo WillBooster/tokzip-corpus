@@ -1,0 +1,223 @@
+frame->Client()->DidDispatchPingLoader(url);
+
+  FetchUtils::LogFetchKeepAliveRequestMetric(
+      params.GetResourceRequest().GetRequestContext(),
+      FetchUtils::FetchKeepAliveRequestState::kTotal);
+  Resource* resource =
+      RawResource::Fetch(params, frame->DomWindow()->Fetcher(), nullptr);
+  return resource->GetStatus() != ResourceStatus::kLoadError;
+}
+```
+
+It first checks for CSP violations. If there are none, it sends a keepalive request and returns whether it was successful.
+
+It is worth noting that in the same file, there is another function that does something similar, called `PingLoader::SendLinkAuditPing`. There is an attribute called `ping` on the `<a>` tag, and when the user clicks the link, the browser sends a request to the location specified by the ping:
+
+``` html
+<a
+  href="https://example.com"
+  ping="https://blog.huli.tw"
+  >click me
+</a>
+```
+
+This is also implemented using a keepalive fetch:
+
+``` c
+void PingLoader::SendLinkAuditPing(LocalFrame* frame,
+                                   const KURL& ping_url,
+                                   const KURL& destination_url) {
+  if (!ping_url.ProtocolIsInHTTPFamily())
+    return;
+
+  ResourceRequest request(ping_url);
+  request.SetHttpMethod(http_names::kPOST);
+  request.SetHTTPContentType(AtomicString("text/ping"));
+  request.SetHttpBody(EncodedFormData::Create(base::span_from_cstring("PING")));
+  request.SetHttpHeaderField(http_names::kCacheControl,
+                             AtomicString("max-age=0"));
+  request.SetHttpHeaderField(http_names::kPingTo,
+                             AtomicString(destination_url.GetString()));
+  scoped_refptr<const SecurityOrigin> ping_origin =
+      SecurityOrigin::Create(ping_url);
+  if (ProtocolIs(frame->DomWindow()->Url().GetString(), "http") ||
+      frame->DomWindow()->GetSecurityOrigin()->CanAccess(ping_origin.get())) {
+    request.SetHttpHeaderField(
+        http_names::kPingFrom,
+        AtomicString(frame->DomWindow()->Url().GetString()));
+  }
+
+  request.SetKeepalive(true);
+  request.SetReferrerString(Referrer::NoReferrer());
+  request.SetReferrerPolicy(network::mojom::ReferrerPolicy::kNever);
+  request.SetRequestContext(mojom::blink::RequestContextType::PING);
+  FetchParameters params(
+      std::move(request),
+      ResourceLoaderOptions(frame->DomWindow()->GetCurrentWorld()));
+  params.MutableOptions().initiator_info.name =
+      fetch_initiator_type_names::kPing;
+
+  frame->Client()->DidDispatchPingLoader(ping_url);
+  FetchUtils::LogFetchKeepAliveRequestMetric(
+      params.GetResourceRequest().GetRequestContext(),
+      FetchUtils::FetchKeepAliveRequestState::kTotal);
+  RawResource::Fetch(params, frame->DomWindow()->Fetcher(), nullptr);
+}
+```
+
+### Implementation of sendBeacon in Safari
+
+The implementation in Safari can be found at [WebKit/Source/WebCore/Modules/beacon/NavigatorBeacon.cpp](https://github.com/WebKit/WebKit/blob/WebKit-7620.1.16.111.5/Source/WebCore/Modules/beacon/NavigatorBeacon.cpp):
+
+``` cpp
+ExceptionOr<bool> NavigatorBeacon::sendBeacon(Document& document, const String& url, std::optional<FetchBody::Init>&& body)
+{
+    URL parsedUrl = document.completeURL(url);
+
+    // Set parsedUrl to the result of the URL parser steps with url and base. If the algorithm returns an error, or if
+    // parsedUrl's scheme is not "http" or "https", throw a "TypeError" exception and terminate these steps.
+    if (!parsedUrl.isValid())
+        return Exception { ExceptionCode::TypeError, "This URL is invalid"_s };
+    if (!parsedUrl.protocolIsInHTTPFamily())
+        return Exception { ExceptionCode::TypeError, "Beacons can only be sent over HTTP(S)"_s };
+
+    if (!document.frame())
+        return false;
+
+    if (!document.shouldBypassMainWorldContentSecurityPolicy() && !document.checkedContentSecurityPolicy()->allowConnectToSource(parsedUrl)) {
+        // We simulate a network error so we return true here. This is consistent with Blink.
+        return true;
+    }
+
+    ResourceRequest request(parsedUrl);
+    request.setHTTPMethod("POST"_s);
+    request.setRequester(ResourceRequestRequester::Beacon);
+    if (RefPtr documentLoader = document.loader())
+        request.setIsAppInitiated(documentLoader->lastNavigationWasAppInitiated());
+
+    ResourceLoaderOptions options;
+    options.credentials = FetchOptions::Credentials::Include;
+    options.cache = FetchOptions::Cache::NoCache;
+    options.keepAlive = true;
+    options.sendLoadCallbacks = SendCallbackPolicy::SendCallbacks;
+
+    if (body) {
+        options.mode = FetchOptions::Mode::NoCors;
+        String mimeType;
+        auto result = FetchBody::extract(WTFMove(body.value()), mimeType);
+        if (result.hasException())
+            return result.releaseException();
+        auto fetchBody = result.releaseReturnValue();
+        if (fetchBody.isReadableStream())
+            return Exception { ExceptionCode::TypeError, "Beacons cannot send ReadableStream body"_s };
+
+        request.setHTTPBody(fetchBody.bodyAsFormData());
+        if (!mimeType.isEmpty()) {
+            request.setHTTPContentType(mimeType);
+            if (!isCrossOriginSafeRequestHeader(HTTPHeaderName::ContentType, mimeType)) {
+                options.mode = FetchOptions::Mode::Cors;
+                options.httpHeadersToKeep.add(HTTPHeadersToKeepFromCleaning::ContentType);
+            }
+        }
+    }
+
+    auto cachedResource = document.protectedCachedResourceLoader()->requestBeaconResource({ WTFMove(request), options });
+    if (!cachedResource) {
+        logError(cachedResource.error());
+        return false;
+    }
+
+    ASSERT(!m_inflightBeacons.contains(cachedResource.value().get()));
+    m_inflightBeacons.append(cachedResource.value().get());
+    cachedResource.value()->addClient(*this);
+    return true;
+}
+```
+
+You can see that the entire process is quite similar to Chromium. It first checks the validity of the URL, then checks CSP, and then sends a keepalive request.
+
+This echoes what we mentioned earlier and what is written in the specifications: the underlying sendBeacon is essentially a keepalive fetch. So where is the source code for when the keepalive queue size exceeds the limit?
+
+From the implementation, it can be seen that if the queue size exceeds, it is likely that this segment is where the error occurs, because only here will it return false:
+
+``` cpp
+auto cachedResource = document.protectedCachedResourceLoader()->requestBeaconResource({ WTFMove(request), options });
+if (!cachedResource) {
+    logError(cachedResource.error());
+    return false;
+}
+```
+
+Therefore, we can trace down to `requestBeaconResource`. Additionally, we can also trace the source code from another direction.
+
+Do you remember the example that sent a string of length 10000 eight times? In Chrome, you will only see the request become pending, but in Safari, a helpful message will appear:
+
+> Beacon API cannot load https://httpstat.us/200?log7. Reached maximum amount of queued data of 64Kb for keepalive requests
+
+You can directly use this error message to find the relevant source code at [WebKit/Source/WebCore/loader/cache/CachedResource.cpp](https://github.com/WebKit/WebKit/blob//WebKit-7620.1.16.111.5/Source/WebCore/loader/cache/CachedResource.cpp#L249):
+
+``` cpp
+if (
+    m_options.keepAlive && type() != Type::Ping &&
+    !cachedResourceLoader.keepaliveRequestTracker().tryRegisterRequest(*this)
+  ) {
+    setResourceError({
+      errorDomainWebKitInternal, 0, request.url(),
+      "Reached maximum amount of queued data of 64Kb for keepalive requests"_s,
+      ResourceError::Type::AccessControl
+    });
+    failBeforeStarting();
+    return;
+}
+```
+
+If it is a keepalive, and the type is not ping (the type of sendBeacon will be `Type::Beacon`), and there is no way to register a new request, then this error is returned.
+
+Therefore, the key point is the method `keepaliveRequestTracker().tryRegisterRequest`, located in [Source/WebCore/loader/cache/KeepaliveRequestTracker.cpp](https://github.com/WebKit/WebKit/blob/WebKit-7620.1.16.111.5/Source/WebCore/loader/cache/KeepaliveRequestTracker.cpp):
+
+``` cpp
+const uint64_t maxInflightKeepaliveBytes { 65536 }; // 64 kibibytes as per Fetch specification.
+
+bool KeepaliveRequestTracker::tryRegisterRequest(CachedResource& resource)
+{
+    ASSERT(resource.options().keepAlive);
+    auto body = resource.resourceRequest().httpBody();
+    if (!body)
+        return true;
+
+    uint64_t bodySize = body->lengthInBytes();
+    if (m_inflightKeepaliveBytes + bodySize > maxInflightKeepaliveBytes)
+        return false;
+
+    registerRequest(resource);
+    return true;
+}
+```
+
+It actually just counts how many are still waiting, and checks if adding them would exceed the maximum value of 65536. The operation is quite similar to the last PR from Sentry.
+
+### Firefox's sendBeacon Implementation
+
+In the previous Sentry PR, it was mentioned that Firefox does not support keepalive, corresponding to this ticket: [[meta] Support Fetch keepalive flag and enforce limit on inflight keepalive bytes](https://bugzilla.mozilla.org/show_bug.cgi?id=1342484), which is still open. From the discussion, it seems there has been progress since about half a year ago, and support officially started in Firefox version 133, released in November 2024. Although there are still some bugs, it should become more stable over time.
+
+I tested a scenario with three browsers, sending out 10 strings of length 60,000:
+
+``` html
+<script>
+  for(let i=1; i<=10; i++) {
+    navigator.sendBeacon("https://httpstat.us/200?log"+i, 'A'.repeat(60000));
+  }
+</script>
+```
+
+Both Chrome and Safari only sent one request, but Firefox 133.0.3 kindly sent them all out, currently without a 64 KiB limit:
+
+![Firefox Screenshot](/img/navigator-sendbeacon-64kib-and-source-code/p7.png)
+
+For those curious about the underlying implementation, the code is here: [gecko-dev/dom/base/Navigator.cpp](https://github.com/mozilla/gecko-dev/blob/94c62970ba2f9c40efd5a4f83a538595425820d9/dom/base/Navigator.cpp#L1163). It seems that keepalive has not been integrated yet, which is why the limit has not been triggered. In the future, it should follow the spec, using keepalive requests and adhering to the payload size limits.
+
+## Conclusion
+
+Small features can have great significance. A seemingly simple `sendBeacon` is actually quite interesting upon deeper research. Understanding its limitations and solutions, as well as learning from Sentry's patching process, and reviewing the browser's source code, provides a better understanding of the underlying implementation.
+
+In practice, if you are going to use `sendBeacon`, please remember to add error handling. When the return value is false, switch to a regular fetch or add a retry mechanism to enhance the stability of data transmission.

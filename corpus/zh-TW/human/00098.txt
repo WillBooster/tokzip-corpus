@@ -1,0 +1,199 @@
+綜合以上想法，那時候我就想寫兩個 rule：
+
+1. 檢查 namespace 是不是用的 alias 都一樣
+2. 檢查哪些 key 存在在程式碼裡面，卻不在語言檔裡
+
+想要寫一個堪用的 ESLint plugin 不難，需要的基礎知識在這一篇：[透過製作 Babel-plugin 初訪 AST](https://blog.techbridge.cc/2018/09/22/visit-ast-with-babel-plugin/) 都有，稍微了解一下 AST 即可，當初我也是看這一篇然後邊看邊弄的，底下我就預設大家看過這篇了，直接來講應該怎麼弄。
+
+## 實戰
+
+首先第一件事情就是打開我們強大的 [AST Explorer](http://astexplorer.net/)，在 transform 那邊選擇 ESLint，就會看到左下角自動載入了範本：
+
+![](https://static.coderbridge.com/img/aszx87410/bf677339575647dc9bdd29cc03b4a4a2.png)
+
+``` js
+export default function(context) {
+  return {
+    TemplateLiteral(node) {
+      context.report({
+        node,
+        message: 'Do not use template literals',
+
+        fix(fixer) {
+          if (node.expressions.length) {
+            // Can't auto-fix template literal with expressions
+            return;
+          }
+          
+          return [
+            fixer.replaceTextRange([node.start, node.start + 1], '"'),
+            fixer.replaceTextRange([node.end - 1, node.end], '"'),
+          ];
+        },
+      });
+    }
+  };
+};
+```
+
+會發現 ESLint 跟 babel 其實都是一樣的，可以針對某個特定的節點去做操作，而 ESLint 是用 `context.report` 來回報錯誤，message 就是你會在 console 看到的那些錯誤，`fix` 則是給 auto fix 功能用的，這個比較複雜一點，我們先不管它。
+
+再來呢，就是在左上角先把我們的範例程式碼給寫好：
+
+``` js
+import { useTranslation } from 'react-i18next'
+import { NS_GENERAL, NS_AUTH } from '@/i18n/namespaces'
+
+function Page() {
+  const { t: tGeneral } = useTranslation(NS_GENERAL)
+  const { t: tAuth } = useTranslation(NS_AUTH)
+  return (
+    <div>
+      {tGeneral('contact_us')}
+      <p>{tAuth('login_success')}</p>
+    </div>
+  )
+}
+```
+
+接著直接在右邊看 AST，我們關心的是 Variable Declarator
+
+![](https://static.coderbridge.com/img/aszx87410/ae85c9da19b94c9da0d7687607047a17.png)
+
+再繼續往下看 AST，你會發現 `const { t: tGeneral } = useTranslation(NS_GENERAL)` 可以先簡單分為兩個部分，左邊的 `{t: tGeneral}` 跟右邊的 `useTranslation(NS_GENERAL)`。
+
+左邊是在這個 Variable Declarator node 的 id 的地方，右邊則是 init 的地方。
+
+init 點下去會看到 callee 跟 arguments
+
+![](https://static.coderbridge.com/img/aszx87410/9f304ff5534c49df8759a1d65f169d13.png)
+
+callee.name 就是 `useTranslation`，arguments[0].name 則是 `NS_GENERAL`。
+
+而另外一邊 id 點下去可以找到 properties[0].key.name 是 `t`，properties[0].value.name 是 `tGeneral`
+
+有了這些之後，其實我們想找的元素都找齊了，就可以根據 AST 的這些節點位置來寫一段基本的程式碼：
+
+``` js
+// 正確的命名
+const NS_RULES = {
+  NS_GENERAL: 'tGeneral',
+  NS_AUTH: 'tTest'
+}
+
+export default function(context) {
+  return {
+    VariableDeclarator(node) {
+      // 判斷是不是 useTranslation
+      if (node.init.callee.name === 'useTranslation') {
+        // 抓出 namespace 跟 alias
+        const ns = node.init.arguments[0].name
+        const alias = node.id.properties[0].value.name
+        if (alias !== NS_RULES[ns]) {
+          context.report({
+            node,
+            message: `Wrong alias, should use ${NS_RULES[ns]}`,
+          })
+        }
+      }
+    }
+  }
+}
+```
+
+結果會長這樣：
+
+![](https://static.coderbridge.com/img/aszx87410/b14435b7cdd44b6bb206dce3cba40c72.png)
+
+其實我們只是根據 AST 上的節點內容去做簡單的判斷，但是只要做到這邊，差不多就完成八成了，上面的結果其實已經是我們要的了。
+
+但是我們的 ESLint plugin 其實太針對範例程式碼，所以只要輕輕改一下就會壞掉，例如說加一行 `var a`，就會跑出錯誤：`Cannot read property 'callee' of null`，這是因為 `var a` 的 type 也是 `VariableDeclarator`，只是 `init` 是 null，因為 `init.callee` 就報錯了。
+
+其實這些語法可以有各種的組合，所以最後節點的長相有超級多種可能，標題之所以寫「堪用」，就是因為我不想努力了，針對 i18n 的使用場景程式碼結構都會長一樣，所以我只要針對一種就好。如果是這樣的話，只要用最新的 optional chaining 就可以避免這種存取錯誤的問題：
+
+``` js
+// 正確的命名
+const NS_RULES = {
+  NS_GENERAL: 'tGeneral',
+  NS_AUTH: 'tTest'
+}
+
+export default function(context) {
+  return {
+    VariableDeclarator(node) {
+      // 判斷是不是 useTranslation
+      if (node.init?.callee?.name === 'useTranslation') {
+        // 抓出 namespace 跟 alias
+        const ns = node.init?.arguments?.[0]?.name
+        const alias = node.id?.properties?.[0].value?.name
+        if (alias !== NS_RULES[ns]) {
+          context.report({
+            node,
+            message: `Wrong alias, should use ${NS_RULES[ns]}`,
+          })
+        }
+      }
+    }
+  }
+}
+```
+
+不過 AST Explorer 好像還沒支援 optional chaining 就是了。
+
+寫到這邊，其實我們的目標就已經達成了，寫出一個會幫你抓錯誤的 alias 的 ESLint rule。不過這個寫法其實有幾個缺陷，那就是我們把東西寫太死，所以結構變了就抓不出來了，例如說：
+
+```
+var a = NS_AUTH
+const { t: tAuth } = useTranslation(a)
+```
+
+plugin 所抓到的 namespace 就會是 `a`，而不是 `NS_AUTH`，但如果有做好處理的話，應該是可以去找 a 的值發現是 NS_AUTH。不過前面我講過了，因為這個 i18n 使用的時候結構都會一樣，所以暫時不會碰到這種問題。
+
+另外一個找出遺漏的 key 其實也是一樣的做法，就是根據 AST 找出 function call，然後呼叫的 function 名稱是我們剛剛定義好的那些像是 t, tGeneral, tAuth 之類的，把參數取出來，就是應該要存在的 i18n key，接著去語言檔裡面找一下是否存在。
+
+簡單做個示範：
+
+``` js
+// 正確的命名
+const NS_RULES = {
+  NS_GENERAL: 'tGeneral',
+  NS_AUTH: 'tAuth'
+}
+
+// 應該從語言檔讀入
+const KEYS = ['contact', 'login_success']
+
+export default function(context) {
+  return {
+    CallExpression(node) {
+      if (Object.values(NS_RULES).includes(node.callee.name)) {
+        if (!KEYS.includes(node.arguments[0].value)) {
+          context.report({
+            node,
+            message: `i18n key: ${node.arguments[0].value} not found`
+          })
+        }
+      }
+    }
+  }
+}
+```
+
+結果會長這樣：
+
+![](https://static.coderbridge.com/img/aszx87410/33ee7bcd006c44e7995bc9884be70914.png)
+
+只要掌握 AST 的結構依樣畫葫蘆，就可以快速寫出一個簡單堪用的 ESLint plugin。
+
+## 結語
+
+這篇寫出來的 ESLint plugin 我大概會用「簡陋」來形容，就是滿足了最低限度的需求而已，沒有 options 可以調整，也沒有對比較複雜的狀況做處理。
+
+如果你要寫一個沒那麼簡陋的 ESLint plugin，其實不是一件簡單的事，就舉 `no-alert` 為例好了，裡面需要考慮到不同狀況以及 options 的設置，原始碼在這邊：[eslint/lib/rules/no-alert.js](https://github.com/eslint/eslint/blob/master/lib/rules/no-alert.js)。
+
+這篇算是做個小嘗試而已，先寫寫看比較針對性而且簡單的的規則來入門，未來如果還有類似的需求，可以再研究該怎麼寫得更完整。
+
+參考資料：
+
+1. [How To Write Your First ESLint Plugin](https://dev.to/spukas/how-to-write-your-first-eslint-plugin-145)
+2. [Create custom ESLint rules in 2 minutes](https://www.webiny.com/blog/create-custom-eslint-rules-in-2-minutes-e3d41cb6a9a0)

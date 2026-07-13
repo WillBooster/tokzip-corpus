@@ -1,0 +1,111 @@
+接著下面又有幾條規則，來決定最後應該要做出怎樣的行為，而我們的範例會是這一條規則：
+
+![p9-rules](/img/session_storage/p9-rules.png)
+
+
+從流程中可以看出來，在第三個步驟中判斷 noopener 是不是 true，是的話就建立一個新的 top-level browsing context，不是的話就建一個 auxiliary browsing context。
+
+這樣看下來，整個流程都清楚了，只要我們進到這邊而且 noopener 是 false，就會建立一個 auxiliary browsing context，進而把 sessionStorage 複製過去。
+
+等等...可是我們的 noopener 不是 true 嗎？在上面決定 noopener 的值的時候，根據我們的狀況，spec 很明顯是 true，那就應該會建立一個新的 top-level browsing context，sessionStorage 也不會被複製過去。
+
+難道我看漏了什麼？
+
+## 第一次被 spec 搞混就上手
+
+原本自信滿滿想寫這篇文章，結果寫一寫的時候就發現到上面的狀況：「咦，怎麼實際的行為跟 spec 對不起來？」，一直覺得自己看漏了什麼，就又再檢查了幾遍，發現沒錯啊，noopener 的確是 true 才對，那應該就不會建立 auxiliary browsing context 了，sessionStorage 也不應該被複製。
+
+可是在 Chrome 上觀察到的就不是這樣，於是我突然想到了一個可能性，那就是 Chrome 沒有照著 spec 做。這邊要特別留意一件事，那就是我們看的 spec 是最新的 spec，但通常瀏覽器都不會跟到這麼新，再加上有些東西可能是 breaking changes，就會更緩慢一點。
+
+因此我猜測是 spec 有改過，Chrome 所遵照的是以前的行為。有了這個猜測之後，就去搜相關的字眼，真的讓我找到了一個 commit：[Make target=_blank imply noopener; support opener](https://github.com/whatwg/html/commit/5c68ab3ee22bff367baf72c59e0af836868c2f95)。
+
+這是 2019 年 2 月 7 號的一個 commit，在 diff 中可以看到這段改動：
+
+![p10-diff](/img/session_storage/p10-diff.png)
+
+
+在舊的 spec 中，如果 noopener 或是 noreferrer 屬性是 true 才會讓 noopener 是 true，否則就都是 false。
+
+所以我們開頭觀測到的行為是符合舊的 spec 的，我們用 a 連結新開了一個分頁，沒有設置 noopener 跟 noreferrer，所以新開的分頁建立了一個 auxiliary browsing context，sessionStorage 就跟著被複製過去了。
+
+寫到這邊，我們終於得到了一個合理而且權威的解釋，再來只剩下最後幾個問題要處理了：
+
+> noopener 跟 noreferrer 是什麼？為什麼 spec 要做這個改動？
+
+## noopener 與 noreferrer
+
+我最早看到這兩個屬性是在 2016 年 5 月，沒記錯的話應該是從這篇[臉書貼文](https://www.facebook.com/Orange.8361/posts/1309695172378612)中看到的，那時候我好像還有跟同事分享這個東西，因為覺得這招滿帥的。
+
+想知道問題是什麼，可以直接看這篇文章：[About rel=noopener, what problems does it solve?](https://mathiasbynens.github.io/rel-noopener/)。
+
+簡單來說呢，當你從網站 A 使用 `<a target="_blank">` 連結到網站 B 的時候，網站 B 可以拿到 `window.opener`，這就等於是網站 A 的 `window`，因此我只要在網站 B 執行 `window.opener.location = 'phishing_site_url'`，就可以把網站 A 導到其他地方，如果導去的地方是刻意設置的釣魚網站，那使用者就很有可能中招，因為他根本沒有預期到點了連結之後，網站 A 會跳去其他地方。
+
+而解法呢，就是加上 `rel="noopener"` 這個屬性。
+
+另外一個屬性 noreferrer 則是跟 [Referer](https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/Referer) 這個 HTTP request header 有關，例如說我從網站 A 連到網站 B，網站 B 的 `Referer` 就會是網站的 A 的 URL，所以它會知道你從哪邊來的。
+
+而帶上了這個屬性就是告訴瀏覽器說：「不要幫我帶 Referer 這個 header」。
+
+接著我們回到 spec，看一下 spec 怎麼說。
+
+[4.6.6.13 Link type "noopener"](https://html.spec.whatwg.org/multipage/links.html#link-type-noopener)：
+
+> The keyword indicates that any newly created top-level browsing context which results from following the hyperlink will not be an auxiliary browsing context. E.g., its window.opener attribute will be null.
+
+[4.6.6.14 Link type "noreferrer"](https://html.spec.whatwg.org/multipage/links.html#link-type-noreferrer)：
+
+> It indicates that no referrer information is to be leaked when following the link and also implies the noopener keyword behavior under the same conditions.
+
+這邊的定義是「no referrer information is to be leaked」，而這個 referrer information 除了我上面講的 Referer header 之外，其實也包含了其他相關的資訊，不過實際上到底還有什麼，就要去看其他 spec 或是瀏覽器的相關實作了。
+
+然後還有一點要注意的是：「also implies the noopener keyword」，所以用了 noreferrer 之後就蘊含著 noopener 的效果了。
+
+有在寫 React 並且使用 eslint 的朋友們應該都看過一條規則，那就是在用 a link 而且 target 是 `_blank` 的時候，必須要搭配使用 `rel="noreferrer noopener"`，這個規則其實已經被改掉了，現在只要求放上 `noreferrer` 就好，原因就是我上面講的。
+
+想看更多細節可以看這個 issue：[target=_blank rel=noreferrer implies noopener](https://github.com/yannickcr/eslint-plugin-react/issues/2022)，原本怕一些舊的 browser 會出問題所以沒有要改，後來是有人提供了一堆瀏覽器的測試資料，確認沒問題之後才改的。
+
+讓我們把主題再拉回 opener 這個問題，當初這個問題被揭露之後我記得受到滿大的關注，在 spec 的 repo 上也可以找到一大堆相關的討論，其實很多人都滿驚訝原來預設的行為是這樣。
+
+相關的討論可以看這一串：[Windows opened via a target=_blank should not have an opener by default](https://github.com/whatwg/html/issues/4078) 還有這個 PR：[Make target=_blank imply noopener; support opener](https://github.com/whatwg/html/pull/4330)。
+
+總之呢，後來 [Safari](https://trac.webkit.org/changeset/237144/webkit/) 跟 [Firefox](https://bugzilla.mozilla.org/show_bug.cgi?id=1522083) 都針對這點做出改動，使用 `target=_blank`，預設的 opener 就會是 noopener。
+
+那 Chrome 呢？抱歉，還沒。可以參考：[Issue 898942: Anchor target=_blank should imply rel=noopener](https://bugs.chromium.org/p/chromium/issues/detail?id=898942)。
+
+## 回到 sessionStorage
+
+繞了一大圈，看了一大堆 spec 跟 bug tracker 之後，最後我們回到一開始的主題：sessionStorage。
+
+在 spec 裡面說了，如果建立的是 auxiliary browsing context 就會把 sessionSotrage 複製過去。而如果我們加上了 `rel="noopener"`，就不會有這個行為。
+
+所以這就是開頭問題的正解：「加上 `rel="noopener"`」。
+
+可是我開頭已經講過了，我試過這些都沒有用，這是為什麼呢？這是因為 Chrome 還沒支援這個行為：[Issue 771959: Do not copy sessionStorage when a window is created with noopener](https://bugs.chromium.org/p/chromium/issues/detail?id=771959)，而 Safari 雖然說 `target=_blank` 會蘊含 `rel="noopener"`，但是也沒有支援 `noopener` 不會複製 sessionStorage。
+
+唯一符合最新標準的是 Firefox，你加上 `rel="noopener"`，就真的不會把 sessionStorage 一起帶過去了。
+
+由於這些都是瀏覽器還沒修正的行為，所以我們在開發的時候也無能為力。就現階段來說，在 Chrome 跟 Safari 上面，用 `<a target="_blank">` 開啟同個 origin 下的新分頁，就是會把 sessionStorage 複製一份過去。
+
+再提醒最後一個小細節，「點擊連結」跟「右鍵 -> 開新分頁」的行為是不同的。前者會把 sessionStorage 複製過去，但後者不會。因為瀏覽器（至少是 Chrome 跟 Safari）認為「右鍵 -> 開新分頁」就像是你新開一個 tab，然後把網址複製貼上，而不是直接從現有的分頁連過去，所以不會幫你複製 sessionStorage。
+
+再次附上開頭的 demo，你自己試試看就知道了：https://aszx87410.github.io/demo/session_storage/index.html
+
+相關討論可以看：[Issue 165452: sessionStorage variables not being copied to new tab](https://bugs.chromium.org/p/chromium/issues/detail?id=165452)。
+
+## 結語
+
+以 sessionStorage 為起點向外延伸，我們探索到了很多新的東西，而且連結到了我幾年前看到的 noopener 安全性的文章，也連結到了之前寫 code 時碰到的 eslint warning，如果還想再繼續連結，甚至也可以連到 Chrome 最近對 Referer 做出的[改動](https://developers.google.com/web/updates/2020/07/referrer-policy-new-chrome-default)。所以儘管只是一個看起來很小的知識點，背後都蘊含著一整張超大的知識圖譜。
+
+在發現 spec 跟實作不一樣的時候，我瞬間體會到了「盡信書不如無書」的感覺，我原本一直都以為 spec 就是唯一的權威，卻忽略了 spec 會不斷變動、更新，但實作不一定會跟上的這個事實。還有一點，那就是瀏覽器的實作有時候會因為一些考量，不會完全跟著 spec 走，這一點也是往後需要特別注意的。
+
+經歷過這麼一段旅程之後，對 sessionStorage 的理解又更深入了一些。以後有機會的話把 HTML 的 spec 都翻一翻好了，應該能看到更多有趣的東西。
+
+參考資料：
+
+1. [HTML spec](https://html.spec.whatwg.org/multipage/webstorage.html#introduction-16)
+2. [About rel=noopener, what problems does it solve?](https://mathiasbynens.github.io/rel-noopener/)
+3. [target=_blank rel=noreferrer implies noopener](https://github.com/yannickcr/eslint-plugin-react/issues/2022)
+4. [Windows opened via a target=_blank should not have an opener by default](https://github.com/whatwg/html/issues/4078)
+5. [Issue 898942: Anchor target=_blank should imply rel=noopener](https://bugs.chromium.org/p/chromium/issues/detail?id=898942)
+6. [Issue 771959: Do not copy sessionStorage when a window is created with noopener](https://bugs.chromium.org/p/chromium/issues/detail?id=771959)
+7. [Issue 165452: sessionStorage variables not being copied to new tab](https://bugs.chromium.org/p/chromium/issues/detail?id=165452)

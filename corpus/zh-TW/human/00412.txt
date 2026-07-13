@@ -1,0 +1,60 @@
+就是用 JSON 的方式來制定 pre-render 的規則，跟以前用 `<link rel="prerender">` 的方式滿不一樣的。
+
+
+
+## 問題三
+
+靈感一樣來自於 CTF，Securinets CTF Quals 2022 的 [PlanetSheet](https://ctf.zeyu2001.com/2022/securinets-ctf-quals-2022/planetsheet)，當 content type 是 `text/xsl` 的時候，可以用 `<x:script>` 來執行 XSS。
+
+每篇 writeup 中都有提到這個經典的研究：[Content-Type Research
+](https://github.com/BlackFan/content-type-research/blob/master/XSS.md)，細節可以點進去看，底下這五個 content type 在所有瀏覽器下都可以執行 XSS：
+
+1. text/html	
+2. application/xhtml+xml	
+3. application/xml	
+4. text/xml	
+5. image/svg+xml	
+
+我好奇去找了一下 Chromium 的程式碼，發現還有另外兩個 content type 總是跟其他的被放在一起：
+
+1. application/rss+xml
+2. application/atom+xml
+
+程式碼：[xsl_style_sheet_resource.cc](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/103.0.5012.1/third_party/blink/renderer/core/loader/resource/xsl_style_sheet_resource.cc#45)
+
+``` c++
+static void ApplyXSLRequestProperties(FetchParameters& params) {
+  params.SetRequestContext(mojom::blink::RequestContextType::XSLT);
+  params.SetRequestDestination(network::mojom::RequestDestination::kXslt);
+  // TODO(japhet): Accept: headers can be set manually on XHRs from script, in
+  // the browser process, and... here. The browser process can't tell the
+  // difference between an XSL stylesheet and a CSS stylesheet, so it assumes
+  // stylesheets are all CSS unless they already have an Accept: header set.
+  // Should we teach the browser process the difference?
+  DEFINE_STATIC_LOCAL(const AtomicString, accept_xslt,
+                      ("text/xml, application/xml, application/xhtml+xml, "
+                       "text/xsl, application/rss+xml, application/atom+xml"));
+  params.MutableResourceRequest().SetHTTPAccept(accept_xslt);
+}
+```
+
+不過這兩個並不會被當做 XML 載入，於是我找了一下，找到這個 bug：[Issue 104358: Consider allowing more types to parse as XML](https://bugs.chromium.org/p/chromium/issues/detail?id=104358)，裡面提到了這個 2009 就新增的 [commit](https://chromium.googlesource.com/chromium/src/+/b4599a15c90a853930187cc751c951beb819c02d%5E%21/#F0)，新增了底下的程式碼：
+
+``` c++
+if (mime_type == "application/rss+xml" ||
+    mime_type == "application/atom+xml") {
+  // Sad face.  The server told us that they wanted us to treat the response
+  // as RSS or Atom.  Unfortunately, we don't have a built-in feed previewer
+  // like other browsers.  We can't just render the content as XML because
+  // web sites let third parties inject arbitrary script into their RSS
+  // feeds.  That leaves us with little choice but to practically ignore the
+  // response.  In the future, when we have an RSS feed previewer, we can
+  // remove this logic.
+  mime_type.assign("text/plain");
+  response_->response_head.mime_type.assign(mime_type);
+}
+```
+
+因為 RSS feed 有可能會包含第三方的東西，如果直接當 XML 來 render 的話會用 XSS 的風險，所以這兩個就被強制關掉了。
+
+最後筆記一下一個可以幫忙搜尋原始碼的工具，超好用：https://sourcegraph.com/search

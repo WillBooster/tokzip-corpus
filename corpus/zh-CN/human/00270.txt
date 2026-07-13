@@ -1,0 +1,132 @@
+至于运行时具体是怎么做到这一点的，已经超出了本书的范围。不过关键是看清 future 的基本机制：运行时会去*轮询*它所负责的每个 future，而当 future 还没准备好时，就让它重新休眠。
+
+### `Pin` 类型与 `Unpin` trait
+
+回到示例 17-13，我们使用过 `trpl::join!` 宏来等待三个 future。不过，更常见的情况是你会有一个集合，比如一个向量，其中包含若干个 future，而这些 future 的个数要到运行时才知道。让我们把示例 17-13 改成示例 17-23 中的代码：把这三个 future 放进一个向量里，再调用 `trpl::join_all`。不过，这段代码暂时还编译不过。
+
+<figure class="listing">
+
+<span class="file-name">文件名：src/main.rs</span>
+
+```rust,ignore,does_not_compile
+{{#rustdoc_include ../listings/ch17-async-await/listing-17-23/src/main.rs:here}}
+```
+
+<figcaption>示例 17-23：等待一个集合中的多个 future</figcaption>
+
+</figure>
+
+我们把每个 future 都放进了一个 `Box` 中，好把它们变成 *trait object*，就像我们在第十二章“从 `run` 返回错误”那一节做的那样。（我们会在第十八章详细讨论 trait object。）使用 trait object 后，我们就能把这些类型各不相同的匿名 future 当成同一种类型来对待，因为它们全都实现了 `Future` trait。
+
+这也许会让人意外。毕竟，这些 async 代码块都没有返回任何值，所以它们每一个产生的都是 `Future<Output = ()>`。但别忘了：`Future` 是个 trait，而编译器会为每个 async 代码块生成一个独一无二的 enum，即使它们的输出类型完全相同。就像你不能把两个不同的手写 struct 放进同一个 `Vec`，你也同样不能把这些编译器生成的不同 enum 混在一起。
+
+然后，我们把这组 future 传给 `trpl::join_all`，再等待结果。然而，这段代码仍然无法编译。下面是报错中最关键的一部分：
+
+```text
+error[E0277]: `dyn Future<Output = ()>` cannot be unpinned
+  --> src/main.rs:48:33
+   |
+48 |         trpl::join_all(futures).await;
+   |                                 ^^^^^ the trait `Unpin` is not implemented for `dyn Future<Output = ()>`
+   |
+   = note: consider using the `pin!` macro
+           consider using `Box::pin` if you need to access the pinned value outside of the current scope
+   = note: required for `Box<dyn Future<Output = ()>>` to implement `Future`
+note: required by a bound in `futures_util::future::join_all::JoinAll`
+  --> file:///home/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.30/src/future/join_all.rs:29:8
+   |
+27 | pub struct JoinAll<F>
+   |            ------- required by a bound in this struct
+28 | where
+29 |     F: Future,
+   |        ^^^^^^ required by this bound in `JoinAll`
+```
+
+这段错误信息里的 note 告诉我们，应该使用 `pin!` 宏来 *pin* 这些值，也就是把它们放进 `Pin` 类型中，以保证这些值不会在内存中移动。报错之所以说需要 pin，是因为 `dyn Future<Output = ()>` 需要实现 `Unpin` trait，而它当前并没有实现。
+
+`trpl::join_all` 返回的是一个名为 `JoinAll` 的结构体。这个结构体在类型参数 `F` 上是泛型的，而 `F` 又被约束必须实现 `Future` trait。直接通过 `await` 去等待一个 future 时，Rust 会隐式地把它 pin 住。这也正是为什么我们平常不需要在每个想等待 future 的地方都显式写 `pin!`。
+
+但这里，我们并不是直接在等待某个 future。相反，我们是通过把一组 future 传给 `join_all`，构造出了一个新的 future：`JoinAll`。而 `join_all` 的签名要求集合中的元素类型都必须实现 `Future` trait。另一方面，`Box<T>` 只有在它包裹的 `T` 本身是 future 且实现了 `Unpin` trait 时，才会实现 `Future`。
+
+这一下信息量很大！为了真正理解它，我们得再更深入一点，看清 `Future` trait 尤其是 pinning 这一部分到底是如何运作的。再看一遍 `Future` trait 的定义：
+
+```rust
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+pub trait Future {
+    type Output;
+
+    // Required method
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
+}
+```
+
+这里的 `cx` 参数以及它的 `Context` 类型，是运行时在保持 lazy 的同时，真正知道该在什么时候重新检查某个 future 的关键。和前面一样，这部分具体机制超出了本章范围，而且通常也只有在你自己实现 `Future` 时才需要关注。我们这里聚焦的是 `self` 的类型，因为这是我们第一次见到一个方法里的 `self` 带有类型注解。对 `self` 进行类型注解，和给其他函数参数写类型注解类似，但有两个关键区别：
+
+- 它告诉 Rust：要调用这个方法，`self` 必须是什么类型。
+- 它不能随便写成任意类型。它必须是方法所实现类型本身、该类型的引用或智能指针，或者是一个包裹了该类型引用的 `Pin`。
+
+我们会在[第十八章][ch-18]<!-- ignore -->里看到更多相关语法。眼下，只要知道：如果我们想通过轮询 future 来检查它到底是 `Pending` 还是 `Ready(Output)`，那么就需要一个 `Pin` 包裹的、指向该类型的可变引用。
+
+`Pin` 是一种针对指针类类型的包装器，比如 `&`、`&mut`、`Box` 和 `Rc`。（严格来说，`Pin` 作用于实现了 `Deref` 或 `DerefMut` 的类型，但实际效果基本等同于“引用和智能指针”。）`Pin` 本身并不是指针，也不像 `Rc` 或 `Arc` 那样自带引用计数之类的行为；它纯粹是一个让编译器能够对指针使用方式施加约束的工具。
+
+回忆一下：`await` 是通过调用 `poll` 实现的。理解这一点以后，前面的错误信息就已经开始变得容易理解了，不过那个报错说的是 `Unpin`，不是 `Pin`。那么，`Pin` 和 `Unpin` 究竟是什么关系？为什么 `Future` 又要求 `self` 必须放在 `Pin` 里才能调用 `poll` 呢？
+
+记住，我们在本章前面提过，一个 future 里的多个 await 点会被编译成一个状态机，而编译器会确保这个状态机遵守 Rust 关于安全性的全部常规规则，包括借用和所有权。为了做到这一点，Rust 会分析：在某个 await 点和下一个 await 点之间，或者直到 async 代码块结束之前，哪些数据是需要保留的。然后，它会在编译出来的状态机里生成对应的变体。每个变体都会得到其对应源代码片段所需的数据访问权限，这种访问可能是获得所有权，也可能是获得可变或不可变引用。
+
+到这里为止，一切都很好：如果你在某个 async 代码块里把所有权或引用关系写错了，借用检查器会告诉你。但当我们想要移动这个代码块对应的 future 时，比如把它放进 `Vec` 然后传给 `join_all`，事情就开始变复杂了。
+
+当我们移动一个 future 时，无论是把它放进数据结构，以便通过 `join_all` 这种方式迭代处理，还是从函数里返回它，本质上都是在移动 Rust 为我们生成的那个状态机。与 Rust 中大多数其他类型不同的是，Rust 为 async 代码块生成的 future，可能会在某个状态变体的字段里保存指向它自身其他字段的引用，就像图 17-4 里的简化示意图那样。
+
+<figure>
+
+<img alt="A single-column, three-row table representing a future, fut1, which has data values 0 and 1 in the first two rows and an arrow pointing from the third row back to the second row, representing an internal reference within the future." src="img/trpl17-04.svg" class="center" />
+
+<figcaption>图 17-4：一个自引用的数据类型</figcaption>
+
+</figure>
+
+但默认情况下，任何包含自引用的对象，一旦移动就是不安全的，因为引用始终指向它们所引用对象的真实内存地址（见图 17-5）。如果我们移动了这个数据结构本身，那么这些内部引用仍然会指向旧位置。然而那个内存地址现在已经失效了。一方面，你之后对数据结构做的修改不会再反映到那些旧引用上；另一方面，更严重的是，计算机此时已经可以把那块内存拿去做别的用途了。最后你很可能会读到完全无关的数据。
+
+<figure>
+
+<img alt="Two tables, depicting two futures, fut1 and fut2, each of which has one column and three rows, representing the result of having moved a future out of fut1 into fut2. The first, fut1, is grayed out, with a question mark in each index, representing unknown memory. The second, fut2, has 0 and 1 in the first and second rows and an arrow pointing from its third row back to the second row of fut1, representing a pointer that is referencing the old location in memory of the future before it was moved." src="img/trpl17-05.svg" class="center" />
+
+<figcaption>图 17-5：移动自引用数据类型后产生的不安全结果</figcaption>
+
+</figure>
+
+理论上，Rust 编译器也可以尝试在对象被移动时更新所有引用，但这样很可能带来大量性能开销，尤其在需要更新的是一整张引用网络的时候。如果我们反过来，确保这个数据结构*根本不在内存中移动*，那就完全不需要更新任何引用。这正是 Rust 借用检查器要做的事：在安全代码里，它会阻止你移动任何仍然存在活动引用的值。
+
+`Pin` 正是在这个基础上，进一步提供了我们需要的精确保证。当我们把一个指向某值的指针包进 `Pin` 里，也就是对这个值进行 *pin* 之后，它就不能再被移动了。因此，如果你有的是 `Pin<Box<SomeType>>`，那么真正被 pin 住的是 `SomeType` 这个值，而*不是* `Box` 指针本身。图 17-6 展示了这个过程。
+
+<figure>
+
+<img alt="Three boxes laid out side by side. The first is labeled “Pin”, the second “b1”, and the third “pinned”. Within “pinned” is a table labeled “fut”, with a single column; it represents a future with cells for each part of the data structure. Its first cell has the value “0”, its second cell has an arrow coming out of it and pointing to the fourth and final cell, which has the value “1” in it, and the third cell has dashed lines and an ellipsis to indicate there may be other parts to the data structure. All together, the “fut” table represents a future which is self-referential. An arrow leaves the box labeled “Pin”, goes through the box labeled “b1” and terminates inside the “pinned” box at the “fut” table." src="img/trpl17-06.svg" class="center" />
+
+<figcaption>图 17-6：把一个指向自引用 future 类型的 `Box` pin 住</figcaption>
+
+</figure>
+
+实际上，`Box` 指针本身仍然可以自由移动。请记住：我们真正关心的是最终被引用的数据必须固定不动。如果指针移动了，*但它指向的数据*仍然留在原地，就像图 17-7 那样，那么就不会产生问题。（你可以把这当作一个独立练习：去查阅相关类型以及 `std::pin` 模块的文档，试着想清楚如果是 `Pin` 包着 `Box`，到底如何做到这一点。）关键在于：那个自引用的类型本身不能移动，因为它仍然是被 pin 住的。
+
+<figure>
+
+<img alt="Four boxes laid out in three rough columns, identical to the previous diagram with a change to the second column. Now there are two boxes in the second column, labeled “b1” and “b2”, “b1” is grayed out, and the arrow from “Pin” goes through “b2” instead of “b1”, indicating that the pointer has moved from “b1” to “b2”, but the data in “pinned” has not moved." src="img/trpl17-07.svg" class="center" />
+
+<figcaption>图 17-7：移动一个指向自引用 future 类型的 `Box`</figcaption>
+
+</figure>
+
+不过，大多数类型即使碰巧放在 `Pin` 指针后面，也完全可以安全移动。只有当某个值内部真的包含引用时，我们才需要关心 pin。比如数字和布尔值这类基本类型显然没有内部引用，所以当然是安全的。你平时在 Rust 里处理的大多数类型也都是这样。比如一个 `Vec` 就可以自由移动而不用担心。考虑到目前为止我们看到的内容，如果你有一个 `Pin<Vec<String>>`，那理论上你必须通过 `Pin` 提供的那套安全但受限的 API 来操作它，哪怕 `Vec<String>` 在没有其他引用存在时始终都是可以安全移动的。因此，我们需要一种机制来告诉编译器：像这种情况，移动它完全没问题。这正是 `Unpin` 的用途。
+
+`Unpin` 是一个标记 trait（marker trait），就像我们在第十六章见过的 `Send` 和 `Sync` 一样，它本身没有任何功能。marker trait 的存在，只是为了告诉编译器：实现了该 trait 的类型，在某种特定上下文里可以被安全使用。`Unpin` 告诉编译器，某个类型*不需要*维护“这个值是否可以安全移动”方面的额外保证。
+
+就像 `Send` 和 `Sync` 一样，只要编译器能证明某个类型这样做是安全的，它就会自动为其实现 `Unpin`。同样也存在一个特殊情况：某个类型*不会*实现 `Unpin`。这种写法是 <code>impl !Unpin for <em>SomeType</em></code>，其中 <code><em>SomeType</em></code> 表示的是：为了在被 `Pin` 指针引用时保持安全，该类型必须保证自身不会被移动。
+
+换句话说，关于 `Pin` 和 `Unpin` 的关系，有两件事要记住。第一，`Unpin` 才是“正常情况”，`!Unpin` 才是特殊情况。第二，一个类型到底实现的是 `Unpin` 还是 `!Unpin`，*只有在*你使用像 <code>Pin<&mut <em>SomeType</em>></code> 这样指向该类型的 pin 过的指针时，才真正有意义。
+
+为了更具体一点，想想 `String`。它内部保存的是长度以及组成它的 Unicode 字符。我们完全可以把一个 `String` 包进 `Pin`，如图 17-8 所示。不过，`String` 会自动实现 `Unpin`，Rust 中绝大多数其他类型也一样。
+
+<figure>

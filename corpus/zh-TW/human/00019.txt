@@ -1,0 +1,254 @@
+如此一來，底下的 origin 都可以過關：
+
+1. example.com
+2. buy.example.com
+3. social.example.com
+
+可是這樣寫是有問題的，因為這樣也可以過關：
+
+1. fakeexample.com
+
+像是這類型的漏洞是經由錯誤的 CORS 設置引起，所以稱為 CORS misconfiguration。
+
+而解決方法就是不要用 RegExp 去判斷，而是事先準備好一個清單，有在清單中出現的才通過，否則都是失敗，如此一來就可以保證不會有判斷上的漏洞，然後也記得把 cookie 加上 SameSite 屬性。
+
+``` js
+const allowOrigins = [
+  'example.com',
+  'buy.example.com',
+  'social.example.com'
+]
+app.use((req, res, next) => {
+  res.headers['Access-Control-Allow-Credentials'] = 'true'
+  const origin = req.headers['Origin']
+
+  if (allowOrigins.includes(origin)) {
+    res.headers['Access-Control-Allow-Origin'] = origin
+  }
+})
+```
+
+想知道更多的話可以參考：
+
+1. [3 Ways to Exploit Misconfigured Cross-Origin Resource Sharing (CORS)](https://we45.com/blog/3-ways-to-exploit-misconfigured-cross-origin-resource-sharing-cors/)
+2. [JetBrains IDE Remote Code Execution and Local File Disclosure](http://blog.saynotolinux.com/blog/2016/08/15/jetbrains-ide-remote-code-execution-and-local-file-disclosure-vulnerability-analysis/)
+3. [AppSec EU 2017 Exploiting CORS Misconfigurations For Bitcoins And Bounties by James Kettle](https://www.youtube.com/watch?v=wgkj4ZgxI4c&ab_channel=OWASP)
+
+## 繞過 Same-origin Policy？
+
+除了 CORS 以外，Same-origin policy 其實出現在瀏覽器的各個地方，例如說 `window.open` 以及 `iframe`。當你使用 `window.open` 打開一個網頁的時候，回傳值會是那個新的網頁的 window（更精確來說是 WindowProxy 啦，可以參考 [MDN: Window.open()](https://developer.mozilla.org/en-US/docs/Web/API/Window/open)），但只有在 same origin 的狀況下才能存取，如果不是 same origin 的話，只能存取很小一部分的東西。
+
+假設我現在在 `a.example.com` 好了，然後寫了這一段 script：
+
+``` js
+var win = window.open('http://b.example.com')
+// 等新的頁面載入完成
+setTimeout(() => {
+  console.log(win)
+}, 2000)
+```
+
+用 `window.open` 去開啟 `b.example.com`，等頁面載入完成之後去存取 `b.example.com` 的 window。
+
+執行之後會看到 console 有一段錯誤：
+
+![](/img/cors/part5/frame-block.png)
+
+因為 `a.example.com` 跟 `b.example.com` 是 cross origin，所以沒辦法存取到 window。這個規範其實也十分合理，因為如果能存取到 window 的話其實可以做滿多事情的，所以限制在 same origin 底下才能拿到 window。
+
+不過「沒辦法存取 window」這個說法不太精確，因為就算是 cross origin，仍然有一些操作是允許的，例如說：
+
+``` js
+var win = window.open('http://b.example.com')
+// 等新的頁面載入完成
+setTimeout(() => {
+  // 變更開啟的 window 的位置
+  win.location = 'https://google.com'
+  setTimeout(() => {
+    // 關閉視窗
+    win.close()
+  }, 2000)
+}, 2000)
+```
+
+可以改變開啟的 window 的 location，也可以關閉開啟的視窗。
+
+相對地，身為被開啟的那個視窗（`b.example.com`），也可以用 `window.opener` 拿到開啟它的網頁（`a.example.com`）的 window，不過一樣只有部分操作是被允許的。
+
+但是呢，如果這兩個網站是在同一個 subdomain 底下，而且你對兩個網站都有控制權，是可以透過更改 `document.domain` 來讓他們的 origin 相同的！
+
+在 `a.example.com`，這樣子做：
+
+``` js
+// 新增這個，把 domain 設為 example.com
+document.domain = 'example.com'
+
+var win = window.open('http://b.example.com')
+// 等新的頁面載入完成
+setTimeout(() => {
+  console.log(win.secret) // 12345
+}, 2000)
+```
+
+在 `b.example.com` 裡面也需要做一樣的事情：
+
+``` js
+document.domain = 'example.com'
+window.secret = 12345
+```
+
+然後你就會神奇地發現，你現在可以拿到 `b.example.com` 的 window 了！而且幾乎是什麼操作都可以做。
+
+更詳細的介紹可以參考 MDN：[Document.domain](https://developer.mozilla.org/en-US/docs/Web/API/Document/domain)，會這樣可能是有什麼歷史因素，但未來因為安全性的問題有可能會被拔掉就是了。
+
+相關的 spec 可以參考：[7.5.2 Relaxing the same-origin restriction](https://html.spec.whatwg.org/multipage/origin.html#relaxing-the-same-origin-restriction)
+
+## 進入正題：其他各種 COXX 是什麼？
+
+前面這兩個其實都只是小菜而已，並不是這一篇著重的主題。這一篇最想跟大家分享的其實是：
+
+1. CORB（Cross-Origin Read Blocking）
+2. CORP（Cross-Origin Resource Policy）
+3. COEP（Cross-Origin-Embedder-Policy）
+4. COOP（Cross-Origin-Opener-Policy）
+
+這幾個東西。
+
+開頭我有提過了，這幾個東西沒有好好講的話很容易搞混，所以我會用我自己覺得可能比較好懂的方式來講解，接下來就開始吧。
+
+## 嚴重的安全漏洞：Meltdown 與 Spectre
+
+在 2018 年 1 月 3 號，Google 的 Project Zeror 對外發布了一篇名為：[Reading privileged memory with a side-channel](https://googleprojectzero.blogspot.com/2018/01/reading-privileged-memory-with-side.html) 的文章，裡面講述了三種針對 CPU data cache 的攻擊：
+
+* Variant 1: bounds check bypass (CVE-2017-5753)
+* Variant 2: branch target injection (CVE-2017-5715)
+* Variant 3: rogue data cache load (CVE-2017-5754)
+
+而前兩種又被稱為 Spectre，第三種被稱為是 Meltdown。如果你有印象的話，在當時這可是一件大事，因為問題是出在 CPU，而且並不是個容易修復的問題。
+
+而這個漏洞的公佈我覺得對於瀏覽器的運作機制有滿大的影響（或至少加速了瀏覽器演進的過程），尤其是 spectre 可以拿來攻擊瀏覽器，而這當然也影響了這系列的主題：跨來源資源存取。
+
+因此，稍微理解一下 Spectre 在幹嘛我覺得是很有必要的。如果想要完全理解這個攻擊，需要有滿多的背景知識，但這不是這一篇主要想講的東西，因此底下我會以非常簡化的模型來解釋 Spectre，想要完全理解的話可以參考上面的連結。
+
+## 超級簡化版的 Spectre 攻擊解釋
+
+再次強調，這是為了方便理解所簡化過的版本，跟原始的攻擊有一定出入，但核心概念應該是類似的。
+
+假設現在有一段程式碼（C 語言）長這樣子：
+
+``` c
+uint8_t array1[16] = {1, 2, 3}; 
+uint8_t array2[256]; 
+unsigned int array1_size = 16;
+
+void run(size_t x) {
+  if(x < array1_size) {
+    uint8_t y = array2[array1[x]];
+  }
+}
+
+size_t x = 1;
+run(x);
+```
+
+我宣告了兩個陣列，型態是 uint8_t，所以每個陣列的元素大小都會是 1 個 byte（8 bit）。而 array1 的長度是 16，array2 的長度是 256。
+
+接下來我有一個 function 叫做 run，會吃一個數字 x，然後判斷 x 是不是比 array1_size 小，是的話我就先把 `array1[x]` 的值取出來，然後作為索引去存取 `array2`，再把拿到的值給 y。
+
+以上面的例子來說，`run(1)` 的話，就會執行：
+
+``` C
+uint8_t y = array2[array1[1]];
+```
+
+而 `array1[1]` 的值是 2，所以就是 `y = array2[2]`。
+
+這段程式碼看起來沒什麼問題，而且我有做了陣列長度的判斷，所以不會有超出陣列索引（Out-of-Bounds，簡稱 OOB）的狀況發生，只有在 x 比 array1_size 小的時候才會繼續往下執行。 
+
+不過這只是你看起來而已。
+
+在 CPU 執行程式碼的時候，有一個機制叫做 branch prediction。為了增進程式碼執行的效率，所以 CPU 在執行的時候如果碰到 if 條件，會先預測結果是 true 還是 false，如果預測的結果是 true，就會先幫你執行 if 裡面的程式碼，把結果先算出來。
+
+剛剛講的都只是「預測」，等到實際的 if 條件執行完之後，如果跟預測的結果相同，那就皆大歡喜，如果不同的話，就會把剛剛算完的結果丟掉，這個機制稱為：預測執行（speculatively execute）
+
+因為 CPU 會把結果丟掉，所以我們也拿不到預測執行的結果，除非 CPU 有留下一些線索。
+
+而這就是 Spectre 攻擊成立的主因，因為還真的有留下線索。
+
+一樣是為了增進執行的效率，在預測執行的時候會把一些結果放到 CPU cache 裡面，增進之後讀取資料的效率。
+
+假設現在有 ABC 三個東西，一個在 CPU cache 裡面，其他兩個都不在，我們要怎麼知道是哪一個在？
+
+答案是，透過存取這三個東西的時間！因為在 CPU cache 裡面的東西讀取一定比較快，所以如果讀取 A 花了 10ms，B 花了 10ms，C 只花了 1ms，我們就知道 C 一定是在 CPU cache 裡面。這種透過其他線索來得知資訊的攻擊方法，叫做 side-channel attack，從其他管道來得知資訊。
+
+上面的方法我們透過時間來判斷，所以又叫做 timing-attack。
+
+結合上述知識之後，我們再回來看之前那段程式碼：
+
+``` c
+uint8_t array1[16] = {1, 2, 3}; 
+uint8_t array2[256]; 
+unsigned int array1_size = 16;
+
+void run(size_t x) {
+  if(x < array1_size) {
+    uint8_t y = array2[array1[x]];
+  }
+}
+
+size_t x = 1;
+run(x);
+```
+
+假設現在我跑很多次 `run(10)`，CPU 根據 branch prediction 的機制，合理推測我下一次也會滿足 if 條件，執行到裡面的程式碼。就在這時候我突然把 x 設成 100，跑了一個 `run(100)`。
+
+這時候 if 裡面的程式碼會被預測執行：
+
+``` C
+uint8_t y = array2[array1[100]];
+```
+
+假設 array1[100] 的值是 38 好了，那就是 `y = array2[38]`，所以 `array2[38]` 會被放到 CPU cache 裡面，增進之後載入的效率。
+
+接著實際執行到 if condition 發現條件不符合，所以把剛剛拿到的結果丟掉，什麼事都沒發生，function 執行完畢。
+
+然後我們根據剛剛上面講的 timing attack，去讀取 array2 的每一個元素，並且計算時間，會發現 `array2[38]` 的讀取時間最短。
+
+這時候我們就知道了一件事：
+
+> array1[100] 的內容是 38
+
+你可能會問說：「那你知道這能幹嘛？」，能做的事情可多了。array1 的長度只有 16，所以我讀取到的值並不是 array1 本身的東西，而是其他部分的記憶體，是我不應該存取到的地方。而我只要一直複製這個模式，就能把其他地方的資料全都讀出來。
+
+這個攻擊如果放在瀏覽器上面，我就能讀取同一個 process 的其他資料，換句話說，如果同一個 process 裡面有其他網站的內容，我就能讀取到那個網站的內容！
+
+這就是 Spectre 攻擊，透過 CPU 的一些機制來進行 side-channal attack，進而讀取到本來不該讀到的資料，造成安全性問題。
+
+所以用一句白話文解釋，在瀏覽器上面，Spectre 可以讓你有機會讀取到其他網站的資料。
+
+有關 Spectre 的解釋就到這裡了，上面簡化了很多細節，而那些細節我其實也沒有完全理解，想知道更多的話可以參考：
+
+1. [Reading privileged memory with a side-channel](https://googleprojectzero.blogspot.com/2018/01/reading-privileged-memory-with-side.html)
+2. [解读 Meltdown & Spectre CPU 漏洞](https://zhuanlan.zhihu.com/p/32757727)
+3. [浅谈处理器级Spectre Attack及Poc分析](https://yangrz.github.io/blog/2018/01/09/cpu/)
+4. [[閒聊] Spectre & Meltdown漏洞概論(翻譯)](https://www.ptt.cc/bbs/NetSecurity/M.1515146856.A.750.html)
+5. [Google update: Meltdown/Spectre](https://developers.google.com/web/updates/2018/02/meltdown-spectre)
+6. [Mitigating Spectre with Site Isolation in Chrome](https://security.googleblog.com/2018/07/mitigating-spectre-with-site-isolation.html)
+
+而那些 COXX 的東西，目的都是差不多的，都是要防止一個網站能夠讀取到其他網站的資料。只要不讓惡意網站跟目標網站處在同一個 process，這類型的攻擊就失效了。
+
+從這個角度出發，我們來看看各種相關機制。
+
+## CORB（Cross-Origin Read Blocking）
+
+Google 於 Spectre 攻擊公開的一個月後，也就是 2018 年 2 月，在部落格上面發了一篇文章講述 Chrome 做了哪些事情來防堵這類型的攻擊：[Meltdown/Spectre](https://developers.google.com/web/updates/2018/02/meltdown-spectre)。
+
+文章中的 Cross-Site Document Blocking 就是 CORB 的前身。根據 [Chrome Platform Status](https://www.chromestatus.com/feature/5629709824032768)，在 Chrome for desktop release 67 的時候正式預設啟用，那時候大概是 2018 年 5 月，也差不多那個時候，被 merge 進去 fetch 的 spec，成為規格的一部分（[CORB: blocking of nosniff and 206 responses](https://github.com/whatwg/fetch/pull/686)）。
+
+前面有提到過 Spectre 能夠讀取到同一個 process 底下的資料，所以防禦的其中一個方式就是不要讓其他網站的資料出現在同一個 process 底下。
+
+一個網站有許多方式可以把跨來源的資源設法弄進來，例如說 `fetch` 或是 `xhr`，但這兩種已經被 CORS 給控管住了，而且拿到的 response 應該是存在 network 相關的 process 而不是網站本身的 process，所以就算用 Spectre 也讀不到。
+
+但是呢，用 `<img>` 或是 `<script>` 這些標籤也可以輕易地把其他網站的資源載入。例如說：`<img src="https://bank.com/secret.json">`，假設 `secret.json` 是個機密的資料，我們就可以把這個機密的資料給「載入」。
+
+你可能會好奇說：「這樣做有什麼用？那又不是一張圖片，而且我用 JS 也讀取不到」。沒錯，這不是一張圖片，但以 Chrome 的運作機制來說，Chrome 在下載之前不知道它不是圖片（有可能副檔名是 .json 但其實是圖片對吧），因此會先下載，下載之後把結果丟進 render process，這時候才會知道這不是一張圖片，然後引發載入錯誤。

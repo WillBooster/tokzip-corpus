@@ -1,0 +1,157 @@
+![](/img/open-redirect/chat.png)
+
+The last part of the URL in the picture is actually the result of url encoding `https://attacker.com`, so the user will not notice the string behind it, only the beginning of the URL starting with facebookb.com. What I want to emphasize here is that "when users see a familiar URL, they will be less vigilant."
+
+However, in this situation, similar URLs can also achieve similar results (although less effective), such as facebo0k.com or myfacebook.com.
+
+At this point, let's imagine another scenario where some websites will remind you when you click on an external link: "You are about to go to an external website, be careful." If you use open redirect at this time, the website may not pop up a warning (because it is the same domain), and the user may unknowingly jump to another website.
+
+For example, suppose there is a forum with an open redirect vulnerability, and I put a link in the article that uses open redirect to disable the prompt for jumping to an external website. When the user clicks the link, they will go to a "well-designed phishing website" that looks exactly the same but pops up a popup asking for the user's account and password, saying that their connection session has expired and they need to log in again. At this point, the user is more likely to enter their account and password because they did not realize that they were redirected to a phishing website.
+
+All of these issues only discuss the harm that open redirect can cause "without combining with other vulnerabilities". It seems okay, right? Compared with other attacks, it seems not that serious. However, the underestimated aspect of open redirect is the power it can exert when combined with other vulnerabilities.
+
+Before we continue, we must first understand the implementation of redirection, which is mainly divided into two types:
+
+1. Backend redirection, using the response header `Location`
+2. Front-end redirection, which may use history.push, window.open, and location, etc.
+
+The first type of redirecting through the backend is done by returning the `Location` header from the server, and the browser will redirect the user to the corresponding location. The implementation may look like this:
+
+``` js
+function handler(req, res) {
+  res.setStatus(302)
+  res.setHeader('Location: ' + req.query.redirect)
+  return
+}
+```
+
+The second type, implemented by the front-end, is different. A common example is to directly assign the destination to `window.location` for page redirection:
+
+``` js
+const searchParams = new URLSearchParams(location.search)
+window.location = searchParams.get('redirect')
+```
+
+Or, if it is an SPA and you don't want to change pages, you may directly use `history.push` or the built-in router in the framework.
+
+Regardless of whether it is done by the front-end or the back-end, there are issues that need to be addressed in the implementation of redirection.
+
+## Back-end: CRLF injection
+
+In the back-end redirection, the value passed in will be placed in the `Location` response header. If some servers or frameworks do not handle it properly, newline characters can be inserted. For example, setting the redirected URL to `abc\ntest:123` may result in the following response:
+
+```
+HTTP/2 302 Found
+Location: abc
+test:123
+```
+
+If changed to: `abc\n\n<script>alert(1)</script>`, the response will become:
+
+```
+HTTP/2 302 Found
+Location: abc
+
+<script>alert(1)</script>
+....
+```
+
+By using CRLF injection to change the content of the response body, it is unfortunately impossible to directly achieve XSS because when the browser sees a status code of 301/302, it ignores the response body and directly redirects the user to the target page.
+
+The information I found that can work is already four or five years old:
+
+1. [[stagecafrstore.starbucks.com] CRLF Injection, XSS](https://hackerone.com/reports/192667)
+2. [[dev.twitter.com] XSS and Open Redirect](https://hackerone.com/reports/260744)
+
+I remember reading an article about how to deal with this situation, but I couldn't find it after searching for a long time. If you know how to bypass it, please let me know.
+
+However, even if changing the response body is not very useful, changing other headers may also lead to other attacks, such as Set-Cookie, which can set arbitrary cookies for users, and may lead to session fixation or CSRF attacks.
+
+## Front-end: XSS
+
+If the redirection is implemented by the front-end, one issue that needs to be particularly careful is XSS.
+
+You may wonder what the relationship is between redirection and XSS. Let's first review the code for front-end redirection:
+
+``` js
+const searchParams = new URLSearchParams(location.search)
+window.location = searchParams.get('redirect')
+```
+
+What problems does this have?
+
+In JS, there is something that many people have seen but may use less frequently, called the JavaScript pseudo protocol, like this:
+
+```
+<a href="javascript:alert(1)">click me</a>
+```
+
+After clicking on that `a`, it will execute JS to pop up an alert. And this trick can be used not only in href but also on location:
+
+``` js
+window.location = 'javascript:alert(1)'
+```
+
+Open a new tab in your browser and execute the above code directly in the devtool console, and you will find that the alert really pops up, and the following methods will trigger it:
+
+``` js
+window.location.href = 'javascript:alert(1)'
+window.location.assign('javascript:alert(1)')
+window.location.replace('javascript:alert(1)')
+```
+
+Therefore, as long as the attacker sets the redirect location to `javascript:xxx`, arbitrary code can be executed, triggering XSS. Front-end developers must pay special attention to this case because assigning the value directly to location is a very common implementation method.
+
+Below is a real-world example, targeting the website that appeared in another article: [Preventing XSS May Be Harder Than You Think](https://tech-blog.cymetrics.io/posts/huli/prevent-xss-might-be-harder-than-you-thought/): [Matters News](https://matters.news/).
+
+This is their login page:
+
+![](/img/open-redirect/matters.png)
+
+After clicking login, a function called `redirectToTarget` is called, and the code for this function is as follows:
+
+``` js
+/**
+ * Redirect to "?target=" or fallback URL with page reload.
+ *
+ * (works on CSR)
+ */
+export const redirectToTarget = ({
+  fallback = 'current',
+}: {
+  fallback?: 'homepage' | 'current'
+} = {}) => {
+  const fallbackTarget =
+    fallback === 'homepage'
+      ? `/` // FIXME: to purge cache
+      : window.location.href
+  const target = getTarget() || fallbackTarget
+
+  window.location.href = decodeURIComponent(target)
+}
+```
+
+After obtaining the `target`, it was directly used as follows: `window.location.href = decodeURIComponent(target)` for redirection. `getTarget` is actually used to retrieve the value of `target` from the URL query string. Therefore, if the login URL is `https://matters.news/login?target=javascript:alert(1)`, an alert will pop up when the user clicks on the login button and successfully logs in, triggering an XSS attack!
+
+Moreover, once this XSS attack is triggered, its impact is significant because it is on the login page. Therefore, the XSS executed on this page can directly capture the input values, which are the user's account and password. If an actual attack is to be executed, a phishing email can be sent to the website's users, containing this malicious link for them to click on. Since the URL is a normal one and the page they are redirected to is the actual website's page, the credibility should be quite high.
+
+After the user enters their account and password and logs in, using XSS to steal the account and password and redirecting the user back to the homepage can steal the user's account without leaving any traces, achieving account theft.
+
+The fix is to only allow URLs that start with http/https:
+
+``` js
+const fallbackTarget =
+  fallback === 'homepage'
+    ? `/` // FIXME: to purge cache
+    : window.location.href
+let target = decodeURIComponent(getTarget())
+
+const isValidTarget = /^((http|https):\/\/)/.test(target)
+if (!isValidTarget) {
+  target = fallbackTarget
+}
+
+window.location.href = target || fallbackTarget
+```
+
+However, this only fixes the XSS vulnerability in the redirection function, and the open redirect vulnerability still exists. Further checks on the domain are required to eliminate the open redirect vulnerability.

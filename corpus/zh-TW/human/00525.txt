@@ -1,0 +1,170 @@
+Simply put, you can upload any file, but if the file's MIME type has `script`, it will be `application/octet-stream`.
+
+`X-Content-Type-Optionsit` is set to `nosniff`, so we can't abuse MIME type sniffing.
+
+The goal is to successfully execute XSS.
+
+It is not difficult to see from the above code that an HTML file can be uploaded, but because of `script-src 'self'` CSP, even if HTML can be uploaded, inline script cannot be used.
+
+We can only import script this way: `<script src="/uploads/xxx">`.
+
+But, if the content type of `/uploads/xxx` is `application/octet-stream`, Chrome will throw following error:
+
+> Refused to execute script from 'https://uploader.c.hc.lc/uploads/xxx' because its MIME type ('application/octet-stream') is not executable, and strict MIME type checking is enabled.
+
+So the goal of this question is very clear, to find a MIME type that does not contain `script` but can be successfully loaded by the browser.
+
+After seeing this challenge, my first idea is to check the source code of Chromium, it's easier to find the related part by googling the error message:`"strict MIME type checking is enabled" site:https://chromium.googlesource.com/`
+
+We can find this related file through the search results: https://chromium.googlesource.com/chromium/blink/+/refs/heads/main/Source/core/dom/ScriptLoader.cpp
+
+This file is very old and deprecated, but at least we know it's part of blink, so we can find a similiar file in the latest codebase, what I found is: [third_party/blink/renderer/core/script/script_loader.cc](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/103.0.5012.1/third_party/blink/renderer/core/script/script_loader.cc)
+
+You can find this function: `IsValidClassicScriptTypeAndLanguage` 
+
+``` cpp
+// <specdef href="https://html.spec.whatwg.org/C/#prepare-a-script">
+bool IsValidClassicScriptTypeAndLanguage(
+    const String& type,
+    const String& language,
+    ScriptLoader::LegacyTypeSupport support_legacy_types) {
+  // FIXME: IsLegacySupportedJavaScriptLanguage() is not valid HTML5. It is used
+  // here to maintain backwards compatibility with existing web tests. The
+  // specific violations are:
+  // - Allowing type=javascript. type= should only support MIME types, such as
+  //   text/javascript.
+  // - Allowing a different set of languages for language= and type=. language=
+  //   supports Javascript 1.1 and 1.4-1.6, but type= does not.
+  if (type.IsNull()) {
+    // <spec step="8">the script element has no type attribute but it has a
+    // language attribute and that attribute's value is the empty string,
+    // or</spec>
+    //
+    // <spec step="8">the script element has neither a type attribute
+    // nor a language attribute, then</spec>
+    if (language.IsEmpty())
+      return true;
+    // <spec step="8">Otherwise, the element has a non-empty language attribute;
+    // let the script block's type string for this script element be the
+    // concatenation of the string "text/" followed by the value of the language
+    // attribute.</spec>
+    if (MIMETypeRegistry::IsSupportedJavaScriptMIMEType("text/" + language))
+      return true;
+    // Not spec'ed.
+    if (MIMETypeRegistry::IsLegacySupportedJavaScriptLanguage(language))
+      return true;
+  } else if (type.IsEmpty()) {
+    // <spec step="8">the script element has a type attribute and its value is
+    // the empty string, or</spec>
+    return true;
+  } else {
+    // <spec step="8">Otherwise, if the script element has a type attribute, let
+    // the script block's type string for this script element be the value of
+    // that attribute with leading and trailing ASCII whitespace
+    // stripped.</spec>
+    if (MIMETypeRegistry::IsSupportedJavaScriptMIMEType(
+            type.StripWhiteSpace())) {
+      return true;
+    }
+    // Not spec'ed.
+    if (support_legacy_types == ScriptLoader::kAllowLegacyTypeInTypeAttribute &&
+        MIMETypeRegistry::IsLegacySupportedJavaScriptLanguage(type)) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+
+Then, we can search this keyword:`IsSupportedJavaScriptMIMEType` and find this file: [third_party/blink/common/mime_util/mime_util.cc](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/103.0.5012.1/third_party/blink/common/mime_util/mime_util.cc)
+
+``` js
+//  Support every script type mentioned in the spec, as it notes that "User
+//  agents must recognize all JavaScript MIME types." See
+//  https://html.spec.whatwg.org/#javascript-mime-type.
+const char* const kSupportedJavascriptTypes[] = {
+    "application/ecmascript",
+    "application/javascript",
+    "application/x-ecmascript",
+    "application/x-javascript",
+    "text/ecmascript",
+    "text/javascript",
+    "text/javascript1.0",
+    "text/javascript1.1",
+    "text/javascript1.2",
+    "text/javascript1.3",
+    "text/javascript1.4",
+    "text/javascript1.5",
+    "text/jscript",
+    "text/livescript",
+    "text/x-ecmascript",
+    "text/x-javascript",
+};
+```
+
+You can also see the URL of the spec from the comments. The list given is the same, and this list is basically the answer to the first question. The above MIME types can be loaded as script.
+
+But we can find one thing, that is, every MIME type contains `script`.
+
+At that time, I got stuck at this point. Later, the author released a hint: `Origin Trials`. Follow the hint I found a feature called [Web Bundles](https://web.dev/web-bundles/). This is the answer to the XSS challenge.
+
+What is Web Bundles?
+
+To put it simply, Web Bundles is a feature that you can package a bunch of data (HTML, CSS, JS...) together into a .wbn file. The above article mentions an example that your friend wants to share with a web game with you, but he can't do it because there is no internet connection.
+
+But through the Web Bundles, he can package the web game into a .wbn file and send it to you. After you receive it via bluetooth or airdrop, you can just open it in the browser, just like an app.
+
+In addition to loading the entire app, you can also load specific resources from the Web Bundle. You can find the detail here:[Explainer: Subresource loading with Web Bundles](https://github.com/WICG/webpackage/blob/main/explainers/subresource-loading.md).
+
+Here is the example from the article:
+
+``` html
+<script type="webbundle">
+{
+   "source": "https://example.com/dir/subresources.wbn",
+   "resources": ["https://example.com/dir/a.js", "https://example.com/dir/b.js", "https://example.com/dir/c.png"]
+}
+</script>
+```
+
+When you load `https://example.com/dir/a.js` , the browser will first go to subresources.wbn to find this resource, instead of reaching to the server to download it directly.
+
+So, for the XSS challenge I mentioned in the beginning, the answer is to bundle the JavaScript into a web bundle file, and then load it. It's MIME type is `application/webbundle`, so it's allow.
+
+After web bundle is loaded, we can load script from it.
+
+But why didn't we see this feature when we looked at the Chromium code?
+
+This is because we are too focus on MIME type, so we only look at`IsValidClassicScriptTypeAndLanguage`, but we should see another function who call it: [GetScriptTypeAtPrepare](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/103.0.5012.1/third_party/blink/renderer/core/script/script_loader.cc)：
+
+``` C++
+ScriptLoader::ScriptTypeAtPrepare ScriptLoader::GetScriptTypeAtPrepare(
+    const String& type,
+    const String& language,
+    LegacyTypeSupport support_legacy_types) {
+  if (IsValidClassicScriptTypeAndLanguage(type, language,
+                                          support_legacy_types)) {
+    // <spec step="8">... If the script block's type string is a JavaScript MIME
+    // type essence match, the script's type is "classic". ...</spec>
+    return ScriptTypeAtPrepare::kClassic;
+  }
+  if (EqualIgnoringASCIICase(type, script_type_names::kModule)) {
+    // <spec step="8">... If the script block's type string is an ASCII
+    // case-insensitive match for the string "module", the script's type is
+    // "module". ...</spec>
+    return ScriptTypeAtPrepare::kModule;
+  }
+  if (EqualIgnoringASCIICase(type, script_type_names::kImportmap)) {
+    return ScriptTypeAtPrepare::kImportMap;
+  }
+  if (EqualIgnoringASCIICase(type, script_type_names::kSpeculationrules)) {
+    return ScriptTypeAtPrepare::kSpeculationRules;
+  }
+  if (EqualIgnoringASCIICase(type, script_type_names::kWebbundle)) {
+    return ScriptTypeAtPrepare::kWebBundle;
+  }
+  // <spec step="8">... If neither of the above conditions are true, then
+  // return. No script is executed.</spec>
+  return ScriptTypeAtPrepare::kInvalid;
+}
+```

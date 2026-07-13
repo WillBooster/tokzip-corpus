@@ -1,0 +1,681 @@
+We’ll implement this behavior by introducing a new data structure between the
+`ThreadPool` and the threads that will manage this new behavior. We’ll call
+this data structure *Worker*, which is a common term in pooling
+implementations. The `Worker` picks up code that needs to be run and runs the
+code in its thread.
+
+Think of people working in the kitchen at a restaurant: The workers wait until
+orders come in from customers, and then they’re responsible for taking those
+orders and filling them.
+
+Instead of storing a vector of `JoinHandle<()>` instances in the thread pool,
+we’ll store instances of the `Worker` struct. Each `Worker` will store a single
+`JoinHandle<()>` instance. Then, we’ll implement a method on `Worker` that will
+take a closure of code to run and send it to the already running thread for
+execution. We’ll also give each `Worker` an `id` so that we can distinguish
+between the different instances of `Worker` in the pool when logging or
+debugging.
+
+Here is the new process that will happen when we create a `ThreadPool`. We’ll
+implement the code that sends the closure to the thread after we have `Worker`
+set up in this way:
+
+1. Define a `Worker` struct that holds an `id` and a `JoinHandle<()>`.
+1. Change `ThreadPool` to hold a vector of `Worker` instances.
+1. Define a `Worker::new` function that takes an `id` number and returns a
+   `Worker` instance that holds the `id` and a thread spawned with an empty
+   closure.
+1. In `ThreadPool::new`, use the `for` loop counter to generate an `id`, create
+   a new `Worker` with that `id`, and store the `Worker` in the vector.
+
+If you’re up for a challenge, try implementing these changes on your own before
+looking at the code in Listing 21-15.
+
+Ready? Here is Listing 21-15 with one way to make the preceding modifications.
+
+src/lib.rs
+
+```
+use std::thread;
+
+pub struct ThreadPool {
+    workers: Vec<Worker>,
+}
+
+impl ThreadPool {
+    // --snip--
+    pub fn new(size: usize) -> ThreadPool {
+        assert!(size > 0);
+
+        let mut workers = Vec::with_capacity(size);
+
+        for id in 0..size {
+            workers.push(Worker::new(id));
+        }
+
+        ThreadPool { workers }
+    }
+    // --snip--
+}
+
+struct Worker {
+    id: usize,
+    thread: thread::JoinHandle<()>,
+}
+
+impl Worker {
+    fn new(id: usize) -> Worker {
+        let thread = thread::spawn(|| {});
+
+        Worker { id, thread }
+    }
+}
+```
+
+Listing 21-15: Modifying `ThreadPool` to hold `Worker` instances instead of holding threads directly
+
+We’ve changed the name of the field on `ThreadPool` from `threads` to `workers`
+because it’s now holding `Worker` instances instead of `JoinHandle<()>`
+instances. We use the counter in the `for` loop as an argument to
+`Worker::new`, and we store each new `Worker` in the vector named `workers`.
+
+External code (like our server in *src/main.rs*) doesn’t need to know the
+implementation details regarding using a `Worker` struct within `ThreadPool`,
+so we make the `Worker` struct and its `new` function private. The
+`Worker::new` function uses the `id` we give it and stores a `JoinHandle<()>`
+instance that is created by spawning a new thread using an empty closure.
+
+> Note: If the operating system can’t create a thread because there aren’t
+> enough system resources, `thread::spawn` will panic. That will cause our
+> whole server to panic, even though the creation of some threads might
+> succeed. For simplicity’s sake, this behavior is fine, but in a production
+> thread pool implementation, you’d likely want to use
+> `std::thread::Builder` and its
+> `spawn` method that returns `Result` instead.
+
+This code will compile and will store the number of `Worker` instances we
+specified as an argument to `ThreadPool::new`. But we’re *still* not processing
+the closure that we get in `execute`. Let’s look at how to do that next.
+
+#### Sending Requests to Threads via Channels
+
+The next problem we’ll tackle is that the closures given to `thread::spawn` do
+absolutely nothing. Currently, we get the closure we want to execute in the
+`execute` method. But we need to give `thread::spawn` a closure to run when we
+create each `Worker` during the creation of the `ThreadPool`.
+
+We want the `Worker` structs that we just created to fetch the code to run from
+a queue held in the `ThreadPool` and send that code to its thread to run.
+
+The channels we learned about in Chapter 16—a simple way to communicate between
+two threads—would be perfect for this use case. We’ll use a channel to function
+as the queue of jobs, and `execute` will send a job from the `ThreadPool` to
+the `Worker` instances, which will send the job to its thread. Here is the plan:
+
+1. The `ThreadPool` will create a channel and hold on to the sender.
+1. Each `Worker` will hold on to the receiver.
+1. We’ll create a new `Job` struct that will hold the closures we want to send
+   down the channel.
+1. The `execute` method will send the job it wants to execute through the
+   sender.
+1. In its thread, the `Worker` will loop over its receiver and execute the
+   closures of any jobs it receives.
+
+Let’s start by creating a channel in `ThreadPool::new` and holding the sender
+in the `ThreadPool` instance, as shown in Listing 21-16. The `Job` struct
+doesn’t hold anything for now but will be the type of item we’re sending down
+the channel.
+
+src/lib.rs
+
+```
+use std::{sync::mpsc, thread};
+
+pub struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: mpsc::Sender<Job>,
+}
+
+struct Job;
+
+impl ThreadPool {
+    // --snip--
+    pub fn new(size: usize) -> ThreadPool {
+        assert!(size > 0);
+
+        let (sender, receiver) = mpsc::channel();
+
+        let mut workers = Vec::with_capacity(size);
+
+        for id in 0..size {
+            workers.push(Worker::new(id));
+        }
+
+        ThreadPool { workers, sender }
+    }
+    // --snip--
+}
+```
+
+Listing 21-16: Modifying `ThreadPool` to store the sender of a channel that transmits `Job` instances
+
+In `ThreadPool::new`, we create our new channel and have the pool hold the
+sender. This will successfully compile.
+
+Let’s try passing a receiver of the channel into each `Worker` as the thread
+pool creates the channel. We know we want to use the receiver in the thread that
+the `Worker` instances spawn, so we’ll reference the `receiver` parameter in the
+closure. The code in Listing 21-17 won’t quite compile yet.
+
+src/lib.rs
+
+```
+impl ThreadPool {
+    // --snip--
+    pub fn new(size: usize) -> ThreadPool {
+        assert!(size > 0);
+
+        let (sender, receiver) = mpsc::channel();
+
+        let mut workers = Vec::with_capacity(size);
+
+        for id in 0..size {
+            workers.push(Worker::new(id, receiver));
+        }
+
+        ThreadPool { workers, sender }
+    }
+    // --snip--
+}
+
+// --snip--
+
+impl Worker {
+    fn new(id: usize, receiver: mpsc::Receiver<Job>) -> Worker {
+        let thread = thread::spawn(|| {
+            receiver;
+        });
+
+        Worker { id, thread }
+    }
+}
+```
+
+Listing 21-17: Passing the receiver to each `Worker`
+
+We’ve made some small and straightforward changes: We pass the receiver into
+`Worker::new`, and then we use it inside the closure.
+
+When we try to check this code, we get this error:
+
+```
+$ cargo check
+    Checking hello v0.1.0 (file:///projects/hello)
+error[E0382]: use of moved value: `receiver`
+  --> src/lib.rs:26:42
+   |
+21 |         let (sender, receiver) = mpsc::channel();
+   |                      -------- move occurs because `receiver` has type `std::sync::mpsc::Receiver<Job>`, which does not implement the `Copy` trait
+...
+25 |         for id in 0..size {
+   |         ----------------- inside of this loop
+26 |             workers.push(Worker::new(id, receiver));
+   |                                          ^^^^^^^^ value moved here, in previous iteration of loop
+   |
+note: consider changing this parameter type in method `new` to borrow instead if owning the value isn't necessary
+  --> src/lib.rs:47:33
+   |
+47 |     fn new(id: usize, receiver: mpsc::Receiver<Job>) -> Worker {
+   |        --- in this method       ^^^^^^^^^^^^^^^^^^^ this parameter takes ownership of the value
+help: consider moving the expression out of the loop so it is only moved once
+   |
+25 ~         let mut value = Worker::new(id, receiver);
+26 ~         for id in 0..size {
+27 ~             workers.push(value);
+   |
+
+For more information about this error, try `rustc --explain E0382`.
+error: could not compile `hello` (lib) due to 1 previous error
+```
+
+The code is trying to pass `receiver` to multiple `Worker` instances. This
+won’t work, as you’ll recall from Chapter 16: The channel implementation that
+Rust provides is multiple *producer*, single *consumer*. This means we can’t
+just clone the consuming end of the channel to fix this code. We also don’t
+want to send a message multiple times to multiple consumers; we want one list
+of messages with multiple `Worker` instances such that each message gets
+processed once.
+
+Additionally, taking a job off the channel queue involves mutating the
+`receiver`, so the threads need a safe way to share and modify `receiver`;
+otherwise, we might get race conditions (as covered in Chapter 16).
+
+Recall the thread-safe smart pointers discussed in Chapter 16: To share
+ownership across multiple threads and allow the threads to mutate the value, we
+need to use `Arc<Mutex<T>>`. The `Arc` type will let multiple `Worker` instances
+own the receiver, and `Mutex` will ensure that only one `Worker` gets a job from
+the receiver at a time. Listing 21-18 shows the changes we need to make.
+
+src/lib.rs
+
+```
+use std::{
+    sync::{Arc, Mutex, mpsc},
+    thread,
+};
+// --snip--
+
+impl ThreadPool {
+    // --snip--
+    pub fn new(size: usize) -> ThreadPool {
+        assert!(size > 0);
+
+        let (sender, receiver) = mpsc::channel();
+
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        let mut workers = Vec::with_capacity(size);
+
+        for id in 0..size {
+            workers.push(Worker::new(id, Arc::clone(&receiver)));
+        }
+
+        ThreadPool { workers, sender }
+    }
+
+    // --snip--
+}
+
+// --snip--
+
+impl Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+        // --snip--
+    }
+}
+```
+
+Listing 21-18: Sharing the receiver among the `Worker` instances using `Arc` and `Mutex`
+
+In `ThreadPool::new`, we put the receiver in an `Arc` and a `Mutex`. For each
+new `Worker`, we clone the `Arc` to bump the reference count so that the
+`Worker` instances can share ownership of the receiver.
+
+With these changes, the code compiles! We’re getting there!
+
+#### Implementing the execute Method
+
+Let’s finally implement the `execute` method on `ThreadPool`. We’ll also change
+`Job` from a struct to a type alias for a trait object that holds the type of
+closure that `execute` receives. As discussed in the “Type Synonyms and Type
+Aliases” section in Chapter 20, type aliases
+allow us to make long types shorter for ease of use. Look at Listing 21-19.
+
+src/lib.rs
+
+```
+// --snip--
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+impl ThreadPool {
+    // --snip--
+
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job = Box::new(f);
+
+        self.sender.send(job).unwrap();
+    }
+}
+
+// --snip--
+```
+
+Listing 21-19: Creating a `Job` type alias for a `Box` that holds each closure and then sending the job down the channel
+
+After creating a new `Job` instance using the closure we get in `execute`, we
+send that job down the sending end of the channel. We’re calling `unwrap` on
+`send` for the case that sending fails. This might happen if, for example, we
+stop all our threads from executing, meaning the receiving end has stopped
+receiving new messages. At the moment, we can’t stop our threads from
+executing: Our threads continue executing as long as the pool exists. The
+reason we use `unwrap` is that we know the failure case won’t happen, but the
+compiler doesn’t know that.
+
+But we’re not quite done yet! In the `Worker`, our closure being passed to
+`thread::spawn` still only *references* the receiving end of the channel.
+Instead, we need the closure to loop forever, asking the receiving end of the
+channel for a job and running the job when it gets one. Let’s make the change
+shown in Listing 21-20 to `Worker::new`.
+
+src/lib.rs
+
+```
+// --snip--
+
+impl Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+        let thread = thread::spawn(move || {
+            loop {
+                let job = receiver.lock().unwrap().recv().unwrap();
+
+                println!("Worker {id} got a job; executing.");
+
+                job();
+            }
+        });
+
+        Worker { id, thread }
+    }
+}
+```
+
+Listing 21-20: Receiving and executing the jobs in the `Worker` instance’s thread
+
+Here, we first call `lock` on the `receiver` to acquire the mutex, and then we
+call `unwrap` to panic on any errors. Acquiring a lock might fail if the mutex
+is in a *poisoned* state, which can happen if some other thread panicked while
+holding the lock rather than releasing the lock. In this situation, calling
+`unwrap` to have this thread panic is the correct action to take. Feel free to
+change this `unwrap` to an `expect` with an error message that is meaningful to
+you.
+
+If we get the lock on the mutex, we call `recv` to receive a `Job` from the
+channel. A final `unwrap` moves past any errors here as well, which might occur
+if the thread holding the sender has shut down, similar to how the `send`
+method returns `Err` if the receiver shuts down.
+
+The call to `recv` blocks, so if there is no job yet, the current thread will
+wait until a job becomes available. The `Mutex<T>` ensures that only one
+`Worker` thread at a time is trying to request a job.
+
+Our thread pool is now in a working state! Give it a `cargo run` and make some
+requests:
+
+<!-- manual-regeneration
+cd listings/ch21-web-server/listing-21-20
+cargo run
+make some requests to 127.0.0.1:7878
+Can't automate because the output depends on making requests
+-->
+
+```
+$ cargo run
+   Compiling hello v0.1.0 (file:///projects/hello)
+warning: field `workers` is never read
+ --> src/lib.rs:7:5
+  |
+6 | pub struct ThreadPool {
+  |            ---------- field in this struct
+7 |     workers: Vec<Worker>,
+  |     ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` on by default
+
+warning: fields `id` and `thread` are never read
+  --> src/lib.rs:48:5
+   |
+47 | struct Worker {
+   |        ------ fields in this struct
+48 |     id: usize,
+   |     ^^
+49 |     thread: thread::JoinHandle<()>,
+   |     ^^^^^^
+
+warning: `hello` (lib) generated 2 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.91s
+     Running `target/debug/hello`
+Worker 0 got a job; executing.
+Worker 2 got a job; executing.
+Worker 1 got a job; executing.
+Worker 3 got a job; executing.
+Worker 0 got a job; executing.
+Worker 2 got a job; executing.
+Worker 1 got a job; executing.
+Worker 3 got a job; executing.
+Worker 0 got a job; executing.
+Worker 2 got a job; executing.
+```
+
+Success! We now have a thread pool that executes connections asynchronously.
+There are never more than four threads created, so our system won’t get
+overloaded if the server receives a lot of requests. If we make a request to
+*/sleep*, the server will be able to serve other requests by having another
+thread run them.
+
+> Note: If you open */sleep* in multiple browser windows simultaneously, they
+> might load one at a time in five-second intervals. Some web browsers execute
+> multiple instances of the same request sequentially for caching reasons. This
+> limitation is not caused by our web server.
+
+This is a good time to pause and consider how the code in Listings 21-18, 21-19,
+and 21-20 would be different if we were using futures instead of a closure for
+the work to be done. What types would change? How would the method signatures be
+different, if at all? What parts of the code would stay the same?
+
+After learning about the `while let` loop in Chapter 17 and Chapter 19, you
+might be wondering why we didn’t write the `Worker` thread code as shown in
+Listing 21-21.
+
+src/lib.rs
+
+```
+// --snip--
+
+impl Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+        let thread = thread::spawn(move || {
+            while let Ok(job) = receiver.lock().unwrap().recv() {
+                println!("Worker {id} got a job; executing.");
+
+                job();
+            }
+        });
+
+        Worker { id, thread }
+    }
+}
+```
+
+Listing 21-21: An alternative implementation of `Worker::new` using `while let`
+
+This code compiles and runs but doesn’t result in the desired threading
+behavior: A slow request will still cause other requests to wait to be
+processed. The reason is somewhat subtle: The `Mutex` struct has no public
+`unlock` method because the ownership of the lock is based on the lifetime of
+the `MutexGuard<T>` within the `LockResult<MutexGuard<T>>` that the `lock`
+method returns. At compile time, the borrow checker can then enforce the rule
+that a resource guarded by a `Mutex` cannot be accessed unless we hold the
+lock. However, this implementation can also result in the lock being held
+longer than intended if we aren’t mindful of the lifetime of the
+`MutexGuard<T>`.
+
+The code in Listing 21-20 that uses `let job = receiver.lock().unwrap().recv().unwrap();` works because with `let`, any
+temporary values used in the expression on the right-hand side of the equal
+sign are immediately dropped when the `let` statement ends. However, `while let` (and `if let` and `match`) does not drop temporary values until the end of
+the associated block. In Listing 21-21, the lock remains held for the duration
+of the call to `job()`, meaning other `Worker` instances cannot receive jobs.
+
+## Graceful Shutdown and Cleanup
+
+The code in Listing 21-20 is responding to requests asynchronously through the
+use of a thread pool, as we intended. We get some warnings about the `workers`,
+`id`, and `thread` fields that we’re not using in a direct way that reminds us
+we’re not cleaning up anything. When we use the less elegant
+<kbd>ctrl</kbd>-<kbd>C</kbd> method to halt the main thread, all other threads
+are stopped immediately as well, even if they’re in the middle of serving a
+request.
+
+Next, then, we’ll implement the `Drop` trait to call `join` on each of the
+threads in the pool so that they can finish the requests they’re working on
+before closing. Then, we’ll implement a way to tell the threads they should
+stop accepting new requests and shut down. To see this code in action, we’ll
+modify our server to accept only two requests before gracefully shutting down
+its thread pool.
+
+One thing to notice as we go: None of this affects the parts of the code that
+handle executing the closures, so everything here would be the same if we were
+using a thread pool for an async runtime.
+
+### Implementing the Drop Trait on ThreadPool
+
+Let’s start with implementing `Drop` on our thread pool. When the pool is
+dropped, our threads should all join to make sure they finish their work.
+Listing 21-22 shows a first attempt at a `Drop` implementation; this code won’t
+quite work yet.
+
+src/lib.rs
+
+```
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            worker.thread.join().unwrap();
+        }
+    }
+}
+```
+
+Listing 21-22: Joining each thread when the thread pool goes out of scope
+
+First, we loop through each of the thread pool `workers`. We use `&mut` for this
+because `self` is a mutable reference, and we also need to be able to mutate
+`worker`. For each `worker`, we print a message saying that this particular
+`Worker` instance is shutting down, and then we call `join` on that `Worker`
+instance’s thread. If the call to `join` fails, we use `unwrap` to make Rust
+panic and go into an ungraceful shutdown.
+
+Here is the error we get when we compile this code:
+
+```
+$ cargo check
+    Checking hello v0.1.0 (file:///projects/hello)
+error[E0507]: cannot move out of `worker.thread` which is behind a mutable reference
+  --> src/lib.rs:52:13
+   |
+52 |             worker.thread.join().unwrap();
+   |             ^^^^^^^^^^^^^ ------ `worker.thread` moved due to this method call
+   |             |
+   |             move occurs because `worker.thread` has type `JoinHandle<()>`, which does not implement the `Copy` trait
+   |
+note: `JoinHandle::<T>::join` takes ownership of the receiver `self`, which moves `worker.thread`
+  --> /rustc/4eb161250e340c8f48f66e2b929ef4a5bed7c181/library/std/src/thread/mod.rs:1876:17
+
+For more information about this error, try `rustc --explain E0507`.
+error: could not compile `hello` (lib) due to 1 previous error
+```
+
+The error tells us we can’t call `join` because we only have a mutable borrow
+of each `worker` and `join` takes ownership of its argument. To solve this
+issue, we need to move the thread out of the `Worker` instance that owns
+`thread` so that `join` can consume the thread. One way to do this is to take
+the same approach we took in Listing 18-15. If `Worker` held an
+`Option<thread::JoinHandle<()>>`, we could call the `take` method on the
+`Option` to move the value out of the `Some` variant and leave a `None` variant
+in its place. In other words, a `Worker` that is running would have a `Some`
+variant in `thread`, and when we wanted to clean up a `Worker`, we’d replace
+`Some` with `None` so that the `Worker` wouldn’t have a thread to run.
+
+However, the *only* time this would come up would be when dropping the
+`Worker`. In exchange, we’d have to deal with an
+`Option<thread::JoinHandle<()>>` anywhere we accessed `worker.thread`.
+Idiomatic Rust uses `Option` quite a bit, but when you find yourself wrapping
+something you know will always be present in an `Option` as a workaround like
+this, it’s a good idea to look for alternative approaches to make your code
+cleaner and less error-prone.
+
+In this case, a better alternative exists: the `Vec::drain` method. It accepts
+a range parameter to specify which items to remove from the vector and returns
+an iterator of those items. Passing the `..` range syntax will remove *every*
+value from the vector.
+
+So, we need to update the `ThreadPool` `drop` implementation like this:
+
+src/lib.rs
+
+```
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        for worker in self.workers.drain(..) {
+            println!("Shutting down worker {}", worker.id);
+
+            worker.thread.join().unwrap();
+        }
+    }
+}
+```
+
+
+
+This resolves the compiler error and does not require any other changes to our
+code. Note that, because drop can be called when panicking, the unwrap
+could also panic and cause a double panic, which immediately crashes the
+program and ends any cleanup in progress. This is fine for an example program,
+but it isn’t recommended for production code.
+
+### Signaling to the Threads to Stop Listening for Jobs
+
+With all the changes we’ve made, our code compiles without any warnings.
+However, the bad news is that this code doesn’t function the way we want it to
+yet. The key is the logic in the closures run by the threads of the `Worker`
+instances: At the moment, we call `join`, but that won’t shut down the threads,
+because they `loop` forever looking for jobs. If we try to drop our
+`ThreadPool` with our current implementation of `drop`, the main thread will
+block forever, waiting for the first thread to finish.
+
+To fix this problem, we’ll need a change in the `ThreadPool` `drop`
+implementation and then a change in the `Worker` loop.
+
+First, we’ll change the `ThreadPool` `drop` implementation to explicitly drop
+the `sender` before waiting for the threads to finish. Listing 21-23 shows the
+changes to `ThreadPool` to explicitly drop `sender`. Unlike with the thread,
+here we *do* need to use an `Option` to be able to move `sender` out of
+`ThreadPool` with `Option::take`.
+
+src/lib.rs
+
+```
+pub struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: Option<mpsc::Sender<Job>>,
+}
+// --snip--
+impl ThreadPool {
+    pub fn new(size: usize) -> ThreadPool {
+        // --snip--
+
+        ThreadPool {
+            workers,
+            sender: Some(sender),
+        }
+    }
+
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job = Box::new(f);
+
+        self.sender.as_ref().unwrap().send(job).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+
+        for worker in self.workers.drain(..) {
+            println!("Shutting down worker {}", worker.id);
+
+            worker.thread.join().unwrap();
+        }
+    }
+}
+```
+
+Listing 21-23: Explicitly dropping `sender` before joining the `Worker` threads

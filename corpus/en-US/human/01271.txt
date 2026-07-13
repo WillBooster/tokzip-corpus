@@ -1,0 +1,208 @@
+:::
+
+This will automatically collect and export runtime observability data like
+`console.log`, traces for HTTP requests, and metrics for the Deno runtime.
+[Learn more about auto instrumentation](#auto-instrumentation).
+
+You can also create your own metrics, traces, and logs using the
+`npm:@opentelemetry/api` package.
+[Learn more about user defined metrics](#user-metrics).
+
+## Auto instrumentation
+
+Deno automatically collects and exports some observability data to the OTLP
+endpoint.
+
+This data is exported in the built-in instrumentation scope of the Deno runtime.
+This scope has the name `deno`. The version of the Deno runtime is the version
+of the `deno` instrumentation scope. (e.g. `deno:2.1.4`).
+
+### Traces
+
+Deno automatically creates spans for various operations, such as:
+
+- Incoming HTTP requests served with [`Deno.serve`](/api/deno/~/Deno.serve).
+- Outgoing HTTP requests made with [`fetch`](/api/web/~/fetch).
+- HTTP/2 traffic over `node:http2`, both client requests and incoming server
+  requests, with trace context propagated across services (added in Deno 2.9).
+- [`Deno.cron()`](/api/deno/~/Deno.cron) job invocations (added in Deno 2.7).
+
+#### [`Deno.serve`](/api/deno/~/Deno.serve)
+
+When you use [`Deno.serve`](/api/deno/~/Deno.serve) to create an HTTP server, a
+span is created for each incoming request. The span automatically ends when
+response headers are sent (not when the response body is done sending).
+
+The name of the created span is `${method}`. The span kind is `server`.
+
+The following attributes are automatically added to the span on creation:
+
+- `http.request.method`: The HTTP method of the request.
+- `url.full`: The full URL of the request (as would be reported by `req.url`).
+- `url.scheme`: The scheme of the request URL (e.g. `http` or `https`).
+- `url.path`: The path of the request URL.
+- `url.query`: The query string of the request URL.
+
+After the request is handled, the following attributes are added:
+
+- `http.response.status_code`: The status code of the response.
+
+Deno does not automatically add a `http.route` attribute to the span as the
+route is not known by the runtime, and instead is determined by the routing
+logic in a user's handler function. If you want to add a `http.route` attribute
+to the span, you can do so in your handler function using
+`npm:@opentelemetry/api`. In this case you should also update the span name to
+include the route.
+
+```ts
+import { trace } from "npm:@opentelemetry/api@1";
+
+const INDEX_ROUTE = new URLPattern({ pathname: "/" });
+const BOOK_ROUTE = new URLPattern({ pathname: "/book/:id" });
+
+Deno.serve(async (req) => {
+  const span = trace.getActiveSpan();
+  if (INDEX_ROUTE.test(req.url)) {
+    span.setAttribute("http.route", "/");
+    span.updateName(`${req.method} /`);
+
+    // handle index route
+  } else if (BOOK_ROUTE.test(req.url)) {
+    span.setAttribute("http.route", "/book/:id");
+    span.updateName(`${req.method} /book/:id`);
+
+    // handle book route
+  } else {
+    return new Response("Not found", { status: 404 });
+  }
+});
+```
+
+#### [`fetch`](/api/web/~/fetch)
+
+When you use [`fetch`](/api/web/~/fetch) to make an HTTP request, a span is
+created for the request. The span automatically ends when the response headers
+are received.
+
+The name of the created span is `${method}`. The span kind is `client`.
+
+The following attributes are automatically added to the span on creation:
+
+- `http.request.method`: The HTTP method of the request.
+- `url.full`: The full URL of the request.
+- `url.scheme`: The scheme of the request URL.
+- `url.path`: The path of the request URL.
+- `url.query`: The query string of the request URL.
+
+After the response is received, the following attributes are added:
+
+- `http.status_code`: The status code of the response.
+
+### Metrics
+
+The following metrics are automatically collected and exported:
+
+#### [`Deno.serve`](/api/deno/~/Deno.serve) / [`Deno.serveHttp`](/api/deno/~/Deno.serveHttp)
+
+##### `http.server.request.duration`
+
+A histogram of the duration of incoming HTTP requests served with
+[`Deno.serve`](/api/deno/~/Deno.serve) or
+[`Deno.serveHttp`](/api/deno/~/Deno.serveHttp). The time that is measured is
+from when the request is received to when the response headers are sent. This
+does not include the time to send the response body. The unit of this metric is
+seconds. The histogram buckets are
+`[0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0]`.
+
+This metric is recorded with the following attributes:
+
+- `http.request.method`: The HTTP method of the request.
+- `url.scheme`: The scheme of the request URL.
+- `network.protocol.version`: The version of the HTTP protocol used for the
+  request (e.g. `1.1` or `2`).
+- `server.address`: The address that the server is listening on.
+- `server.port`: The port that the server is listening on.
+- `http.response.status_code`: The status code of the response (if the request
+  has been handled without a fatal error).
+- `error.type`: The type of error that occurred (if the request handling was
+  subject to an error).
+
+##### `http.server.active_requests`
+
+A gauge of the number of active requests being handled by
+[`Deno.serve`](/api/deno/~/Deno.serve) or
+[`Deno.serveHttp`](/api/deno/~/Deno.serveHttp) at any given time. This is the
+number of requests that have been received but not yet responded to (where the
+response headers have not yet been sent). This metric is recorded with the
+following attributes:
+
+- `http.request.method`: The HTTP method of the request.
+- `url.scheme`: The scheme of the request URL.
+- `server.address`: The address that the server is listening on.
+- `server.port`: The port that the server is listening on.
+
+##### `http.server.request.body.size`
+
+A histogram of the size of the request body of incoming HTTP requests served
+with [`Deno.serve`](/api/deno/~/Deno.serve) or
+[`Deno.serveHttp`](/api/deno/~/Deno.serveHttp). The unit of this metric is
+bytes. The histogram buckets are
+`[0, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]`.
+
+This metric is recorded with the following attributes:
+
+- `http.request.method`: The HTTP method of the request.
+- `url.scheme`: The scheme of the request URL.
+- `network.protocol.version`: The version of the HTTP protocol used for the
+  request (e.g. `1.1` or `2`).
+- `server.address`: The address that the server is listening on.
+- `server.port`: The port that the server is listening on.
+- `http.response.status_code`: The status code of the response (if the request
+  has been handled without a fatal error).
+- `error.type`: The type of error that occurred (if the request handling was
+  subject to an error).
+
+##### `http.server.response.body.size`
+
+A histogram of the size of the response body of incoming HTTP requests served
+with [`Deno.serve`](/api/deno/~/Deno.serve) or
+[`Deno.serveHttp`](/api/deno/~/Deno.serveHttp). The unit of this metric is
+bytes. The histogram buckets are
+`[0, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]`.
+
+This metric is recorded with the following attributes:
+
+- `http.request.method`: The HTTP method of the request.
+- `url.scheme`: The scheme of the request URL.
+- `network.protocol.version`: The version of the HTTP protocol used for the
+  request (e.g. `1.1` or `2`).
+- `server.address`: The address that the server is listening on.
+- `server.port`: The port that the server is listening on.
+- `http.response.status_code`: The status code of the response (if the request
+  has been handled without a fatal error).
+- `error.type`: The type of error that occurred (if the request handling was
+  subject to an error).
+
+### Logs
+
+The following logs are automatically collected and exported:
+
+- Any logs created with `console.*` methods such as `console.log` and
+  `console.error`.
+- Any logs created by the Deno runtime, such as debug logs, `Downloading` logs,
+  and similar.
+- Any errors that cause the Deno runtime to exit (both from user code, and from
+  the runtime itself).
+
+Logs raised from JavaScript code will be exported with the relevant span
+context, if the log occurred inside of an active span.
+
+`console` auto instrumentation can be configured using the `OTEL_DENO_CONSOLE`
+environment variable:
+
+- `capture`: Logs are emitted to stdout/stderr and are also exported with
+  OpenTelemetry. (default)
+- `replace`: Logs are only exported with OpenTelemetry, and not emitted to
+  stdout/stderr.
+- `ignore`: Logs are emitted only to stdout/stderr, and will not be exported
+  with OpenTelemetry.

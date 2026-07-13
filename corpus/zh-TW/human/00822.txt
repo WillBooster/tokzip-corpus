@@ -1,0 +1,231 @@
+The challenge is as follows:
+
+``` php
+<?php
+/*
+FROM php:7.0-apache
+
+RUN a2dismod status
+
+COPY ./files/index.php /var/www/html
+COPY ./files/harder.php /var/www/html
+EXPOSE 80
+
+*/
+$message = isset($_GET['message']) ? $_GET['message'] : 'hello, world';
+$type = isset($_GET['type']) ? $_GET['type'] : die(highlight_file(__FILE__));
+header("Content-Type: text/$type");
+header("X-Frame-Options: DENY");
+
+if($type == "plain"){
+    die("the message is: $message");
+}
+
+?>
+<html>
+<h1>The message is:</h1>
+<hr/>
+<pre>
+    <input type="text" value="<?php echo preg_replace('/([^\s\w!-~]|")/','',$message);?>">
+</pre>
+<br>
+solved by:
+<li> nobody yet!</li>
+</html>
+```
+
+You can control part of the content and part of the content type. How can you achieve XSS?
+
+The first trick is to set the content type to `text/html; charset=UTF-16LE`, which allows the browser to interpret the page as UTF16 and control the output content.
+
+This trick reminds me of the "modernism" challenge in [UIUCTF 2022](https://blog.huli.tw/2022/08/01/en/uiuctf-2022-writeup/).
+
+The second trick is to utilize the feature of the content type header. When the response header is `Content-Type: text/x,image/gif`, because `text/x` is an invalid content type, the browser will prioritize the valid `image/gif`.
+
+In other words, even though the first half of the content type is hardcoded, you can still use this technique to override the complete content type. There is an old content type called `multipart/mixed`, which is like the response version of multipart/form and can output a response like this:
+
+```
+HTTP/1.1 200 OK
+Content-type: multipart/mixed;boundary="8ormorebytes"
+
+
+ignored_first_part_before_boundary
+
+--8ormorebytes
+Content-Type: text/html
+
+<img src=x onerror=alert(domain)>
+
+--8ormorebytes
+
+ignored_last_part
+```
+
+The browser will render the part it understands, and Firefox supports this content type.
+
+This content type could be used to bypass CSP as well. You can refer to this link: [https://twitter.com/ankursundara/status/1723410507389129092](https://twitter.com/ankursundara/status/1723410507389129092)
+
+## Intigriti October 2023 challenge
+
+Challenge: [https://challenge-1023.intigriti.io/](https://challenge-1023.intigriti.io/)
+
+There is an injection point in the backend:
+
+``` html
+<title>Intigriti XSS Challenge - <%- title %></title>
+```
+
+This title comes from:
+
+``` js
+const getTitle = (path) => {
+    path = decodeURIComponent(path).split("/");
+    path = path.slice(-1).toString();
+    return DOMPurify.sanitize(path);
+}
+```
+
+Although it seems that DOMPurify cannot be bypassed, you can actually close the preceding `<title>` tag by using `<div id="</title><h1>hello</h1>">`, allowing you to inject any tag.
+
+However, the input for this challenge comes from the path, so some `/` characters need to be removed. Here, the `/` is replaced with `&sol;` because `innerHTML` decodes attributes. Finally, the following payload is constructed:
+
+```
+/<p id="<%26sol%3Btitle><script>alert()<%26sol%3Bscript>">
+```
+
+The goal of this challenge is to read a local file, so XSS is not enough. The next step is to find a way to extend from XSS.
+
+The flag for this challenge has `--disable-web-security`, so SOP is disabled, allowing access to responses from other sources. However, CDP has restrictions on origin and cannot be fully used, but some functionalities are available, such as opening a new webpage.
+
+Since the file is local, only files starting with `file:///` can be read. Therefore, the goal is to find a way to create a file locally.
+
+The solution is to trigger the download feature, which is enabled by default in the new headless mode. Once the download is triggered, the file will be saved to a fixed location. It can then be opened using CDP.
+
+Author's writeup: [https://mizu.re/post/intigriti-october-2023-xss-challenge](https://mizu.re/post/intigriti-october-2023-xss-challenge)
+
+## DOM clobbering
+
+Source: [https://twitter.com/kevin_mizu/status/1697625861543923906](https://twitter.com/kevin_mizu/status/1697625861543923906)
+
+The challenge is a homemade sanitizer:
+
+``` js
+class Sanitizer {
+    // https://source.chromium.org/chromium/chromium/src/+/main:out/android-Debug/gen/third_party/blink/renderer/modules/sanitizer_api/builtins/sanitizer_builtins.cc;l=360
+    DEFAULT_TAGS  = [ /* ... */ ];
+
+    constructor(config={}) {
+        this.version = "2.0.0";
+        this.creator = "@kevin_mizu";
+        this.ALLOWED_TAGS = config.ALLOWED_TAGS
+            ? config.ALLOWED_TAGS.concat([ "html", "head", "body" ]).filter(tag => this.DEFAULT_TAGS.includes(tag))
+            : this.DEFAULT_TAGS;
+        this.ALLOWED_ATTS = config.ALLOWED_ATTS
+            ? config.ALLOWED_ATTS.filter(attr => this.DEFAULT_ATTRS.includes(attr))
+            : this.DEFAULT_ATTRS;
+    }
+
+    // https://github.com/cure53/DOMPurify/blob/48bd850cc20190e3896cb6291367c2da2ed2bddb/src/purify.js#L924
+    _isClobbered = function (elm) {
+        return (
+            elm instanceof HTMLFormElement &&
+            (typeof elm.nodeName !== 'string' ||
+            typeof elm.textContent !== 'string' ||
+            typeof elm.removeChild !== 'function' ||
+            !(elm.attributes instanceof NamedNodeMap) ||
+            typeof elm.removeAttribute !== 'function' ||
+            typeof elm.setAttribute !== 'function' ||
+            typeof elm.namespaceURI !== 'string' ||
+            typeof elm.insertBefore !== 'function' ||
+            typeof elm.hasChildNodes !== 'function')
+        )
+    }
+
+    // https://github.com/cure53/DOMPurify/blob/48bd850cc20190e3896cb6291367c2da2ed2bddb/src/purify.js#L1028
+    removeNode = (currentNode) => {
+        const parentNode = currentNode.parentNode;
+        const childNodes = currentNode.childNodes;
+
+        if (childNodes && parentNode) {
+            const childCount = childNodes.length;
+
+            for (let i = childCount - 1; i >= 0; --i) {
+                parentNode.insertBefore(
+                    childNodes[i].cloneNode(),
+                    currentNode.nextSibling
+                );
+            }
+        }
+
+        currentNode.parentElement.removeChild(currentNode);
+    }
+
+    sanitize = (input) => {
+        let currentNode;
+        var dom_tree = new DOMParser().parseFromString(input, "text/html");
+        var nodeIterator = document.createNodeIterator(dom_tree);
+
+        while ((currentNode = nodeIterator.nextNode())) {
+
+            // avoid DOMClobbering
+            if (this._isClobbered(currentNode) || typeof currentNode.nodeType !== "number") {
+                this.removeNode(currentNode);
+                continue;
+            }
+
+            switch(currentNode.nodeType) {
+                case currentNode.ELEMENT_NODE:
+                    var tag_name   = currentNode.nodeName.toLowerCase();
+                    var attributes = currentNode.attributes;
+
+                    // avoid mXSS
+                    if (currentNode.namespaceURI !== "http://www.w3.org/1999/xhtml") {
+                        this.removeNode(currentNode);
+                        continue;
+
+                    // sanitize tags
+                    } else if (!this.ALLOWED_TAGS.includes(tag_name)){
+                        this.removeNode(currentNode);
+                        continue;
+                    }
+
+                    // sanitize attributes
+                    for (let i=0; i < attributes.length; i++) {
+                        if (!this.ALLOWED_ATTS.includes(attributes[i].name)){
+                            this.removeNode(currentNode);
+                            continue;
+                        }
+                    }
+            }
+        }
+
+        return dom_tree.body.innerHTML;
+    }
+}
+```
+
+It references many other sanitizer libraries, such as DOMPurify.
+
+The key to this challenge is the DOM clobbering of forms, which is usually done like this:
+
+``` html
+<form id="test">
+    <input name=x>
+</form>
+```
+
+By placing the element inside a form, `test.x` can be polluted.
+
+However, there is another trick using the `form` attribute to place the element outside:
+
+``` html
+<input form=test name=x>
+<form id="test"></form>
+```
+
+In this challenge, when removing elements, the sanitizer does it like this:
+
+``` js
+removeNode = (currentNode) => {
+    const parentNode = currentNode.parentNode;
+    const childNodes = currentNode.childNodes;

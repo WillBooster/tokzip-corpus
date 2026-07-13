@@ -1,0 +1,195 @@
+![fetch 的 spec](/img/navigator-sendbeacon-64kib-and-source-code/fetch-spec.png)
+
+專門做 error tracking 的服務 Sentry 以前其實就碰過這問題，在 2018 年時有人發現 Sentry 在 fetch 時會預設打開 keepalive，導致有些超過 65536 bytes 的請求送不出去，因此把這個 flag 給拿掉了：
+
+![Sentry 的 issue](/img/navigator-sendbeacon-64kib-and-source-code/p5.png)
+
+來源：[When fetch is used keepalive is the default, and Chrome only allows a POST body <= 65536 bytes in that scenario #1464](https://github.com/getsentry/sentry-javascript/issues/1464)，拿掉的 PR：[ref: Remove keepalive:true as a default and document payload size #1496](https://github.com/getsentry/sentry-javascript/pull/1496)
+
+兩年後的 2020 年，有人發現了 keepalive 的規格以及正確用法：[Fetch KeepAlive #2547](https://github.com/getsentry/sentry-javascript/issues/2547)，提議在 payload 許可之下用 keepalive，超過才不用，而不是像當時全部都不用。
+
+但當時並沒有任何動作，是又過了兩年，在 2022 年時，有人發現 Chrome 在 navigation 的時候會取消所有請求，因此有些請求送不出去，才想到要利用 keepalive 來解決。
+
+因此在 2022 年 9 月時，才又把它加了回去，並且留下精闢的註解：
+
+[feat(browser): Use fetch keepalive flag #5697](https://github.com/getsentry/sentry-javascript/issues/2547)
+
+``` js
+// Outgoing requests are usually cancelled when navigating to a different page, causing a "TypeError: Failed to
+// fetch" error and sending a "network_error" client-outcome - in Chrome, the request status shows "(cancelled)".
+// The `keepalive` flag keeps outgoing requests alive, even when switching pages. We want this since we're
+// frequently sending events right before the user is switching pages (eg. whenfinishing navigation transactions).
+// Gotchas:
+// - `keepalive` isn't supported by Firefox
+// - As per spec (https://fetch.spec.whatwg.org/#http-network-or-cache-fetch), a request with `keepalive: true`
+//   and a content length of > 64 kibibytes returns a network error. We will therefore only activate the flag when
+//   we're below that limit.
+keepalive: request.body.length <= 65536,
+```
+
+中文機翻：
+
+> 當切換到不同頁面時，未完成的請求通常會被取消，進而導致「TypeError: Failed to fetch」錯誤，並出現「network_error」。在 Chrome 中，請求狀態會顯示「(cancelled)」。
+keepalive 標誌可以讓未完成的請求在頁面切換時繼續保持活動狀態。由於我們經常在使用者切換頁面前傳送事件，因此需要這個功能。
+> 
+> 需要注意：
+>
+> 1. Firefox 不支援 keepalive。
+> 2. 根據規範，如果請求設定了 keepalive: true 並且內容長度超過 64 KiB，將會返回網路錯誤。因此，我們只會在請求內容長度低於該限制時啟用此標誌。
+
+但故事還沒完，就像我剛才提到的，這個 65536 的限制並不只是單個請求，而是有個 queue，因此這樣做是不夠的。半年之後，Sentry 也注意到了這個問題，加上了計算 queue size 的邏輯，讓整個機制變得更加穩健：[fix(browser): Ensure keepalive flag is correctly set for parallel requests #7553](https://github.com/getsentry/sentry-javascript/pull/7553)
+
+![Issue 截圖](/img/navigator-sendbeacon-64kib-and-source-code/p6.png)
+
+如果之後有想要實作類似的東西，可以直接參考上面 Sentry 的 PR。
+
+## sendBeacon 的實作
+
+### Chromium 的 sendBeacon 實作
+
+最後我們來看一下 sendBeacon 底層的實作，先從 Chromium 開始，我以寫文章時最新的穩定版 131.0.6778.205 為例，相關程式碼在：[third_party/blink/renderer/modules/beacon/navigator_beacon.cc](https://source.chromium.org/chromium/chromium/src/+/refs/tags/131.0.6778.205:third_party/blink/renderer/modules/beacon/navigator_beacon.cc;l=93)
+
+我擷取其中一小段核心程式碼：
+
+``` c
+bool NavigatorBeacon::SendBeaconImpl(
+    ScriptState* script_state,
+    const String& url_string,
+    const V8UnionReadableStreamOrXMLHttpRequestBodyInit* data,
+    ExceptionState& exception_state) {
+  ExecutionContext* execution_context = ExecutionContext::From(script_state);
+  KURL url = execution_context->CompleteURL(url_string);
+  if (!CanSendBeacon(execution_context, url, exception_state)) {
+    return false;
+  }
+
+  bool allowed;
+  LocalFrame* frame = GetSupplementable()->DomWindow()->GetFrame();
+  if (data) {
+    switch (data->GetContentType()) {
+      // [...]
+      case V8UnionReadableStreamOrXMLHttpRequestBodyInit::ContentType::
+          kUSVString:
+        UseCounter::Count(execution_context,
+                          WebFeature::kSendBeaconWithUSVString);
+        allowed = PingLoader::SendBeacon(*script_state, frame, url,
+                                         data->GetAsUSVString());
+        break;
+    }
+  } else {
+    allowed = PingLoader::SendBeacon(*script_state, frame, url, String());
+  }
+
+  if (!allowed) {
+    UseCounter::Count(execution_context, WebFeature::kSendBeaconQuotaExceeded);
+  }
+
+  return allowed;
+}
+```
+
+開頭的 `CanSendBeacon` 基本上就是檢查 URL 是否合法而已，合法的話繼續往下走，會判斷要送出的 payload 的 content type，而實際送出是在 `PingLoader::SendBeacon` 這個方法裡面。
+
+除此之外可以在程式碼裡面看到 `UseCounter::Count`，這個是 Chromium 用來追蹤某些功能的使用頻率時會用到的。
+
+`PingLoader::SendBeacon` 的實作在 [third_party/blink/renderer/core/loader/ping_loader.cc](https://source.chromium.org/chromium/chromium/src/+/refs/tags/131.0.6778.205:third_party/blink/renderer/core/loader/ping_loader.cc)：
+
+``` c
+bool SendBeaconCommon(const ScriptState& state,
+                      LocalFrame* frame,
+                      const KURL& url,
+                      const BeaconData& beacon) {
+  if (!frame->DomWindow()
+           ->GetContentSecurityPolicyForWorld(&state.World())
+           ->AllowConnectToSource(url, url, RedirectStatus::kNoRedirect)) {
+    // We're simulating a network failure here, so we return 'true'.
+    return true;
+  }
+
+  ResourceRequest request(url);
+  request.SetHttpMethod(http_names::kPOST);
+  request.SetKeepalive(true);
+  request.SetRequestContext(mojom::blink::RequestContextType::BEACON);
+  beacon.Serialize(request);
+  FetchParameters params(std::move(request),
+                         ResourceLoaderOptions(&state.World()));
+  // The spec says:
+  //  - If mimeType is not null:
+  //   - If mimeType value is a CORS-safelisted request-header value for the
+  //     Content-Type header, set corsMode to "no-cors".
+  // As we don't support requests with non CORS-safelisted Content-Type, the
+  // mode should always be "no-cors".
+  params.MutableOptions().initiator_info.name =
+      fetch_initiator_type_names::kBeacon;
+
+  frame->Client()->DidDispatchPingLoader(url);
+
+  FetchUtils::LogFetchKeepAliveRequestMetric(
+      params.GetResourceRequest().GetRequestContext(),
+      FetchUtils::FetchKeepAliveRequestState::kTotal);
+  Resource* resource =
+      RawResource::Fetch(params, frame->DomWindow()->Fetcher(), nullptr);
+  return resource->GetStatus() != ResourceStatus::kLoadError;
+}
+```
+
+開頭先檢查是否違反 CSP，如果沒有違反，就送出一個 keepalive 的請求，然後回傳是否成功。
+
+值得注意的是在同個檔案中，也有另一個功能做了類似的事情，叫做 `PingLoader::SendLinkAuditPing`。在 `<a>` 標籤上有個屬性叫做 `ping`，當使用者點了連結，瀏覽器就會發送一個請求到 ping 所指定的位置：
+
+``` html
+<a
+  href="https://example.com"
+  ping="https://blog.huli.tw"
+  >click me
+</a>
+```
+
+這背後一樣是用 keepalive 的 fetch 來實作的：
+
+``` c
+void PingLoader::SendLinkAuditPing(LocalFrame* frame,
+                                   const KURL& ping_url,
+                                   const KURL& destination_url) {
+  if (!ping_url.ProtocolIsInHTTPFamily())
+    return;
+
+  ResourceRequest request(ping_url);
+  request.SetHttpMethod(http_names::kPOST);
+  request.SetHTTPContentType(AtomicString("text/ping"));
+  request.SetHttpBody(EncodedFormData::Create(base::span_from_cstring("PING")));
+  request.SetHttpHeaderField(http_names::kCacheControl,
+                             AtomicString("max-age=0"));
+  request.SetHttpHeaderField(http_names::kPingTo,
+                             AtomicString(destination_url.GetString()));
+  scoped_refptr<const SecurityOrigin> ping_origin =
+      SecurityOrigin::Create(ping_url);
+  if (ProtocolIs(frame->DomWindow()->Url().GetString(), "http") ||
+      frame->DomWindow()->GetSecurityOrigin()->CanAccess(ping_origin.get())) {
+    request.SetHttpHeaderField(
+        http_names::kPingFrom,
+        AtomicString(frame->DomWindow()->Url().GetString()));
+  }
+
+  request.SetKeepalive(true);
+  request.SetReferrerString(Referrer::NoReferrer());
+  request.SetReferrerPolicy(network::mojom::ReferrerPolicy::kNever);
+  request.SetRequestContext(mojom::blink::RequestContextType::PING);
+  FetchParameters params(
+      std::move(request),
+      ResourceLoaderOptions(frame->DomWindow()->GetCurrentWorld()));
+  params.MutableOptions().initiator_info.name =
+      fetch_initiator_type_names::kPing;
+
+  frame->Client()->DidDispatchPingLoader(ping_url);
+  FetchUtils::LogFetchKeepAliveRequestMetric(
+      params.GetResourceRequest().GetRequestContext(),
+      FetchUtils::FetchKeepAliveRequestState::kTotal);
+  RawResource::Fetch(params, frame->DomWindow()->Fetcher(), nullptr);
+}
+```
+
+### Safari 的 sendBeacon 實作
+
+Safari 的實作在 [WebKit/Source/WebCore/Modules/beacon
+/NavigatorBeacon.cpp](https://github.com/WebKit/WebKit/blob/WebKit-7620.1.16.111.5/Source/WebCore/Modules/beacon/NavigatorBeacon.cpp)：

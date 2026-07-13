@@ -1,0 +1,200 @@
+Basically, you just need to run an executable on your phone with root privileges. If it is not the default root when you run the file, you can use `adb shell` to change it:
+
+``` shell
+adb shell
+
+# kill old process
+ps -e | grep frida-server
+kill -9 {your_process_id}
+
+# run as root
+su
+/data/local/tmp/frida-server &
+```
+
+After running it, you can use `frida-ps -U` to confirm that it is running.
+
+The second method, which does not require root access, involves modifying the APK. You add a Frida so file to the APK and add a line of `System.loadLibrary()` at the entry point to use Frida. Details can be found in the wiki: https://github.com/sensepost/objection/wiki/Patching-Android-Applications
+
+You don't need to execute the above process yourself; there are ready-made commands to help you. If you can't package it, you can use this command:
+
+``` shell
+objection patchapk --source test.apk --skip-resources --ignore-nativelibs
+```
+
+If it still doesn't work, you can use the knowledge we learned earlier to modify it yourself. First, use `apktool d` to unpack the packaged APK, then modify the contents yourself. For example, sometimes there may be an alignment issue with the so file, so you can change `android:extractNativeLibs` in `AndroidManifest.xml` to true and then repack it.
+
+## Basic Usage of Frida
+
+First, let's talk about what Frida does. The most common use case is to write some code to hook functions. Hooking means that you can override the implementation of any function, observe input and output, and change the return value of the function.
+
+These codes are written in JavaScript and injected into the app when it is launched. In my experience, after seeing more examples, it is quite easy to get started.
+
+Instead of talking so much, let's try it out. The sample app used this time is the same as the first article, which is an app that checks whether the device is rooted after pressing a button: https://github.com/aszx87410/demo/raw/master/android/demoapp.apk
+
+After opening this app, the default activity will be `com.cymetrics.demo/MainActivity`. Let's hook the onCreate method of this class.
+
+First, create a file named `script.js` with the following content:
+
+``` js
+function run() {
+  Java.perform(() => {
+    var MainActivity = Java.use('com.cymetrics.demo.MainActivity')
+    MainActivity.onCreate.implementation = function() {
+      console.log('MainActivity onCreate')
+    }
+  })
+}
+
+setImmediate(run)
+```
+
+Then run the command:
+
+``` shell
+frida -U --no-pause -l script.js -f "com.cymetrics.demo"
+```
+
+If you don't have root, the startup method will be different. First, patch the app as mentioned above, then install it on your phone, and then enter the following command in the terminal:
+
+``` shell
+frida -U Gadget -l script.js
+```
+
+Then you should see a new log line on your terminal, which is `MainActivity onCreate`, and the app on your phone crashes. This is normal.
+
+Let's briefly talk about the basic structure of Frida scripts. The starting point is:
+
+``` js
+function run() {
+  Java.perform(() => {
+    // code
+  })
+}
+
+setImmediate(run)
+```
+
+Then it depends on what method you want to hook. In our previous code, we first use `Java.use` to get the class we want to hook, and then use `MainActivity.onCreate.implementation` to replace the original implementation with our own function.
+
+Why did the app crash after hooking? Because the function we implemented ourselves did nothing except log, which means that everything the original onCreate should have done was removed, so the crash is reasonable. To find out the root cause of the crash, you can use `adb logcat | grep AndroidRuntime`:
+
+``` shell
+android.util.SuperNotCalledException: Activity {com.cymetrics.demo/com.cymetrics.demo.MainActivity} did not call through to super.onCreate()
+```
+
+So what should we do? Just remember to call the original implementation at the end, like this:
+
+``` js
+function run() {
+  Java.perform(() => {
+    var MainActivity = Java.use('com.cymetrics.demo.MainActivity')
+    MainActivity.onCreate.implementation = function() {
+      console.log('MainActivity onCreate')
+      this.onCreate.call(this)
+    }
+  })
+}
+
+setImmediate(run)
+```
+
+`this` will be the original MainActivity, and `this.onCreate.call` can call the original implementation, with the first parameter of the call method being `this`, followed by the parameters.
+
+After executing the above script, another error will appear:
+
+``` shell
+Error: onCreate(): argument types do not match any of:
+  .overload('android.os.Bundle')
+```
+
+This is because onCreate should actually have parameters, but we did not receive any parameters when we overrode it, so an error occurred. To avoid this problem, I would recommend adding `.overload()` at the beginning when overriding the implementation, like this:
+
+``` js
+MainActivity.onCreate.overload().implementation = function() {
+
+}
+```
+
+Frida will then show an error message again to tell you what the correct parameters should be, so you can follow it. Finally, it will look like this:
+
+``` js
+function run() {
+  Java.perform(() => {
+    var MainActivity = Java.use('com.cymetrics.demo.MainActivity')
+    MainActivity.onCreate.overload('android.os.Bundle').implementation = function(a) {
+      console.log('MainActivity onCreate')
+      this.onCreate.call(this, a)
+    }
+  })
+}
+
+setImmediate(run)
+```
+
+In this way, you can know what the parameters are, and you can also pass in parameters when calling the original implementation, so there will be no errors.
+
+Since we can insert code, we can do a lot of things, such as displaying a new message directly on the UI:
+
+``` js
+function run() {
+  Java.perform(() => {
+    var MainActivity = Java.use('com.cymetrics.demo.MainActivity')
+    MainActivity.onCreate.overload('android.os.Bundle').implementation = function(a) {
+      console.log('MainActivity onCreate')
+      // Toast should be run on the main thread(UI thread)
+      Java.scheduleOnMainThread(function() {
+        var Toast = Java.use("android.widget.Toast");
+        var currentApplication = Java.use('android.app.ActivityThread').currentApplication();
+        // We need context for displaying the Toast
+        var context = currentApplication.getApplicationContext();
+        Toast.makeText(
+          context,
+          // The type should be correct
+          Java.use("java.lang.String").$new("Hello!"),
+          Toast.LENGTH_SHORT.value
+        ).show();
+      });
+      this.onCreate.call(this, a)
+    }
+  })
+}
+
+setImmediate(run)
+```
+
+Code from: [makeToast.js](https://gist.github.com/myzhan/ab13068463cd7f77b7f06ae561ea853a).
+
+## Bypassing Root Detection with Frida
+
+In our previous article, we bypassed root detection by directly modifying the smali code and patching the function that performs the detection. With Frida, we don't need to modify the smali code anymore. We can directly hook the function that performs the detection and replace its implementation, like this:
+
+``` js
+function run() {
+  Java.perform(() => {
+    var RootBeer = Java.use('com.scottyab.rootbeer.RootBeer')    
+    RootBeer.isRooted.overload().implementation = function(){
+        console.log('bypass rootbeer')
+        return false
+    };
+  })
+}
+
+setImmediate(run)
+```
+
+Yes, it's that easy.
+
+You may ask, how do we know to hook this function? This part still requires static analysis. From static analysis, we know that this function is doing a check, so we use Frida to hook this function.
+
+For myself, I usually use two methods in combination. First, I disassemble and statically analyze the code, take a quick look at the code, and then use Frida to hook it to see if I can achieve what I want. If I can, I will go to the corresponding place in smali and then repack the app. This way, I can execute the process I want even on a phone without Frida.
+
+In fact, the basic use of Frida is like this. The rest depends on understanding of the code and Android development to determine which function to hook.
+
+## Other Frida Tips
+
+Below are some Frida tips that I found on the internet and have used in practice for your reference.
+
+### Print stack trace
+
+Suppose an app has a check mechanism that detects whether it has root, and the source code is obfuscated, making it difficult to trace. However, when checking, it will output check-related information using Log.d. At this time, we can hook Log.d and use `Log.getStackTraceString` to output the stack trace to know where this function is called:
