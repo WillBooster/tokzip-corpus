@@ -1,0 +1,204 @@
+After playing for a while, I noticed a vulnerability. When you send a message, the JSON looks like this:
+
+``` json
+{
+  "type": "widget",
+  "widget": "/widget/chatmessage",
+  "author": {
+    "user": "ewfwefoenfof32of<h1 a=\">test</h1#ab525155",
+    "platform": "web"
+  },
+  "recipients": [
+    "qdqwd",
+    "admin#13371337"
+  ],
+  "data": {
+    "message": "hello"
+  }
+}
+```
+
+After sending the message, the browser sends a request to `https://example.com/widget/chatmessage` to get data, and the response is as follows:
+
+![chat message](/img/defcon-2022-qual-writeup/p2.png)
+
+Text version:
+
+```
+þRFWcorewidgetscoremateriallocalrootloaded        Containerchild    Columnchildren    Rowchildren    TexttextFrom     TexttextauthoruserstylecolorÊÿ    Paddingpadding@child    Texttextdatatitle
+loaded    Columnchildrenpoll_options    Rowchildren    Paddingchild    ElevatedButtonchild    Texttexttext    onPressedapi_postpathdataapiVotebody    selectiontextpadding@$@    Texttextcount    
+TextButtonchild    TexttextRefreshstylecolorÿÿ    onPressedloaded        ApiMapperurldataapiGetjsonKeyoptionsdataKeypoll_optionsonLoadedloaded
+```
+
+It looks like something that has been serialized, and if I change the content of the widget to `.huli.tw/test`, the browser will fetch something from `https://example.com.huli.tw/test`. Therefore, I can manipulate where JS goes to get this serialized thing using `.huli.tw` or `@huli.tw`.
+
+Therefore, I guessed that this problem is:
+
+1. Find out how to generate this widget
+2. Use the widget to XSS (e.g. add `<script>` or other XSS payloads)
+3. Let the admin bot load your widget
+4. Get the admin token
+5. Call the API to get the flag
+
+Therefore, the next step is to see how to generate this widget, and continue to look for information in the source code.
+
+### 18:26(46m) Continue studying the source code
+
+I found a function called getChatWidget in the source code that is used to load the widget, but it took some time to study what it was doing.
+
+![getChatWidget](/img/defcon-2022-qual-writeup/p3.png)
+
+### 18:35(55m) Confirm loading method
+
+At this point, I confirmed that it was a set of things called [rfw](https://github.com/flutter/packages/tree/main/packages/rfw), which stands for Remote Flutter Widgets. Although I had found this set of things on Google when I discovered that it was a remote loading component, and my teammates had also found it, I didn't dare to confirm it before because I was afraid of going in the wrong direction.
+
+Later, we were able to confirm it because of this code: https://github.com/flutter/packages/blob/main/packages/rfw/lib/src/dart/binary.dart#L32
+
+``` js
+/// The first four bytes of a Remote Flutter Widgets binary library blob.
+///
+/// This signature is automatically added by [encodeLibraryBlob] and is checked
+/// in [decodeLibraryBlob].
+///
+/// See also:
+///
+///  * [dataBlobSignature], which is the signature for binary data blobs.
+const List<int> libraryBlobSignature = <int>[0xFE, 0x52, 0x46, 0x57];
+```
+
+These four bytes match the remote widget we saw earlier, so we confirmed that it was generated using this method.
+
+Next, I had to study how to write in Flutter and how to generate widgets. Just installing the Flutter SDK took some time.
+
+### 19:03 (1h 23m) Decoding the widget
+
+Actually, there isn't much documentation for RFW, so it was faster to just look at the examples. I found the code to encode/decode widgets in the example, modified it, and was able to decode our `/widget/chatmessage`, which looked like this:
+
+``` js
+widget root = Container({
+    child: Column({
+        children: [Row({
+            children: [Text({
+                text: From
+            }), Expanded({
+                child: Text({
+                    text: data.author.user,
+                    style: {
+                        color: 4278230474
+                    }
+                })
+            })]
+        }), Row({
+            children: [Expanded({
+                child: Text({
+                    text: data.data.message
+                })
+            })]
+        })]
+    })
+});
+```
+
+Here's the code I used to decode it:
+
+``` js
+import 'dart:io';
+
+import 'package:rfw/formats.dart';
+
+void main () async {
+  final File currentFile = File('chatmessage');
+  print(decodeLibraryBlob(await currentFile.readAsBytes()));
+}
+```
+
+At this point, my focus was on "how to write a Flutter widget that can be XSSed." I originally had three ideas:
+
+1. Write HTML directly, like in React.
+2. Write JS code directly, such as using `eval()` in the widget's onload event.
+3. Use iframe src or srcdoc to XSS.
+
+At first, I thought it would be easy, but the more I researched, the more I realized it wasn't that simple. I thought Flutter was like React/Vue, but then I realized it had its own system and syntax, which was completely different.
+
+You can't write HTML or JS, and although iframes can be used, they require importing another library, which would cause problems in this problem.
+
+However, since there were no other clues at the time, I continued to research this direction.
+
+### 19:37 (1h 57m) Dinner break
+
+I thought I would finish before dinner, but I was too naive.
+
+### 20:12 (2h 32m) Back to work after dinner
+
+### 20:26 (2h 46m) Found the right direction
+
+At this point, since the path of inserting HTML/JS seemed to be a dead end, I wondered if I was going in the wrong direction and if this problem should rely on some existing mechanism.
+
+And just at this time, my teammate asked me to help decode the poll widget, and after seeing the content, I confirmed that this was the right direction:
+
+``` js
+widget root = Container({
+    child: Column({
+        children: [Row({
+                children: [Text({
+                    text: From
+                }), Text({
+                    text: data.author.user,
+                    style: {
+                        color: 4278230474
+                    }
+                })]
+            }), Padding({
+                padding: [0.0, 5.0, 0.0, 0.0],
+                child: Text({
+                    text: data.data.title
+                })
+            }),
+            switch state.loaded {
+                true: Column({
+                    children: [...
+                        for loop in data.poll_options: Row({
+                            children: [Padding({
+                                child: ElevatedButton({
+                                    child: Text({
+                                        text: loop0.text
+                                    }),
+                                    onPressed: event api_post {
+                                        path: data.data.apiVote,
+                                        body: {
+                                            selection: loop0.text
+                                        }
+                                    }
+                                }),
+                                padding: [0.0, 5.0, 10.0, 0.0]
+                            }), Text({
+                                text: loop0.count
+                            })]
+                        }), TextButton({
+                            child: Text({
+                                text: Refresh,
+                                style: {
+                                    color: 4294942366
+                                }
+                            }),
+                            onPressed: set state.loaded = false
+                        })
+                    ]
+                }),
+                null: ApiMapper({
+                    url: data.data.apiGet,
+                    jsonKey: options,
+                    dataKey: poll_options,
+                    onLoaded: set state.loaded = true
+                })
+            }
+        ]
+    })
+});
+```
+
+The ApiMapper at the bottom looks like it can send an API, although I don't know what can be done with it yet, but it's worth a try.
+
+Then I tried to see if I could rebuild the same widget locally, but no matter how I ran it, there were errors, which took a lot of time.
+
+### 21:11 (3h 31m) Found the right way to build

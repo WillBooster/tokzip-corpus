@@ -1,0 +1,70 @@
+<!-- more -->
+
+## 漏洞分析
+
+在 GitHub 上面也有一個比較偏技術的說明：[CVE-2023-46729: SSRF via Next.js SDK tunnel endpoint](https://github.com/getsentry/sentry-javascript/security/advisories/GHSA-2rmr-xw8m-22q9)
+
+可以看到這一段：
+
+> An unsanitized input of Next.js SDK tunnel endpoint allows sending HTTP requests to arbitrary URLs and reflecting the response back to the user. 
+
+在 Sentry 裡面，有一個叫做 tunnel 的功能，這張來自於[官方文件](https://docs.sentry.io/platforms/javascript/troubleshooting/#dealing-with-ad-blockers)的圖完美地解釋了為什麼需要 tunnel：
+
+![tunnel](/img/sentry-nextjs-sdk-cve-2023-46729/p1.png)
+
+如果沒有 tunnel 的話，送給 Sentry 的請求會在前端直接透過瀏覽器發送，而這些直接發給 Sentry 的請求可能會被一些 ad blocker 擋住，Sentry 就沒辦法接收到數據。若是有開啟 tunnel，就會變成先將請求發送給自己的 server，再從自己的 server 轉發給 Sentry，這樣就變成了 same-origin 的請求，便不會被 ad blocker 擋住。
+
+在專門提供給 Next.js 使用的 Sentry SDK 中，是用了一個叫做 [rewrite](https://nextjs.org/docs/app/api-reference/next-config-js/rewrites) 的功能，官方範例如下：
+
+``` js
+module.exports = {
+  async rewrites() {
+    return [
+      {
+        source: '/blog',
+        destination: 'https://example.com/blog',
+      },
+      {
+        source: '/blog/:slug',
+        destination: 'https://example.com/blog/:slug', // Matched parameters can be used in the destination
+      },
+    ]
+  },
+}
+```
+
+Next.js 的 rewrite 基本上可以分為兩種，internal 跟 external，後者的話其實更像是 proxy 的感覺，可以直接把請求導向到外部網站，然後顯示出 response。
+
+Next.js Sentry SDK 的實作在 [sentry-javascript/packages/nextjs/src/config/withSentryConfig.ts](https://github.com/getsentry/sentry-javascript/blob/7.69.0/packages/nextjs/src/config/withSentryConfig.ts#L98)：
+
+``` js
+/**
+ * Injects rewrite rules into the Next.js config provided by the user to tunnel
+ * requests from the `tunnelPath` to Sentry.
+ *
+ * See https://nextjs.org/docs/api-reference/next.config.js/rewrites.
+ */
+function setUpTunnelRewriteRules(userNextConfig: NextConfigObject, tunnelPath: string): void {
+  const originalRewrites = userNextConfig.rewrites;
+
+  // This function doesn't take any arguments at the time of writing but we future-proof
+  // here in case Next.js ever decides to pass some
+  userNextConfig.rewrites = async (...args: unknown[]) => {
+    const injectedRewrite = {
+      // Matched rewrite routes will look like the following: `[tunnelPath]?o=[orgid]&p=[projectid]`
+      // Nextjs will automatically convert `source` into a regex for us
+      source: `${tunnelPath}(/?)`,
+      has: [
+        {
+          type: 'query',
+          key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
+          value: '(?<orgid>.*)',
+        },
+        {
+          type: 'query',
+          key: 'p', // short for projectId - we keep it short so matching is harder for ad-blockers
+          value: '(?<projectid>.*)',
+        },
+      ],
+      destination: 'https://o:orgid.ingest.sentry.io/api/:projectid/envelope/?hsts=0',
+    };

@@ -1,0 +1,56 @@
+### 案例一：Cocos2d 遊戲
+
+AI 把 apk 拆開後，用 jadx 還原出 Java，發現遊戲邏輯不在裡面。
+
+觀察一下發現是用 Cocos2d 寫的，assets 底下有大量加密過的 JavaScript 與 JSON 文件，還有個 `libcocos2djs.so`。
+
+下一步把 `libcocos2djs.so` 裡面的符號解析出來，確實看到一些加解密函數，而這個 so 有 35 MB 它覺得太大，所以沒有整包解開，而是選擇從解密的函式開始逆向，識別出加密演算法是 Blowfish。
+
+接著追了一下誰 call 了設置 key 的函式，把那一段反編譯後還原出了 key，在原始程式碼中是用字串拼接的方式一個一個拼上去的：
+
+``` c
+std::string key;
+key.push_back('7');  // MOV W8, 0x37
+key.push_back('2');  // MOV W8, 0x32
+key.push_back('c');  // MOV W8, 0x63
+key.push_back('d');  // MOV W8, 0x64
+....（共 32 個字元）
+```
+
+之所以特別講這個，是因為 AI 在嘗試這個方法之前，先在 code 裡面掃過一次，看有沒有長得很像 key 的字串，但發現沒有。做到這步 AI 就知道因為 key 是一個一個加上去的，所以在 code 裡不連續，沒辦法直接掃出來。
+
+再來用 Python 寫了個腳本去解密所有資源，最後就拿到了 JavaScript，還原出遊戲邏輯以及 client 端配置。
+
+這個案例主要是走純靜態分析，AI 光用靜態分析就找到加解密函式以及設置 key 的地方，再反編譯回推出 key 的內容，把加密過的遊戲資源解開。
+
+### 案例二：另一個 Cocos2d 遊戲
+
+一樣先拆開先 jadx，發現 dex 有加了個殼，不過這個遊戲也觀察出來是 Cocos2d，所以 dex 先放一旁，先看 `libcocos2djs.so`，從裡面找到一個疑似的 key。
+
+但因為這個 key 解不了加密的 jsc，所以換別條路，用 Unicorn Engine 去模擬執行這個 so，不過沒進展，跑一跑卡住。
+
+靜態分析跑不出來，改採動態分析，安裝了 Android 模擬器以及 frida，去 hook 多個參數，`Memory.scanSync` 跟 `fopen` 都失敗了，後來也去找了 `libcocos2djs.so` 導出的函數，發現 `xxtea_decrypt` 是 public 的，就去 hook `xxtea_decrypt`。
+
+把遊戲跑起來之後，就拿到了正確的 key，並且還原出了那些加密後的 jsc 檔案，同樣含有遊戲邏輯與配置。
+
+跑到這邊之後因為遊戲已經還原，就停止了，我想繼續測試他的能力，於是跟他説：「那你試著脫脫看那個殼吧」，結果那個殼的保護滿弱，跑起來之後 frida-dexdump 一下就把 dex 都 dump 出來了。
+
+這個案例靜態分析跑不通改採動態分析加上 hook，並且還順便脫了一個殼(雖然殼滿弱的就是了)。
+
+### 案例三：Unity 遊戲
+
+APK 拆開之後有 libil2cpp、libunity 跟 libxlua 三個 so 檔案，猜測核心邏輯在 Lua 層。之後先用 Il2CppDumper 把 global-metadata 拆開，解出一些 C# 檔案跟 DLL，用 ILSpy 反編譯之後發現都是 class，實作是空的（似乎 IL2CPP 本來就是這樣？）
+
+用 jadx 拆 Java，也都是一些 SDK，沒有遊戲邏輯，於是把心力放在找出 Lua 檔案。
+
+用 UnityPy 掃所有 asset bundle 的 TextAsset，只找到 4 個 lua 腳本，都不是遊戲核心邏輯。從剛剛拿的 C# 程式碼中找到一些字串，發現遊戲有熱更新系統，用裡面翻到的 URL 跟 AES key 與 IV 嘗試去下載，發現都回 404 載不下來。
+
+後來轉向再回去 asset bundle 找，找到一個 bundle 裡面有 3000 個 TextAsset（第一次沒檢查到），從檔名確認是加密的 Lua 腳本。
+
+接著觀察發現這些檔案有許多前 6 個 byte 一樣，猜測是 Lua 5.3 編譯後的 bytecode 開頭，用 XOR 反推回 key 發現解不開。然後又嘗試了幾種不同的加密法，各種 AES 的模式，還是解不開。
+
+再來去反編譯 libil2cpp，看到解密的過程是用 XOR 沒錯，然後密鑰是 6 個 byte 不斷重複。在 C# 裡面跟 global-metadata 用靜態的方式都找不到，到這邊卡關，由我介入。
+
+我就問他說：「你動態分析會不會比較快？」
+
+AI 給了兩個方案，一個 Frida hook，一個 Unicorn 模擬，我選後者，結果 AI 在寫腳本的時候，神來一筆地用別的方法破解了。他說他觀察那些文件，發現有一半前 54 個 bytes 都一樣，而且是 6 個 bytes 不斷重複，`c3 70 43 22 34 a6`。

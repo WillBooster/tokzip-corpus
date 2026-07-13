@@ -1,0 +1,75 @@
+改完以後重新跑一遍測試，那一刻，我終於想起了被 CORS 困擾下的恐懼：
+
+![sw-error](https://user-images.githubusercontent.com/2755720/49351841-35343d00-f6f0-11e8-8661-ae6094c17e41.png)
+
+
+# 撥雲見日
+
+既然有了一些線索就應該好好追查下去，從截圖裡面看起來，SW 是成功註冊了，但是在用 SW 快取檔案的時候碰到一些錯誤，所以好像連帶影響了整個測試。總之呢，只要把這個 CORS 問題解決掉就沒事了吧。
+
+先幫大家再做個背景說明，我們這些靜態檔案都是放在 Amazon S3，然後前面再掛 Cloudfront，我們已經有乖乖按照 [Amazon 的指示](https://docs.aws.amazon.com/AmazonS3/latest/dev/cors.html)加上該加的東西，所以只要 request header 有 origin，response 就一定會有 CORS 的 header，所以一定不會發生這個錯誤。
+
+而 SW 在快取檔案的時候是用 fetch，所以也一定會加上 origin 這個 header，沒理由出問題。
+
+大概卡了一兩個小時還是還無頭緒，於是我決定看一下 network 的 tab，發現了更多線索：
+
+下面這一張是從 SW 裡面發出的 request，header 裡面確實有 origin，可是 response 卻沒有 `Access-Control-Allow-Origin`！
+![sw-r1](https://user-images.githubusercontent.com/2755720/49351843-382f2d80-f6f0-11e8-964e-faeb9e786ff7.png)
+
+除此之外，發現更早以前也有一個相同的 request，因為這個 request 是由 `<script>` 發出的，所以不會帶上 origin，因此 response 也就沒有 CORS 的 header。
+![sw-r2](https://user-images.githubusercontent.com/2755720/49351854-44b38600-f6f0-11e8-8a11-b8b63248c8a8.png)
+
+而這邊值得注意的事情是，第二個 response 是 from disk cache（雖然上面兩個都是，但那是因為我截圖的時候東西沒清空，事實上應該只有第二個是）
+![sw-tab](https://user-images.githubusercontent.com/2755720/49351857-4715e000-f6f0-11e8-8a25-f597a0aa6ab3.png)
+
+查線索查到這裡，大概有點頭緒了。
+
+# 深入追查
+
+好，讓我先來解釋一下。
+
+SW 所要快取的那個檔案是頁面會載入的其中一個 JavaScript，而因為頁面會載入，所以在 HTML 裡面我們放了一個 `<script>` 的 tag 來載入這個檔案，從上面的圖片看起來，瀏覽器先載入了這個 JavaScript 檔案，然後因為這個檔案不是用 ajax 發出，所以沒有 origin，根據 S3 的規定，也就自然沒有 `Access-Control-Allow-Origin`。
+
+再來呢，SW 註冊成功，開始執行裡面的程式碼把我們預先準備好的清單給快取住，其中一個就是這個 JavaScript 的檔案，但是當我們用 fetch 來抓這個檔案時，瀏覽器直接用了快取住的前一個的 response（因為 URL、method 都一樣），而這個 response 是沒有 `Access-Control-Allow-Origin` 的！因此就跳出了我們最前面看到的跨網域的錯誤。
+
+到這邊真相大白了，都是瀏覽器快取的問題。
+
+那為什麼我之前自己測都測不出來呢？因為身為一個前端工程師，devtool 有把「Disable cache」打勾是很合情合理的事，所以我怎麼試都試不出來這個問題。
+
+知道問題的成因之後就比較簡單了，拜了 Google 大神查到了這一篇 Chromium 的 ticket：[CORS Preflight Cache Does not Consider Origin](https://bugs.chromium.org/p/chromium/issues/detail?id=260239)
+
+裡面碰到的問題基本上跟我碰到的差不多，最後給的解法是 response 加上一個 `Vary: Origin`，讓瀏覽器知道如果 Origin 不一樣的話就不要用快取，可是我發現我們早就加了但不知道為什麼沒用。
+
+除此之外也找到幾個類似的問題：
+
+1. [Chrome S3 Cloudfront: No 'Access-Control-Allow-Origin' header on initial XHR request](https://serverfault.com/questions/856904/chrome-s3-cloudfront-no-access-control-allow-origin-header-on-initial-xhr-req)
+2. [S3 CORS, always send Vary: Origin](https://stackoverflow.com/questions/31732533/s3-cors-always-send-vary-origin)
+
+後來採用裡面其中一個的解法：「既然 S3 要有 origin header 才能開啟 CORS，那就用 Cloudfront 傳一個固定的 origin 給它吧！這樣每個 response 都一定會有 `Access-Control-Allow-Origin` 了！」
+
+可以參考這篇：[AWS CloudFront + S3 + Allow all CORS](http://strd6.com/2017/05/aws-cloudfront-s3-allow-all-cors/)，基本上就是調一個設定而已。
+
+這招聽起來滿有效的，但其實不是最好的解法，感覺有點骯髒，畢竟 origin 這東西不是這樣用的，為了 S3 的機制硬要這樣做總覺得不是太好。
+
+於是最後我就想到一個東西，同時也解決了心中的一個疑惑。
+
+那就是在`<script>`加上 `crossorigin="anonymous"`，讓`<script>`發出去的 request 也有 origin header！
+
+我以前就看到某些地方會加這個，但始終不懂為什麼要加，因為 script 本來就可以不限制網域，為什麼還要特地加一個 tag 讓它變成像 ajax 那樣的 request？
+
+但沒想到我居然被這個屬性幫助到了，一旦我加了這個，那 script 的載入就會附上 Origin，S3 就會回傳 `Access-Control-Allow-Origin`，也就不會碰到之後的跨網域問題了！
+
+至於這個屬性其他的功用，可參考：[Purpose of the crossorigin attribute …?](https://stackoverflow.com/questions/18336789/purpose-of-the-crossorigin-attribute)
+
+# 總結
+
+要碰到我所碰到的這個問題，你必須同時滿足下面四個條件：
+
+1. 你把靜態檔案放在 S3 上面
+2. 你沒有勾選瀏覽器的 Disable cache
+3. 你用 script 跟 SW 載入同一個檔案
+4. 瀏覽器用快取的 script 的 response 回應 SW 的請求
+
+只要任何一個條件沒有滿足，就不會碰到這問題。換句話說，要踩到這個坑其實也挺困難的。
+
+但坑踩的越多就越強，解決了一個問題就代表你未來會碰到的問題又少了一個。解決掉這個 CORS 相關的問題，我想我以後應該不會再碰到相關的問題了...吧。

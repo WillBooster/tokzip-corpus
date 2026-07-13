@@ -1,0 +1,163 @@
+Next, let's talk about the second point. If the password reset link can be guessed, it means that the attacker can reset the password on behalf of the user.
+
+Or more precisely, the password reset token cannot be guessed.
+
+For example, if the password reset link looks like this: `https://example.com/reset-password?token=user@example.com`, then I can reset the password for anyone, which is obviously insecure.
+
+Therefore, in general, the token will generate a unique id, such as UUID v4, which looks like this: `2c59d26a-f99a-425e-bb69-91e7c6ffe54d`, with 128 bits, which is 2^128 combinations, and the probability of guessing it is very small.
+
+If the strength of the generated token is not enough, it will increase the probability of successful brute force cracking.
+
+However, it should be noted that even so, some system vulnerabilities are elsewhere, such as when sending emails, the password reset URL or host can be controlled! For example, as long as `X-Forwarded-Host: abc.com` is added in the request header, the password reset link will become: `https://abc.com/reset-password?token=...`. If the user clicks the link carelessly after receiving the email, the token will be sent to the attacker's server, and he can still use this token to reset the password and take over the account.
+
+This has also happened in actual cases:
+
+1. [Password Reset link hijacking via Host Header Poisoning](https://hackerone.com/reports/226659)
+2. [Email link poisoning / Host header attack](https://hackerone.com/reports/182670)
+
+Apart from these, there are many small details to pay attention to, such as:
+
+1. The reset password token should only be used once.
+2. The reset password token should have an expiration time.
+3. If the user generates a new reset password token, the old one should be invalidated.
+
+These limitations are in place to reduce the feasibility of brute-force attacks.
+
+If time were unlimited, theoretically brute-force attacks could guess the token, so the key to preventing brute-force attacks is twofold: one is to increase the time required for cracking, making it long enough to exceed a thousand years or more, and the second key is to limit the time. There are several ways to do this, such as:
+
+1. Increase the base, for example, the possibility of a six-digit number is only one million, but if it is changed to a six-digit alphanumeric, there are 2 billion possibilities, and the number of guesses increases by 2000 times, requiring more time.
+2. Reduce the guessable time, for example, the token will expire after 300 seconds. If there are 100 million possibilities, then 300,000 guesses per second must be made to ensure success.
+
+Next, let's take a look at what happened to Matters' reset password mechanism.
+
+## Matters' Reset Password Mechanism
+
+The following image is the interface for resetting the password on Matters. You enter your email and then a link is sent to your mailbox:
+
+![](/img/reset-password-vulnerability/matters.png)
+
+The reset password request looks like this:
+
+``` js
+{
+   "operationName":"SendVerificationCode",
+   "variables":{
+      "input":{
+         "email":"user@example.com",
+         "type":"password_reset",
+         "redirectUrl":"https://matters.news/forget?email=user%40example.com"
+      }
+   }
+}
+```
+
+This is the link I received: `https://matters.news/forget?email=user%40example.com&code=UYBQ912rhd_9s3TfywZnk1kQl6PCaDjPlXuNX3Df&type=password_reset`
+
+From here, we can see the first problem, which is that the front half of the received link is controlled by `redirectUrl`. If we intercept the request and modify the `redirectUrl` parameter to `https://cymetrics.io`, we will find that the link received in the mailbox does start with `https://cymetrics.io`!
+
+In this way, we have the vulnerability mentioned earlier. If the user clicks the link in the email, our server will receive the token and can reset the user's password.
+
+Next, let's see if there is a brute-force attack problem. The token itself looks quite complex, with a length of 40 characters composed of uppercase and lowercase letters, numbers, and underscores.
+
+Although it doesn't seem to be a problem, Matters is open source, so we can directly see how `SendVerificationCode` is implemented. The code is here: https://github.com/thematters/matters-server/blob/v3.19.0/src/mutations/user/sendVerificationCode.ts
+
+We are concerned with where the code is generated, mainly this part:
+
+``` js
+// insert record
+const { code } = await userService.createVerificationCode({
+  userId: viewer.id,
+  email,
+  type,
+  strong: !!redirectUrl, // strong random code for link
+})
+```
+
+And the code for `userService.createVerificationCode` is here: https://github.com/thematters/matters-server/blob/v3.19.0/src/connectors/userService.ts#L1500
+
+``` js
+createVerificationCode = ({
+  userId,
+  email,
+  type,
+  strong,
+  expiredAt,
+}: {
+  userId?: string | null
+  email: string
+  type: string
+  strong?: boolean
+  expiredAt?: Date
+}) => {
+  const code = strong ? nanoid(40) : _.random(100000, 999999)
+
+  return this.baseCreate(
+    {
+      uuid: v4(),
+      userId,
+      email,
+      type,
+      code,
+      expiredAt:
+        expiredAt || new Date(Date.now() + VERIFICATION_CODE_EXIPRED_AFTER),
+    },
+    'verification_code'
+  )
+}
+```
+
+From here, we see a key point, which is that the code generation in the system is divided into two types: strong is `nanoid(40)`, and not strong is a six-digit number from 100000 to 999999. The strong parameter is determined by whether `redirectUrl` is passed in.
+
+That is to say, if we remove the `redirectUrl` parameter when creating the reset password verification code, the code will instantly drop from 40 characters to a six-digit number!
+
+The verification code's expiration time `VERIFICATION_CODE_EXIPRED_AFTER` is five minutes, or 300 seconds. 900000/300 = 3000. If we can send 3000 requests per second to the server, we can brute-force the reset password token and then take over the user's account.
+
+But this statement is not very accurate because we can send 3000, but it does not mean that the server can handle 3000. Therefore, we also need to consider the number of requests the server can accept, and there is another limitation to overcome before that.
+
+## Rate Limiting
+
+One way to increase the difficulty of brute-force attacks is rate limiting, which many websites or WAFs have to prevent a large number of requests in a short period.
+
+Matters' rate limit is handled by nginx, and the code is here: https://github.com/thematters/matters-server/blob/v3.19.0/.ebextensions/rate-limit-connections.config
+
+```
+limit_req_zone $http_x_forwarded_for zone=application:16m rate=5r/s;
+
+limit_req zone=application burst=20 nodelay;
+limit_req_status 429;
+limit_conn_status 429;
+
+# pass real IP from client to NGINX
+real_ip_header X-Forwarded-For;
+set_real_ip_from 0.0.0.0/0;
+
+server {
+    # set error page for HTTP code 429
+    error_page 429 @ratelimit;
+    location @ratelimit {
+        return 429 '["Connection Limit Exceeded"]\n';
+    }
+
+    listen 80;
+
+    # 底下省略
+}
+```
+
+Nginx's rate limit is mainly based on IP. If you really want to bypass it, you can try [IP rotate](https://rhinosecuritylabs.com/aws/bypassing-ip-based-blocking-aws/). A simple way is to open many API gateways on AWS as proxies, and then you have a bunch of different IPs that can be used in rotation.
+
+But we don't need this technique here because we can see from the settings that it uses the `$http_x_forwarded_for` parameter. If it is not managed properly, you can pass in `X-Forwarded-For` to forge any IP and bypass the rate limit.
+
+Matters obviously didn't set it up properly, so the rate limit is virtual.
+
+By doing this, as long as we can send 3000 requests per second, we can make a POC to prove that the attack is indeed feasible. But are there any other ways to reduce this number?
+
+## Simultaneous Verification Codes
+
+At the beginning, I mentioned that there are some details to pay attention to when resetting the password, such as:
+
+1. The reset password token should only be used once.
+2. The reset password token should have an expiration time.
+3. If the user generates a new reset password token, the old one should be invalidated.
+
+Matters has done the first two points, but not the third. From the code, we can see that when a new verification code is created, the old one is not deleted or marked as invalid.

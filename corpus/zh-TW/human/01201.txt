@@ -1,0 +1,180 @@
+Therefore, when you call `str.repeat`, you are actually calling `String.prototype.repeat`, and this is the principle and operation mode of the prototype chain.
+
+Other things are the same as strings, such as objects:
+
+``` js
+var obj = {}
+console.log(obj.a) // undefined
+console.log(obj.toString) // ƒ toString() { [native code] }
+```
+
+Although `obj` is an empty object, why does `obj.toString` exist? Because the JS engine cannot find it on `obj`, it goes to `obj.__proto__` to find it, and `obj.__proto__` points to `Object.prototype`. Therefore, what `obj.toString` finally finds is actually `Object.prototype.toString`.
+
+``` js
+var obj = {}
+console.log(obj.toString === Object.prototype.toString) // true
+```
+
+## Changing Properties on the Default Prototype
+
+The `__proto__` of a string is `String.prototype`, the `__proto__` of a number is `Number.prototype`, and the `__proto__` of an array is `Array.prototype`. These associations are already pre-set to allow these class objects to share the same function.
+
+If each string has its own `repeat`, then there will be one million different repeats for one million strings, but they actually do the same thing, which doesn't sound reasonable, right? Therefore, through the prototype, we can put `repeat` in `String.prototype`, so that every string that uses this function will call the same function.
+
+You may wonder, since the same function is called with the same parameters, how can the function distinguish which string is calling it?
+
+The answer is: this, let's take an example below:
+
+``` js
+String.prototype.first = function() {
+  return this[0]
+}
+
+console.log("".first()) // undefined
+console.log("abc".first()) // a
+```
+
+First, I added a method called `first` on `String.prototype`, so when I call `"".first`, the JS engine finds `String.prototype` along `__proto__`, finds that `String.prototype.first` exists, and calls this function.
+
+And because of the rules of this, when `"".first()` is written, the this obtained in `first` will be `""`; if `"abc".first()` is called, the this obtained in `first` will be `"abc"`, so we can use this to distinguish who is calling now.
+
+The way `String.prototype.first` is written above is to directly modify the prototype of String, add a new method, and let all strings use this new method. Although it is very convenient, this method is not recommended in development. There is a saying: [Don't modify objects you don't own](https://humanwhocodes.com/blog/2010/03/02/maintainable-javascript-dont-modify-objects-you-down-own/). For example, MooTools did something similar, which caused an array method to be renamed. For details, please see what I wrote before: [Don’t break the Web: SmooshGate and <keygen>](https://blog.huli.tw/2019/11/26/dont-break-web-smooshgate-and-keygen/).
+
+Then, since `String.prototype` can be modified, it is natural that `Object.prototype` can also be modified, like this:
+
+``` js
+Object.prototype.a = 123
+var obj = {}
+console.log(obj.a) // 123
+```
+
+Because `Object.prototype` is modified, when accessing `obj.a`, the JS engine cannot find the property a on obj, so it goes to `obj.__proto__`, which is `Object.prototype`, finds a on it, and returns the value of a.
+
+When the program has vulnerabilities that can be used by attackers to change properties on the prototype chain, it is called prototype pollution. Pollution means pollution. Like the example of the object above, we "polluted" the property `a` on the object prototype through `Object.prototype.a = 123`, causing unexpected behavior when accessing the object.
+
+What are the consequences of this?
+
+## What can be done after polluting properties?
+
+Suppose there is a search function on the website that will take the value of `q` from the query string, and write it to the screen, as shown below:
+
+![search](/img/prototype-pollution/2-search.png)
+
+And the entire code is written like this:
+
+``` js
+// 從網址列上拿到 query string
+var qs = new URLSearchParams(location.search.slice(1))
+
+// 放上畫面，為了避免 XSS 用 innerText
+document.body.appendChild(createElement({
+  tag: 'h2',
+  innerText: `Search result for ${qs.get('q')}`
+}))
+
+// 簡化建立元件用的函式
+function createElement(config){
+  const element = document.createElement(config.tag)
+  if (config.innerHTML) {
+    element.innerHTML = config.innerHTML
+  } else {
+    element.innerText = config.innerText
+  }
+  return element
+}
+```
+
+There should be no problem with the above code, right? We wrote a function `createElement` to simplify some steps for us, and decided what components to generate based on the config passed in. In order to avoid XSS, we use `innerText` instead of `innerHTML`, which is foolproof and absolutely no XSS!
+
+It looks like this, but if there is a prototype pollution vulnerability before executing this code, which allows attackers to pollute properties on the prototype, what will happen? For example, like this:
+
+``` js
+// 先假設可以污染原型上的屬性
+Object.prototype.innerHTML = '<img src=x onerror=alert(1)>'
+
+// 底下都跟剛剛一樣
+var qs = new URLSearchParams(location.search.slice(1))
+
+document.body.appendChild(createElement({
+  tag: 'h2',
+  innerText: `Search result for ${qs.get('q')}`
+}))
+
+function createElement(config){
+  const element = document.createElement(config.tag)
+  // 這一行因為原型鏈被污染，所以 if(config.innerHTML) 的結果會是 true
+  if (config.innerHTML) {
+    element.innerHTML = config.innerHTML
+  } else {
+    element.innerText = config.innerText
+  }
+  return element
+}
+```
+
+The entire code only differs in the beginning, with an additional `Object.prototype.innerHTML = '<img src=x onerror=alert(1)>'`, and just because this line polluted innerHTML, the judgment of `if (config.innerHTML) {` below becomes true, the behavior is changed, and it was originally `innerText`, now it is changed to `innerHTML`, and finally XSS is achieved!
+
+This is an XSS attack caused by prototype pollution. Generally speaking, prototype pollution refers to vulnerabilities in the program that allow attackers to contaminate properties on the prototype chain. However, in addition to contamination, it is also necessary to find places that can be affected in order to form a complete attack.
+
+At this point, you may be curious about what kind of code has vulnerabilities that allow attackers to modify properties on the prototype chain.
+
+## How does prototype pollution occur?
+
+There are two common examples of this happening. The first is parsing the query string.
+
+You might think that the query string is just the type `?a=1&b=2`, what's so difficult about it? But in fact, many query string libraries support arrays, such as `?a=1&a=2` or `?a[]=1&a[]=2`, which can be parsed as arrays.
+
+In addition to arrays, some even support objects, like this: `?a[b][c]=1`, which will produce an object `{a: {b: {c: 1}}}`.
+
+For example, the [qs](https://github.com/ljharb/qs#parsing-objects) library supports object parsing.
+
+If you were responsible for this feature today, how would you write it? We can write a simple version that only targets objects (without considering URL encoding or arrays):
+
+``` js
+function parseQs(qs) {
+  let result = {}
+  let arr = qs.split('&')
+  for(let item of arr) {
+    let [key, value] = item.split('=')
+    if (!key.endsWith(']')) {
+      // 針對一般的 key=value
+      result[key] = value
+      continue
+    }
+
+    // 針對物件
+    let items = key.split('[')
+    let obj = result
+    for(let i = 0; i < items.length; i++) {
+      let objKey = items[i].replace(/]$/g, '')
+      if (i === items.length - 1) {
+        obj[objKey] = value
+      } else {
+        if (typeof obj[objKey] !== 'object') {
+          obj[objKey] = {}
+        }
+        obj = obj[objKey]
+      }
+    }
+  }
+  return result
+}
+
+var qs = parseQs('test=1&a[b][c]=2')
+console.log(qs)
+// { test: '1', a: { b: { c: '2' } } }
+```
+
+Basically, it constructs an object based on the content inside `[]`, and assigns values layer by layer, which doesn't look particularly special.
+
+But! If my query string looks like this, things are different:
+
+``` js
+var qs = parseQs('__proto__[a]=3')
+console.log(qs) // {}
+
+var obj = {}
+console.log(obj.a) // 3
+```
+
+When my query string is like this, `parseQs` will go and change the value of `obj.__proto__.a`, causing prototype pollution, which causes me to declare an empty object and print out `obj.a` later, but it prints out 3 because the object prototype has been contaminated.

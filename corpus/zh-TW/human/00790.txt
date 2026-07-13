@@ -1,0 +1,148 @@
+``` js
+var Log = Java.use("android.util.Log");
+var Exception = Java.use("java.lang.Exception");
+Log.d.overload("java.lang.String", "java.lang.String").implementation = function (a, b) {
+   if (b.indexOf('root') >= 0) {
+    // print stack trace
+    console.log(Log.getStackTraceString( Exception.$new()));
+   }
+   return this.d.overload("java.lang.String", "java.lang.String").call(this, a, b)
+};
+```
+
+### Hook Reflect-related methods
+
+In Java, in addition to calling methods directly, you can also call them through reflection (Reflect). Some obfuscated programs use this technique extensively to enhance the difficulty of static analysis. We can print out every dynamically called method to see if there are any clues:
+
+``` js
+// hook Class.forName
+var JavaClass = Java.use('java.lang.Class');
+JavaClass.forName.overload('java.lang.String', 'boolean', 'java.lang.ClassLoader').implementation = function(name, b, c) {
+  console.log('Class.forName', name)
+  // we can log all methods in certain class
+  if (name.indexOf('cymetrics') === 0) {
+    var TargetClass = Java.use(name);
+    var methodsList = TargetClass.class.getDeclaredMethods();
+    for (var k=0; k<methodsList.length; k++){
+        console.log(methodsList[k].getName());
+    }  
+  }
+  return this.forName.overload('java.lang.String', 'boolean', 'java.lang.ClassLoader').call(this, name, b, c)
+}
+
+// hook Method.invoke
+var Method = Java.use('java.lang.reflect.Method')
+Method.invoke.overload('java.lang.Object', '[Ljava.lang.Object;').implementation = function(a,b){
+  console.log('reflect', a, b)
+  return this.invoke.call(this,a,b)
+}
+```
+
+### Hook string operations
+
+Some obfuscated programs will scramble all the fixed strings in the program through various steps to make them difficult to search, such as turning strings into numbers and then restoring them. Usually, when restoring, string operations will be performed. At this time, we can directly hook the string operations and use the stack trace mentioned earlier to trace:
+
+``` js
+['java.lang.StringBuilder', 'java.lang.StringBuffer'].forEach(function(clazz, i) {
+  Java.use(clazz)['toString'].implementation = function() {
+    var ret = this.toString();
+    console.log('ret:', ret)
+    return ret;
+  }   
+}); 
+```
+
+### Hook encryption and decryption-related operations
+
+Usually, in an Android app, if you want to perform encryption and decryption, you will use the built-in API, like this (source: [AES encryption in Android--Part 1](https://cloud.tencent.com/developer/article/1647740)):
+
+``` java
+public static final String CODE_TYPE = "UTF-8";
+public static final String AES_TYPE = "AES/ECB/PKCS5Padding";
+private static final String AES_KEY="1111222233334444";
+
+public static String encrypt(String cleartext) {
+    try {
+        SecretKeySpec key = new SecretKeySpec(AES_KEY.getBytes(), "AES");
+        Cipher cipher = Cipher.getInstance(AES_TYPE);
+        cipher.init(Cipher.ENCRYPT_MODE, key); 
+        byte[] encryptedData = cipher.doFinal(cleartext.getBytes(CODE_TYPE));
+        return Base64.encodeToString(encryptedData,Base64.DEFAULT);
+    } catch (Exception e) {
+        e.printStackTrace();
+        return "";
+    }
+}
+```
+
+Therefore, as long as you can hook methods like `SecretKeySpec` or `doFinal`, you can intercept the key and plaintext before encryption.
+
+This article is worth reading: [How Secure is your Android Keystore Authentication?](https://labs.f-secure.com/blog/how-secure-is-your-android-keystore-authentication/), which includes a bunch of Frida scripts related to encryption and decryption. Here: https://github.com/FSecureLABS/android-keystore-audit/blob/master/frida-scripts/tracer-cipher.js
+
+By the way, the script does not directly convert byte arrays to strings. Here is a more convenient way (source: [frida小技巧之string与byte转化](https://lingwu111.github.io/frida%E5%B0%8F%E6%8A%80%E5%B7%A7%E4%B9%8Bstring%E4%B8%8Ebyte%E8%BD%AC%E5%8C%96.html)):
+
+``` js
+function bytesToString(bytes) {
+    var javaString = Java.use('java.lang.String');
+    return javaString.$new(bytes);
+}
+
+var Base64 = Java.use('android.util.Base64')
+Base64.decode.overload('[B', 'int').implementation = function(a, b) {
+  console.log(bytesToString(a))
+  return this.decode.call(this, a, b)
+}
+```
+
+## SSL Pinning
+
+I saw a great script in [Defeating Android Certificate Pinning with Frida](https://httptoolkit.tech/blog/frida-certificate-pinning/) that automatically hooks various functions that do SSL pinning, allowing you to bypass this mechanism. I saved a copy here: https://gist.github.com/aszx87410/f7ae60826d436d8e5bd17deb3e40c249
+
+After saving, run it like this:
+
+```
+frida -U --no-pause -l ssl.js -f "com.example"
+```
+
+## Detecting Frida
+
+Since Frida is so powerful, some app security mechanisms naturally want to block it. Once Frida is detected, the app will either exit directly or cause a crash. You can refer to the following two articles:
+
+1. [Android Reverse Engineering: Multiple Feature Detection of Frida](https://www.jianshu.com/p/f679cb404524)
+2. [Multiple Feature Detection of Frida](https://blog.csdn.net/zhangmiaoping23/article/details/109697329)
+
+There are many ways to anti-detection, one of which is to hook the various methods mentioned in the above articles. After all, we have root privileges and Frida hook in front, so as long as we know how it is judged, we can definitely remove the check. If you can't find the check, you can use various hooks mentioned above to find it out step by step.
+
+## Conclusion
+
+In this article, we introduced the basic usage of Frida and learned how to use Frida to hook various methods to obtain various information we want.
+
+In the first four articles, we covered some basic things, including:
+
+1. Basic Android App composition
+2. How to use Apktool to unpack and repack apk
+3. How to use jadx to restore smali to java files
+4. Familiar with a little bit of smali syntax, know how to modify code and add code
+5. How to intercept packets through a proxy on a computer
+6. How to modify the apk to allow the proxy to intercept smoothly
+7. How to use Frida to hook function
+8. Various tricks of Frida
+
+If you go further, you will enter the field of native.
+
+In addition to using Java to write Android Apps, you can also use [Android NDK](https://developer.android.com/ndk) to write code in C/C++, which can be provided to Android apps.
+
+When do you need it? The first is the more performance-consuming places, such as image recognition, using C++ to write will be faster than Java, so native is usually used. The second is some more secretive operations, such as encryption and decryption. If placed in the Java layer, it is easy to decompile and see what is being done. If written in native, more binary-related knowledge is required to crack it.
+
+In addition, the apps in the real world are not as simple as the apps we demonstrated earlier. They may be encapsulated or more strongly obfuscated. Even if the apk can be unpacked, if the shell cannot be removed, the real logic cannot be seen. Some shells also have mechanisms for anti-tampering and anti-dynamic analysis, which can block attackers with insufficient skills. Relevant introductions can refer to the agenda of [2019 Taiwan Cyber Security Week](http://confapi.ithome.com.tw/session/4186): [Building a Secure and Convenient App Security Protection Product](https://s.itho.me/cybersec/2019/slides/321/I_%E4%B8%96%E8%B2%BF%E4%B8%89/0321I51610%E7%8E%8B%E7%BE%BF%E5%BB%B7.pdf)
+
+The reason why this series is called "Introduction" is because it completely does not mention the practical things that will be encountered, and only focuses on the basics and tools of the introduction. However, for apps without special obfuscation or encapsulation, this should be enough.
+
+References:
+
+1. [Frida Handbook](https://github.com/hookmaster/frida-all-in-one)
+2. [Translation-N Ways to Unpack Android Malware](https://www.giantbranch.cn/2019/10/25/%E7%BF%BB%E8%AF%91%E2%80%94%E2%80%94N%E7%A7%8D%E8%84%B1%E5%A3%B3%E5%AE%89%E5%8D%93%E6%81%B6%E6%84%8F%E8%BD%AF%E4%BB%B6%E7%9A%84%E6%96%B9%E5%BC%8F/)
+4. [This is probably the most detailed notes for learning Frida](https://juejin.cn/post/6847902219757420552#heading-39)
+5. [frida-snippets](https://github.com/iddoeldor/frida-snippets#class-description)
+6. [Frida Tutorial](https://book.hacktricks.xyz/mobile-apps-pentesting/android-app-pentesting/frida-tutorial)
+7. [Practical FRIDA Advanced: Memory Roaming, Hook Anywhere, Packet Capture](https://www.anquanke.com/post/id/197657)

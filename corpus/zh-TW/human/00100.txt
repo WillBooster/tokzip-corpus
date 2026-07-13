@@ -1,0 +1,65 @@
+就如同 [spec](https://w3c.github.io/beacon/) 上所寫的：
+
+> This specification defines an interface that web developers can use to schedule asynchronous and non-blocking delivery of data that minimizes resource contention with other time-critical operations, while ensuring that such requests are still processed and delivered to destination
+> 
+> 此規範定義了一個 interface，供網頁開發者用於安排非同步且非阻塞的數據傳輸，以最大限度地減少與其他時間敏感操作的資源競爭，同時確保這些請求仍能被處理並傳遞到目標位置。
+
+而使用的方式也非常簡單：
+
+``` js
+navigator.sendBeacon("/log", payload);
+```
+
+就會發送一個 POST 的請求到 `/log` 去。
+
+雖然簡單易用，但需要注意的一點是，送出的 payload 是有大小限制的，而且這個限制不是單一請求的限制。
+
+## navigator.sendBeacon 的 payload 限制
+
+`sendBeacon` 的 payload 上限是 64 KiB，等同於 65536 個 bytes，如果 payload 都是由英文字組成的話，因為每一個是一個 byte，就是 65536 個字。
+
+如果超過這個大小，你會發現請求送不出去，永遠處於 pending 狀態：
+
+``` html
+<script>
+  navigator.sendBeacon("/log", 'A'.repeat(65536 + 1));
+</script>
+```
+
+![永遠 pending ](/img/navigator-sendbeacon-64kib-and-source-code/p1.png)
+
+而且這個限制其實並不是限制單一請求，而是背後有個 queue，這個 queue 只要超過 65536 bytes 就不接受新的東西了。
+
+舉例來說，當我們連續送出 8 個 10000 字的請求時：
+
+``` html
+<script>
+  for(let i=1; i<=8; i++) {
+    navigator.sendBeacon("https://httpstat.us/200?log"+i, 'A'.repeat(10000));
+  }
+</script>
+```
+
+你會發現最後兩個一直處於 pending 狀態，送不出去：
+
+![超過 queue 的範圍就會一直 pending](/img/navigator-sendbeacon-64kib-and-source-code/p2.png)
+
+這是因為前六次 `sendBeacon` 已經把 queue 填到 60000 了，因此最後兩次都塞不下，所以無法接受新的請求，就會永遠處於 pending，就會 queue 空了也不會主動再塞進去。
+
+不過嚴格來講這其實也不是 `sendBeacon` 的問題，而是 fetch 加上 keepalive 會有的限制。事實上，`navigator.sendBeacon` 的底層就是 fetch 加上 keepalive。
+
+## navigator.sendBeacon 的規格與 Sentry 的小故事
+
+在規格的段落 [3.2 Processing Model](https://w3c.github.io/beacon/#sec-processing-model) 的第六步中，就有提到剛剛講的 queue：
+
+![spec 中的 queue](/img/navigator-sendbeacon-64kib-and-source-code/p3.png)
+
+如果判斷塞不進去 queue 的話，`sendBeacon` 會回傳 false。
+
+其實這就是 payload 碰到問題時的解法，在呼叫 `sendBeacon` 之後判斷回傳值是否為 false，是的話就進行處理，看是要 fallback 成一般的 fetch，還是自己再做個重試的機制。
+
+而第七步則是 `sendBeacon` 主要做的事情，新建一個 keepalive 的請求然後送出：
+
+![keepalive 的段落](/img/navigator-sendbeacon-64kib-and-source-code/p4.png)
+
+而 fetch + keepalive 的 payload 限制就是 64 KiB，這是有寫在 [spec](https://fetch.spec.whatwg.org/#http-network-or-cache-fetch) 裡的：

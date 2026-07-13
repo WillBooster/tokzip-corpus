@@ -1,0 +1,41 @@
+### 为 `ThreadPool` 实现 `Drop` Trait
+
+现在开始为线程池实现 `Drop`。当线程池被丢弃时，应该 join 所有线程以确保它们完成其操作。示例 21-22 展示了 `Drop` 实现的第一次尝试；这些代码还不能够编译：
+
+<span class="filename">文件名：src/lib.rs</span>
+
+```rust,ignore,does_not_compile
+{{#rustdoc_include ../listings/ch21-web-server/listing-21-22/src/lib.rs:here}}
+```
+
+<span class="caption">示例 21-22: 当线程池离开作用域时 join 每个线程</span>
+
+这里首先遍历线程池中的每个 `worker`。之所以使用 `&mut`，是因为 `self` 是一个可变引用，而且我们还需要修改 `worker`。对于每个 `worker`，我们都会打印一条消息，说明该 `Worker` 实例正在关闭，然后对这个 `Worker` 实例中的线程调用 `join`。如果 `join` 调用失败，就用 `unwrap` 让 Rust panic，进入一种不够优雅的关闭方式。
+
+```console
+{{#include ../listings/ch21-web-server/listing-21-22/output.txt}}
+```
+
+这里的错误告诉我们不能调用 `join`，因为我们手里只有每个 `worker` 的可变借用，而 `join` 需要拿走其参数的所有权。要解决这个问题，我们需要把 `thread` 从拥有它的 `Worker` 实例中移出来，这样 `join` 才能消费这个线程。一种做法和示例 18-15 中类似：如果 `Worker` 存放的是 `Option<thread::JoinHandle<()>>`，就可以在这个 `Option` 上调用 `take` 方法，把值从 `Some` 变体中移出来，并在原地留下一个 `None`。换句话说，正在运行的 `Worker` 会在 `thread` 字段中持有一个 `Some`，而当我们想清理这个 `Worker` 时，就把 `Some` 替换成 `None`，这样这个 `Worker` 就不再持有可运行的线程。
+
+然而，这种情况**只**会在丢弃 `Worker` 时出现。相应地，我们必须在任何访问 `worker.thread` 时处理 `Option<thread::JoinHandle<()>>`。在惯用的 Rust 代码中 `Option` 用的很多，但当你发现自己总是知道 `Option` 中一定会有值，却还要将其包装在 `Option` 中来应对这一场景时，就应该考虑其他更优雅的方法了。
+
+在这个例子中，存在一个更好的替代方案：`Vec::drain` 方法。它接受一个 range 参数来指定哪些项要从 `Vec` 中移除，并返回一个这些项的迭代器。使用 `..` range 语法会从 `Vec` 中移除**所有**值。
+
+因此我们需要像下面这样更新 `ThreadPool` 的 `drop` 实现：
+
+<span class="filename">文件名：src/lib.rs</span>
+
+```rust
+{{#rustdoc_include ../listings/ch21-web-server/no-listing-04-update-drop-definition/src/lib.rs:here}}
+```
+
+这解决了编译器错误，而且不需要对我们的代码做任何其他修改。注意，因为 `drop` 可能在 panic 过程中被调用，这里的 `unwrap` 也可能再次 panic，造成双重 panic，并立刻让程序崩溃，中断正在进行的清理。对于示例程序来说这没问题，但在生产代码中并不推荐这样做。
+
+### 向线程发出信号，让它们停止接收任务
+
+有了这些修改后，我们的代码已经可以无警告编译。然而坏消息是，它还不能按我们期望的方式工作。关键在于 `Worker` 实例中线程所运行的闭包逻辑：目前我们确实调用了 `join`，但这并不会让线程停止，因为它们会永远 `loop` 下去寻找新任务。如果用当前这个 `drop` 实现去丢弃 `ThreadPool`，主线程会永远阻塞，等待第一个线程结束。
+
+为了修复这个问题，我们将修改 `ThreadPool` 的 `drop` 实现并修改 `Worker` 循环。
+
+首先修改 `ThreadPool` 的 `drop` 实现在等待线程结束前显式地丢弃 `sender`。示例 21-23 展示了 `ThreadPool` 显式丢弃 `sender` 所作的修改。与处理线程时不同，这里**确实**需要使用 `Option`，以便能够使用 `Option::take` 将 `sender` 从 `ThreadPool` 中移出。

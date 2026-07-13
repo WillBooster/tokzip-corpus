@@ -1,0 +1,252 @@
+有 `nopriv` 的代表沒有權限（未登入）也可以呼叫，沒有的代表需要登入 WordPress 系統才能呼叫，而許多的 plugin 會選擇自己處理身份驗證相關的邏輯，所以會把兩個動作都導到同一個地方。
+
+
+而 `wpAmeliaApiCall` 這個函式則是註冊了 routes：
+
+``` php
+/**
+ * API Call
+ *
+ * @throws \InvalidArgumentException
+ */
+public static function wpAmeliaApiCall()
+{
+    try {
+        /** @var Container $container */
+        $container = require AMELIA_PATH . '/src/Infrastructure/ContainerConfig/container.php';
+
+        $app = new App($container);
+
+        // Initialize all API routes
+        Routes::routes($app);
+
+        $app->run();
+
+        exit();
+    } catch (Exception $e) {
+        echo 'ERROR: ' . $e->getMessage();
+    }
+}
+```
+
+在 `src/Infrastructure/Routes` 底下有許多的資料夾跟檔案，裡面負責處理不同的路由，舉例來說，User 相關的路由在 `src/Infrastructure/Routes/User/User.php`，相關程式碼節錄如下：
+
+``` php
+/**
+ * Class User
+ *
+ * @package AmeliaBooking\Infrastructure\Routes\User
+ */
+class User
+{
+    /**
+     * @param App $app
+     */
+    public static function routes(App $app)
+    {
+        $app->get('/users/wp-users', GetWPUsersController::class);
+        $app->post('/users/authenticate', LoginCabinetController::class);
+        $app->post('/users/logout', LogoutCabinetController::class);
+
+        // Customers
+        $app->get('/users/customers/{id:[0-9]+}', GetCustomerController::class);
+        $app->get('/users/customers', GetCustomersController::class);
+        $app->post('/users/customers', AddCustomerController::class);
+        $app->post('/users/customers/{id:[0-9]+}', UpdateCustomerController::class);
+        $app->post('/users/customers/delete/{id:[0-9]+}', DeleteUserController::class);
+        $app->get('/users/customers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
+        $app->post('/users/customers/reauthorize', ReauthorizeController::class);
+
+        // Providers
+        $app->get('/users/providers/{id:[0-9]+}', GetProviderController::class);
+        $app->get('/users/providers', GetProvidersController::class);
+        $app->post('/users/providers', AddProviderController::class);
+        $app->post('/users/providers/{id:[0-9]+}', UpdateProviderController::class);
+        $app->post('/users/providers/status/{id:[0-9]+}', UpdateProviderStatusController::class);
+        $app->post('/users/providers/delete/{id:[0-9]+}', DeleteUserController::class);
+        $app->get('/users/providers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
+
+        // Current User
+        $app->get('/users/current', GetCurrentUserController::class);
+    }
+}
+```
+
+那實際上到底要怎麼呼叫到這些路由呢？在 `src/Infrastructure/ContainerConfig/request.php` 中，針對 request 的 query string 做了一些轉換：
+
+``` php
+<?php
+
+use Slim\Http\Request;
+use Slim\Http\Uri;
+
+$entries['request'] = function (AmeliaBooking\Infrastructure\Common\Container $c) {
+
+    $curUri = Uri::createFromEnvironment($c->get('environment'));
+    // 附註：AMELIA_ACTION_SLUG = "action=wpamelia_api&call="
+    $newRoute = str_replace(
+        ['XDEBUG_SESSION_START=PHPSTORM&' . AMELIA_ACTION_SLUG, AMELIA_ACTION_SLUG],
+        '',
+        $curUri->getQuery()
+    );
+
+    $newPath = strpos($newRoute, '&') ? substr(
+        $newRoute,
+        0,
+        strpos($newRoute, '&')
+    ) : $newRoute;
+
+    $newQuery = strpos($newRoute, '&') ? substr(
+        $newRoute,
+        strpos($newRoute, '&') + 1
+    ) : '';
+
+   $request = Request::createFromEnvironment($c->get('environment'))
+       ->withUri(
+           $curUri
+               ->withPath($newPath)
+               ->withQuery($newQuery)
+       );
+
+    if (method_exists($request, 'getParam') && $request->getParam('showAmeliaErrors')) {
+        ini_set('display_errors', 1);
+        ini_set('display_startup_errors', 1);
+        error_reporting(E_ALL);
+    }
+
+    return $request;
+};
+```
+
+簡單來說呢，當你的 request URL 長這樣的時候：`/wordpress/wp-admin/admin-ajax.php?action=wpamelia_api&call=/users/wp-users`，query string 就是 `action=wpamelia_api&call=/users/wp-users`，符合 AMELIA_ACTION_SLUG 的地方被換成空白之後，就變成了 `/users/wp-users`，就對應到了上面的檔案看到的路由，重新交由 Slim 這個 PHP 框架去處理。
+
+而 `/users/wp-users` 對應到的是 `GetWPUsersController::class`，讓我們來看一下 controller 的程式碼：
+
+``` php
+<?php
+
+namespace AmeliaBooking\Application\Controller\User;
+
+use AmeliaBooking\Application\Commands\User\GetWPUsersCommand;
+use AmeliaBooking\Application\Controller\Controller;
+use Slim\Http\Request;
+
+/**
+ * Class GetWPUsersController
+ *
+ * @package AmeliaBooking\Application\Controller\User
+ */
+class GetWPUsersController extends Controller
+{
+    /**
+     * Instantiates the Get WP Users command to hand it over to the Command Handler
+     *
+     * @param Request $request
+     * @param         $args
+     *
+     * @return GetWPUsersCommand
+     * @throws \RuntimeException
+     */
+    protected function instantiateCommand(Request $request, $args)
+    {
+        $command = new GetWPUsersCommand($args);
+        $command->setField('id', (int)$request->getQueryParam('id'));
+        $command->setField('role', $request->getQueryParam('role'));
+        $requestBody = $request->getParsedBody();
+        $this->setCommandFields($command, $requestBody);
+
+        return $command;
+    }
+}
+```
+
+這邊使用了設計模式中的 Command Pattern，把每一個動作都包裝成一個指令，那這個指令會被誰處理呢？每一個 controller 都繼承了 `AmeliaBooking\Application\Controller\Controller`，所以處理的程式碼就在裡面：
+
+``` php
+/**
+ * @param Request  $request
+ * @param Response $response
+ * @param          $args
+ *
+ * @return Response
+ * @throws \InvalidArgumentException
+ * @throws \RuntimeException
+ */
+public function __invoke(Request $request, Response $response, $args)
+{
+    /** @var Command $command */
+    $command = $this->instantiateCommand($request, $args);
+
+    if (!wp_verify_nonce($command->getField('ameliaNonce'), 'ajax-nonce') &&
+        (
+            $command instanceof DeleteUserCommand ||
+            $command instanceof DeletePackageCommand ||
+            $command instanceof DeleteCategoryCommand ||
+            $command instanceof DeleteServiceCommand ||
+            $command instanceof DeleteExtraCommand ||
+            $command instanceof DeleteLocationCommand ||
+            $command instanceof DeleteEventCommand ||
+            $command instanceof DeletePaymentCommand ||
+            $command instanceof DeleteCouponCommand ||
+            $command instanceof DeleteCustomFieldCommand ||
+            $command instanceof DeleteAppointmentCommand ||
+            $command instanceof DeleteBookingCommand ||
+            $command instanceof DeleteEventBookingCommand ||
+            $command instanceof DeletePackageCustomerCommand ||
+            $command instanceof DeleteNotificationCommand
+        )
+    ) {
+        return $response->withStatus(self::STATUS_INTERNAL_SERVER_ERROR);
+    }
+
+    /** @var CommandResult $commandResult */
+    $commandResult = $this->commandBus->handle($command);
+
+    if ($commandResult->getUrl() !== null) {
+        $this->emitSuccessEvent($this->eventBus, $commandResult);
+
+        /** @var Response $response */
+        $response = $response->withHeader('Location', $commandResult->getUrl());
+        $response = $response->withStatus(self::STATUS_REDIRECT);
+
+        return $response;
+    }
+
+    if ($commandResult->hasAttachment() === false) {
+        $responseBody = [
+            'message' => $commandResult->getMessage(),
+            'data'    => $commandResult->getData()
+        ];
+
+        $this->emitSuccessEvent($this->eventBus, $commandResult);
+
+        switch ($commandResult->getResult()) {
+            case (CommandResult::RESULT_SUCCESS):
+                $response = $response->withStatus(self::STATUS_OK);
+
+                break;
+            case (CommandResult::RESULT_CONFLICT):
+                $response = $response->withStatus(self::STATUS_CONFLICT);
+
+                break;
+            default:
+                $response = $response->withStatus(self::STATUS_INTERNAL_SERVER_ERROR);
+
+                break;
+        }
+
+        /** @var Response $response */
+        $response = $response->withHeader('Content-Type', 'application/json;charset=utf-8');
+        $response = $response->write(
+            json_encode(
+                $commandResult->hasDataInResponse() ?
+                    $responseBody : array_merge($responseBody, ['data' => []])
+            )
+        );
+    }
+
+    return $response;
+}
+```
+
+這邊先實例化一個指令之後，再丟到 commandBus 去做處理：`$this->commandBus->handle($command)`，程式碼在 `src/Infrastructure/ContainerConfig/command.bus.php`，節錄部分：

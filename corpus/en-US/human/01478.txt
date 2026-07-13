@@ -1,0 +1,55 @@
+This is the "legacy abort" behavior, and it is enabled by default today. The
+[`--unstable-no-legacy-abort`](/runtime/reference/cli/unstable_flags/#--unstable-no-legacy-abort)
+flag opts in to the corrected behavior, which will become the default in an
+upcoming release.
+
+## Why the behavior is changing
+
+Because the signal aborted on success, code that watches `request.signal` could
+not tell the difference between "the client disconnected" and "the response was
+delivered normally". This breaks a number of common libraries, most visibly
+Node-style HTTP proxies such as
+[`http-proxy`](https://www.npmjs.com/package/http-proxy) and
+[`http-proxy-middleware`](https://www.npmjs.com/package/http-proxy-middleware)
+(used by Vite, among others), which treat the upstream abort as a genuine
+failure and surface a spurious error.
+
+See issues [#28850](https://github.com/denoland/deno/issues/28850) and
+[#29111](https://github.com/denoland/deno/issues/29111) for background.
+
+## The new behavior
+
+With `--unstable-no-legacy-abort` enabled, `request.signal` aborts **only** when
+the client actually cancels the request or the connection is lost before the
+response has been fully sent. A successful response no longer triggers an abort.
+
+```ts
+Deno.serve((req) => {
+  req.signal.addEventListener("abort", () => {
+    // With --unstable-no-legacy-abort this only runs on a real client
+    // disconnect, not on every successful response.
+    console.log("client went away");
+  });
+
+  return new Response("hello");
+});
+```
+
+## Detecting when a request has been fully delivered
+
+If you relied on the legacy abort to know that a response had been fully sent,
+use the `completed` promise on the second argument to the handler
+([`ServeHandlerInfo`](/api/deno/~/Deno.ServeHandlerInfo)) instead. It is the
+intended, mode-independent way to observe delivery:
+
+```ts
+Deno.serve((req, info) => {
+  info.completed
+    .then(() => {
+      // The response, including a streaming body, was sent successfully.
+      console.log("response fully delivered");
+    })
+    .catch((err) => {
+      // Delivery failed partway through (client disconnected, write error, ...).
+      console.error("response was not sent successfully:", err);
+    });

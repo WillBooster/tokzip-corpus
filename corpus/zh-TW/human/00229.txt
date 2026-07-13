@@ -1,0 +1,373 @@
+我們來細看一下 class 的運作，自己先看這段重點程式碼模擬一遍：
+
+``` js
+handleCallback = token => {
+  this.props.onChange(token);
+};
+
+handleLoad = () => {
+  grecaptcha.render(this.divRef.current, {
+    callback: this.handleCallback
+  });
+};
+```
+
+在呼叫 `grecaptcha.render` 時，我們把 callback function 綁定到 `this.handleCallback`，而這個 function 會呼叫 `this.props.onChange(token)`，所以一定可以呼叫到最新的 props 裡面的 onChange 事件，完全沒有問題。
+
+那 hook 呢？
+
+``` js
+const handleCallback = token => {
+  onChange(token);
+};
+const handleLoad = () => {
+  grecaptcha.render(divRef.current, {
+    callback: handleCallback
+  });
+};
+
+useEffect(() => {
+  handleLoad();
+}, []);
+```
+
+在元素第一次 render 完以後會去執行 `useEffect` 裡面的 `handleLoad`，而裡面會把 callback 綁定到 `handleCallback`，在裡面再去呼叫 `onChange` 這個 props，看起來也沒問題啊？
+
+不，問題可大了。
+
+function 跟 class component 最大的差異，就在於：「function component 會記住當下傳入的值」。這點或許聽起來有點難體會，但只要你把 mental model 建立好我相信就沒問題。你要牢記一件事，那就是：
+
+> Function component 的每一次 render，都是「重新」呼叫一次 function
+
+聽起來有點廢話，但重點是「重新」這兩個字，以這個方式去思考，你就能理解 function component 的重點。我們用這個方式再重新看一遍上面的流程，底下我有附上每一個步驟的編號，請按照編號閱讀：
+
+``` js
+// 1. 第一次 render，onChange = oldFunction
+// 2. 呼叫 ReCAPTCHA({ onChange: oldFunction })
+// 3. 這邊的 onChange 會等於 oldFunction（這是重點，畫三顆星星必考）
+const ReCAPTCHA = ({ onChange }) => {
+  // 4. 建立 ref
+  const divRef = useRef();
+
+  // 5. 建立函式 handleCallback
+  // 11. 當 callback 被觸發時，呼叫 onChange（oldFunction）
+  // 這是重點，畫五顆星星必考
+  const handleCallback = token => {
+    onChange(token);
+  };
+
+  // 6. 建立函式 handleLoad
+  // 10. 執行 handleLoad，把 callback 綁定到 handleCallback
+  const handleLoad = () => {
+    grecaptcha.render(divRef.current, {
+      callback: handleCallback
+    });
+  };
+
+  // 7. 宣告 useEffect
+  // 9. render 完畢，執行 handleLoad
+  useEffect(() => {
+    handleLoad();
+  }, []);
+
+  // 8. render
+  return <div ref={divRef} />;
+};
+```
+
+當使用者點擊「change function」之後，流程是這樣的：
+
+``` js
+// 1. 第二次 render，onChange = newFunction
+// 2. 呼叫 ReCAPTCHA({ onChange: newFunction })
+// 3. 這邊的 onChange 會等於 newFunction
+const ReCAPTCHA = ({ onChange }) => {
+  // 4. 建立 ref
+  const divRef = useRef();
+
+  // 5. 建立函式 handleCallback
+  const handleCallback = token => {
+    onChange(token);
+  };
+
+  // 6. 建立函式 handleLoad
+  const handleLoad = () => {
+    grecaptcha.render(divRef.current, {
+      callback: handleCallback
+    });
+  };
+
+  // 7. 宣告 useEffect
+  // 9. render 完畢，但因為不是第一次，所以不會執行 handleLoad
+  useEffect(() => {
+    handleLoad();
+  }, []);
+
+  // 8. render
+  return <div ref={divRef} />;
+};
+```
+
+這裡的重點有幾個：
+
+1. 第一次 render 裡的 `handleCallback` 跟第二次裡的 `handleCallback`，是兩個完全不同的 function，不是同一個
+2. 因此你綁定的是第一次的 `handleCallback`，就只會執行第一次的，而且第一次的 onChange 是 oldFunction
+3. 所以儘管你改變了 onChange，只有第二次的 `handleCallback` 會執行到新的 newFunction，但你綁定的 callback 是第一次的 `handleCallback`
+
+這邊的關鍵在於：「第一次 render 裡的 function」跟「第二次 render 裡的 function」已經是完全不同的東西了。在使用 hook 時，有個 eslint 的提示會一直提醒你使用 useEffect 或是 useCallback 的時候要加上的 dependency array，就是為了要讓你能夠獲取到最新的值。
+
+其實在寫上面那段 hook 的程式碼時，eslint 就有跳提醒了，那我們按照它講的來修修看：
+
+``` js
+const ReCAPTCHA = ({ onChange }) => {
+  const divRef = useRef();
+
+  // 當 onChange 改變時，就會產生新的 handleCallback
+  const handleCallback = useCallback(
+    token => {
+      onChange(token);
+    },
+    [onChange]
+  );  
+
+  // 當 handleCallback 改變時，就會重新呼叫
+  useEffect(() => {
+    const handleLoad = () => {
+      grecaptcha.render(divRef.current, {
+        callback: handleCallback
+      });
+    };
+    handleLoad();
+  }, [handleCallback]);
+
+  return <div ref={divRef} />;
+};
+```
+
+看起來好像沒什麼問題，有把 dependency 都修好，就能確保 `handleCallback` 呼叫到的一定是最新的 onChange 事件，馬上來試試看：
+
+![](https://static.coderbridge.com/img/aszx87410/47ed0b7274e24a039c283c9898a1fdd8.gif)
+
+完了，怎麼出錯了。
+
+當我們 onChange 改變時，handleCallback 就會跟著變，然後連帶的 useEffect 那一段也會重新執行，所以 `grecaptcha.render` 就被呼叫了兩遍，就跳出了這個錯誤。還記得我前面特別強調這點嗎？這個問題之所以比較麻煩，就是因為 `grecaptcha.render` 只能呼叫一遍，所以我們這樣改是行不通的。
+
+接著給大家一個小考驗，大家可以自己試試看開這個 codesandbox 來改，看看能不能改對：https://codesandbox.io/s/react-hook-change-props-fix-gi10h?file=/src/App.js
+
+改對的標準是：
+
+1. 按下「click me if you are not robot」時，console 會印出 old function
+2. 按下「change function」不會出錯
+3. 再按「click me if you are not robot」時，console 會印出 new function
+
+有達成這三點，你就成功了。
+
+強烈建議大家立刻點開 codesandbox 去試試看，因為沒有試的話，看下面的範例你可能會沒什麼感覺。但如果你有試過，就會深有同感。若是你試了一段時間還是沒成功，可以接著看下面的段落，或許會發現你的錯誤解法。
+
+## 為什麼你的解法行不通？
+
+首先呢，`handleLoad` 一定只能呼叫一次，所以 useEffect 放的 dependency array 絕對是空陣列，這個沒有問題。而你要思考的就是怎麼樣去改傳入的 callback 以及 `handleCallback`。
+
+### 嘗試一
+
+你可能試過這種解法，直接把 useEffect 的依賴改成空陣列，然後其他不動：
+
+``` js
+const ReCAPTCHA = ({ onChange }) => {
+  const divRef = useRef();
+
+  // 當 onChange 改變時，就會產生新的 handleCallback
+  const handleCallback = useCallback(
+    token => {
+      onChange(token);
+    },
+    [onChange]
+  );
+
+  useEffect(() => {
+    const handleLoad = () => {
+      grecaptcha.render(divRef.current, {
+        callback: handleCallback
+      });
+    };
+    handleLoad();
+  }, []);
+
+  return <div ref={divRef} />;
+};
+```
+
+看起來好像很合理，onChange 變的時候我就改變我的 handleCallback，確認可以在裡面呼叫到最新的 onChange，然後每一次 grecaptcha 改變時都會呼叫到我傳入的 function，也就是 handleCallback，十分合理。
+
+不，你又忽略了前面強調的 mental model：
+
+> Function component 的每一次 render，都是「重新」呼叫一次 function
+
+我寫一遍執行順序給你看，記得按照順序看：
+
+``` js
+// 1. 第一次執行，呼叫 ReCAPTCHA({ onChange: oldFunction })
+// 5. 第二次執行，呼叫 ReCAPTCHA({ onChange: newFunction })
+const ReCAPTCHA = ({ onChange }) => {
+  const divRef = useRef();
+
+  // 2. 第一次執行，產生 handleCallback1
+  // 6. 第二次執行，產生 handleCallback2
+  // 8. 當 grecaptcha 的 callback 觸發時，會呼叫到的是 handleCallback1
+  // 而 handleCallback1 裡的 onChange 是 oldFunction
+  // 因為在建立 handleCallback1 時，傳入的 onChange 是 oldFunction
+  const handleCallback = useCallback(
+    token => {
+      onChange(token);
+    },
+    [onChange]
+  );
+
+  // 3. 第一次 render，執行這個 function
+  // 4. 把 grecaptcha 的 callback 設成 handleCallback1
+  // 7. 第二次 render，不執行這一段
+  useEffect(() => {
+    const handleLoad = () => {
+      grecaptcha.render(divRef.current, {
+        callback: handleCallback
+      });
+    };
+    handleLoad();
+  }, []);
+
+  return <div ref={divRef} />;
+};
+```
+
+或是看這張圖片可能比較容易理解：
+
+![](https://static.coderbridge.com/img/aszx87410/7ca5607102a544e4b5095b5f5ab153bd.png)
+
+每一次 render 就是重新呼叫一次 function，你第一次的 function call 會建立一個 handleCallback，當 props.onChange 改變以後，又會建立一個新的 handleCallback，這兩個同名，但是卻是不同的 function。
+
+### 嘗試二
+
+前面說過最大的問題是「當 onChange 改變時會產生不同的 function」，所以想要解決這個問題，就必須有某個「不會變動的東西」。
+
+此時你可能會靈機一動，想說：那這種情況是不是就是 useRef 登場的時候了？
+
+``` jsx
+const ReCAPTCHA = ({ onChange }) => {
+  const divRef = useRef();
+  const handleCallback = useRef(onChange);
+
+  // 當 onChange 改變時，去改變 handleCallback.current
+  useEffect(() => {
+    handleCallback.current = onChange
+  }, [onChange])
+
+  useEffect(() => {
+    const handleLoad = () => {
+      grecaptcha.render(divRef.current, {
+        callback: handleCallback.current
+      });
+    };
+    handleLoad();
+  }, []);
+
+  return <div ref={divRef} />;
+};
+```
+
+把 `handleCallback.current` 傳給 callback，所以每次點擊時都會呼叫到 `handleCallback.current`，然後我在 useEffect 裡面再去隨著 onChange 更改 `handleCallback.current`，看起來十分合理。
+
+不，還是不合理，請看底下的圖：
+
+![](https://static.coderbridge.com/img/aszx87410/6a1e7bfa64a04bcc997235aa493acd71.png)
+
+這其實是一個「重新賦值」的問題，我們先把 `handleCallback.current` 看成是一個變數 A 好了，我們在第一次 render 的時候，在 13 行把 callback 設成 A，然後在二次的 render 的時候，我們執行：`handleCallback.current = newFunction`，也就是 `A = newFunction`，我們把 A 重新賦值了，可是原本綁定到 callback 去的還是原本的 A，不會因為你把 A 重新賦值就改變。
+
+## 嘗試三
+
+這時你可能會想說，那既然問題好像是出在直接把 `handleCallback.current` 掛在 callback 上面，那我再宣告一個 function 不就好了嗎：
+
+``` js
+const ReCAPTCHA = ({ onChange }) => {
+  const divRef = useRef();
+  const cbRef = useRef(onChange);
+
+  const handleCallback = () => {
+    cbRef.current()
+  } 
+
+  useEffect(() => {
+    cbRef.current = onChange
+  }, [onChange])
+
+  useEffect(() => {
+    const handleLoad = () => {
+      grecaptcha.render(divRef.current, {
+        callback: handleCallback
+      });
+    };
+    handleLoad();
+  }, []);
+
+  return <div ref={divRef} />;
+};
+```
+
+每次點擊時都會去呼叫 `handleCallback`，然後在裡面呼叫 `cbRef.current()`，每當 onChange 改變時，我就去改變 `cbRef.current`，根本完美。
+
+沒錯，你成功了！而且 `handleCallback` 其實可以用 useCallback 包起來，就不會每一次 render 時都產生一個新的 `handleCallback`。
+
+或甚至是你其實根本不需要宣告一個 function，直接用箭頭函式就行了：
+
+``` js
+const ReCAPTCHA = ({ onChange }) => {
+  const divRef = useRef();
+  const cbRef = useRef(onChange);
+
+  useEffect(() => {
+    cbRef.current = onChange
+  }, [onChange])
+
+  useEffect(() => {
+    const handleLoad = () => {
+      grecaptcha.render(divRef.current, {
+        callback: () => {
+          cbRef.current()
+        }
+      });
+    };
+    handleLoad();
+  }, []);
+
+  return <div ref={divRef} />;
+};
+```
+
+最後的程式碼長這樣，大家可以自己玩玩看：https://codesandbox.io/s/react-hook-change-props-solution-ll8os?file=/src/App.js
+
+## 回顧與思考
+
+在兜了這麼多圈之後，終於找到了解法。可是為什麼以前寫 class component 的時候，從來沒有碰過這個問題？因為我們隨時都可以用 `this.props.onChange` 拿到最新的屬性。
+
+可是 function component 並不是這樣的，每一次 render 就是一次 function call，而傳進來的 props 就會是「當時」的 props，不會因為 props 改變而改變。這個就是 function component 與 class component 最大的差別。
+
+原本我一直不是很理解之前 dan 哥說的：「唯有拋下 class component，你才能真正理解 hook」是什麼意思，但我現在懂了。以前在 class component 時你會以那些 lifecycle 去思考，去想說「didMount 要做什麼」、「update 的時候要做什麼」，但 hook 的重點會放在「每一次 render」。
+
+class component 是以 class 的 instance 為主體去思考，而 hook 是以 function 為主體去思考。以前在寫 class 的時候，你只會知道 render 這個 method 是每一次 render 都會執行到，其他的 lifecycle 不會。
+
+但是 function component 就是「每一次 render 都會把整個 function 重新執行一遍」，是很不一樣的。最後再強調一次這點：
+
+> function component 的每一次渲染，都是一個新的 function call
+
+## 總結
+
+雖然說 React hook 看起來容易上手，程式碼也比較少，但我認為今天特地提的這個案例，並沒有讓 hook 在實戰的使用上變得更簡單，某種程度上反而更容易讓新手寫出 bug。或者更精確地說，會出 bug 的地方不一樣。
+
+以前在寫 class 的時候，新手的第一個障礙是 this 的理解，第二個障礙是 props 與 state 永遠會拿到「最新的」而不是當時的。而 function 的障礙就是 closure，如果沒有正確的 mental model，很容易就會在 hook 裡面迷失，畢竟寫 class 跟寫 function component 真的完全不一樣。
+
+原本我以為只是從 class 換到 functoon 只是換一種寫法，沒想到連整個思考模式都換了，衷心佩服 React 團隊的成員，一次次帶給前端這個領域一些全新的東西。
+
+關於 function component 與 class component 的差異，誠心推薦大家去讀 dan 哥的文章，寫的真的很讚，可以先看這一篇：[How Are Function Components Different from Classes?](https://overreacted.io/how-are-function-components-different-from-classes/) 來理解差別，然後再看這篇：[A Complete Guide to useEffect](https://overreacted.io/a-complete-guide-to-useeffect/) 來了解 useEffect，看完之後再來看我文章提到的這個例子會更有感覺，而且可能會覺得：「咦？你這篇在寫什麼廢話，這不是很基本嗎」
+
+這篇文章就差不多到這邊結束了，剛好在學習 hook 的過程中有一個實戰案例可以分享。
+
+最後，特別感謝 [Onedegree](https://www.yourator.co/companies/AIFinancialTechnology) 的前端同事們跟我一起討論這個問題。

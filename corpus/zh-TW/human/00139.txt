@@ -1,0 +1,103 @@
+console.time('test');
+IMAGE_URL_REGEXP.test('a.' + 'a'.repeat(100000))
+console.timeLog('test')
+// test: 0.570068359375 ms
+```
+
+以 JavaScript 來說，這些配對的程式碼都是跑在 main thread，如果是網頁的話會直接畫面凍結，直接卡死，如果是以 Node.js 來執行的伺服器也會卡住，無法處理其他請求。
+
+## 該怎麼知道有沒有 ReDoS 的風險？
+
+有一些現成的工具可以幫忙，我自己最常用的是這個：https://devina.io/redos-checker
+
+只要把 regexp 丟進去，就可以跟你說有沒有問題，有的話還會附上測試的字串，讓你可以自己再測試一遍。
+
+![devina redos checker](/img/redos-regular-expression-denial-of-service/p1.png)
+
+不過有時候會有 false positive 就是了，它覺得有但是沒有，或也有可能真的有，但是它給的攻擊字串跑不出來。因此還是建議測完以後自己拿它給的 payload 再試一次，確認一下。
+
+## ReDoS 在攻擊上的應用
+
+前面講的都是「regexp 已經寫好，而使用者可以控制輸入」，這時候只要找到有問題的 regexp 產生攻擊字串即可。
+
+而有另外一種狀況是：「使用者可以控制 regexp」。舉例來說，假設有個網站提供搜尋使用者的功能，你可以傳入一個 regexp，伺服器就會回傳是否有符合此 regexp 的 username 存在。
+
+伺服器的實作大概如下（隨意寫的，意思有到就好）：
+
+``` js
+app.get('/search', (req, res) => {
+    const q = req.query.q
+    return users
+        .filter(user => new RegExp(q).test(user.username))
+})
+```
+
+這個危險的功能除了可以讓攻擊者把所有的 username 都拿到手以外，也會有 ReDoS 的風險在。
+
+舉例來說，當 `/((([^m]|[^m]?)+)+)+$/` 這個 regexp 碰到 `"username"` 時，需要花費將近 4 秒才能跑完：
+
+``` js
+console.time('test');
+/((([^m]|[^m]?)+)+)+$/.test('username')
+console.timeEnd('test');
+// test: 3728.89990234375 ms
+```
+
+只要繼續按照相同的模式把 regexp 延伸下去，就可以讓這整段程式碼執行超過 30 秒或是更久，癱瘓整個 server。
+
+在打 CTF 時還有另一種常見的狀況是一樣可以傳入 regexp，但是伺服器不會跟你講有沒有成功，你只能根據時間差來判斷，這時候靠 ReDoS 就很有用了：
+
+``` js
+console.time('CTF{a');
+console.log(/CTF{[a](((((.*)*)*)*)*)!/.test('CTF{this_is_flag}'))
+console.timeEnd('CTF{a');
+// CTF{a: 0.071ms
+
+console.time('CTF{t');
+console.log(/CTF{[t](((((.*)*)*)*)*)!/.test('CTF{this_is_flag}'))
+console.timeEnd('CTF{t');
+// CTF{t: 24.577s
+```
+
+透過傳入精心構造的 regexp，就可以利用時間差得知第一個字元是什麼。
+
+最後簡單提一下防禦方式，最根本的解決方法就是不要寫出有缺陷的 regexp，先去學習哪一些 pattern 應該盡量少用，就能掌握到大概的方向。除此之外，似乎也有人做了一些自動化的工具幫忙掃 code 裡面出現的 regexp，這也是一種在出事前先預防的方法。
+
+## 為了防止 ReDoS 而出現的另一種問題
+
+底下這段 PHP 的程式碼會檢查輸入是否為 PHP 的格式，如果不是的話才進行後續操作，你有辦法繞過正規表達式嗎？
+
+``` php
+<?php
+function is_php($data){  
+    return preg_match('/<\?.*[(`;?>].*/is', $data);  
+}
+
+if(!is_php($input)) {
+    // fwrite($f, $input); ...
+}
+```
+
+答案是有辦法，但繞過的並不是正規表達式本身，而是利用了 PHP 的一個機制。
+
+PHP 為了防止 ReDoS 的發生，設有回朔次數的上限，如果超過了上限，就會回傳 `false`，而非原本預期的 0 或是 1。雖然 PHP 的[文件](https://www.php.net/manual/en/function.preg-match.php#refsect1-function.preg-match-returnvalues)裡面有就有提到這點，但老實說會乖乖去看文件的還是少數，因此我相信有不少開發者都不知道這個行為。
+
+因此，只需要構造出一個與 ReDoS 類似的結構觸發上限，就會讓 `preg_match` 回傳 `false`，進而繞過檢查。
+
+上面的範例來自於 phith0n 在 2018 年發表的文章：[PHP利用PCRE回溯次数限制绕过某些安全限制](https://www.leavesongs.com/PENETRATION/use-pcre-backtrack-limit-to-bypass-restrict.html)，而 2019 年的 Facebook CTF 中也有一題是相同的原理，可以參考 balsn 的 [writeup](https://balsn.tw/ctf_writeup/20190603-facebookctf/#rceservice)。
+
+甚至於這個漏洞在 2023 年也出現在現實世界中：[MyBB Admin Panel RCE CVE-2023-41362](https://blog.sorcery.ie/posts/mybb_acp_rce/)。
+
+## 總結
+
+我自己覺得 ReDoS 是一個滿有趣的攻擊方式，以前沒想過靠著 regexp 還可以做出這種效果。
+
+以前第一次知道這個攻擊，似乎是還在當開發者的時候，偶爾會看到使用到的 library 有這個漏洞，不過當初沒有很在意就是了。後來在資安裡面再度碰到這東西，才覺得好像挺有趣的。
+
+這篇比較像是我的個人筆記，只是想趁著記憶猶新的時候把一些 payload 記下來，以後比較好找。
+
+最後附上一些參考資料以及延伸閱讀，有興趣深入了解的讀者們可以看一下：
+
+1. [HackTricks - Regular expression Denial of Service - ReDoS](https://book.hacktricks.xyz/pentesting-web/regular-expression-denial-of-service-redos)
+2. [OWASP: Regular expression Denial of Service - ReDoS](https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS)
+3. [snyk: ReDoS](https://learn.snyk.io/lessons/redos/javascript/)

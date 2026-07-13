@@ -1,0 +1,190 @@
+### Fetching local files
+
+Deno supports fetching `file:` URLs. This makes it easier to write code that
+uses the same code path on a server as local, as well as easier to author code
+that works both with the Deno CLI and Deno Deploy.
+
+Deno only supports absolute file URLs, this means that `fetch("./some.json")`
+will not work. It should be noted though that if [`--location`](#location) is
+specified, relative URLs use the `--location` as the base, but a `file:` URL
+cannot be passed as the `--location`.
+
+To be able to fetch a resource, relative to the current module, which would work
+if the module is local or remote, you should to use `import.meta.url` as the
+base. For example:
+
+```js
+const response = await fetch(new URL("./config.json", import.meta.url));
+const config = await response.json();
+```
+
+Notes on fetching local files:
+
+- Permissions are applied to reading resources, so an appropriate `--allow-read`
+  permission is needed to be able to read a local file.
+- Fetching locally only supports the `GET` method, and will reject the promise
+  with any other method.
+- A file that does not exist simply rejects the promise with a vague
+  `TypeError`. This is to avoid the potential of fingerprinting attacks.
+- No headers are set on the response. Therefore it is up to the consumer to
+  determine things like the content type or content length.
+- Response bodies are streamed from the Rust side, so large files are available
+  in chunks, and can be cancelled.
+
+## Structured Clone & Transferable Objects
+
+Deno supports [`structuredClone()`](/api/web/~/structuredClone) and
+[`postMessage()`](/api/web/~/Worker) for cloning and transferring objects across
+contexts (e.g. between the main thread and Web Workers).
+
+### Serializable types
+
+These types can be cloned with `structuredClone()` and sent via `postMessage()`:
+
+| Type                                      | Notes                                                                                        |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Primitives                                | `string`, `number`, `boolean`, `null`, `undefined`, `bigint`                                 |
+| `Array`, `Object`, `Map`, `Set`           | Including nested structures and circular references                                          |
+| `Date`, `RegExp`                          |                                                                                              |
+| `ArrayBuffer`, `TypedArray`, `DataView`   | Copied by default, or transferred (see below)                                                |
+| `Error` types                             | `Error`, `EvalError`, `RangeError`, `ReferenceError`, `SyntaxError`, `TypeError`, `URIError` |
+| [`Blob`](/api/web/~/Blob)                 | Requires Deno 2.8+                                                                           |
+| [`File`](/api/web/~/File)                 | Requires Deno 2.8+                                                                           |
+| [`DOMException`](/api/web/~/DOMException) |                                                                                              |
+| [`CryptoKey`](/api/web/~/CryptoKey)       |                                                                                              |
+
+### Transferable types
+
+These types can be _transferred_ (not copied) via the `transfer` option in
+`structuredClone()` or the `transfer` list in `postMessage()`. After transfer,
+the original object becomes unusable:
+
+| Type                                            | Notes                                    |
+| ----------------------------------------------- | ---------------------------------------- |
+| [`ArrayBuffer`](/api/web/~/ArrayBuffer)         | Moves the backing memory to the receiver |
+| [`MessagePort`](/api/web/~/MessagePort)         | Transfers the port to another context    |
+| [`ReadableStream`](/api/web/~/ReadableStream)   | Transfers the stream to another context  |
+| [`WritableStream`](/api/web/~/WritableStream)   | Transfers the stream to another context  |
+| [`TransformStream`](/api/web/~/TransformStream) | Transfers the stream to another context  |
+
+```ts
+// Clone a Blob
+const blob = new Blob(["hello"], { type: "text/plain" });
+const cloned = structuredClone(blob);
+console.log(await cloned.text()); // "hello"
+
+// Transfer an ArrayBuffer through a MessageChannel
+const buffer = new ArrayBuffer(1024);
+const ch = new MessageChannel();
+ch.port1.postMessage(buffer, [buffer]);
+// buffer.byteLength is now 0 (transferred)
+```
+
+## CustomEvent and EventTarget
+
+The [DOM Event API](/api/web/~/Event) can be used to dispatch and listen to
+events happening in an application. It is implemented as specified in the
+[WHATWG DOM spec](https://dom.spec.whatwg.org/#events).
+
+### Spec deviations
+
+- Events do not bubble, because Deno does not have a DOM hierarchy, so there is
+  no tree for Events to bubble/capture through.
+- `timeStamp` property is always set to `0`.
+
+## Typings
+
+The TypeScript definitions for the implemented web APIs can be found in the
+[`lib.deno.shared_globals.d.ts`](https://github.com/denoland/deno/blob/main/cli/tsc/dts/lib.deno.shared_globals.d.ts)
+and
+[`lib.deno.window.d.ts`](https://github.com/denoland/deno/blob/main/cli/tsc/dts/lib.deno.window.d.ts)
+files.
+
+Definitions that are specific to workers can be found in the
+[`lib.deno.worker.d.ts`](https://github.com/denoland/deno/blob/main/cli/tsc/dts/lib.deno.worker.d.ts)
+file.
+
+## Location
+
+Deno supports the [`location`](/api/web/~/Location) global from the web.
+
+### Location flag
+
+There is no "web page" whose URL we can use for a location in a Deno process. We
+instead allow users to emulate a document location by specifying one on the CLI
+using the `--location` flag. It can be a `http` or `https` URL.
+
+```ts
+// deno run --location https://example.com/path main.ts
+
+console.log(location.href);
+// "https://example.com/path"
+```
+
+You must pass `--location <href>` for this to work. If you don't, any access to
+the `location` global will throw an error.
+
+```ts
+// deno run main.ts
+
+console.log(location.href);
+// error: Uncaught ReferenceError: Access to "location", run again with --location <href>.
+```
+
+Setting `location` or any of its fields will normally cause navigation in
+browsers. This is not applicable in Deno, so it will throw in this situation.
+
+```ts
+// deno run --location https://example.com/path main.ts
+
+location.pathname = "./foo";
+// error: Uncaught NotSupportedError: Cannot set "location.pathname".
+```
+
+### Extended usage
+
+On the web, resource resolution (excluding modules) typically uses the value of
+`location.href` as the root on which to base any relative URLs. This affects
+some web APIs adopted by Deno.
+
+#### Fetch API
+
+```ts
+// deno run --location https://api.github.com/ --allow-net main.ts
+
+const response = await fetch("./orgs/denoland");
+// Fetches "https://api.github.com/orgs/denoland".
+```
+
+The `fetch()` call above would throw if the `--location` flag was not passed,
+since there is no web-analogous location to base it onto.
+
+#### Worker modules
+
+```ts
+// deno run --location https://example.com/index.html --allow-net main.ts
+
+const worker = new Worker("./workers/hello.ts", { type: "module" });
+// Fetches worker module at "https://example.com/workers/hello.ts".
+```
+
+:::note
+
+For the above use cases, it is preferable to pass URLs in full rather than
+relying on `--location`. You can manually base a relative URL using the
+[`URL`](/api/web/~/URL) constructor if needed.
+
+:::
+
+The `--location` flag is intended for those who have a specific purpose in mind
+for emulating a document location and are aware that this will only work at
+application-level. However, you may also use it to silence errors from a
+dependency which is frivolously accessing the `location` global.
+
+## Web Storage
+
+The [Web Storage API](/api/web/storage) provides an API for storing string keys
+and values. Persisting data works similar to a browser, and has a 10MB storage
+limit. The global `sessionStorage` object only persists data for the current
+execution context, while `localStorage` persists data from execution to
+execution.

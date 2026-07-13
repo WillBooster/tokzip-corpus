@@ -1,0 +1,58 @@
+？第一個想到的就是從 aws 提供的服務：WAF 來擋
+https://aws.amazon.com/tw/waf/
+
+可是發現 WAF 跟原本想的不一樣，他沒有辦法設定像是：「擋掉 10 秒鐘內發超過 100 個 request 的 IP」這種規則
+只能繼續在網路上找解法，找到從 nginx 來擋的解法：
+
+[nginx防止DDOS攻击配置](https://www.52os.net/articles/nginx-anti-ddos-setting.html)
+[通过Nginx和Nginx Plus阻止DDoS攻击](http://www.infoq.com/cn/news/2016/01/Nginx-AntiDDoS)
+[Module ngx_http_limit_req_module](http://nginx.org/en/docs/http/ngx_http_limit_req_module.html)
+```
+http {
+
+  //觸發條件，限制 ip 每秒 10 個 request
+  limit_req_zone $binary_remote_addr zone=one:10m rate=10r/s; 
+  
+  server {
+    location  ~ \.php$ {
+
+      //執行的動作
+      limit_req zone=one burst=5 nodelay;   
+    }
+  }
+}
+```
+
+總之就是利用 `limit_req_zone`，這個 nginx 提供的東西
+宣告一個 10mb 的 zone 叫做 `one` 來儲存狀態，這裡的 `10r/s` 指的就是一秒 10 個 request
+
+接著在你想擋的地方加上：`limit_req zone=one burst=5 nodelay;`，就可以擋掉了
+nginx 會把處理 request 的數量調整成「最多 1 秒 10 個」，如果那個 ip 在同一時間有超過 5 個 request 還沒處理的話，就會傳回 `503 service temporarily unavailable`，這邊的 5 就是 `burst` 設定的值
+傳回去的 status code 也可以自己指定，例如說：`limit_req_status 505;`
+
+儘管這個解法看起來很棒，但不知道為什麼，加了之後好像沒有用似的
+伺服器的警報還是一直在響，DB 還是持續飆高
+
+在請教過其他同事之後，得知 iptabls 也可以擋，而且還是直接從 tcp 層擋
+找到下面兩篇資料：
+
+[淺談DDoS攻擊防護](http://blog.eztable.com/2011/05/17/how-to-prevent-ddos/)
+```
+-A INPUT -p tcp –dports 80 -j WEB_SRV_DOS
+-A WEB_SRV_DOS -p tcp –syn –dports 80 -m recent –rcheck –second 30 –hitcount 200 -j LOG –log-prefix "[Possible DOS Attack]"
+-A WEB_SRV_DOS -p tcp –syn –dports 80 -m recent –rcheck –second 30 –hitcount 200 -j REJECT  
+-A WEB_SRV_DOS -p tcp –syn –dports 80 -m recent –set  
+-A WEB_SRV_DOS -p tcp –dports 80 -j ACCEPT
+```
+
+[運用 iptables 限制同一IP單位時間連線數](http://ishm.idv.tw/?p=188)
+```
+-A INPUT -p tcp --dport 80 -m recent --rcheck --seconds 1 --hitcount 5 --name HTTP_LOG --rsource -j DROP
+-A INPUT -p tcp --dport 80 -m recent --set --name HTTP_LOG --rsource
+-A INPUT -p tcp --dport 80 -j ACCEPT
+```
+
+兩個的原理都一樣，是透過`-m recent –rcheck –second 30 –hitcount 200` 這段敘述，描述說你要擋住幾秒內發送幾次的 request，把這個連線 reject 或是 drop。
+
+直接從 iptables 去擋聽起來是個更好的解法，這樣 request 連 nginx 都不會進去就被擋住了
+可是天不從人願，用了之後發現還是

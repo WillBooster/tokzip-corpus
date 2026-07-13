@@ -1,0 +1,244 @@
+/**
+   * Fires non-authenticated Ajax actions for logged-out users.
+   *
+   * The dynamic portion of the hook name, `$action`, refers
+   * to the name of the Ajax action callback being fired.
+   *
+   * @since 2.8.0
+   */
+  do_action( "wp_ajax_nopriv_{$action}" );
+}
+
+?>
+```
+
+Amelia registered two hooks in `ameliabooking.php`:
+
+``` php
+/** Isolate API calls */
+add_action('wp_ajax_wpamelia_api', array('AmeliaBooking\Plugin', 'wpAmeliaApiCall'));
+add_action('wp_ajax_nopriv_wpamelia_api', array('AmeliaBooking\Plugin', 'wpAmeliaApiCall'));
+```
+
+The difference between `wp_ajax_wpamelia_api` and `wp_ajax_nopriv_wpamelia_api` is that the former requires authenticated user to perform the action, while the latter requires none.
+
+As you can see, many plugins choose to handle both actions in the same place, to deal with the permission check itself.
+
+In `wpAmeliaApiCall`, a few routes have been registered:
+
+``` php
+/**
+ * API Call
+ *
+ * @throws \InvalidArgumentException
+ */
+public static function wpAmeliaApiCall()
+{
+    try {
+        /** @var Container $container */
+        $container = require AMELIA_PATH . '/src/Infrastructure/ContainerConfig/container.php';
+
+        $app = new App($container);
+
+        // Initialize all API routes
+        Routes::routes($app);
+
+        $app->run();
+
+        exit();
+    } catch (Exception $e) {
+        echo 'ERROR: ' . $e->getMessage();
+    }
+}
+```
+
+There are a few files in `src/Infrastructure/Routes` folder for handling routing. For example, `src/Infrastructure/Routes/User/User.php` is responsible for the routing of `/users`:
+
+``` php
+/**
+ * Class User
+ *
+ * @package AmeliaBooking\Infrastructure\Routes\User
+ */
+class User
+{
+    /**
+     * @param App $app
+     */
+    public static function routes(App $app)
+    {
+        $app->get('/users/wp-users', GetWPUsersController::class);
+        $app->post('/users/authenticate', LoginCabinetController::class);
+        $app->post('/users/logout', LogoutCabinetController::class);
+
+        // Customers
+        $app->get('/users/customers/{id:[0-9]+}', GetCustomerController::class);
+        $app->get('/users/customers', GetCustomersController::class);
+        $app->post('/users/customers', AddCustomerController::class);
+        $app->post('/users/customers/{id:[0-9]+}', UpdateCustomerController::class);
+        $app->post('/users/customers/delete/{id:[0-9]+}', DeleteUserController::class);
+        $app->get('/users/customers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
+        $app->post('/users/customers/reauthorize', ReauthorizeController::class);
+
+        // Providers
+        $app->get('/users/providers/{id:[0-9]+}', GetProviderController::class);
+        $app->get('/users/providers', GetProvidersController::class);
+        $app->post('/users/providers', AddProviderController::class);
+        $app->post('/users/providers/{id:[0-9]+}', UpdateProviderController::class);
+        $app->post('/users/providers/status/{id:[0-9]+}', UpdateProviderStatusController::class);
+        $app->post('/users/providers/delete/{id:[0-9]+}', DeleteUserController::class);
+        $app->get('/users/providers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
+
+        // Current User
+        $app->get('/users/current', GetCurrentUserController::class);
+    }
+}
+```
+
+Usually, the routing is related to the URL path directly, but Amelia is a bit different because it's a WordPress plugin.
+
+In Amelia, it's based on the query string, instead of the path of URL(`src/Infrastructure/ContainerConfig/request.php`):
+
+``` php
+<?php
+
+use Slim\Http\Request;
+use Slim\Http\Uri;
+
+$entries['request'] = function (AmeliaBooking\Infrastructure\Common\Container $c) {
+
+    $curUri = Uri::createFromEnvironment($c->get('environment'));
+    // Note: AMELIA_ACTION_SLUG = "action=wpamelia_api&call="
+    $newRoute = str_replace(
+        ['XDEBUG_SESSION_START=PHPSTORM&' . AMELIA_ACTION_SLUG, AMELIA_ACTION_SLUG],
+        '',
+        $curUri->getQuery()
+    );
+
+    $newPath = strpos($newRoute, '&') ? substr(
+        $newRoute,
+        0,
+        strpos($newRoute, '&')
+    ) : $newRoute;
+
+    $newQuery = strpos($newRoute, '&') ? substr(
+        $newRoute,
+        strpos($newRoute, '&') + 1
+    ) : '';
+
+   $request = Request::createFromEnvironment($c->get('environment'))
+       ->withUri(
+           $curUri
+               ->withPath($newPath)
+               ->withQuery($newQuery)
+       );
+
+    if (method_exists($request, 'getParam') && $request->getParam('showAmeliaErrors')) {
+        ini_set('display_errors', 1);
+        ini_set('display_startup_errors', 1);
+        error_reporting(E_ALL);
+    }
+
+    return $request;
+};
+```
+
+For example, when the request URL is `/wordpress/wp-admin/admin-ajax.php?action=wpamelia_api&call=/users/wp-users`, query string is `action=wpamelia_api&call=/users/wp-users`. After AMELIA_ACTION_SLUG has been replaced with empty string, the remaining part is `/users/wp-users`, that's how the system handles routes.
+
+Let's check `GetWPUsersController::class`, the corresponding controller for `/users/wp-users`:
+
+``` php
+<?php
+
+namespace AmeliaBooking\Application\Controller\User;
+
+use AmeliaBooking\Application\Commands\User\GetWPUsersCommand;
+use AmeliaBooking\Application\Controller\Controller;
+use Slim\Http\Request;
+
+/**
+ * Class GetWPUsersController
+ *
+ * @package AmeliaBooking\Application\Controller\User
+ */
+class GetWPUsersController extends Controller
+{
+    /**
+     * Instantiates the Get WP Users command to hand it over to the Command Handler
+     *
+     * @param Request $request
+     * @param         $args
+     *
+     * @return GetWPUsersCommand
+     * @throws \RuntimeException
+     */
+    protected function instantiateCommand(Request $request, $args)
+    {
+        $command = new GetWPUsersCommand($args);
+        $command->setField('id', (int)$request->getQueryParam('id'));
+        $command->setField('role', $request->getQueryParam('role'));
+        $requestBody = $request->getParsedBody();
+        $this->setCommandFields($command, $requestBody);
+
+        return $command;
+    }
+}
+```
+
+We can see a classic design pattern here: Command Pattern, every action is a command. The command will be processed by its parent class `AmeliaBooking\Application\Controller\Controller`:
+
+``` php
+/**
+ * @param Request  $request
+ * @param Response $response
+ * @param          $args
+ *
+ * @return Response
+ * @throws \InvalidArgumentException
+ * @throws \RuntimeException
+ */
+public function __invoke(Request $request, Response $response, $args)
+{
+    /** @var Command $command */
+    $command = $this->instantiateCommand($request, $args);
+
+    if (!wp_verify_nonce($command->getField('ameliaNonce'), 'ajax-nonce') &&
+        (
+            $command instanceof DeleteUserCommand ||
+            $command instanceof DeletePackageCommand ||
+            $command instanceof DeleteCategoryCommand ||
+            $command instanceof DeleteServiceCommand ||
+            $command instanceof DeleteExtraCommand ||
+            $command instanceof DeleteLocationCommand ||
+            $command instanceof DeleteEventCommand ||
+            $command instanceof DeletePaymentCommand ||
+            $command instanceof DeleteCouponCommand ||
+            $command instanceof DeleteCustomFieldCommand ||
+            $command instanceof DeleteAppointmentCommand ||
+            $command instanceof DeleteBookingCommand ||
+            $command instanceof DeleteEventBookingCommand ||
+            $command instanceof DeletePackageCustomerCommand ||
+            $command instanceof DeleteNotificationCommand
+        )
+    ) {
+        return $response->withStatus(self::STATUS_INTERNAL_SERVER_ERROR);
+    }
+
+    /** @var CommandResult $commandResult */
+    $commandResult = $this->commandBus->handle($command);
+
+    if ($commandResult->getUrl() !== null) {
+        $this->emitSuccessEvent($this->eventBus, $commandResult);
+
+        /** @var Response $response */
+        $response = $response->withHeader('Location', $commandResult->getUrl());
+        $response = $response->withStatus(self::STATUS_REDIRECT);
+
+        return $response;
+    }
+
+    if ($commandResult->hasAttachment() === false) {
+        $responseBody = [
+            'message' => $commandResult->getMessage(),
+            'data'    => $commandResult->getData()
+        ];

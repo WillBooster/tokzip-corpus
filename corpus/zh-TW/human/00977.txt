@@ -1,0 +1,199 @@
+With JavaScript disabled, the attack surface is greatly reduced, so we can only work with HTML and CSS. The CSS for this challenge has `unsafe-inline` enabled, so we can add CSS rules.
+
+However, it seems that we cannot send requests to external resources. So, either we need to find a bypass (such as DNS prefetch, but it may not be applicable to this challenge), or we need to combine it with other parts of the challenge.
+
+The operation of the bot in this challenge is different:
+
+``` js
+import { createServer } from 'http';
+import { readFileSync } from 'fs';
+import { spawn } from 'child_process'
+import { randomInt } from 'crypto';
+
+const sleep = timeout => new Promise(resolve => setTimeout(resolve, timeout));
+const wait = child => new Promise(resolve => child.on('exit', resolve));
+const index = readFileSync('index.html', 'utf-8');
+
+let token = randomInt(2 ** 24).toString(16).padStart(6, '0');
+let browserOpen = false;
+
+const visit = async code => {
+  browserOpen = true;
+  const proc = spawn('node', ['visit.js', token, code], { detached: true });
+
+  await Promise.race([
+    wait(proc),
+    sleep(10000)
+  ]);
+
+  if (proc.exitCode === null) {
+    process.kill(-proc.pid);
+  }
+  browserOpen = false;
+}
+
+createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost/');
+  if (url.pathname === '/') {
+    return res.end(index);
+  } else if (url.pathname === '/bot') {
+    if (browserOpen) return res.end('already open!');
+    const code = url.searchParams.get('code');
+    if (!code || code.length > 1000) return res.end('no');
+    visit(code);
+    return res.end('visiting');
+  } else if (url.pathname === '/flag') {
+    if (url.searchParams.get('token') !== token) {
+      res.end('wrong');
+      await sleep(1000);
+      process.exit(0);
+    }
+    return res.end(process.env.FLAG ?? 'dice{flag}');
+  }
+  return res.end();
+}).listen(8080);
+```
+
+If `browserOpen` is true, we can obtain information from the response. So, when I saw the challenge, I had an idea: what would happen if we crash Chromium? Can we leak the token using this method?
+
+For example, if we write a CSS rule like `h1[data-token^="0"] { /*crash*/ }` to crash Chromium, it might speed up or slow down the execution of the bot, allowing us to determine if this selector matches.
+
+Later, my teammate found a way to crash Chromium from the Chromium issues:
+
+``` html
+<style>
+  h1[data-token^="a"] {
+    --c1: color-mix(in srgb, blue 50%, red);
+    --c2: srgb(from var(--c1) r g b);
+    background-color: var(--c2);
+  }
+</style>
+```
+
+In the post-competition discussion, I also saw someone in Discord posting a payload that made the webpage load extremely slowly, achieving a similar effect. This is what @Trixter posted:
+
+``` html
+<style>
+  html:has([data-token^="a"]) {
+      --a: url(/?1),url(/?1),url(/?1),url(/?1),url(/?1);
+      --b: var(--a),var(--a),var(--a),var(--a),var(--a);
+      --c: var(--b),var(--b),var(--b),var(--b),var(--b);
+      --d: var(--c),var(--c),var(--c),var(--c),var(--c);
+      --e: var(--d),var(--d),var(--d),var(--d),var(--d);
+      --f: var(--e),var(--e),var(--e),var(--e),var(--e);
+  }
+</style>
+<style>
+  *{
+    background-image: var(--f)
+  }
+</style>
+```
+
+It's somewhat similar to the Billion Laughs attack, constructing a super large payload repeatedly to slow down the speed.
+
+After slowing down the speed, we can measure the time it takes for the webpage to load using the method mentioned earlier. If it exceeds 10 seconds, it will time out, allowing us to leak the flag.
+
+## web/safestlist (2 solves)
+
+This challenge is a modified version of a challenge I previously solved: [SekaiCTF 2022 Notes and concurrent limit](https://blog.huli.tw/2022/10/08/en/sekaictf2022-safelist-and-connection/). Let me briefly describe the modified version.
+
+This challenge is a classic note app. You can create new notes, but the problem is that the note content will be sanitized using `DOMPurify.sanitize`, so XSS is not possible. The CSP part is `default-src 'self'`, which means that requests can only be sent to the origin of the challenge.
+
+In other words, you cannot send requests outside.
+
+In addition to creating notes, you can also delete notes using the index of the note.
+
+The core of this problem is the code for creating a note:
+
+```js
+fastify.post("/create", (req, reply) => {
+    const { text } = req.body;
+    if (!text || typeof text !== "string") {
+        return reply.type("text/html").send("Missing text");
+    }
+
+    const userNotes = notes.get(req.cookies.id) ?? [];
+    const totalLen = userNotes.reduce((prev, curr) => prev + curr.length, 0);
+
+    const newLen = totalLen + text.length;
+    if (newLen > 16384) {
+        return reply.redirect(`/?message=Cannot add, please delete some notes first (${newLen} > 16384 chars)`);
+    }
+
+    userNotes.push(text);
+    userNotes.sort();
+    notes.set(req.cookies.id, userNotes);
+
+    reply.redirect("/?message=Note added successfully");
+});
+```
+
+Note the `userNotes.sort();`, which sorts the notes based on their content. The format of the flag is `dice{[a-z]+}`. By using this sorting feature, a simple strategy can be derived.
+
+Assuming the flag is `dice{c}`, and we first create a note with `dice{a`, after creating it, we delete the first note. At this point, `dice{a` will be deleted, leaving the flag `dice{c}`.
+
+If we first create a note with `dice{d`, and then delete the first one, `dice{c}` will be deleted, leaving the newly created `dice{d`.
+
+In other words, depending on the order of creation and deletion of notes, the note that remains will be different.
+
+If I can know which note remains in the end, I can infer the order of the flag. If the note I created remains, it means that the flag must be at the beginning and in lexicographical order.
+
+Therefore, the key to this problem is how to know which note remains.
+
+Based on last year's solution, my initial idea was to make the server side busy. Node.js is single-threaded, so it cannot handle other requests until it finishes processing one (asynchronous is a different story).
+
+So my idea is to create a note with a bunch of `<img src=/?{random_number}>`, which can send about 700-1000 requests within the word limit. By sending a bunch of requests to the server, we make the server busy.
+
+There is another difference in this problem, which is the bot:
+
+``` js
+const visit = async (url) => {
+    // clear all data
+    await fsp.rm(tmpDir, { recursive: true, force: true });
+
+    let browser;
+    try {
+        browser = await launchBrowser();
+        let page = await browser.newPage();
+
+        // set flag
+        await page.goto("http://localhost:3000", { timeout: 7500, waitUntil: "networkidle2" });
+        await sleep(2000);
+        await page.evaluate((flag) => {
+            document.querySelector("input[type=text]").value = flag;
+            document.querySelector("form[action='/create']").submit();
+        }, FLAG);
+        await page.waitForNavigation({ waitUntil: "networkidle2" });
+
+        // restart browser, which should close all windows
+        await browser.close();
+        browser = await launchBrowser();
+        page = await browser.newPage();
+
+        // go to the submitted site
+        await page.goto(url, { timeout: 7500, waitUntil: "networkidle2" })
+
+        // restart browser, which should close all windows
+        await browser.close();
+        browser = await launchBrowser();
+        page = await browser.newPage();
+
+        // check on notes now that all other windows are closed
+        await page.goto("http://localhost:3000", { timeout: 7500, waitUntil: "networkidle2" });
+        await sleep(8000);
+        await page.evaluate(() => {
+            document.querySelector("form[action='/view']").submit();
+        });
+        await page.waitForNavigation({ waitUntil: "networkidle2" });
+        await browser.close();
+        browser = null;
+    } catch (err) {
+        console.log(err);
+    } finally {
+        if (browser) await browser.close();
+    }
+};
+```
+
+After accessing the URL we provided, the bot visits the `/view` page. Therefore, we cannot measure the time from the browser this time, but we have to measure it from our local machine. If the idea mentioned earlier is correct, the server response time should be slower.

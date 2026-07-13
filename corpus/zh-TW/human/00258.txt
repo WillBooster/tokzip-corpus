@@ -1,0 +1,77 @@
+<!-- more -->
+
+
+## HITCON CTF 2023
+
+最近好像很少看到每一題都低於 10 組解出來的 web 題了，上次有這種整場比賽幾乎都是 hard web 可能是 DiceCTF 吧？不過我覺得難度是其次，好玩有趣有學到新東西才是重點，而這些題目在我看來很顯然有做到這點。
+
+先附上兩位作者的 writeup，底下提到作者 writeup 就不額外附連結了：
+
+1. https://blog.splitline.tw/hitcon-ctf-2023-challenges-zh_tw/
+2. https://github.com/maple3142/My-CTF-Challenges/#hitcon-ctf-2023
+
+兩個作者的 writeup 都寫得很詳細，我這邊只是看完之後記錄一些重點而已。
+
+### Login System (7 solves)
+
+這題有兩個 server，node.js 跟 nim，基本上大部分功能都是在 nim server 實現的，你可以登入、註冊以及修改密碼，而使用者的資料會存在 yaml 檔案裡面，目標是要達成 RCE。
+
+第一個洞是 request smuggling，Node.js 接受 `Transfer-Encoding: CHUNKED` 但是 Nim 只看 `chunk`，可以利用這個差異來達成走私的目的。
+
+但走私之後能幹嘛呢？
+
+第二個洞是 Nim 對於 JSON 的行為，先把一個欄位設成很大的數字，Nim 會把它當作是一個 RawNumber，在更新的時候就會不帶引號，可以利用這點來達成 JSON injection。
+
+第三個洞是有了 JSON injection 之後就可以利用 js-yaml 的功能創造出一個有 JS function 的物件，最後利用這個物件會在渲染時呼叫 toString，就達成 RCE 了。
+
+大概會像這樣：
+
+``` js
+privilegeLevel: {
+  toString: !<tag:yaml.org,2002:js/function> "function (){console.log('hi')}"
+}
+access: {'profile': true, register: true, login: true}
+```
+
+喔對了，還有一個洞是 Nim 的檔案讀取，檔名的部分可以用 null byte 截斷：`test.yaml\u0000`
+
+### Canvas (4 solves)
+
+這題很有趣！
+
+簡單來講就是把你的程式碼丟到 worker 裡面去執行，在 worker 裡面有做一些防護措施，讓你不能存取到 globalThis。就算在 worker 取得了 XSS，從 worker 唯一能做的事情就是往 main thread postMessage，但是結果會經過 `setHTML`，被瀏覽器的 Sanitizer API 給過濾掉。
+
+worker 的 sandbox 滿有趣的，大概像是這樣：
+
+``` js
+function allKeys(obj) {
+  let keys = []
+  while (obj !== null) {
+    keys = keys.concat(Object.getOwnPropertyNames(obj))
+    keys = keys.concat(Object.keys(Object.getOwnPropertyDescriptors(obj)))
+    obj = Object.getPrototypeOf(obj)
+  }
+  return [...new Set(keys)]
+}
+
+function hardening() {
+  const fnCons = [function () {}, async function () {}, function* () {}, async function* () {}].map(
+    f => f.constructor
+  )
+  for (const c of fnCons) {
+    Object.defineProperty(c.prototype, 'constructor', {
+      get: function () {
+        throw new Error('Nope')
+      },
+      set: function () {
+        throw new Error('Nope')
+      },
+      configurable: false
+    })
+  }
+  const cons = [Object, Array, Number, String, Boolean, Date, RegExp, Promise, Symbol, BigInt].concat(fnCons)
+  for (const c of cons) {
+    Object.freeze(c)
+    Object.freeze(c.prototype)
+  }
+}

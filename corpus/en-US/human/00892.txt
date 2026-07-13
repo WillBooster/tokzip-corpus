@@ -1,0 +1,179 @@
+In some cases, `trpl` also renames or wraps the original APIs to keep you
+focused on the details relevant to this chapter. If you want to understand what
+the crate does, we encourage you to check out [its source code][crate-source].
+You’ll be able to see what crate each re-export comes from, and we’ve left
+extensive comments explaining what the crate does.
+
+Create a new binary project named `hello-async` and add the `trpl` crate as a
+dependency:
+
+```console
+$ cargo new hello-async
+$ cd hello-async
+$ cargo add trpl
+```
+
+Now we can use the various pieces provided by `trpl` to write our first async
+program. We’ll build a little command line tool that fetches two web pages,
+pulls the `<title>` element from each, and prints out the title of whichever
+page finishes that whole process first.
+
+### Defining the page_title Function
+
+Let’s start by writing a function that takes one page URL as a parameter, makes
+a request to it, and returns the text of the `<title>` element (see Listing
+17-1).
+
+<Listing number="17-1" file-name="src/main.rs" caption="Defining an async function to get the title element from an HTML page">
+
+```rust
+{{#rustdoc_include ../listings/ch17-async-await/listing-17-01/src/main.rs:all}}
+```
+
+</Listing>
+
+First, we define a function named `page_title` and mark it with the `async`
+keyword. Then we use the `trpl::get` function to fetch whatever URL is passed
+in and add the `await` keyword to await the response. To get the text of the
+`response`, we call its `text` method and once again await it with the `await`
+keyword. Both of these steps are asynchronous. For the `get` function, we have
+to wait for the server to send back the first part of its response, which will
+include HTTP headers, cookies, and so on and can be delivered separately from
+the response body. Especially if the body is very large, it can take some time
+for it all to arrive. Because we have to wait for the _entirety_ of the
+response to arrive, the `text` method is also async.
+
+We have to explicitly await both of these futures, because futures in Rust are
+_lazy_: they don’t do anything until you ask them to with the `await` keyword.
+(In fact, Rust will show a compiler warning if you don’t use a future.) This
+might remind you of the discussion of iterators in the [“Processing a Series of
+Items with Iterators”][iterators-lazy]<!-- ignore --> section in Chapter 13.
+Iterators do nothing unless you call their `next` method—whether directly or by
+using `for` loops or methods such as `map` that use `next` under the hood.
+Likewise, futures do nothing unless you explicitly ask them to. This laziness
+allows Rust to avoid running async code until it’s actually needed.
+
+> Note: This is different from the behavior we saw when using `thread::spawn`
+> in the [“Creating a New Thread with spawn”][thread-spawn]<!-- ignore -->
+> section in Chapter 16, where the closure we passed to another thread started
+> running immediately. It’s also different from how many other languages
+> approach async. But it’s important for Rust to be able to provide its
+> performance guarantees, just as it is with iterators.
+
+Once we have `response_text`, we can parse it into an instance of the `Html`
+type using `Html::parse`. Instead of a raw string, we now have a data type we
+can use to work with the HTML as a richer data structure. In particular, we can
+use the `select_first` method to find the first instance of a given CSS
+selector. By passing the string `"title"`, we’ll get the first `<title>`
+element in the document, if there is one. Because there may not be any matching
+element, `select_first` returns an `Option<ElementRef>`. Finally, we use the
+`Option::map` method, which lets us work with the item in the `Option` if it’s
+present, and do nothing if it isn’t. (We could also use a `match` expression
+here, but `map` is more idiomatic.) In the body of the function we supply to
+`map`, we call `inner_html` on the `title` to get its content, which is a
+`String`. When all is said and done, we have an `Option<String>`.
+
+Notice that Rust’s `await` keyword goes _after_ the expression you’re awaiting,
+not before it. That is, it’s a _postfix_ keyword. This may differ from what
+you’re used to if you’ve used `async` in other languages, but in Rust it makes
+chains of methods much nicer to work with. As a result, we could change the
+body of `page_title` to chain the `trpl::get` and `text` function calls
+together with `await` between them, as shown in Listing 17-2.
+
+<Listing number="17-2" file-name="src/main.rs" caption="Chaining with the `await` keyword">
+
+```rust
+{{#rustdoc_include ../listings/ch17-async-await/listing-17-02/src/main.rs:chaining}}
+```
+
+</Listing>
+
+With that, we have successfully written our first async function! Before we add
+some code in `main` to call it, let’s talk a little more about what we’ve
+written and what it means.
+
+When Rust sees a _block_ marked with the `async` keyword, it compiles it into a
+unique, anonymous data type that implements the `Future` trait. When Rust sees
+a _function_ marked with `async`, it compiles it into a non-async function
+whose body is an async block. An async function’s return type is the type of
+the anonymous data type the compiler creates for that async block.
+
+Thus, writing `async fn` is equivalent to writing a function that returns a
+_future_ of the return type. To the compiler, a function definition such as the
+`async fn page_title` in Listing 17-1 is roughly equivalent to a non-async
+function defined like this:
+
+```rust
+# extern crate trpl; // required for mdbook test
+use std::future::Future;
+use trpl::Html;
+
+fn page_title(url: &str) -> impl Future<Output = Option<String>> {
+    async move {
+        let text = trpl::get(url).await.text().await;
+        Html::parse(&text)
+            .select_first("title")
+            .map(|title| title.inner_html())
+    }
+}
+```
+
+Let’s walk through each part of the transformed version:
+
+- It uses the `impl Trait` syntax we discussed back in Chapter 10 in the
+  [“Traits as Parameters”][impl-trait]<!-- ignore --> section.
+- The returned value implements the `Future` trait with an associated type of
+  `Output`. Notice that the `Output` type is `Option<String>`, which is the
+  same as the original return type from the `async fn` version of `page_title`.
+- All of the code called in the body of the original function is wrapped in
+  an `async move` block. Remember that blocks are expressions. This whole block
+  is the expression returned from the function.
+- This async block produces a value with the type `Option<String>`, as just
+  described. That value matches the `Output` type in the return type. This is
+  just like other blocks you have seen.
+- The new function body is an `async move` block because of how it uses the
+  `url` parameter. (We’ll talk much more about `async` versus `async move`
+  later in the chapter.)
+
+Now we can call `page_title` in `main`.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id ="determining-a-single-pages-title"></a>
+
+### Executing an Async Function with a Runtime
+
+To start, we’ll get the title for a single page, shown in Listing 17-3.
+Unfortunately, this code doesn’t compile yet.
+
+<Listing number="17-3" file-name="src/main.rs" caption="Calling the `page_title` function from `main` with a user-supplied argument">
+
+```rust,ignore,does_not_compile
+{{#rustdoc_include ../listings/ch17-async-await/listing-17-03/src/main.rs:main}}
+```
+
+</Listing>
+
+We follow the same pattern we used to get command line arguments in the
+[“Accepting Command Line Arguments”][cli-args]<!-- ignore --> section in
+Chapter 12. Then we pass the URL argument to `page_title` and await the result.
+Because the value produced by the future is an `Option<String>`, we use a
+`match` expression to print different messages to account for whether the page
+had a `<title>`.
+
+The only place we can use the `await` keyword is in async functions or blocks,
+and Rust won’t let us mark the special `main` function as `async`.
+
+<!-- manual-regeneration
+cd listings/ch17-async-await/listing-17-03
+cargo build
+copy just the compiler error
+-->
+
+```text
+error[E0752]: `main` function is not allowed to be `async`
+ --> src/main.rs:6:1
+  |
+6 | async fn main() {
+  | ^^^^^^^^^^^^^^^ `main` function is not allowed to be `async`
+```

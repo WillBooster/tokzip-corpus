@@ -1,0 +1,137 @@
+例如說這個拿來抓系統字體列表的套件 [system-font-families](https://www.npmjs.com/package/system-font-families)，它的依賴是：
+
+``` json
+{
+  "dependencies": {
+    "babel-polyfill": "^6.23.0",
+    "file-type": "^10.11.0",
+    "read-chunk": "^3.2.0",
+    "ttfinfo": "https://github.com/rBurgett/ttfinfo.git"
+  }
+}
+```
+
+這個 `ttfinfo` 直接就寫 git URL，當我們用 `npm install system-font-families` 安裝這個套件後，會在 lockfile 中看到：
+
+``` json
+{
+  "node_modules/ttfinfo": {
+    "version": "0.2.0",
+    "resolved": "git+ssh://git@github.com/rBurgett/ttfinfo.git#f00e43e2a6d4c8a12a677df20b7804492d50863c",
+    "license": "MIT"
+  }
+}
+```
+
+`ttfinfo` 最後被解析出來的地方是個 git URL，而後面 pin 了目前最新的 commit `f00e43e2a6d4c8a12a677df20b7804492d50863c`。當其他人用相同的 lockfile 安裝時，就會安裝到相同版本。
+
+但問題是，最原先的 `system-font-families` 其實並沒有指定版本，所以若是沒有 lockfile，你每次都會裝到最新的 `ttfinfo`，而且 min release age 同樣不起作用。
+
+更重要的是，資安公司 [koi](https://www.koi.ai/blog/packagegate-6-zero-days-in-js-package-managers-but-npm-wont-act) 在去年 11 月時回報過一個漏洞給 npm，在安裝 git 的依賴時，npm 會把 git repo clone 下來，然後在 repo 中再跑一次 `npm install`。
+
+而 `.npmrc` 中有一個設定叫做 [git](https://docs.npmjs.com/cli/v11/using-npm/config#git)，你可以指定要用什麼 command 來跑 git 的指令。因此呢，某個惡意的 git 套件只要新增一個 `.npmrc`，內容是：
+
+```sh
+git=./pwn.sh
+```
+
+然後再新增一個 git 的子依賴，當你安裝這套件時，系統就會執行到 `pwn.sh`，繞過了原本 `ignore-scripts` 的限制。你以為 `ignore-scripts` 可以阻止任何腳本的執行，但其實沒有。
+
+而 npm 當時雖然說這個是 intentional design，不視為是漏洞，但後來其實還是有做出一些改動（等等會提到）。
+
+## 阻止 git 與 direct URL 
+
+儘管我們又檔了 script 又加了 cooldown，但若套件是從 git 或是 direct URL 下載，又會碰到其他的問題。因此，最好的方式就是乾脆阻止這些來源的套件，一率只能從 registry 下載，這樣攻擊面就被局限住了。
+
+pnpm 從 v11 開始，就把 [blockExoticSubdeps](https://pnpm.io/settings#blockexoticsubdeps) 這個參數預設成 true，這個 `Exotic` 指的是 git 以及 direct URL，而 `Subdeps` 指的是「子依賴」。
+
+換句話說，如果你安裝的套件本身是 `Exotic`，那 pnpm 是不會擋的。例如說你直接安裝 xlsx，可以裝起來。但若是你安裝某個套件 A，而套件 A 需要安裝 xlsx，這時就裝不起來。
+
+畢竟第一層的依賴都是使用者親手裝的，應該要知道自己在幹嘛以及風險，但這些子依賴很多人都不知道到底有什麼，所以就預設封掉了。
+
+我簡單示範給你看，若是執行 `pnpm i n8n`，會看到底下的錯誤：
+
+![安裝 n8n 時的錯誤](/img/dive-into-npm-supply-chain-attack/p9.png)
+
+明確寫著 n8n 的子依賴 `@n8n/instance-ai@1.6.2` 又依賴了 xlsx，但因為 `blockExoticSubdeps` 的關係所以被擋掉了。
+
+而 npm 也在 `v11.10.0` 以後多出了 [allow-git](https://docs.npmjs.com/cli/v11/using-npm/config#allow-git) 還有 [allow-remote](https://docs.npmjs.com/cli/v11/using-npm/config#allow-git) 這兩個參數，可以設定成 `none`、`root` 或是 `all`。
+
+目前預設的是 `all`，跟之前的行為一樣，git 跟 direct URL 都不擋。若是兩個都設定成 `root`，那就會跟 pnpm 一樣，只允許第一層的套件是 URL 或是 git。
+
+根據 2 月份時 npm 的[公告](https://github.blog/changelog/2026-02-18-npm-bulk-trusted-publishing-config-and-script-security-now-generally-available/)，從下一個大版本 v12 開始，`allow-git` 預設會變成 `none`，全部都不給裝了。
+
+而這份公告甚至還有提到前面 koi 回報的行為：
+
+> Git dependencies—direct or transitive—can include .npmrc files that override the git executable path. This enables arbitrary code execution during install even when using --ignore-scripts. The new --allow-git flag gives you explicit control over this behavior.
+
+一開始說這不是漏洞所以把報告關掉，但後來某種層面上看來還是修了，畢竟下個大版本就不允許 git 了，可能是不覺得這個行為有嚴重到要立刻當成漏洞來修吧。
+
+## 誠心推薦 pnpm 以及我的 npm 設定
+
+在研究這些 JavaScript 生態系的供應鏈攻擊手法時，我可以明確感覺到 pnpm 是做得比較用心的，而且預設就幫你把該擋的都擋掉了。
+
+舉例來說，你可以直接找到一個 [Mitigating supply chain attacks](https://pnpm.io/supply-chain-security#block-risky-postinstall-scripts) 的文件，裡面把目前的攻擊面以及防禦方式講得很清楚，其實就是我們前面提到的那幾個：
+
+1. 阻止 postinstall scripts
+2. 阻止 exotic transitive dependencies
+3. 延遲更新套件
+4. 使用 lockfile
+
+還有一個前面沒提到的 `trustPolicy`，這個主要是跟發布有關，如果發布的「可信度」下降了就先擋掉之類的，主要與發布時用的方式以及 provenance 有關，我還沒時間研究就先不多談了。
+
+而上面提到的這些防禦方式，從 pnpm v11 開始就自動幫你做完了：
+
+1. `postinstall` 等 scripts 預設關閉（這個更早，v10 就有）
+2. `minimumReleaseAge` 預設 1 天
+3. `blockExoticSubdeps` 預設打開
+
+而 npm 的話則是要自己設定，目前我自己的設定是：
+
+``` ini
+# 不執行 postinstall 等腳本
+ignore-scripts=true
+
+# 不下載 3 天內發布的套件
+min-release-age=3
+
+# 關閉 git 下載
+allow-git=none
+
+# 關閉 direct URL 下載
+allow-remote=none
+```
+
+有需要的話可以自己再調整，例如說需要用到 git 就 `allow-git=root` 之類的。
+
+## 總結
+
+在一般使用電腦時，大家都會知道不要隨便下載與安裝來路不明的軟體，但與此同時，有些人卻又隨意裝著 VScode 的擴充套件、GitHub 上的開源項目或是開發時會用到的套件，忽略了這些也都有可能出問題。
+
+開發者一向是價值比較高的目標，有許多開發者電腦上都直接放著各種雲端服務的 key 甚至有可能是 production 的，而在 CI 上安裝套件時也存在風險，CI 中通常有著更多高價值的 token 可以偷取。有許多攻擊都是先駭入某一個套件，接著藉由這個套件駭入更多套件以及公司，不斷把影響範圍擴大。
+
+最近的供應鏈攻擊真的很多，每一兩周就會看到一起，而且規模很大。再者，以前的供應鏈攻擊可能是入侵某一個小套件，但最近的攻擊是直接把大的那個給駭掉（如 axios 與 TanStack，都是直接駭入大的），並不是從那些很小的子套件下手。
+
+建議大家把該設定的東西都設定好，如果用 npm 就是：
+
+``` ini
+# 不執行 postinstall 等腳本
+ignore-scripts=true
+
+# 不下載 3 天內發布的套件
+min-release-age=3
+
+# 關閉 git 下載
+allow-git=none
+
+# 關閉 direct URL 下載
+allow-remote=none
+```
+
+用 pnpm 就是更新到最新版本，就能享有預設的保護。
+
+若是想要更安全，可以用之前提過的 [sfw](https://socket.dev/features/firewall)，多加一層防護。
+
+雖然說風險沒辦法 100% 避免，但至少我們可以盡量降低它。想要再安全的就是裝套件或甚至開發時一律在 [dev container](https://code.visualstudio.com/docs/devcontainers/containers) 裡面做，能夠從更低的 level 去控制該環境可以存取到的東西，是一種 sandbox 的概念，但這個成本就比較高就是了。
+
+總之呢，我覺得把 npm 設定好是一定要的，或是改用 pnpm。

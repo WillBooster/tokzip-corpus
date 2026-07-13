@@ -1,0 +1,165 @@
+function htmlError(str, safe){
+      const div = document.getElementById("error-content");
+      const container = document.getElementById("error-container");
+      container.style.display = "block";
+      if(safe) div.innerHTML = str;
+      else div.innerText = str;
+      window.setTimeout(function(){
+        div.innerHTML = "";
+        container.style.display = "none";
+      }, 10000);
+  }
+
+  function addError(str){
+      wafIframe.postMessage({
+          identifier,
+          str
+      }, '*');
+  }
+
+  window.addEventListener('message', e => {
+      if(e.data.type === 'waf'){
+          if(identifier !== e.data.identifier) throw /nice try/
+          htmlError(e.data.str, e.data.safe)
+      }
+  });
+
+  window.onload = () => {
+      const error = (new URL(location)).searchParams.get('error');
+      if(error !== null) addError(error);
+  }
+
+</script>
+```
+
+First, when the window loads, the content of `error` is taken from the URL's query string, and then `addError(error)` is called. Then, the content is added with a randomly generated ID and sent to `wafIframe` using postMessage.
+
+After `wafIframe` finishes processing, it sends the result back using postMessage. First, it checks whether the identifier is the same. If it is, the verification is passed, and then it checks whether `e.data.safe` is true. If it is, it uses innerHTML to add `e.data.str`, otherwise it uses innerText.
+
+Next, let's take a look at what the other page, waf.html, is doing:
+
+``` js
+onmessage = e => {
+    const identifier = e.data.identifier;
+    e.source.postMessage({
+        type:'waf',
+        identifier,
+        str: e.data.str,
+        safe: (new WAF()).isSafe(e.data.str)
+    },'*');
+}
+
+function WAF() {
+    const forbidden_words = ['<style', '<iframe', '<embed', '<form', '<input', '<button', '<svg', '<script', '<math', '<base', '<link', 'javascript:', 'data:'];
+    const dangerous_operators = ['"', "'", '`', '(', ')', '{', '}', '[', ']', '=']
+
+    function decodeHTMLEntities(str) {
+        var ta = document.createElement('textarea');
+        ta.innerHTML = str;
+        return ta.value;
+    }
+
+    function onlyASCII(str){
+        return str.replace(/[^\x21-\x7e]/g,'');
+    }
+
+    function firstTag(str){
+        return str.search(/<[a-z]+/i)
+    }
+
+    function firstOnHandler(str){
+        return str.search(/on[a-z]{3,}/i)
+    }
+
+    function firstEqual(str){
+        return str.search(/=/);
+    }
+
+    function hasDangerousOperators(str){
+        return dangerous_operators.some(op=>str.includes(op));
+    }
+
+    function hasForbiddenWord(str){
+        return forbidden_words.some(word=>str.search(new RegExp(word, 'gi'))!==-1);
+    }
+
+    this.isSafe = function(str) {
+        let decoded = onlyASCII(decodeHTMLEntities(str));
+
+        const first_tag = firstTag(decoded);
+        if(first_tag === -1) return true;
+        decoded = decoded.slice(first_tag);
+
+        if(hasForbiddenWord(decoded)) return false;
+
+        const first_on_handler = firstOnHandler(decoded);
+        if(first_on_handler === -1) return true;
+        decoded = decoded.slice(first_on_handler)
+
+        const first_equal = firstEqual(decoded);
+        if(first_equal === -1) return true;
+        decoded = decoded.slice(first_equal+1);
+
+        if(hasDangerousOperators(decoded)) return false;
+        return true;
+    }
+}
+```
+
+When it receives data from index, it goes through a series of verifications to see if the data is safe. The verifications are done in the following order:
+
+1. First, the sent data is decoded and only ASCII is allowed.
+2. Find the first HTML tag and filter out `['<style', '<iframe', '<embed', '<form', '<input', '<button', '<svg', '<script', '<math', '<base', '<link', 'javascript:', 'data:']`.
+3. Find the first = sign that appears after the onXXX handler.
+4. Cannot have the following characters: `['"', "'", '``', '(', ')', '{', '}', '[', ']', '=']`.
+5. If all of the above are successful, it is safe and will be interpreted as innerHTML by index.html.
+
+Combining the above conditions, if I pass `error=123`, the screen will display 123. If I pass `<h1>hello</h1>`, the screen will actually display a heading with the word "hello", but if I pass `<script>alert(1)</script>`, the screen will only display the text and will not execute it as HTML because `safe` is false.
+
+That's basically the introduction to the challenge. I highly recommend that you try it out for yourself first, at least for an hour or two, before reading this article, as you will gain a lot more from it.
+
+Below is my train of thought in solving the challenge, and I will write it according to the timeline of my solution.
+
+## First Attempt
+
+As can be seen from the title, there are two ways to successfully execute XSS:
+
+1. Bypass the restrictions using various tricks and execute XSS directly on the page.
+2. Use `window.open` to open this page and then postMessage, forge messages and make safe true, so that any HTML can be inserted.
+
+At first, I thought about the first method because for the second method, you need to know what the identifier is, but since it is random, it is impossible. I thought it was a dead end.
+
+So the next step is to think about how to bypass the restrictions.
+
+From the filtered tags, I found that my favorite `<img>` was not filtered out, and the onXX event handler was only restricted in content and was not filtered out together, so you can use: `<img src=x onerror=123>` to execute JS.
+
+But the problem is that there are too many characters that cannot be used, `()` cannot be used, so functions cannot be called, and using backticks ` to call is not possible either. So how can we execute alert? I was stuck here for a long time, and finally went to Google: "js call function without parentheses" and found this article: [js call function without parentheses](https://stackoverflow.com/questions/35949554/invoking-a-function-without-parentheses/35949617), which mentioned many tricks that I had never thought of.
+
+For example, using the object's valueOf with +, or using new with constructor, or the most amazing one is onerror=eval with throw. These are all super cool techniques to bypass restrictions without using `()`.
+
+But none of the above worked because the restrictions were too strict. The object's `{}` cannot be used, and new cannot be used because it requires a space. The reason why there cannot be a space is because `<img onerror=new abc>` will be interpreted as: `<img onerror="new" abc>`. If you want them to be put together in onerror, you can only use `"` to enclose them, but `"` is a restricted character that cannot be used, so there cannot be spaces in onerror.
+
+Throw seemed to have a chance, but `onerror=eval`, which is a prerequisite for execution, has an equal sign, so it cannot be used.
+
+At this point, I thought, what if I HTML entity encode the restricted characters? Change `=` to `&#61;` to bypass the restrictions.
+
+After trying it out, I found that it didn't work because it had been restored to characters in the first step `decodeHTMLEntities(str)`. At this point, I had two ideas:
+
+1. Can decoding HTML entities inside textarea cause XSS?
+2. Can double encoding be used?
+
+The first approach is not feasible because although there is `ta.innerHTML = str;`, this element has never been placed on the DOM, so it is useless.
+
+The second approach is also not feasible because the final `&#61;` will only be treated as text to display.
+
+After trying for a long time, I couldn't come up with anything. The only code that can be executed successfully is `<img src=x onerror=throw/0/+identifier>`, which throws the identifier as an error message and then nothing happens. But this can't do anything.
+
+## Hints
+
+For every 100 likes received, a hint will be released. Due to the difficulty of the challenge, there are also additional hints. The hints I saw were:
+
+1. First hint: find the objective! (4/19 21:57)
+2. Time for another hint! Where to smuggle data? (4/20 00:24)
+3. Time for another tip! One bite after another! (4/20 19:55)
+
+To be honest, I didn't understand these hints very well. The one I understood the most was the third one, which should mean "One Byte after another". Looking back at the XS-Leaks mentioned earlier, I thought, "Damn, could it be that the dead end I thought was the right solution?".

@@ -1,0 +1,56 @@
+pub trait Future {
+    type Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
+}
+```
+
+这个 trait 定义里包含了不少新类型，也有一些我们之前还没见过的语法，所以我们逐部分来看。
+
+首先，`Future` 的关联类型 `Output` 指明了这个 future 最终会解析成什么值。这和 `Iterator` trait 里的关联类型 `Item` 是类似的。其次，`Future` 提供了一个 `poll` 方法。它接收一个特殊的 `Pin` 包裹的 `self` 引用、一个指向 `Context` 类型的可变引用，并返回 `Poll<Self::Output>`。稍后我们会再讲 `Pin` 和 `Context`。现在，先聚焦到这个方法的返回值 `Poll`：
+
+```rust
+pub enum Poll<T> {
+    Ready(T),
+    Pending,
+}
+```
+
+这个 `Poll` 类型有点像 `Option`。它也有一个带值的变体 `Ready(T)`，以及一个不带值的变体 `Pending`。但 `Poll` 的语义和 `Option` 完全不同。`Pending` 表示这个 future 还有工作没做完，因此调用方稍后还需要再次检查。`Ready` 则表示这个 `Future` 已经完成，其结果值 `T` 现在已经可用。
+
+> 注意：直接调用 `poll` 的场景很少，但如果你真的需要这么做，请记住：对于大多数 future 来说，一旦它已经返回过 `Ready`，调用方就不应再对它调用 `poll`。很多 future 在 ready 之后再次被轮询时会 panic。那些可以安全重复轮询的 future，会在文档里明确说明。这和 `Iterator::next` 的行为有些相似。
+
+当你看到使用 `await` 的代码时，Rust 在底层会把它编译成调用 `poll` 的代码。如果你回头看示例 17-4，也就是在单个 URL 的标题解析完成后把它打印出来的那个例子，Rust 编译出来的代码大致会像下面这样（虽然并不完全一致）：
+
+```rust,ignore
+match page_title(url).poll() {
+    Ready(page_title) => match page_title {
+        Some(title) => println!("The title for {url} was {title}"),
+        None => println!("{url} had no title"),
+    }
+    Pending => {
+        // 这里该怎么办？
+    }
+}
+```
+
+如果 future 仍然是 `Pending`，那我们该怎么办？我们需要一种办法不断重试，直到 future 最终准备好。换句话说，我们需要一个循环：
+
+```rust,ignore
+let mut page_title_fut = page_title(url);
+loop {
+    match page_title_fut.poll() {
+        Ready(value) => match page_title {
+            Some(title) => println!("The title for {url} was {title}"),
+            None => println!("{url} had no title"),
+        }
+        Pending => {
+            // continue
+        }
+    }
+}
+```
+
+但如果 Rust 真按这段代码精确地编译，那么每个 `await` 就都会变成阻塞式的，这恰恰和我们想要的效果相反！Rust 实际上会保证：这个循环能够把控制权交给某个东西，由它暂停当前 future 的工作，去处理别的 future，然后稍后再回来重新检查当前这个。正如我们已经见过的，这个“某个东西”就是异步运行时，而调度和协调这些工作，正是运行时的核心职责之一。
+
+在[“通过消息传递在两个任务之间发送数据”][message-passing]<!-- ignore -->一节中，我们描述过等待 `rx.recv` 的过程。`recv` 调用会返回一个 future，而等待这个 future 本质上就是在轮询它。我们之前提到，运行时会暂停这个 future，直到它准备好，最终要么得到 `Some(message)`，要么在信道关闭时得到 `None`。现在，借助对 `Future` trait，尤其是 `Future::poll` 的更深入理解，我们就能看清它的工作方式了：当返回 `Poll::Pending` 时，运行时知道这个 future 还没准备好；反过来，当 `poll` 返回 `Poll::Ready(Some(message))` 或 `Poll::Ready(None)` 时，运行时就知道这个 future 已经准备好，可以继续推进它。

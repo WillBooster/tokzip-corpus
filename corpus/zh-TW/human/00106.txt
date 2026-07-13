@@ -1,0 +1,155 @@
+為了方便大家理解，直接來個 demo。
+
+我改了本機的 `/etc/hosts`，內容如下：
+
+```
+127.0.0.1   alice.example.com
+127.0.0.1   bob.example.com
+```
+
+如此一來，這兩個網址都會連到 local，接著我開了一個簡單的 HTTP server，寫了一個簡單的 HTML，讓它跑在 localhost:5555
+
+``` html
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content ="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <h1></h1>
+    <h2></h2>
+    <button onclick="load('alice')">load alice iframe</button>
+    <button onclick="load('bob')">load bob iframe</button>
+    <button onclick="access()">access iframe content</button>
+    <button onclick="update()">update domain</button>
+    <br>
+    <br>
+  </body>
+  <script>
+    const name = document.domain.replace('.example.com', '')
+    document.querySelector('h1').innerText = name
+    document.querySelector('h2').innerText = Math.random()
+
+    function load(name) {
+      const iframe = document.createElement('iframe')
+      iframe.src = 'http://' + name + '.example.com:5555'
+      document.body.appendChild(iframe)
+    }
+
+    function access() {
+      const win = document.querySelector('iframe').contentWindow
+      alert('secret:' + win.document.querySelector('h2').innerText)    
+    }
+
+    function update() {
+      document.domain = 'example.com'
+    }
+  </script>
+</html>
+```
+
+頁面上有三個功能：
+
+1. 載入 iframe
+2. 讀取 iframe 內 DOM 的資料
+3. 改變 document.domain
+
+我們先開啟 `http://alice.example.com:5555`，然後載入 `http://bob.example.com:5555` 的 iframe，接著按下 alice 頁面中的「access iframe content」：
+
+![exception](/img/same-site-to-same-origin/p4-error.png)
+
+你會在 console 看到錯誤訊息，寫說：
+
+> Uncaught DOMException: Blocked a frame with origin "http://alice.example.com:5555" from accessing a cross-origin frame.
+
+因為 alice 跟 bob 雖然是 same site，但是並不是 same origin，而 iframe 如果要存取到 DOM 的內容，必須是 same origin 才行。
+
+接著我們雙雙按下 alice 跟 bob 頁面中的「update domain」，按完以後再按一次「access iframe content」：
+
+![success](/img/same-site-to-same-origin/p5-success.png)
+
+你會看到這一次，我們順便取得了 bob 頁面中的資料，成功把  `http://alice.example.com:5555` 跟 `http://bob.example.com:5555` 從 cross origin 變成了 same origin，這就是忍術，same site 變成 same origin 之術！
+
+這一招並不是任意兩個網頁都可以使用的，基本上只有 same site 的網站可以，而且在設置時還會做很多檢查：
+
+![check](/img/same-site-to-same-origin/p6-detail.png)
+
+以 github.io 為例，如果 `alice.github.io` 執行了 `document.domain = 'github.io'`，console 就會跳出錯誤：
+
+> Uncaught DOMException: Failed to set the 'domain' property on 'Document': 'github.io' is a top-level domain.
+
+為什麼改變 `document.domain` 後，兩個頁面就會變成是 same origin 呢？其實嚴格來說不是 same origin，而是 same origin-domain，在 [docuemnt](https://html.spec.whatwg.org/multipage/browsers.html#concept-bcc-content-document) 相關的 spec 中有寫到，有些檢查是看 same origin-domain，而不是 same origin。
+
+那怎麼看兩個 origin 是不是 same origin-domain 呢？一起來看看 spec 怎麼說：
+
+> 1. If A and B are the same opaque origin, then return true.  
+> 2. If A and B are both tuple origins, run these substeps:
+>   * If A and B's schemes are identical, and their domains are identical and non-null, then return true.  
+>   * Otherwise, if A and B are same origin and their domains are identical and null, then return true.
+> 3. Return false.
+
+如果 A 跟 B 的 scheme 一樣，而且 domain 屬性也一樣而且不是 null 的話，就回傳 true，否則的話檢查 A 跟 B 是不是 same origin 而且 domain 都是 null，成立才回傳 true。
+
+這邊可以看到幾個有趣的地方：
+
+
+1. 一定要兩個網頁都沒有設置 domain 或是都有設置，才有可能回傳 true（這很重要）
+2. 如果有設置 domain 的話，same origin-domain 就不檢查 port 了
+
+`document.domain` 就是改變 origin tuple 中 domain 這個屬性用的。
+
+在上面的範例中，我們兩個網頁 `http://alice.example.com:5555` 跟 `http://bob.example.com:5555` 都將自己的 domain 改成 `example.com`，所以是 same origin-domain。
+
+底下我們來看看三個有趣的案例。
+
+### 案例一：單方面改變
+
+如果 `https://alice.example.com` 執行了 `document.domain = 'example.com'`，接著把 `https://example.com` 嵌入在 iframe 裡面，它們兩個「依舊不是 same origin-domain」，因為 alice 頁面有 domain 屬性，但是 `example.com` 頁面沒有 domain 屬性。
+
+`example.com` 也要執行 `document.domain = 'example.com'`，兩者才會是 same origin-domain。
+
+### 案例二：消失的 port
+
+`http://alice.example.com:1234` 跟 `http://alice.example.com:4567`，因為 port 不一樣，所以是 cross origin，但如果兩個頁面都執行了 `document.domain = 'alice.example.com'` 的話，就會變成 same origin-domain，可以存取彼此的 DOM，因為它不看 port。
+
+### 案例三：我不是原來的我
+
+假設 `http://alice.example.com` 把自己嵌入在 iframe 裡面，那 iframe 跟原本的頁面顯然是 same origin，可以存取彼此的 DOM。
+
+但是呢，如果我在頁面上執行了 `document.domain = 'alice.example.com'`，這頁面就會被設置 domain 屬性，而 iframe 裡的頁面並沒有設置 domain 屬性，所以它們就變得不是 same origin-domain 了。
+
+## document.domain 的淡出及退場
+
+用這一招來放寬 same origin 的限制應該滿早就有了，而到現在還沒有拔除掉就是為了相容早期的行為，我猜在早期的時候很多網頁都會用這招，才能夠去存取 same site 但是 cross origin 的頁面。
+
+但這樣做顯然是有風險的，例如說假設某個 subdomain 有 XSS 漏洞，就有機會利用這個方式擴大影響範圍，在 2016 年由 [@fin1te](https://twitter.com/fin1te) 所寫的一篇文章 [An XSS on Facebook via PNGs & Wonky Content Types](https://whitton.io/articles/xss-on-facebook-via-png-content-types/) 中，就利用了這個手法，成功從 subdomain 繞到 `www.facebook.com` 進行 XSS，提升漏洞的影響力。 
+
+也因為安全性的問題，Chrome 在 2022 年 1 月 11 日於部落格發布了一篇文章：[Chrome will disable modifying document.domain to relax the same-origin policy](https://developer.chrome.com/blog/immutable-document-domain/)，文中說明了最快從 Chrome 101 版開始，就會停止支援更改 `document.domain`。
+
+原本的行為可以用 `postMessage` 或是 `Channel Messaging API` 來取代，只是要多寫一些程式碼就是了，畢竟沒辦法像原本直接操作 DOM 這麼方便。
+
+而如果有網頁想繼續使用這個修改 document.domain 的功能，需要在 response header 裡面帶上 `Origin-Agent-Cluster: ?0`，才能繼續使用。
+
+文中也有附上關於這個改動的相關討論串：[Deprecating document.domain setter. #564](https://github.com/w3ctag/design-reviews/issues/564)
+
+## 結語
+
+我似乎是兩三年以前知道這招的，知道可以透過改變 `document.domain` 讓兩個網站從 cross origin 變成 same origin，但我自己在實務上是還沒看過有人這樣用就是了。
+
+這次會想寫這篇，就是因為前幾天看到了文末附的文章，得知了在不久後的未來，這一招將會被 Chrome 預設停用。雖然說出發點只是為了寫這個行為，但其實花更多時間在 origin 以及 site 的定義，在看 spec 的過程中也注意到一些以前沒注意到的盲點，像是 same site 會看 public suffix 之類的。
+
+關於 origin，其實還有更多細節可以談，例如說到底什麼是 opaque origin？但一方面再講下去就太長，另一方面我也還沒仔細研究，先留下一些參考資料，未來有機會再把這個坑補完：
+
+1. [What is an "opaque origin" and why do we care? #321](https://github.com/w3c/wpub/issues/321)
+2. [chromium/src/+/HEAD/url/origin.h](https://chromium.googlesource.com/chromium/src/+/HEAD/url/origin.h)
+3. [File origins](https://developer.mozilla.org/en-US/docs/Web/Security/Same-origin_policy#file_origins)
+
+最後，希望這篇有讓大家更理解什麼是 same origin，什麼又是 same site，以及更細節的 same origin-domain 還有 schemelessly same site。
+
+參考資料：
+
+1. [HTML spec](https://html.spec.whatwg.org/multipage/origin.html#origin)
+2. [URL spec](https://url.spec.whatwg.org/#host-registrable-domain)
+3. [如何判斷兩個網域的擁有者是否相同？](https://blog.kalan.dev/2021-11-09-url-and-samesite/)
+4. [Chrome will disable modifying document.domain to relax the same-origin policy](https://developer.chrome.com/blog/immutable-document-domain/)

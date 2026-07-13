@@ -1,0 +1,250 @@
+``` js
+const templates = require('./templates');
+
+const parseMultipartData  = (data, boundary) => {
+  var chunks = data.split(boundary);
+  // always start with the <head> element
+  var processedTemplate = templates.head_start;
+  // to prevent loading an html page of arbitrarily large size, limit to just 7 at a time
+  let end = 7;
+  if (chunks.length-1 <= end) {
+    end = chunks.length-1;
+  }
+  for (var i = 1; i < end; i++) {
+    // seperate body from the header parts
+    var lines = chunks[i].split('\r\n\r\n')
+    .map((item) => item.replaceAll("\r\n", ""))
+    .filter((item) => { return item != ''})
+    for (const item of Object.keys(templates)) {
+        if (lines.includes(item)) {
+            processedTemplate += templates[item];
+        }
+    }
+  }
+  return processedTemplate;
+}
+```
+
+As mentioned above, we can add our own content and prevent it from being rendered by the CSP.
+
+There is a bypass in the frontend part as well:
+
+``` js
+constructor(url) {
+  const clean = (path) => {
+    try {
+      if (!path) throw new Error("no path");
+      let re = new RegExp(/^[A-z0-9\s_-]+$/i);
+      if (re.test(path)) {
+        // normalize
+        let cleaned = path.replaceAll(/\s/g, "");
+        return cleaned;
+      } else {
+        throw new Error("regex fail");
+      }
+    } catch (e) {
+      console.log(e);
+      return "dfv";
+    }
+    };
+  url = clean(url);
+  this.url = new URL(url, 'https://grandprixheaven-web.2024.ctfcompetition.com/api/get-car/');
+}
+```
+
+The check for `A-z` here is crucial because some symbols are included, such as `\`, allowing the URL to be `\test` and overwrite the original path `/api/get-car`.
+
+The above is just a simple record. For a more detailed walkthrough and the challenges, you can refer to the author's writeup: [GoogleCTF 2024 GRAND PRIX HEAVEN Solution](https://github.com/google/google-ctf/tree/main/2024/quals/web-grandprixheaven/solution)
+
+## SAPPY (64 solves)
+
+Once again, my teammates solved this before I could take a look. I'll briefly discuss the core concept and note the Discord discussion.
+
+The core code snippet is as follows:
+
+``` js
+const Uri = goog.require("goog.Uri");
+
+function validate(host) {
+  const h = Uri.parse(host);
+  if (h.hasQuery()) {
+    throw "invalid host";
+  }
+  if (h.getDomain() !== "sappy-web.2024.ctfcompetition.com") {
+    throw "invalid host";
+  }
+  return host;
+}
+```
+
+Essentially, the challenge is to bypass this check and allow the input URL to send requests to our server.
+
+Two bypass methods were observed. One is using a data URI: `data://sappy-web.2024.ctfcompetition.com/;base64,...`, where the domain is resolved as `sappy-web.2024.ctfcompetition.com` by this library.
+
+The other method is `\\\\www%2eURL%2ex://sappy-web.2024.ctfcompetition.com`, tricking the parser into recognizing `\\\\www%2eURL%2ex` as the scheme. However, browsers interpret `\\` as `//`, resulting in `https://www.URL.ex//sappy-web.2024.ctfcompetition.com`.
+
+For a more detailed process, you can refer to this article: [GoogleCTF 2024 SAPPY](https://zimzi.substack.com/p/googlectf-2024-sappy)
+
+## POSTVIEWER V3 (19 solves)
+
+I couldn't solve [v1](https://blog.huli.tw/2022/07/09/en/google-ctf-2022-writeup/#postviewer-10-solves) in 2022 or [v2](https://blog.huli.tw/2023/07/28/en/google-zer0pts-imaginary-ctf-2023-writeup/#postviewer-v2-7-solves) in 2023, but I finally managed to solve v3 released this year.
+
+The core concept of this year's version is similar to the previous ones, aiming to create a preview file mechanism with a sandbox. The interface is simple, with just a feature to upload files:
+
+![upload file](/img/google-ctf-2024-writeup/p1.png)
+
+After clicking the file, the hash value on the URL will be updated, and this hash value is `sha1(filename)`. Then, based on the file name, the content is retrieved from IndexedDB, and that's when the crucial part begins.
+
+After obtaining the content, a sandbox domain is generated. The name of this domain depends on: `calculateHash(body, product, window.origin, location.href)`, where the body is a fixed HTML and the product is also fixed.
+
+Next, an iframe is used to load this sandbox domain, and the query string is appended with: `?o=${window.origin}`. Below is an example:
+
+```
+https://sbx-0wguyijf8lspklnc3724kqvia43l62tu7v1l2gdelcy503m2cd.
+  postviewer3-web.2024.ctfcompetition.com/postviewer/shim.html
+  ?o=https%3A%2F%2Fpostviewer3-web.2024.ctfcompetition.com
+```
+
+So, what does this `shim.html` do? The content is quite simple, focusing only on JavaScript-related paragraphs:
+
+``` js
+const HASH_REGEXP = /^sbx-([a-z0-9]{50})[.]/;
+const PRODUCT_REGEXP = /[/]([a-z0-9_-]*)[/]shim.html/;
+let FILE_HASH, PRODUCT
+
+function _throw(err){
+  document.body.innerText = err;
+  throw Error(err);
+}
+
+try{
+  FILE_HASH = HASH_REGEXP.exec(location.host)[1];
+}catch(e){
+  _throw("Incorrect hash");
+}
+
+try{
+  PRODUCT = PRODUCT_REGEXP.exec(location.pathname)[1];
+}catch(e){
+  _throw("Incorrect product");
+}
+
+const TRUSTED_ORIGIN = new URL(location.href).searchParams.get('o');
+if(!/^https?:\/\//.test(TRUSTED_ORIGIN)) {
+    _throw("Untrusted Origin");
+}
+
+function arrayToBase36(arr) {
+  return arr
+    .reduce((a, b) => BigInt(256) * a + BigInt(b), BigInt(0))
+    .toString(36);
+}
+
+async function calculateHash(...strings){
+  const encoder = new TextEncoder();
+  const string = strings.join('');
+  const hash = await crypto.subtle.digest('SHA-256', encoder.encode(string));
+  return arrayToBase36(new Uint8Array(hash)).padStart(50, '0').slice(0, 50);
+}
+
+window.onmessage = async (e) => {
+    if(e.origin !== TRUSTED_ORIGIN){
+        _throw("Wrong origin");
+    }
+    if (e.data.body === undefined || !e.data.mimeType) {
+        _throw("No content to render");
+    };
+
+    const {body, salt, mimeType} = e.data;
+    [body, salt, mimeType, PRODUCT, TRUSTED_ORIGIN].forEach(e=>{
+      if (typeof e !== 'string') {
+        _throw(`Expected '${e}' to be a string.`);
+      }
+    });
+    const hash = await calculateHash(body, PRODUCT, TRUSTED_ORIGIN, salt);
+    if (hash !== FILE_HASH) {
+      _throw(`Expected hash: ${hash}`);
+    }
+
+    const blob = new Blob([body], { type: mimeType });
+    window.onmessage = null;
+    e.source.postMessage('blob loaded', e.origin);
+    location.replace(URL.createObjectURL(blob));
+};
+```
+
+Essentially, it checks a few things:
+
+1. Whether the origin of `onmessage` matches the origin in the URL
+2. After hashing the incoming data, whether it matches the domain name
+
+If both conditions are met, the incoming body is turned into a blob and loaded into this blob.
+
+Now, let's go back to the iframe mentioned earlier. After the iframe in `shim.html` finishes loading, it sends a postMessage to this iframe, passing the fixed HTML mentioned earlier, which is:
+
+``` html
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Evaluator</title>
+
+    <script>
+      onmessage = e => {
+        if(e.source !== parent) {
+          throw /not parent/;
+        };
+        if(e.data.eval){
+          eval(e.data.eval);
+        }
+      }
+      onload = () => {
+        parent.postMessage('loader ready','*');
+      }
+    </script>
+
+    <style>
+      body{
+        padding: 0px;
+        margin: 0px;
+      }
+      iframe{
+        width: 100vw;
+        height: 100vh;
+        border: 0;
+      }
+      .spinner {
+        background: url(https://storage.googleapis.com/gctf-postviewer/spinner.svg) center no-repeat;
+      }
+      .spinner iframe{
+        opacity: 0.2
+      }
+    </style>
+  </head>
+  <body>
+    <div id="container" class="spinner"></div>
+  </body>
+</html>
+```
+
+Therefore, the content of the iframe will become the above HTML, simply evaluating the passed parameters.
+
+In the final step, a postMessage is sent to this iframe, including the file's content and mimeType, and then the following code is evaluated:
+
+``` js
+const container = document.querySelector("#container");
+container.textContent = '';
+const iframe = document.createElement('iframe');
+iframe.src = URL.createObjectURL(new Blob([e.data.body], {type: e.data.type}));
+if(e.data.sandbox) {
+  iframe.sandbox = e.data.sandbox;
+}
+container.appendChild(iframe);
+setTimeout(()=>{
+  container.classList.remove('spinner');
+}, 5000);
+iframe.onload = () => {
+  setTimeout(()=>{
+    container.classList.remove('spinner');
+  }, 500);
+};
+```

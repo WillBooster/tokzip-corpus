@@ -1,0 +1,235 @@
+This means v2 revisions are **not** a 1:1 equivalent of v1 deployments. In v1,
+multiple deployments within a project could be active simultaneously. In v2,
+only one revision per timeline is active.
+
+Recommended approach:
+
+- Create one app per function with a descriptive slug (e.g. `my-service-auth`,
+  `my-service-billing`)
+- Use **labels** to group related apps — filter with
+  `GET /apps?labels[service]=my-service`
+- Use **layers** to share environment variables across apps
+
+## Configuration inheritance
+
+In v1, every deployment was self-contained: environment variables, entrypoint,
+and other options had to be specified in each deploy request.
+
+In v2, apps carry configuration that revisions inherit:
+
+- **Build config** (`config`): install command, build command, runtime
+  entrypoint. Set once on the app, inherited by all revisions.
+- **Environment variables** (`env_vars`): set on the app or on a layer,
+  inherited by all revisions.
+- **Layers**: set on the app, inherited by all revisions.
+
+You can override any of these per-revision by including them in the deploy
+request. If omitted, the app's configuration is used. This means you typically
+only need to send `assets` after initial setup:
+
+```json
+{
+  "assets": {
+    "main.ts": {
+      "kind": "file",
+      "content": "Deno.serve((req) => new Response('Hello'));"
+    }
+  }
+}
+```
+
+## Authentication
+
+| Aspect       | v1                              | v2                              |
+| ------------ | ------------------------------- | ------------------------------- |
+| Token prefix | `dd...`                         | `ddo_...`                       |
+| Header       | `Authorization: Bearer <token>` | `Authorization: Bearer <token>` |
+| Scope        | Organization                    | Organization                    |
+| Base URL     | `https://api.deno.com/v1`       | `https://api.deno.com/v2`       |
+
+Create v2 tokens in the Deno Deploy dashboard under your organization's
+settings.
+
+## Endpoint mapping
+
+### List projects / apps
+
+**v1**: `GET /organizations/{orgId}/projects`
+
+**v2**: `GET /apps`
+
+The v2 API scopes to the organization automatically based on your token. No
+organization ID needed in the URL.
+
+```bash
+# v1
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v1/organizations/$ORG_ID/projects?page=1&limit=20"
+
+# v2
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v2/apps?limit=30"
+```
+
+| Aspect     | v1                            | v2                                |
+| ---------- | ----------------------------- | --------------------------------- |
+| Pagination | `page` + `limit` (page-based) | `cursor` + `limit` (cursor-based) |
+| Filtering  | `q` (search by name/ID)       | `labels`, `layer`                 |
+| Response   | Array of Project objects      | Array of AppListItem objects      |
+
+Response field mapping:
+
+| v1 Project    | v2 AppListItem                   |
+| ------------- | -------------------------------- |
+| `id` (UUID)   | `id` (UUID)                      |
+| `name`        | `slug`                           |
+| `description` | _not available_                  |
+| `createdAt`   | `created_at`                     |
+| `updatedAt`   | `updated_at`                     |
+| —             | `labels` (object)                |
+| —             | `layers` (array of `{id, slug}`) |
+
+V2 uses `snake_case` for all field names (v1 uses `camelCase`).
+
+### Get project / app details
+
+**v1**: `GET /projects/{projectId}`
+
+**v2**: `GET /apps/{app}`
+
+The v2 endpoint accepts either the app UUID or slug.
+
+```bash
+# v1
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v1/projects/$PROJECT_ID"
+
+# v2
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v2/apps/my-app-slug"
+```
+
+The v2 response includes `env_vars`, `config`, `labels`, and `layers`.
+
+### Create a deployment / revision
+
+**v1**: `POST /projects/{projectId}/deployments`
+
+**v2**: `POST /apps/{app}/deploy`
+
+This is the most significant API change.
+
+#### v1 request
+
+```json
+{
+  "entryPointUrl": "main.ts",
+  "assets": {
+    "main.ts": {
+      "content": "Deno.serve((req) => new Response('Hello'));",
+      "encoding": "utf-8"
+    }
+  },
+  "envVars": {
+    "MY_VAR": "my_value"
+  }
+}
+```
+
+#### v2 request
+
+```json
+{
+  "assets": {
+    "main.ts": {
+      "kind": "file",
+      "content": "Deno.serve((req) => new Response('Hello'));",
+      "encoding": "utf-8"
+    }
+  },
+  "config": {
+    "install": "deno install",
+    "runtime": {
+      "type": "dynamic",
+      "entrypoint": "main.ts"
+    }
+  },
+  "env_vars": [
+    { "key": "MY_VAR", "value": "my_value" }
+  ]
+}
+```
+
+Key differences:
+
+| Aspect           | v1                                | v2                                                                           |
+| ---------------- | --------------------------------- | ---------------------------------------------------------------------------- |
+| Entrypoint       | Top-level `entryPointUrl`         | `config.runtime.entrypoint`                                                  |
+| Assets           | `content`+`encoding` or `gitSha1` | `kind: "file"` with `content`+`encoding`, or `kind: "symlink"` with `target` |
+| Env vars         | Object `{"KEY": "value"}`         | Array `[{"key": "KEY", "value": "value"}]`                                   |
+| Import map       | `importMapUrl` field              | Not needed; Deno auto-discovers `deno.json`                                  |
+| Lock file        | `lockFileUrl` field               | Not needed; handled by `deno install`                                        |
+| Compiler options | `compilerOptions` field           | Not needed; use `deno.json`                                                  |
+| Build config     | None (import caching only)        | `config.install` and `config.build`                                          |
+| Response status  | `200`                             | `202 Accepted` (build is async)                                              |
+| Databases/KV     | `databases` field                 | Not available                                                                |
+| Request timeout  | `requestTimeout` field            | Not available                                                                |
+| Permissions      | `permissions` field               | Not available                                                                |
+
+**Build configuration:** In v1, the "build" step only cached imports. The
+equivalent in v2 is `config.install: "deno install"` with `config.build: null`.
+No framework preset is needed (leave `config.framework` as `""`).
+
+**Configuration inheritance:** `config`, `env_vars`, and `layers` are all
+optional in deploy requests. When omitted, the revision inherits the app's
+configuration. Set these once when creating the app and then only send `assets`
+in subsequent deploys.
+
+#### Status values
+
+| v1        | v2          | Meaning               |
+| --------- | ----------- | --------------------- |
+| `pending` | `queued`    | Build not yet started |
+| _(none)_  | `building`  | Build in progress     |
+| `success` | `succeeded` | Deployed and live     |
+| `failed`  | `failed`    | Build failed          |
+| _(none)_  | `skipped`   | Build was skipped     |
+
+### Get deployment / revision status
+
+**v1**: `GET /deployments/{deploymentId}`
+
+**v2**: `GET /revisions/{revisionId}`
+
+```bash
+# v1
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v1/deployments/$DEPLOYMENT_ID"
+
+# v2
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v2/revisions/$REVISION_ID"
+```
+
+The v2 response includes `failure_reason` when status is `failed`.
+
+### List deployments / revisions
+
+**v1**: `GET /projects/{projectId}/deployments`
+
+**v2**: `GET /apps/{app}/revisions`
+
+```bash
+# v1
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v1/projects/$PROJECT_ID/deployments?page=1&limit=20"
+
+# v2
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v2/apps/my-app-slug/revisions?limit=30"
+```
+
+| Aspect     | v1                 | v2                 |
+| ---------- | ------------------ | ------------------ |
+| Pagination | `page` + `limit`   | `cursor` + `limit` |
+| Filtering  | `q` (search by ID) | `status`           |
