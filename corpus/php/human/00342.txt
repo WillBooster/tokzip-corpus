@@ -10,235 +10,110 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Repository\Vcs;
-
-use Composer\Config;
-use Composer\Cache;
-use Composer\Pcre\Preg;
-use Composer\Util\Hg as HgUtils;
-use Composer\Util\ProcessExecutor;
-use Composer\Util\Filesystem;
-use Composer\IO\IOInterface;
+namespace Composer\Util\Http;
 
 /**
- * @author Per Bernhardt <plb@webfactory.de>
+ * @internal
+ * @author John Stevenson <john-stevenson@blueyonder.co.uk>
  */
-class HgDriver extends VcsDriver
+class ProxyItem
 {
-    /** @var array<int|string, string> Map of tag name to identifier */
-    protected $tags;
-    /** @var array<int|string, string> Map of branch name to identifier */
-    protected $branches;
+    /** @var non-empty-string */
+    private $url;
+    /** @var non-empty-string */
+    private $safeUrl;
+    /** @var ?non-empty-string */
+    private $curlAuth;
     /** @var string */
-    protected $rootIdentifier;
-    /** @var string */
-    protected $repoDir;
+    private $optionsProxy;
+    /** @var ?non-empty-string */
+    private $optionsAuth;
 
     /**
-     * @inheritDoc
+     * @param string $proxyUrl The value from the environment
+     * @param string $envName The name of the environment variable
+     * @throws \RuntimeException If the proxy url is invalid
      */
-    public function initialize(): void
+    public function __construct(string $proxyUrl, string $envName)
     {
-        if (Filesystem::isLocalPath($this->url)) {
-            $this->repoDir = $this->url;
-        } else {
-            if (!Cache::isUsable($this->config->get('cache-vcs-dir'))) {
-                throw new \RuntimeException('HgDriver requires a usable cache directory, and it looks like you set it to be disabled');
+        $syntaxError = sprintf('unsupported `%s` syntax', $envName);
+
+        if (strpbrk($proxyUrl, "\r\n\t") !== false) {
+            throw new \RuntimeException($syntaxError);
+        }
+        if (false === ($proxy = parse_url($proxyUrl))) {
+            throw new \RuntimeException($syntaxError);
+        }
+        if (!isset($proxy['host'])) {
+            throw new \RuntimeException('unable to find proxy host in ' . $envName);
+        }
+
+        $scheme = isset($proxy['scheme']) ? strtolower($proxy['scheme']) . '://' : 'http://';
+        $safe = '';
+
+        if (isset($proxy['user'])) {
+            $safe = '***';
+            $user = $proxy['user'];
+            $auth = rawurldecode($proxy['user']);
+
+            if (isset($proxy['pass'])) {
+                $safe .= ':***';
+                $user .= ':' . $proxy['pass'];
+                $auth .= ':' . rawurldecode($proxy['pass']);
             }
 
-            $cacheDir = $this->config->get('cache-vcs-dir');
-            $this->repoDir = $cacheDir . '/' . Preg::replace('{[^a-z0-9]}i', '-', $this->url) . '/';
+            $safe .= '@';
 
-            $fs = new Filesystem();
-            $fs->ensureDirectoryExists($cacheDir);
-
-            if (!is_writable(dirname($this->repoDir))) {
-                throw new \RuntimeException('Can not clone '.$this->url.' to access package information. The "'.$cacheDir.'" directory is not writable by the current user.');
-            }
-
-            // Ensure we are allowed to use this URL by config
-            $this->config->prohibitUrlByConfig($this->url, $this->io);
-
-            $hgUtils = new HgUtils($this->io, $this->config, $this->process);
-
-            // update the repo if it is a valid hg repository
-            if (is_dir($this->repoDir) && 0 === $this->process->execute('hg summary', $output, $this->repoDir)) {
-                if (0 !== $this->process->execute('hg pull', $output, $this->repoDir)) {
-                    $this->io->writeError('<error>Failed to update '.$this->url.', package information from this repository may be outdated ('.$this->process->getErrorOutput().')</error>');
-                }
-            } else {
-                // clean up directory and do a fresh clone into it
-                $fs->removeDirectory($this->repoDir);
-
-                $repoDir = $this->repoDir;
-                $command = static function ($url) use ($repoDir): string {
-                    return sprintf('hg clone --noupdate -- %s %s', ProcessExecutor::escape($url), ProcessExecutor::escape($repoDir));
-                };
-
-                $hgUtils->runCommand($command, $this->url, null);
+            if (strlen($user) > 0) {
+                $this->curlAuth = $user;
+                $this->optionsAuth = 'Proxy-Authorization: Basic ' . base64_encode($auth);
             }
         }
 
-        $this->getTags();
-        $this->getBranches();
-    }
+        $host = $proxy['host'];
+        $port = null;
 
-    /**
-     * @inheritDoc
-     */
-    public function getRootIdentifier(): string
-    {
-        if (null === $this->rootIdentifier) {
-            $this->process->execute('hg tip --template "{node}"', $output, $this->repoDir);
-            $output = $this->process->splitLines($output);
-            $this->rootIdentifier = $output[0];
+        if (isset($proxy['port'])) {
+            $port = $proxy['port'];
+        } elseif ($scheme === 'http://') {
+            $port = 80;
+        } elseif ($scheme === 'https://') {
+            $port = 443;
         }
 
-        return $this->rootIdentifier;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getUrl(): string
-    {
-        return $this->url;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getSource(string $identifier): array
-    {
-        return ['type' => 'hg', 'url' => $this->getUrl(), 'reference' => $identifier];
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getDist(string $identifier): ?array
-    {
-        return null;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getFileContent(string $file, string $identifier): ?string
-    {
-        if (isset($identifier[0]) && $identifier[0] === '-') {
-            throw new \RuntimeException('Invalid hg identifier detected. Identifier must not start with a -, given: ' . $identifier);
+        // We need a port because curl uses 1080 for http. Port 0 is reserved,
+        // but is considered valid depending on the PHP or Curl version.
+        if ($port === null) {
+            throw new \RuntimeException('unable to find proxy port in ' . $envName);
+        }
+        if ($port === 0) {
+            throw new \RuntimeException('port 0 is reserved in ' . $envName);
         }
 
-        $resource = sprintf('hg cat -r %s -- %s', ProcessExecutor::escape($identifier), ProcessExecutor::escape($file));
-        $this->process->execute($resource, $content, $this->repoDir);
+        $this->url = sprintf('%s%s:%d', $scheme, $host, $port);
+        $this->safeUrl = sprintf('%s%s%s:%d', $scheme, $safe, $host, $port);
 
-        if (!trim($content)) {
-            return null;
-        }
-
-        return $content;
+        $scheme = str_replace(['http://', 'https://'], ['tcp://', 'ssl://'], $scheme);
+        $this->optionsProxy = sprintf('%s%s:%d', $scheme, $host, $port);
     }
 
     /**
-     * @inheritDoc
+     * Returns a RequestProxy instance for the scheme of the request url
+     *
+     * @param string $scheme The scheme of the request url
      */
-    public function getChangeDate(string $identifier): ?\DateTimeImmutable
+    public function toRequestProxy(string $scheme): RequestProxy
     {
-        $this->process->execute(
-            sprintf(
-                'hg log --template "{date|rfc3339date}" -r %s',
-                ProcessExecutor::escape($identifier)
-            ),
-            $output,
-            $this->repoDir
-        );
+        $options = ['http' => ['proxy' => $this->optionsProxy]];
 
-        return new \DateTimeImmutable(trim($output), new \DateTimeZone('UTC'));
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getTags(): array
-    {
-        if (null === $this->tags) {
-            $tags = [];
-
-            $this->process->execute('hg tags', $output, $this->repoDir);
-            foreach ($this->process->splitLines($output) as $tag) {
-                if ($tag && Preg::isMatchStrictGroups('(^([^\s]+)\s+\d+:(.*)$)', $tag, $match)) {
-                    $tags[$match[1]] = $match[2];
-                }
-            }
-            unset($tags['tip']);
-
-            $this->tags = $tags;
+        if ($this->optionsAuth !== null) {
+            $options['http']['header'] = $this->optionsAuth;
         }
 
-        return $this->tags;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getBranches(): array
-    {
-        if (null === $this->branches) {
-            $branches = [];
-            $bookmarks = [];
-
-            $this->process->execute('hg branches', $output, $this->repoDir);
-            foreach ($this->process->splitLines($output) as $branch) {
-                if ($branch && Preg::isMatchStrictGroups('(^([^\s]+)\s+\d+:([a-f0-9]+))', $branch, $match) && $match[1][0] !== '-') {
-                    $branches[$match[1]] = $match[2];
-                }
-            }
-
-            $this->process->execute('hg bookmarks', $output, $this->repoDir);
-            foreach ($this->process->splitLines($output) as $branch) {
-                if ($branch && Preg::isMatchStrictGroups('(^(?:[\s*]*)([^\s]+)\s+\d+:(.*)$)', $branch, $match) && $match[1][0] !== '-') {
-                    $bookmarks[$match[1]] = $match[2];
-                }
-            }
-
-            // Branches will have preference over bookmarks
-            $this->branches = array_merge($bookmarks, $branches);
+        if ($scheme === 'http') {
+            $options['http']['request_fulluri'] = true;
         }
 
-        return $this->branches;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public static function supports(IOInterface $io, Config $config, string $url, bool $deep = false): bool
-    {
-        if (Preg::isMatch('#(^(?:https?|ssh)://(?:[^@]+@)?bitbucket.org|https://(?:.*?)\.kilnhg.com)#i', $url)) {
-            return true;
-        }
-
-        // local filesystem
-        if (Filesystem::isLocalPath($url)) {
-            $url = Filesystem::getPlatformPath($url);
-            if (!is_dir($url)) {
-                return false;
-            }
-
-            $process = new ProcessExecutor($io);
-            // check whether there is a hg repo in that path
-            if ($process->execute('hg summary', $output, $url) === 0) {
-                return true;
-            }
-        }
-
-        if (!$deep) {
-            return false;
-        }
-
-        $process = new ProcessExecutor($io);
-        $exit = $process->execute(sprintf('hg identify -- %s', ProcessExecutor::escape($url)), $ignored);
-
-        return $exit === 0;
+        return new RequestProxy($this->url, $this->curlAuth, $options, $this->safeUrl);
     }
 }

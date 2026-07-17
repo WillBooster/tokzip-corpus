@@ -1,23 +1,97 @@
-This article is intended for beginners who have no idea what Regular Expressions are. Therefore, the explanations will be relatively simple, and the examples will be relatively easy to understand. The patterns will also be relatively fixed, with fewer boundary conditions to consider, making it easier to learn.
+In short, you can think of PWA as: existing website + new technology (Service Worker, manifest.json...), combined to become PWA.
 
-Alright, let's get started!
+That's all for the simple introduction to PWA. If you want to learn more, you can refer to what @arvinh wrote: [Will Progressive Web App be the future trend?](https://blog.techbridge.cc/2016/07/23/progressive-web-app/) or [When React web app meets Progressive web app](https://blog.techbridge.cc/2016/09/17/create-react-pwa/).
 
-<!-- more -->
+For PWA, the most important thing is actually this Service Worker (hereinafter referred to as SW). Chrome's built-in Lighthouse can give a PWA score for the webpage. SW is one of the considerations, because you must implement SW to cache files and implement the offline opening App function.
 
-## What are Regular Expressions?
+The following figure shows the items that Lighthouse will check:
 
-To discuss this topic, I think examples are the best way to explain. Therefore, I will provide several related examples to help you understand what Regular Expressions are used for.
+![lh](https://user-images.githubusercontent.com/2755720/49351838-31a0b600-f6f0-11e8-8a9d-6260a0cdc60d.png)
 
-### Example 1: Finding Data
+Alright, the preface is over, let's get to the point.
 
-Suppose you want to find data in an Excel spreadsheet that contains only names, and you want to find all the people with the surname "Li". You might open the search interface and enter "Li". However, this method is not very effective because it will find not only people with the surname Li, but also anyone with the character "Li" in their name. Therefore, the data found needs to be manually filtered again.
+We've done everything we need to do for our PWA, including registering the service worker and implementing offline functionality. However, there's one thing that keeps failing in Lighthouse's tests: registering the service worker.
 
-What should you do? Some search interfaces may have some options for you to choose from, such as "match at the beginning". If so, then there is no problem, and you can easily find people with the surname Li. But what if it's a more complex example? For example, you want to find "Li X Ming", and all the names that match this rule. Many systems may not be able to do this because this feature is not provided.
+No matter how many times we test it, Lighthouse keeps saying that our website doesn't have a registered service worker.
 
-Even if it is available, the rules may be different. For example, Company A's system may require inputting: `Li% Ming`, while Company B's system may require inputting: `Li* Ming`.
+It's really strange. I tried testing it manually in a clean Chrome window in incognito mode, and I confirmed that the service worker is definitely registered. But no matter how I test it in Lighthouse, it keeps saying that it's not registered.
 
-Is there a "universal rule" that allows us to easily convert these requirements into symbols and text?
+So what should we do?
 
-### Example 2: Data Validation
+Fortunately, Lighthouse is [open source](https://github.com/GoogleChrome/lighthouse) and provides a CLI version that you can run on your own computer.
 
-Currently, most mobile phone numbers in Taiwan follow a certain format, which is a total of ten digits, with the first two digits being 09, such as `0912-345-678` or `0900-111-222`. If we have a string and want to verify that it meets the format of a Taiwanese mobile phone number, we can use the following three rules:
+So I thought, since Lighthouse says it's not registered, let's take a look at how Lighthouse is testing it. I did a little research on the source code of Lighthouse and found that the testing method seemed fine. So I decided to modify Lighthouse to prevent it from closing the window after running the tests, so that I could see if there was any useful information in the console and if the message that should be printed when registration is successful was printed.
+
+I made a few changes:
+
+1. Added a configuration file to only run the service worker test.
+2. After running the test, Chrome won't be closed.
+3. Added a log in the service worker check.
+
+If you need it, the parts I changed are here: [PR for the changes](https://github.com/aszx87410/lighthouse/pull/1/files)
+
+After making the changes, I ran the tests again. And at that moment, I remembered the fear of being trapped by CORS:
+
+![sw-error](https://user-images.githubusercontent.com/2755720/49351841-35343d00-f6f0-11e8-8661-ae6094c17e41.png)
+
+
+# Clearing the clouds and seeing the sun
+
+Since we have some clues, we should investigate them thoroughly. From the screenshot, it looks like the service worker is registered successfully, but there are some errors when using the cached files with the service worker, which seems to affect the entire test. Anyway, as long as we solve this CORS problem, everything should be fine.
+
+Let me give you some background information first. We store all our static files on Amazon S3 and use Cloudfront in front of it. We have followed [Amazon's instructions](https://docs.aws.amazon.com/AmazonS3/latest/dev/cors.html) to add what we need to add, so if the request header has an origin, the response will definitely have the CORS header. So there should be no problem.
+
+And when the service worker caches files, it uses fetch, so it will definitely add the origin header, and there is no reason for it to fail.
+
+After being stuck for an hour or two, I decided to take a look at the network tab and found more clues:
+
+The following is a request sent from the service worker. The header does have an origin, but the response does not have `Access-Control-Allow-Origin`!
+
+![sw-r1](https://user-images.githubusercontent.com/2755720/49351843-382f2d80-f6f0-11e8-964e-faeb9e786ff7.png)
+
+In addition, I found an identical request earlier. Since this request was sent by `<script>`, it did not include the origin, so the response did not have the CORS header.
+
+![sw-r2](https://user-images.githubusercontent.com/2755720/49351854-44b38600-f6f0-11e8-8a11-b8b63248c8a8.png)
+
+It's worth noting that the second response is from disk cache (although both are in the screenshot, that's because I didn't clear the cache when taking the screenshot, in fact, only the second one should be).
+
+![sw-tab](https://user-images.githubusercontent.com/2755720/49351857-4715e000-f6f0-11e8-8a25-f597a0aa6ab3.png)
+
+After investigating these clues, I have a rough idea of what's going on.
+
+# In-depth investigation
+
+Alright, let me explain.
+
+The file that the service worker needs to cache is one of the JavaScript files that the page will load. Since the page will load it, we put a `<script>` tag in the HTML to load this file. From the screenshot, it looks like the browser loaded this JavaScript file first, and because it wasn't sent via AJAX, it didn't include the origin. According to S3's rules, there was naturally no `Access-Control-Allow-Origin`.
+
+Next, after successfully registering SW, we started executing the code inside it to cache the list we prepared in advance, one of which is this JavaScript file. However, when we used fetch to retrieve this file, the browser directly used the cached previous response (because the URL and method are the same), and this response did not have `Access-Control-Allow-Origin`! Therefore, the cross-domain error we saw at the beginning occurred.
+
+The truth is revealed here, all due to browser caching issues.
+
+Why couldn't I find this problem when I tested it myself before? As a front-end engineer, it is reasonable to check "Disable cache" in devtool, so no matter how I tried, I couldn't find this problem.
+
+After knowing the cause of the problem, it is relatively simple. I searched on Google and found this Chromium ticket: [CORS Preflight Cache Does not Consider Origin](https://bugs.chromium.org/p/chromium/issues/detail?id=260239)
+
+The problem encountered inside is basically the same as what I encountered. The solution given in the end is to add a `Vary: Origin` to the response, so that the browser knows not to use the cache if the Origin is different. However, I found that we had already added it but didn't know why it didn't work.
+
+In addition, I found several similar problems:
+
+1. [Chrome S3 Cloudfront: No 'Access-Control-Allow-Origin' header on initial XHR request](https://serverfault.com/questions/856904/chrome-s3-cloudfront-no-access-control-allow-origin-header-on-initial-xhr-req)
+2. [S3 CORS, always send Vary: Origin](https://stackoverflow.com/questions/31732533/s3-cors-always-send-vary-origin)
+
+Later, I adopted one of the solutions inside: "Since S3 needs an origin header to enable CORS, let's send a fixed origin to it using Cloudfront! This way, every response will definitely have `Access-Control-Allow-Origin`!" 
+
+You can refer to this article: [AWS CloudFront + S3 + Allow all CORS](http://strd6.com/2017/05/aws-cloudfront-s3-allow-all-cors/), which is basically just adjusting a setting.
+
+This trick sounds quite effective, but it is not the best solution. It feels a bit dirty, after all, origin is not used in this way. It doesn't seem too good to do this for the S3 mechanism.
+
+So in the end, I thought of something that also solved a doubt in my mind.
+
+That is to add `crossorigin="anonymous"` to `<script>`, so that the request sent by `<script>` also has an origin header!
+
+I have seen some places add this before, but I still don't understand why it needs to be added, because scripts can be unrestricted by domain. Why do you need to add a tag to make it look like an ajax request?
+
+But unexpectedly, this attribute helped me. Once I added it, the script loading would attach Origin, and S3 would return `Access-Control-Allow-Origin`, so I wouldn't encounter cross-domain issues later!
+
+As for the other functions of this attribute, you can refer to: [Purpose of the crossorigin attribute …?](https://stackoverflow.com/questions/18336789/purpose-of-the-crossorigin-attribute)

@@ -1,70 +1,58 @@
-<!-- more -->
+實際的繞過方式如下：
 
-## Fancy Notes
-
-這題的核心程式碼如下：
-
-```  py
-def get_user():
-    if not 'user' in request.cookies:
-        return None
-
-    cookie = base64.b64decode(request.cookies.get(
-        'user')).decode('raw_unicode_escape')
-    assert len(cookie.split('|')) == 2
-    user_string = cookie.split('|')[0]
-    signature_string = cookie.split('|')[1]
-
-    if hashlib.sha256((SECRET_KEY + user_string).encode('raw_unicode_escape')).hexdigest() != signature_string:
-        print("nope")
-        return None
-
-    user = serialize_user(user_string)
-    return user
+``` html
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>CSP bypass</title>
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src https://cdnjs.cloudflare.com">
+  </head>
+  <body>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prototype/1.7.2/prototype.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.0.1/angular.js"></script>
+    <div ng-app ng-csp>
+      {{$on.curry.call().alert('xss')}}
+    </div>
+  </body>
+</html>
 ```
 
-會從 cookie 去判斷你是哪一個 user，序列化跟反序列化的程式碼如下：
+因為 CSP 中有 cdnjs，所以我們可以引入其他的 library，這邊我們挑的是 AngularJS，引入了以後我們就可以用 CSTI 的方式注入底下這一段：
 
-``` py
-def serialize_user(user_string):
-    user = dict()
-    for kv in user_string.split(','):
-        k = kv.split('=')[0]
-        v = kv.split('=')[1]
-        user[k] = v
-    return user
-
-def deserialize_user(user):
-    values = []
-    for k in ["username", "locale"]:
-        values.append(f'{k}={user.__dict__[k]}')
-    return ','.join(values)
+``` html
+<div ng-app ng-csp>
+  {{$on.curry.call().alert('xss')}}
+</div>
 ```
 
-而產生 cookie 的程式碼長這樣：
+這邊為什麼是 `$on.curry.call()` 呢？你可以把它換成 `window` 看看，會發現沒有反應，這是因為 AngularJS 的 expression 是放在一個 scope object 裡面，你沒辦法直接存取到 window 或是 window 上的屬性。
 
-``` py
-def generate_cookie(user):
-    user_string = deserialize_user(user)
-    signature_string = hashlib.sha256(
-        (SECRET_KEY + user_string).encode('raw_unicode_escape')).hexdigest()
-    cookie = base64.b64encode(
-        (f'{user_string}|{signature_string}').encode('raw_unicode_escape')).decode()
-    return cookie
+而這邊有另一個重點是 CSP 沒有開 `unsafe-eval`，所以你也不能直接 `constructor.constructor('alert(1)')()` 之類的。
+
+從最後的結果看起來，`$on.curry.call()` 似乎等同於 window，那是為什麼呢？這就是 prototype.js 派上用場的地方了，我們來看一下它的部分原始碼，[src/prototype/lang/function.js](https://github.com/prototypejs/prototype/blob/master/src/prototype/lang/function.js#L226)：
+
+``` js
+function curry() {
+  if (!arguments.length) return this;
+  var __method = this, args = slice.call(arguments, 0);
+  return function() {
+    var a = merge(args, arguments);
+    return __method.apply(this, a);
+  }
+}
 ```
 
-目標是想辦法偽造成 admin 登入，就可以拿到 flag。
+這個 function 會加在 `Function.prototype` 上面，而重點其實只有第一行：` if (!arguments.length) return this;`，如果沒有帶參數的話，會直接回傳 `this`。在 JavaScript 裡面，如果你用 `call` 或是 `apply` 來呼叫函式的話，第一個參數可以指定 `this` 的值，如果沒有傳的話就會是預設值，在嚴格模式底下是 `undefined`，非嚴格模式底下是 `window`。
 
-正常的狀況下，假設我們的 user 叫做 abc 好了，locale 是 en，產生出來的 user_string 就會是：`username=abc,locale=en`。
+這也是為什麼 `$on.curry.call()` 會是 `window`，因為 `$on` 是個 function，所以呼叫 `$on.curry.call()` 的時候，由於 `this` 沒帶所以預設是 `window`，參數也沒帶，因此 `curry` 這個函式就會根據第一行的條件句，把 `this` 也就是 `window` 回傳回來。
 
-從 `serialize_user` 中可以看出前面的屬性會被後面蓋掉，所以如果我們的 user_string 是 `username=a,locale=en,username=admin`，還原回 user 時身份就會變成 admin。
+總結一下，之所以 AngularJS 需要 prototype.js 的幫忙，是因為 prototype.js：
 
-在產生 cookie 時，後面有特別加上一個簽名（`sha256(secret + user_string)`）來驗證資料完整性。
+1. 提供了一個加在 prototype 上的函式
+2. 而且這個函式會回傳 this
 
-所以在我們不知道 key 的狀況下，照理來說我們沒有辦法偽造 user_string，因為完整性的檢查過不了。
+第一點很重要，因為前面有提過在 expression 裡面沒辦法存取到 window，所以一般的 library 加的東西其實也是拿不到的，但 prototype.js 是把東西放在 prototype 上面，所以可以透過 prototype 來存取到新增的 method。
 
-但是呢，這題用的這種驗證方式可以用一種叫做長度擴充攻擊（Length extension attack）的方式來打。
-
-簡單來說呢，如果今天有一個操作是：`M1 = hash(secret + data)`，你只要知道 secret+data 的「長度」就好，不需要知道內容是什麼，以及產生出來的結果 M1，那你就可以在 `secret+data` 後面拼接任意字串，並且知道合法的 `hash(secret + data + padding + 任意 data)`
-
-舉例來說，你今天知道 `"{secret}username=a"` 在 md5 過後會變成 `781e5e245d69b566979b86e28d23f2c7`，在不知道 secret 為何的狀況之下，你還是能知道 `"{secret}username=a{padding},username=admin"` 的 md5 是多少。
+第二點也很重要，搭配 this 預設會是 window 這個特性，就可以讓我們拿到 window。

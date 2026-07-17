@@ -1,103 +1,46 @@
-如果上面的動作做完以後，proxy 還是監聽不到，那就代表 app 裡面可能有其他安全性的設置，例如說 certificate pinning。
+在眾多 L7 DoS 攻擊手法中有一種我覺得特別有趣，那就是 Cookie Bomb，直翻就叫做 Cookie 炸彈。
 
-什麼是 certificate pinning 呢？如果網頁有用 https，就代表伺服器有一個 https 的憑證，而 certificate pinning 就代表 app 裡有指定某個 domain 對應到的憑證應該要是什麼，如果憑證不符，就代表有人在中間搞事，所以拒絕連線。
+<!-- more -->
 
-以熱門的 library OkHttp 為例，文件上就有寫說應該怎麼實作這個功能：
+## 什麼是 Cookie？
 
-``` java
-String hostname = "publicobject.com";
-CertificatePinner certificatePinner = new CertificatePinner.Builder()
-    .add(hostname, "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-    .build();
-OkHttpClient client = OkHttpClient.Builder()
-    .certificatePinner(certificatePinner)
-    .build();
+如果對 cookie 毫無概念的話，可以參考這篇：[白話 Session 與 Cookie：從經營雜貨店開始](https://hulitw.medium.com/session-and-cookie-15e47ed838bc)。
 
-Request request = new Request.Builder()
-    .url("https://" + hostname)
-    .build();
-client.newCall(request).execute();
-```
+簡單來說呢，一些網站可能會把某些資料存在瀏覽器裡面，而這些資料就稱之為 cookie。當瀏覽器對網站發送 request 的時候，會自動把之前儲存的 cookie 一併帶上去。
 
-如果想實作看看的話，可以拿這個 apk 檔來嘗試：https://github.com/aszx87410/demo/raw/master/android/demoapp-pinning.apk
+最常見的應用之一就是廣告追蹤，例如說我造訪 A 網站，然後 A 網站裡面有 GA（Google Analytics）的 script，因此 GA 寫了一個 id=abc 的 cookie。當使用者造訪 B 網站而且 B 網站也有裝 GA，此時瀏覽器送 request 給 GA 的時候，就會把這個 id=abc 帶上去，那 server 收到以後就會知道「又是這個人，他造訪了 A 網站跟 B 網站」，隨著使用者造訪的網站變多，就會更清楚知道他的喜好。
 
-我們一樣用 apktool 解開，接著先照之前那樣，把 network security config 給放進去，再來就是要找到程式碼哪裡有用到 certificate pinner 了。
+（附註：實際上的追蹤應該會更複雜，而且最近又有第三方 cookie 的問題，所以實作可能會不太一樣，這邊只是簡單舉例）
 
-因為這次的程式碼有開啟 proguard，所以連 okhttp 也被混淆了，直接用 `certificatePinner` 做關鍵字下去搜尋不一定找得到東西。那怎麼辦呢？我們可以換個方式，在使用這個功能的時候，一定要寫一組 sha256 的值在裡面，所以我們可以搜尋：`sha256/`
+在寫入 cookie 的時候，有一個 domain 的選項可以設置，你只能往上寫不能往下寫。什麼意思呢，假設你在 `abc.com`，你就只能寫 cookie 到 `abc.com`。但如果你在 `a.b.abc.com`，你可以寫入 `a.b.abc.com`，也可以寫入 `b.abc.com`，就連 `abc.com` 也可以。
 
-可以找到這樣一個段落：
+所以你在 subdomain `a.b.abc.com` 對 root domain `abc.com` 寫入 cookie 之後，瀏覽器送去 `abc.com` 的 request 就會帶上你寫入的 cookie。
 
-``` java
-# virtual methods
-.method public run()V
-    .locals 13
+## 那 Cookie bomb 又是什麼？
 
-    .line 1
-    new-instance v0, Ljava/util/ArrayList;
+假設我的攻擊目標是 `example.com`，那我只要找到任何 subdomain 或是網站中的某個頁面可以讓我寫 cookie 的話，我就可以自由自在地寫入我想要的 cookie。
 
-    invoke-direct {v0}, Ljava/util/ArrayList;-><init>()V
+舉例來說，假設有個頁面`https://example.com/log?uid=abc`，造訪這個頁面之後，就會把 `uid=abc` 這一段寫到 cookie，那我只要把網址改成 `?uid=xxxxxxxxxx`，就可以把 `xxxxxxxxxx` 寫到 cookie 裡。
 
-    const-string v1, "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+再舉個例子，假設有個部落格網站，每一個使用者都有一個獨特的 subdomain，例如說我的話就是 `huliblog.example.com`，然後部落格可以客製化自己想要的 JS，那我就可以利用 JS 在 `huliblog.example.com` 對 `examepl.com` 寫入我想要的 cookie。
 
-    .line 2
-    filled-new-array {v1}, [Ljava/lang/String;
+好了，那可以寫入任意 cookie 之後能幹嘛呢？
 
-    move-result-object v1
+開始寫一堆垃圾 cookie 進去。
 
-    const-string v2, "archive.org"
+例如說 `a1=o....*4000` 之類的，就是寫一堆無意義的內容進去就好，這邊要特別注意的是一個 cookie 能寫的大小大概是 4kb，而我們最少需要兩個 cookie，也就是要能寫入 8kb 的資料，才能達成攻擊。
 
-    const-string v3, "pattern"
+當你寫了這些 cookie 進去之後，回到主頁 `https://example.com` 時，根據 cookie 的特性，就會一起把這些垃圾 cookie 帶上去給 server 對吧？接下來就是見證奇蹟的時刻。
 
-    .line 3
-    invoke-static {v2, v3}, Lc/j/b/d;->d(Ljava/lang/Object;Ljava/lang/String;)V
+Server 並沒有顯示你平常會看到的頁面，而是回給你一個錯誤：`431 Request Header Fields Too Large`。
 
-    const-string v3, "pins"
+![](/img/cookie-bomb/p1.png)
 
-    invoke-static {v1, v3}, Lc/j/b/d;->d(Ljava/lang/Object;Ljava/lang/String;)V
+在眾多 HTTP status code 裡面，有兩個 code 都跟 request 太大有關：
 
-    const/4 v3, 0x0
+1. [413 Payload Too Large](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/413)
+2. [431 Request Header Fields Too Large](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/431)
 
-    const/4 v4, 0x0
-```
+假設有個表單，你填了一百萬個字送到 server 去，就很可能會收到一個 `413 Payload Too Large` 的回應，就如同錯誤訊息所說的，payload 太大了，伺服器無法處理。
 
-找到之後該做什麼呢？難道要去改 smali，把 certificate pinner 拿掉嗎？其實有更簡單的做法。
-
-從程式碼中可以猜得出來底下那個 `archive.org` 應該就是綁定的網域，因此只要把這個網域隨便改成其他字串即可，如此一來其他的網域就不會檢查憑證是否相符。
-
-改完以後重新打包 app 並安裝，就能正常監聽到流量。
-
-像上面這樣是去改變使用 certificatePinner 的地方，還有另一個方式是直接去改變 okhttp 的實作，找到 smali 中的 `okhttp3/CertificatePinner$Builder.smali`，有一個 function 是：
-
-``` java
-# virtual methods
-.method public varargs add(Ljava/lang/String;[Ljava/lang/String;)Lokhttp3/CertificatePinner$Builder;
-    .locals 5
-```
-
-這個就是 okhttp 在處理新增 certificate pinner 時的方法，我們只要這樣改就好了：
-
-``` java
-# virtual methods
-.method public varargs add(Ljava/lang/String;[Ljava/lang/String;)Lokhttp3/CertificatePinner$Builder;
-    .locals 5
-
-    # patch
-    const-string p1, "abc"
-```
-
-這樣第一個參數（domain）就永遠是 abc，永遠不會生效。
-
-## 總結
-
-這篇文章中我們學習到了如何自己動手改造 app，拿掉一些防中間人攻擊的機制，例如說改掉 network security config 以及程式碼中處理 certificate pinning 的部分。
-
-對於一般的 app 來說，做到這邊應該就滿夠的了，至少能夠監聽流量，看見 app 到底發送了些什麼。而且跟 VPN 的解法相比，還有另外一個好處，那就是可以二次打包，包出一個把 API 網址換掉也能動的版本，自由度比較高。
-
-在下一篇裡面，我們會學習另外一種分析 app 的方式。
-
-系列文連結：
-
-1. [Android App 逆向入門之一：拆開與重組 apk](/2023/04/27/android-apk-decompile-intro-1/)
-2. [Android App 逆向入門之二：修改 smali 程式碼](/2023/04/27/android-apk-decompile-intro-2/)
-3. [Android App 逆向入門之三：監聽 app 封包](/2023/04/27/android-apk-decompile-intro-3/) - 你在這篇
-4. [Android App 逆向入門之四：使用 Frida 進行動態分析](/2023/04/27/android-apk-decompile-intro-4/)
+而 header 也是一樣的，當你的 cookie 太多時，requset header 中的 `Cookie` 會很大，大到伺服器無法處理，就會回一個 `431 Request Header Fields Too Large`（不過根據實測，有些 server 可能會根據實作不同回覆不同的 code，像微軟就是回 400 bad request）。

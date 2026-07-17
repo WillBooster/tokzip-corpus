@@ -1,52 +1,159 @@
-{-# LANGUAGE NoImplicitPrelude #-}
-{-# LANGUAGE DataKinds         #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE NoImplicitPrelude     #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE OverloadedRecordDot   #-}
 
--- | Functions to parse command line arguments for Stack's @setup@ command.
-module Stack.Options.SetupParser
-  ( setupOptsParser
+-- | Functions to parse Stack's \'global\' command line arguments.
+module Stack.Options.GlobalParser
+  ( globalOptsFromMonoid
+  , globalOptsParser
   ) where
 
-import qualified Data.Text as T
-import qualified Options.Applicative as OA
-import qualified Options.Applicative.Builder.Extra as OA
-import qualified Options.Applicative.Types as OA
+import           Options.Applicative
+                   ( Parser, ReadM, auto, completer, help, hidden, internal
+                   , long, metavar, option, strOption, value
+                   )
+import           Options.Applicative.Builder.Extra
+                   ( fileExtCompleter, firstBoolFlagsFalse
+                   , firstBoolFlagsNoDefault, firstBoolFlagsTrue, optionalFirst
+                   )
+import           Options.Applicative.Types ( readerAsk )
+import           Path.IO ( getCurrentDir, resolveDir', resolveFile' )
+import qualified Stack.Docker as Docker
 import           Stack.Prelude
-import           Stack.SetupCmd ( SetupCmdOpts (..) )
+import           Stack.Options.ConfigParser ( configOptsParser )
+import           Stack.Options.LogLevelParser ( logLevelOptsParser )
+import           Stack.Options.ResolverParser
+                   ( abstractResolverOptsParser, compilerOptsParser )
+import           Stack.Options.Utils ( GlobalOptsContext (..), hideMods )
+import           Stack.Types.GlobalOpts ( GlobalOpts (..) )
+import           Stack.Types.GlobalOptsMonoid ( GlobalOptsMonoid (..) )
+import           Stack.Types.LockFileBehavior
+                   ( LockFileBehavior (..), readLockFileBehavior )
+import           Stack.Types.StackYamlLoc ( StackYamlLoc (..) )
+import           Stack.Types.Docker ( dockerEntrypointArgName )
 
--- | Parse command line arguments for Stack's @setup@ command.
-setupOptsParser :: OA.Parser SetupCmdOpts
-setupOptsParser = SetupCmdOpts
-  <$> OA.optional (OA.argument readVersion
-        (  OA.metavar "GHC_VERSION"
-        <> OA.help "Version of GHC to install, e.g. 9.6.5. (default: install \
-                   \the version implied by the resolver)"
+-- | Parser for global command-line options.
+globalOptsParser ::
+     FilePath
+  -> GlobalOptsContext
+  -> Parser GlobalOptsMonoid
+globalOptsParser currentDir kind = GlobalOptsMonoid
+  <$> optionalFirst (strOption
+        (  long Docker.reExecArgName
+        <> hidden
+        <> internal
         ))
-  <*> OA.boolFlags False
-        "reinstall"
-        "reinstalling GHC, even if available (incompatible with --system-ghc)."
-        OA.idm
-  <*> OA.optional (OA.strOption
-        (  OA.long "ghc-bindist"
-        <> OA.metavar "URL"
-        <> OA.help "Alternate GHC binary distribution (requires custom \
-                   \--ghc-variant)."
+  <*> optionalFirst (option auto
+        (  long dockerEntrypointArgName
+        <> hidden
+        <> internal
         ))
-  <*> OA.many (OA.strOption
-        (  OA.long "ghcjs-boot-options"
-        <> OA.metavar "GHCJS_BOOT"
-        <> OA.help "Additional ghcjs-boot options."
+  <*> (First <$> logLevelOptsParser hide0)
+  <*> firstBoolFlagsTrue
+        "time-in-log"
+        "inclusion of timings in logs, for the purposes of using diff with \
+        \logs."
+        hide
+  <*> firstBoolFlagsFalse
+        "rsl-in-log"
+        "inclusion of raw snapshot layer (rsl) in logs."
+        hide
+  <*> firstBoolFlagsFalse
+        "plan-in-log"
+        "inclusion of information about build plan construction in logs."
+        hide
+  <*> configOptsParser currentDir kind
+  <*> optionalFirst (abstractResolverOptsParser hide0)
+  <*> pure (First Nothing)
+  <*> optionalFirst (compilerOptsParser hide0)
+      -- resolver root is only set via the script command
+  <*> firstBoolFlagsNoDefault
+        "terminal"
+        "overriding terminal detection in the case of running in a false \
+        \terminal."
+        hide
+  <*> option readStyles
+        (  long "stack-colors"
+        <> long "stack-colours"
+        <> metavar "STYLES"
+        <> value mempty
+        <> help "Specify Stack's output styles; STYLES is a colon-delimited \
+                \sequence of key=value, where 'key' is a style name and 'value' \
+                \is a semicolon-delimited list of 'ANSI' SGR (Select Graphic \
+                \Rendition) control codes (in decimal). Use 'stack ls \
+                \stack-colors --basic' to see the current sequence. In shells \
+                \where a semicolon is a command separator, enclose STYLES in \
+                \quotes."
+        <> hide
+        )
+  <*> optionalFirst (option auto
+        (  long "terminal-width"
+        <> metavar "INT"
+        <> help "Specify the width of the terminal, used for pretty-print \
+                \messages."
+        <> hide
         ))
-  <*> OA.boolFlags True
-        "ghcjs-boot-clean"
-        "Control if ghcjs-boot should have --clean option present."
-        OA.idm
+  <*> optionalFirst (strOption
+        (  long "stack-yaml"
+        <> metavar "STACK-YAML"
+        <> completer (fileExtCompleter [".yaml"])
+        <> help "Override project stack.yaml file (overrides any STACK_YAML \
+                \environment variable)."
+        <> hide
+        ))
+  <*> optionalFirst (option readLockFileBehavior
+        (  long "lock-file"
+        <> help "Specify how to interact with lock files. (default: if \
+                \resolver is overridden: read-only; otherwise: read/write)"
+        <> hide
+        ))
  where
-  readVersion = do
-    s <- OA.readerAsk
-    case parseWantedCompiler ("ghc-" <> T.pack s) of
-      Left _ ->
-        case parseWantedCompiler (T.pack s) of
-          Left _ -> OA.readerError $ "Invalid version: " ++ s
-          Right x -> pure x
-      Right x -> pure x
+  hide = hideMods hide0
+  hide0 = kind /= OuterGlobalOpts
+
+-- | Create GlobalOpts from GlobalOptsMonoid.
+globalOptsFromMonoid ::
+     MonadIO m
+  => Bool
+  -> GlobalOptsMonoid
+  -> m GlobalOpts
+globalOptsFromMonoid defaultTerminal globalMonoid = do
+  resolver <- for (getFirst globalMonoid.resolver) $ \ur -> do
+    root <-
+      case globalMonoid.resolverRoot of
+        First Nothing -> getCurrentDir
+        First (Just dir) -> resolveDir' dir
+    resolvePaths (Just root) ur
+  stackYaml <-
+    case getFirst globalMonoid.stackYaml of
+      Nothing -> pure SYLDefault
+      Just fp -> SYLOverride <$> resolveFile' fp
+  let lockFileBehavior =
+        let defLFB =
+              case getFirst globalMonoid.resolver of
+                Nothing -> LFBReadWrite
+                _ -> LFBReadOnly
+        in  fromFirst defLFB globalMonoid.lockFileBehavior
+  pure GlobalOpts
+    { reExecVersion = getFirst globalMonoid.reExecVersion
+    , dockerEntrypoint = getFirst globalMonoid.dockerEntrypoint
+    , logLevel = fromFirst defaultLogLevel globalMonoid.logLevel
+    , timeInLog = fromFirstTrue globalMonoid.timeInLog
+    , rslInLog = fromFirstFalse globalMonoid.rslInLog
+    , planInLog = fromFirstFalse globalMonoid.planInLog
+    , configMonoid = globalMonoid.configMonoid
+    , resolver
+    , compiler = getFirst globalMonoid.compiler
+    , terminal = fromFirst defaultTerminal globalMonoid.terminal
+    , stylesUpdate = globalMonoid.styles
+    , termWidthOpt = getFirst globalMonoid.termWidthOpt
+    , stackYaml
+    , lockFileBehavior
+    }
+
+-- | Default logging level should be something useful but not crazy.
+defaultLogLevel :: LogLevel
+defaultLogLevel = LevelInfo
+
+readStyles :: ReadM StylesUpdate
+readStyles = parseStylesUpdateFromString <$> readerAsk

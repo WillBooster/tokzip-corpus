@@ -1,88 +1,244 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
+using System.Diagnostics;
+using System.Threading;
 using NUnit.Framework.Interfaces;
-using NUnit.Framework.Internal.Builders;
-using NUnit.Framework.Internal.Extensions;
+using NUnit.Framework.Internal;
+using NUnit.Framework.Tests.TestUtilities;
 
-namespace NUnit.Framework.Internal.Commands
+namespace NUnit.Framework.Tests.Internal
 {
-    /// <summary>
-    /// TestMethodCommand is the lowest level concrete command
-    /// used to run actual test cases.
-    /// </summary>
-    public class TestMethodCommand : TestCommand
+    [Parallelizable(ParallelScope.Children)]
+    public static class SingleThreadedTestSynchronizationContextTests
     {
-        private readonly TestMethod _testMethod;
-        private readonly object?[] _arguments;
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="TestMethodCommand"/> class.
-        /// </summary>
-        /// <param name="testMethod">The test.</param>
-        public TestMethodCommand(TestMethod testMethod) : base(testMethod)
+        [Test]
+        public static void RunWaitsWhenQueueIsEmptyUntilShutdown()
         {
-            _testMethod = testMethod;
-            _arguments = testMethod.Arguments;
-        }
-
-        /// <summary>
-        /// Runs the test, saving a TestResult in the execution context, as
-        /// well as returning it. If the test has an expected result, it
-        /// is asserts on that value. Since failed tests and errors throw
-        /// an exception, this command must be wrapped in an outer command,
-        /// will handle that exception and records the failure. This role
-        /// is usually played by the SetUpTearDown command.
-        /// </summary>
-        /// <param name="context">The execution context</param>
-        public override TestResult Execute(TestExecutionContext context)
-        {
-            // NOTE: Things would be cleaner if we could handle
-            // exceptions in this command. However, that would
-            // make it impossible to write a wrapper command to
-            // implement ExpectedException, among other things.
-
-            var result = RunTestMethod(context);
-
-            if (_testMethod.HasExpectedResult)
-                Assert.That(result, Is.EqualTo(_testMethod.ExpectedResult));
-
-            context.CurrentResult.SetResult(ResultState.Success);
-
-            if (context.CurrentResult.AssertionResults.Count > 0)
-                context.CurrentResult.RecordTestCompletion();
-
-            return context.CurrentResult;
-        }
-
-        private object? RunTestMethod(TestExecutionContext context)
-        {
-            var methodInfo = MethodInfoCache.Get(_testMethod.Method);
-
-            bool lastParameterAcceptsCancellationToken = methodInfo.Parameters.LastParameterAcceptsCancellationToken();
-
-            if (methodInfo.IsAsyncOperation)
+            using (var context = new SingleThreadedTestSynchronizationContext(shutdownTimeout: TimeSpan.FromSeconds(1)))
             {
-                return AsyncToSyncAdapter.Await(() => InvokeTestMethod(context, lastParameterAcceptsCancellationToken));
+                var thread = new Thread(context.Run);
+
+                using (var queueRunning = new ManualResetEventSlim())
+                {
+                    context.Post(_ => queueRunning.Set(), null);
+                    thread.Start();
+                    Assert.That(queueRunning.Wait(1000), Is.True);
+                }
+
+                Assert.That(thread.Join(10), Is.False);
+
+                context.ShutDown();
+
+                Assert.That(thread.Join(1000), Is.True);
+            }
+        }
+
+        [Test]
+        public static void RunWaitsWhenQueueIsEmptyUntilPostAndExecutesPostedWork()
+        {
+            using (var context = new SingleThreadedTestSynchronizationContext(shutdownTimeout: TimeSpan.FromSeconds(1)))
+            {
+                var thread = new Thread(context.Run);
+                thread.Start();
+
+                using (var workExecuted = new ManualResetEventSlim())
+                {
+                    Thread.Sleep(100);
+                    context.Post(_ => workExecuted.Set(), null);
+
+                    Assert.That(workExecuted.Wait(1000), Is.True);
+                }
+            }
+        }
+
+        [Test]
+        public static void RunAfterShutdownThrowsInvalidOperationException()
+        {
+            using (var context = new SingleThreadedTestSynchronizationContext(shutdownTimeout: TimeSpan.FromSeconds(1)))
+            {
+                context.ShutDown();
+
+                Assert.That(context.Run, Throws.InvalidOperationException);
+            }
+        }
+
+        [Test]
+        public static void ReenteringRunThrowsInvalidOperationException()
+        {
+            using (var context = new SingleThreadedTestSynchronizationContext(shutdownTimeout: TimeSpan.FromSeconds(1)))
+            {
+                context.Post(_ =>
+                {
+                    Assert.That(context.Run, Throws.InvalidOperationException);
+                    context.ShutDown();
+                }, null);
+
+                context.Run();
+            }
+        }
+
+        [Test]
+        public static void RecursivelyPostedWorkIsStillExecutedIfStartedWithinTimeout()
+        {
+            using (var context = new SingleThreadedTestSynchronizationContext(shutdownTimeout: TimeSpan.FromSeconds(1)))
+            using (TestUtils.TemporarySynchronizationContext(context))
+            {
+                var wasExecuted = new CallbackWatcher();
+
+                context.Post(state =>
+                {
+                    context.Post(_ => Thread.Sleep(TimeSpan.FromSeconds(0.5)), null);
+                    context.Post(_ => wasExecuted.OnCallback(), null);
+
+                    context.ShutDown();
+                }, null);
+
+                using (wasExecuted.ExpectCallback())
+                    context.Run();
+            }
+        }
+
+        [Test]
+        public static void WorkInQueueAfterTimeoutIsDiscardedAndCausesRunToThrowAndError()
+        {
+            using (var context = new SingleThreadedTestSynchronizationContext(shutdownTimeout: TimeSpan.FromSeconds(1)))
+            using (TestUtils.TemporarySynchronizationContext(context))
+            {
+                var wasExecuted = new CallbackWatcher();
+
+                context.Post(state =>
+                {
+                    context.Post(_ => Thread.Sleep(TimeSpan.FromSeconds(1.5)), null);
+                    context.Post(_ => wasExecuted.OnCallback(), null);
+
+                    context.ShutDown();
+                }, null);
+
+                TestResult testResult;
+                Exception? exception;
+
+                using (wasExecuted.ExpectCallback(count: 0)) // Work is discarded
+                using (new TestExecutionContext.IsolatedContext())
+                {
+                    try
+                    {
+                        context.Run();
+                        exception = null;
+                    }
+                    catch (Exception ex)
+                    {
+                        exception = ex;
+                    }
+
+                    testResult = TestExecutionContext.CurrentContext.CurrentResult;
+                }
+
+                Assert.That(exception, Is.InstanceOf<InvalidOperationException>()); // Run() throws
+
+                Assert.That(testResult.WorstAssertionStatus, Is.EqualTo(AssertionStatus.Error)); // Run() errors
+            }
+        }
+
+        [Test]
+        public static void PostAfterTimeoutDiscardsWorkAndThrowsAndErrors()
+        {
+            using (var context = new SingleThreadedTestSynchronizationContext(shutdownTimeout: TimeSpan.FromSeconds(1)))
+            using (TestUtils.TemporarySynchronizationContext(context))
+            {
+                var wasExecuted = new CallbackWatcher();
+
+                var testResult = default(TestResult);
+                var exception = default(Exception);
+
+                context.Post(state =>
+                {
+                    context.Post(_ =>
+                    {
+                        Thread.Sleep(TimeSpan.FromSeconds(1.5));
+
+                        try
+                        {
+                            context.Post(_ => wasExecuted.OnCallback(), null);
+                            exception = null;
+                        }
+                        catch (Exception ex)
+                        {
+                            exception = ex;
+                        }
+
+                        testResult = TestExecutionContext.CurrentContext.CurrentResult;
+                    }, null);
+
+                    context.ShutDown();
+                }, null);
+
+                using (wasExecuted.ExpectCallback(count: 0)) // Work is discarded
+                using (new TestExecutionContext.IsolatedContext())
+                {
+                    context.Run();
+                }
+
+                Assert.That(exception, Is.InstanceOf<InvalidOperationException>()); // Run() throws
+
+                Assert.That(testResult, Is.Not.Null);
+                Assert.That(testResult.WorstAssertionStatus, Is.EqualTo(AssertionStatus.Error)); // Run() errors
+            }
+        }
+
+        [Test]
+        public static void RecursivelyPostedWorkIsStillExecutedWithinTimeout()
+        {
+            using (var context = new SingleThreadedTestSynchronizationContext(shutdownTimeout: TimeSpan.FromSeconds(1)))
+            using (TestUtils.TemporarySynchronizationContext(context))
+            {
+                var wasExecuted = new CallbackWatcher();
+
+                context.Post(_ =>
+                {
+                    ScheduleWorkRecursively(Stopwatch.StartNew(), until: TimeSpan.FromSeconds(0.5), wasExecuted: wasExecuted);
+
+                    context.ShutDown();
+                }, null);
+
+                using (wasExecuted.ExpectCallback())
+                    context.Run();
+            }
+        }
+
+        private static void ScheduleWorkRecursively(Stopwatch stopwatch, TimeSpan until, CallbackWatcher wasExecuted)
+        {
+            if (stopwatch.Elapsed >= until)
+            {
+                wasExecuted.OnCallback();
+                return;
             }
 
-            return InvokeTestMethod(context, lastParameterAcceptsCancellationToken);
+            SynchronizationContext? current = SynchronizationContext.Current;
+            Assert.That(current, Is.Not.Null);
+            current.Post(_ => ScheduleWorkRecursively(stopwatch, until, wasExecuted), null);
         }
 
-        private object? InvokeTestMethod(TestExecutionContext context, bool lastParameterAcceptsCancellationToken)
+        [Test]
+        public static void Duplicate_shutdown_call_does_not_extend_shutdown_time()
         {
-            object?[] arguments = _arguments;
-
-            if (lastParameterAcceptsCancellationToken &&
-                !arguments.LastArgumentIsCancellationToken())
+            using (var context = new SingleThreadedTestSynchronizationContext(shutdownTimeout: TimeSpan.FromSeconds(1.5)))
+            using (TestUtils.TemporarySynchronizationContext(context))
             {
-                // Add our CancellationToken as an extra argument to the test method
-                arguments = new object?[_arguments.Length + 1];
-                Array.Copy(_arguments, arguments, _arguments.Length);
-                arguments[_arguments.Length] = context.CancellationToken;
-            }
+                var wasExecuted = new CallbackWatcher();
 
-            return _testMethod.Method.Invoke(context.TestObject, arguments);
+                context.Post(_ =>
+                {
+                    context.ShutDown();
+                    Thread.Sleep(TimeSpan.FromSeconds(1));
+                    context.ShutDown();
+                }, null);
+                context.Post(_ => Thread.Sleep(TimeSpan.FromSeconds(1)), null);
+                context.Post(_ => wasExecuted.OnCallback(), null);
+
+                using (wasExecuted.ExpectCallback(count: 0))
+                    Assert.That(context.Run, Throws.InvalidOperationException);
+            }
         }
     }
 }

@@ -1,207 +1,174 @@
-button.textContent = text;
-  button.dataset.active = "false";
+Set a `.msi` output extension to build a Windows Installer package directly. It
+installs the app per-machine under `%ProgramFiles%\<AppName>\` and registers an
+uninstaller. The MSI is authored in pure Rust, so it cross-compiles from any
+host (only the target must be Windows). To package the directory another way,
+zip it or feed it into a third-party installer generator such as Inno Setup,
+NSIS, or WiX.
 
-  button.addEventListener("click", () => {
-    const isActive = button.dataset.active === "true";
-    button.dataset.active = isActive ? "false" : "true";
-    button.classList.toggle("active", !isActive);
-  });
+### Linux
 
-  return button;
-}
+| Output            | Produced by                                  |
+| ----------------- | -------------------------------------------- |
+| `my-app/`         | Default; app directory with launcher script. |
+| `my-app.AppImage` | Single-file portable bundle.                 |
+| `my-app.deb`      | Debian/Ubuntu package.                       |
+| `my-app.rpm`      | Fedora/RHEL package.                         |
 
-Deno.test("event handling test", () => {
-  // Create button
-  const button = createToggleButton("Toggle Me");
+The app directory layout:
 
-  // Initial state
-  assertEquals(button.dataset.active, "false");
-  assertEquals(button.classList.contains("active"), false);
-
-  // Simulate click event
-  button.dispatchEvent(new Event("click"));
-
-  // Test after first click
-  assertEquals(button.dataset.active, "true");
-  assertEquals(button.classList.contains("active"), true);
-
-  // Simulate another click
-  button.dispatchEvent(new Event("click"));
-
-  // Test after second click
-  assertEquals(button.dataset.active, "false");
-  assertEquals(button.classList.contains("active"), false);
-});
+```
+my-app/
+  my-app                  # launcher shell script
+  libdenort.so            # Deno runtime + your code
+  *.so                    # rendering backend and CEF libraries
+  resources.pak, locales/ # CEF support files
+  AppIcon.png             # icon (optional)
 ```
 
-## Testing Fetch Requests
+`AppImage` is the most portable Linux format: one file, no install step, runs on
+any modern distro. `deno desktop` builds it directly: it packs the app directory
+into a SquashFS image and prepends the AppImage Type-2 runtime, adding the
+required `AppRun`, `.desktop`, and icon entries. There is no external tool to
+install (no `appimagetool`), and it works from any build host, so you can
+produce a Linux `.AppImage` while cross-compiling from macOS or Windows.
 
-Testing components that make network requests requires mocking the fetch API.
+Set a `.deb` or `.rpm` output extension to build a Linux package directly. Both
+install the app under `/usr/lib/<pkg>/`, symlink a launcher into `/usr/bin/`,
+and register a `.desktop` entry and icon. Like the `.AppImage`, they are
+assembled in pure Rust and cross-compile from any host (only the target must be
+Linux).
 
-In the below example we will [mock](/runtime/test/mocking/) the `fetch` API to
-test a function that retrieves user data from an external API. The test creates
-a spy function that returns predefined responses based on the requested URL,
-allowing you to test both successful requests and error handling without making
-actual network calls:
+## Compressing the bundle
 
-```ts
-import { assertSpyCalls, spy } from "jsr:@std/testing/mock";
-import { assertEquals } from "jsr:@std/assert";
+Pass `--compress` to ship a self-extracting bundle. The heavy payload (the
+runtime and UI backend) is compressed inside the distributed app and unpacked to
+a per-user data directory on first launch, then reused on later runs. This
+shrinks the distributed artifact substantially, a webview hello-world drops from
+about 66 MB to 19 MB, in exchange for a one-time decompression on first launch.
 
-// Component that fetches data
-async function fetchUserData(
-  userId: string,
-): Promise<{ name: string; email: string }> {
-  const response = await fetch(`https://api.example.com/users/${userId}`);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch user: ${response.status}`);
-  }
-  return await response.json();
-}
+```sh
+# Self-extracting, compressed bundle
+deno desktop --compress main.ts
 
-Deno.test("fetch request test", async () => {
-  // Mock fetch response
-  const originalFetch = globalThis.fetch;
+# Choose the codec explicitly
+deno desktop --compress=xz main.ts
+deno desktop --compress=zstd main.ts
+```
 
-  const mockFetch = spy(async (input: RequestInfo | URL): Promise<Response> => {
-    const url = input.toString();
-    if (url === "https://api.example.com/users/123") {
-      return new Response(
-        JSON.stringify({ name: "John Doe", email: "john@example.com" }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
+`xz` produces the smaller artifact; `zstd` trades some size for faster
+first-launch decompression.
+
+## Choosing the output path
+
+The output path can be set in three places, in priority order:
+
+1. The `--output` CLI flag.
+2. The `desktop.output` field in `deno.json` (per-platform).
+3. The default: the project name, with the platform-appropriate extension.
+
+```sh
+# Override per build:
+deno desktop --output ./builds/MyApp-1.4.0.dmg main.ts
+```
+
+```jsonc title="deno.json"
+{
+  "desktop": {
+    "output": {
+      "macos": "./dist/macos/MyApp.app",
+      "windows": "./dist/windows/MyApp",
+      "linux": "./dist/linux/my-app.AppImage"
     }
-    return new Response("Not found", { status: 404 });
-  });
-
-  // Replace global fetch with mock
-  globalThis.fetch = mockFetch;
-
-  try {
-    // Call the function with a valid ID
-    const userData = await fetchUserData("123");
-
-    // Assert the results
-    assertEquals(userData, { name: "John Doe", email: "john@example.com" });
-    assertSpyCalls(mockFetch, 1);
-
-    // Test error handling (optional)
-    try {
-      await fetchUserData("invalid");
-      throw new Error("Should have thrown an error for invalid ID");
-    } catch (error) {
-      assertEquals((error as Error).message, "Failed to fetch user: 404");
-    }
-
-    assertSpyCalls(mockFetch, 2);
-  } finally {
-    // Restore the original fetch
-    globalThis.fetch = originalFetch;
   }
-});
+}
 ```
 
-## Using Testing Steps to set up and teardown
+## Cross-compilation details
 
-For complex tests, you can use steps to organize test logic into discrete
-sections, making tests more readable and maintainable. Steps also enable better
-isolation between different parts of your test. Using step naming you can
-implement a setup and teardown of the test conditions.
+Cross-compiling from one OS to another requires:
 
-```ts
-import { DOMParser } from "jsr:@b-fuze/deno-dom";
-import { assertEquals, assertExists } from "jsr:@std/assert";
+- The right `denort` binary for the target. Downloaded automatically from
+  `github.com/denoland/deno/releases`, matching your local Deno version.
+- The right backend archive for the target. Downloaded automatically, pinned to
+  your Deno version.
 
-Deno.test("complex web component test", async (t) => {
-  const doc = new DOMParser().parseFromString(
-    "<!DOCTYPE html><html></html>",
-    "text/html",
-  );
-  const body = doc.createElement("body");
-  const container = doc.createElement("div");
-  body.appendChild(container);
+Both downloads are SHA-256 verified and cached under `<deno_dir>/`.
 
-  await t.step("initial rendering", () => {
-    container.innerHTML = `<div id="app"></div>`;
-    const app = container.querySelector("#app");
-    assertExists(app);
-    assertEquals(app.children.length, 0);
-  });
+There is **no Rust toolchain involved** in cross-compiling a desktop app. You
+are not compiling Rust on the host; you are downloading prebuilt artifacts for
+the target and packaging them with your code. This is the same model as
+`deno compile --target`.
 
-  await t.step("adding content", () => {
-    const app = container.querySelector("#app");
-    assertExists(app);
+Icon assembly (`.icns`, `.ico`) and the Linux `.AppImage` are produced on any
+host. The one exception is the macOS `.dmg`, which shells out to `hdiutil` and
+therefore must be built on a macOS host. To produce a `.dmg` from another
+platform, build it on a macOS CI machine.
 
-    const header = doc.createElement("header");
-    header.textContent = "My App";
-    app.appendChild(header);
+## CI
 
-    assertEquals(app.children.length, 1);
-    assertEquals(app.firstElementChild?.tagName.toLowerCase(), "header");
-  });
+A typical GitHub Actions matrix builds platform-native installers in parallel:
 
-  await t.step("responding to user input", () => {
-    const app = container.querySelector("#app");
-    assertExists(app);
+```yaml title=".github/workflows/release.yml"
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
 
-    const button = doc.createElement("button");
-    button.textContent = "Click me";
-    button.id = "test-button";
-    app.appendChild(button);
+      - run: deno desktop --target ${{ matrix.target }} main.ts
 
-    let clickCount = 0;
-    button.addEventListener("click", () => clickCount++);
-
-    button.dispatchEvent(new Event("click"));
-    button.dispatchEvent(new Event("click"));
-
-    assertEquals(clickCount, 2);
-  });
-
-  await t.step("removing content", () => {
-    const app = container.querySelector("#app");
-    assertExists(app);
-
-    const header = app.querySelector("header");
-    assertExists(header);
-
-    header.remove();
-    assertEquals(app.children.length, 1); // Only the button should remain
-  });
-});
+      - uses: actions/upload-artifact@v4
+        with:
+          name: my-app-${{ matrix.target }}
+          path: dist/
 ```
 
-## Best Practices for Web Testing in Deno
+Cross-compiling from a single host (e.g. only running on `ubuntu-latest` with
+`--all-targets`) works for the bundles and the Linux `.AppImage`. Only the macOS
+`.dmg` needs a macOS host.
 
-1. Maintain isolation - Each test should be self-contained and not depend on
-   other tests.
+## Code signing
 
-2. Use names to show intent - descriptive names for tests make it clear what is
-   being tested and give more readable output in the console
+On macOS, `deno desktop` code-signs the bundle for you. By default it applies an
+**ad-hoc** signature (`-`), which gives the app a stable code identity, enough
+for the OS to grant [notification](/runtime/desktop/notifications/) permission,
+but not enough to distribute without Gatekeeper warnings. The CEF helper
+processes' bundle identifiers are harmonized with the main bundle id
+automatically.
 
-3. Clean up after your tests - remove any DOM elements created during tests to
-   prevent test pollution.
+To produce a distributable, notarizable bundle, set a real signing identity in
+`deno.json` (signing must run on a macOS host, since it shells out to
+`codesign(1)`):
 
-4. Mock external services (such as APIs) to make tests faster and more reliable.
-
-5. Organize tests into logical steps using `t.step()` for complex components.
-
-## Running Your Tests
-
-Execute your tests with the Deno test command:
-
-```bash
-deno test
+```jsonc title="deno.json"
+{
+  "desktop": {
+    "app": { "identifier": "com.example.myapp" },
+    "macos": {
+      "codesignIdentity": "Developer ID Application: Acme, Inc. (TEAMID)"
+    }
+  }
+}
 ```
 
-For web tests, you might need additional permissions:
+With a real identity, the bundle is signed with Hardened Runtime and a secure
+timestamp. **Notarization is still a separate step**. Submit the signed bundle
+with `xcrun notarytool submit` and staple the ticket.
 
-```bash
-deno test --allow-net --allow-read --allow-env
-```
+On Windows, sign the produced executables (the backend `.exe` and `denort.dll`
+in the output directory) externally for now, e.g.
+`signtool sign /f cert.pfx /tr <timestamp> <file>`.
 
-🦕 By following the patterns in this tutorial, you can write comprehensive tests
-for your web applications that verify both functionality and user experience.
+## Distributing updates after release
 
-Remember that effective testing leads to more robust applications and helps
-catch issues before they reach your users.
+Once your binary is in users' hands, ship updates via
+[`Deno.autoUpdate()`](/runtime/desktop/auto_update/): `bsdiff` patches shipped
+from your own server, no app store required.

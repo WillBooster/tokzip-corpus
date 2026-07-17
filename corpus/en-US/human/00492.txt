@@ -1,39 +1,216 @@
-Rust releases every six weeks, like clockwork. If you know the date of one Rust
-release, you can know the date of the next one: it’s six weeks later. A nice
-aspect of having releases scheduled every six weeks is that the next train is
-coming soon. If a feature happens to miss a particular release, there’s no need
-to worry: another one is happening in a short time! This helps reduce pressure
-to sneak possibly unpolished features in close to the release deadline.
+```
+pub fn spawn<F, T>(f: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T,
+        F: Send + 'static,
+        T: Send + 'static,
+```
 
-Thanks to this process, you can always check out the next build of Rust and
-verify for yourself that it’s easy to upgrade to: if a beta release doesn’t
-work as expected, you can report it to the team and get it fixed before the
-next stable release happens! Breakage in a beta release is relatively rare, but
-`rustc` is still a piece of software, and bugs do exist.
+The `F` type parameter is the one we’re concerned with here; the `T` type
+parameter is related to the return value, and we’re not concerned with that. We
+can see that `spawn` uses `FnOnce` as the trait bound on `F`. This is probably
+what we want as well, because we’ll eventually pass the argument we get in
+`execute` to `spawn`. We can be further confident that `FnOnce` is the trait we
+want to use because the thread for running a request will only execute that
+request’s closure one time, which matches the `Once` in `FnOnce`.
 
-### Maintenance time
+The `F` type parameter also has the trait bound `Send` and the lifetime bound
+`'static`, which are useful in our situation: We need `Send` to transfer the
+closure from one thread to another and `'static` because we don’t know how long
+the thread will take to execute. Let’s create an `execute` method on
+`ThreadPool` that will take a generic parameter of type `F` with these bounds:
 
-The Rust project supports the most recent stable version. When a new stable
-version is released, the old version reaches its end of life (EOL). This means
-each version is supported for six weeks.
+src/lib.rs
 
-### Unstable Features
+```
+impl ThreadPool {
+    // --snip--
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+    }
+}
+```
 
-There’s one more catch with this release model: unstable features. Rust uses a
-technique called “feature flags” to determine what features are enabled in a
-given release. If a new feature is under active development, it lands on the
-main branch, and therefore, in nightly, but behind a *feature flag*. If you, as
-a user, wish to try out the work-in-progress feature, you can, but you must be
-using a nightly release of Rust and annotate your source code with the
-appropriate flag to opt in.
 
-If you’re using a beta or stable release of Rust, you can’t use any feature
-flags. This is the key that allows us to get practical use with new features
-before we declare them stable forever. Those who wish to opt into the bleeding
-edge can do so, and those who want a rock-solid experience can stick with
-stable and know that their code won’t break. Stability without stagnation.
 
-This book only contains information about stable features, as in-progress
-features are still changing, and surely they’ll be different between when this
-book was written and when they get enabled in stable builds. You can find
-documentation for nightly-only features online.
+We still use the `()` after `FnOnce` because this `FnOnce` represents a closure
+that takes no parameters and returns the unit type `()`. Just like function
+definitions, the return type can be omitted from the signature, but even if we
+have no parameters, we still need the parentheses.
+
+Again, this is the simplest implementation of the `execute` method: It does
+nothing, but we’re only trying to make our code compile. Let’s check it again:
+
+```
+$ cargo check
+    Checking hello v0.1.0 (file:///projects/hello)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
+```
+
+It compiles! But note that if you try `cargo run` and make a request in the
+browser, you’ll see the errors in the browser that we saw at the beginning of
+the chapter. Our library isn’t actually calling the closure passed to `execute`
+yet!
+
+> Note: A saying you might hear about languages with strict compilers, such as
+> Haskell and Rust, is “If the code compiles, it works.” But this saying is not
+> universally true. Our project compiles, but it does absolutely nothing! If we
+> were building a real, complete project, this would be a good time to start
+> writing unit tests to check that the code compiles *and* has the behavior we
+> want.
+
+Consider: What would be different here if we were going to execute a future
+instead of a closure?
+
+#### Validating the Number of Threads in new
+
+We aren’t doing anything with the parameters to `new` and `execute`. Let’s
+implement the bodies of these functions with the behavior we want. To start,
+let’s think about `new`. Earlier we chose an unsigned type for the `size`
+parameter because a pool with a negative number of threads makes no sense.
+However, a pool with zero threads also makes no sense, yet zero is a perfectly
+valid `usize`. We’ll add code to check that `size` is greater than zero before
+we return a `ThreadPool` instance, and we’ll have the program panic if it
+receives a zero by using the `assert!` macro, as shown in Listing 21-13.
+
+src/lib.rs
+
+```
+impl ThreadPool {
+    /// Create a new ThreadPool.
+    ///
+    /// The size is the number of threads in the pool.
+    ///
+    /// # Panics
+    ///
+    /// The `new` function will panic if the size is zero.
+    pub fn new(size: usize) -> ThreadPool {
+        assert!(size > 0);
+
+        ThreadPool
+    }
+
+    // --snip--
+}
+```
+
+Listing 21-13: Implementing `ThreadPool::new` to panic if `size` is zero
+
+We’ve also added some documentation for our `ThreadPool` with doc comments.
+Note that we followed good documentation practices by adding a section that
+calls out the situations in which our function can panic, as discussed in
+Chapter 14. Try running `cargo doc --open` and clicking the `ThreadPool` struct
+to see what the generated docs for `new` look like!
+
+Instead of adding the `assert!` macro as we’ve done here, we could change `new`
+into `build` and return a `Result` like we did with `Config::build` in the I/O
+project in Listing 12-9. But we’ve decided in this case that trying to create a
+thread pool without any threads should be an unrecoverable error. If you’re
+feeling ambitious, try to write a function named `build` with the following
+signature to compare with the `new` function:
+
+```
+pub fn build(size: usize) -> Result<ThreadPool, PoolCreationError> {
+```
+
+#### Creating Space to Store the Threads
+
+Now that we have a way to know we have a valid number of threads to store in
+the pool, we can create those threads and store them in the `ThreadPool` struct
+before returning the struct. But how do we “store” a thread? Let’s take another
+look at the `thread::spawn` signature:
+
+```
+pub fn spawn<F, T>(f: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T,
+        F: Send + 'static,
+        T: Send + 'static,
+```
+
+The `spawn` function returns a `JoinHandle<T>`, where `T` is the type that the
+closure returns. Let’s try using `JoinHandle` too and see what happens. In our
+case, the closures we’re passing to the thread pool will handle the connection
+and not return anything, so `T` will be the unit type `()`.
+
+The code in Listing 21-14 will compile, but it doesn’t create any threads yet.
+We’ve changed the definition of `ThreadPool` to hold a vector of
+`thread::JoinHandle<()>` instances, initialized the vector with a capacity of
+`size`, set up a `for` loop that will run some code to create the threads, and
+returned a `ThreadPool` instance containing them.
+
+src/lib.rs
+
+```
+use std::thread;
+
+pub struct ThreadPool {
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+impl ThreadPool {
+    // --snip--
+    pub fn new(size: usize) -> ThreadPool {
+        assert!(size > 0);
+
+        let mut threads = Vec::with_capacity(size);
+
+        for _ in 0..size {
+            // create some threads and store them in the vector
+        }
+
+        ThreadPool { threads }
+    }
+    // --snip--
+}
+```
+
+Listing 21-14: Creating a vector for `ThreadPool` to hold the threads
+
+We’ve brought `std::thread` into scope in the library crate because we’re
+using `thread::JoinHandle` as the type of the items in the vector in
+`ThreadPool`.
+
+Once a valid size is received, our `ThreadPool` creates a new vector that can
+hold `size` items. The `with_capacity` function performs the same task as
+`Vec::new` but with an important difference: It pre-allocates space in the
+vector. Because we know we need to store `size` elements in the vector, doing
+this allocation up front is slightly more efficient than using `Vec::new`,
+which resizes itself as elements are inserted.
+
+When you run `cargo check` again, it should succeed.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id ="a-worker-struct-responsible-for-sending-code-from-the-threadpool-to-a-thread"></a>
+
+#### Sending Code from the ThreadPool to a Thread
+
+We left a comment in the `for` loop in Listing 21-14 regarding the creation of
+threads. Here, we’ll look at how we actually create threads. The standard
+library provides `thread::spawn` as a way to create threads, and
+`thread::spawn` expects to get some code the thread should run as soon as the
+thread is created. However, in our case, we want to create the threads and have
+them *wait* for code that we’ll send later. The standard library’s
+implementation of threads doesn’t include any way to do that; we have to
+implement it manually.
+
+We’ll implement this behavior by introducing a new data structure between the
+`ThreadPool` and the threads that will manage this new behavior. We’ll call
+this data structure *Worker*, which is a common term in pooling
+implementations. The `Worker` picks up code that needs to be run and runs the
+code in its thread.
+
+Think of people working in the kitchen at a restaurant: The workers wait until
+orders come in from customers, and then they’re responsible for taking those
+orders and filling them.
+
+Instead of storing a vector of `JoinHandle<()>` instances in the thread pool,
+we’ll store instances of the `Worker` struct. Each `Worker` will store a single
+`JoinHandle<()>` instance. Then, we’ll implement a method on `Worker` that will
+take a closure of code to run and send it to the already running thread for
+execution. We’ll also give each `Worker` an `id` so that we can distinguish
+between the different instances of `Worker` in the pool when logging or
+debugging.

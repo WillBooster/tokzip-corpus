@@ -1,139 +1,93 @@
-At this point, the phone is ready.
+## The second issue: Unfiltered HTML
 
-## Modifying the Apk
+The first issue can cause the biggest danger, probably just a redirect (the codimd article says that XSS can be done in Safari, but I can't do it QQ). However, there is a bigger problem besides this, which is here:
 
-The apk used for this demonstration can be found here: https://github.com/aszx87410/demo/raw/master/android/demoapp-http.apk
+``` js
+<>
+  <div
+    className={classNames({ 'u-content': true, translating })}
+    dangerouslySetInnerHTML={{
+      __html: optimizeEmbed(translation || article.content),
+    }}
+    onClick={captureClicks}
+    ref={contentContainer}
+  />
 
-The content of the app is simple: pressing a button sends a request, and if it is intercepted, it means that it was successful. After installing the app, you can try it out. You should find that even though all the settings are in place, the proxy is still empty.
-
-As I mentioned at the beginning, there is a section in the Android official documentation that explains this: [Network security configuration](https://developer.android.com/training/articles/security-config)
-
-The modification method is also simple and basically does not require any changes to the code. Therefore, we first use Apktool to unpack the apk.
-
-Next, open AndroidManifest.xml and find `<application>`. Check if it has the attribute `android:networkSecurityConfig`. If it does not, add it: `android:networkSecurityConfig="@xml/network_security_config"`. If it does, remember the name of the xml.
-
-Then, go to res/xml and add `network_security_config.xml`, with the following content:
-
-``` xml
-<?xml version="1.0" encoding="utf-8"?>
-<network-security-config>
-  <base-config cleartextTrafficPermitted="true">
-    <trust-anchors>
-      <certificates src="system" />
-      <certificates src="user" />
-    </trust-anchors>
-  </base-config>
-</network-security-config>
+  <style jsx>{styles}</style>
+</>
 ```
 
-This file represents that the app trusts all certificates, including those installed by the user. If the app already has this file, you can replace the contents with the above to ensure that the app trusts user certificates.
+`article.content` is an HTML string filtered by js-xss, so it is safe. However, here it goes through an `optimizeEmbed` to do custom conversion, which is a more dangerous thing to do after filtering, because if there is negligence in the process, it will cause an XSS vulnerability.
 
-Then repack the apk and click the button again to see if you can intercept the traffic from the proxy:
+In the conversion, there is a piece of code:
 
-![](/img/android-apk-decompile-intro/p8-success.png)
-
-## Certificate pinning
-
-If the proxy still cannot listen after the above steps, it means that the app may have other security settings, such as certificate pinning.
-
-What is certificate pinning? If a webpage uses https, it means that the server has an https certificate, and certificate pinning means that the app specifies what certificate should correspond to a certain domain. If the certificate does not match, it means that someone is messing with it in the middle, so the connection is rejected.
-
-Taking the popular library OkHttp as an example, the document writes how to implement this feature:
-
-``` java
-String hostname = "publicobject.com";
-CertificatePinner certificatePinner = new CertificatePinner.Builder()
-    .add(hostname, "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-    .build();
-OkHttpClient client = OkHttpClient.Builder()
-    .certificatePinner(certificatePinner)
-    .build();
-
-Request request = new Request.Builder()
-    .url("https://" + hostname)
-    .build();
-client.newCall(request).execute();
+``` html
+<source
+  type="image/webp"
+  media="(min-width: 768px)"
+  srcSet=${toSizedImageURL({ url: src, size: '1080w', ext: 'webp' })}
+  onerror="this.srcset='${src}'"
+/>
 ```
 
-If you want to try it out, you can use this apk file: https://github.com/aszx87410/demo/raw/master/android/demoapp-pinning.apk
+Looking closely at this code, if `${toSizedImageURL({ url: src, size: '1080w', ext: 'webp' })}` or `src` can be controlled, there is a chance to change the content of the attribute or add a new attribute.
 
-We still use apktool to unpack it, then put the network security config in as before, and then find where the code uses certificate pinner.
+I originally wanted to insert a malicious src to make onerror become `onerror="this.srcset='test';alert(1)"` and other code, but I later found that the onerror event of the source under the picture seems to be invalid, even if there is an error in srcset, it will not trigger, so it is useless.
 
-Because the code has turned on proguard this time, even okhttp has been obfuscated, and searching for the keyword `certificatePinner` may not find anything. What should we do? We can try another way. When using this feature, you must write a set of sha256 values in it, so we can search for: `sha256/`
+Therefore, I focused on srcSet and inserting new attributes. Here, `onanimationstart` can be used, which is an event that will be triggered when the animation starts, and the name of the animation can be found in CSS. Fortunately, I found a keyframe called `spinning`.
 
-We can find such a paragraph:
+So if the img src is: `https://assets.matters.news/processed/1080w/embed/test style=animation-name:spinning onanimationstart=console.log(1337)`
 
-``` java
-# virtual methods
-.method public run()V
-    .locals 13
+The combined code is:
 
-    .line 1
-    new-instance v0, Ljava/util/ArrayList;
-
-    invoke-direct {v0}, Ljava/util/ArrayList;-><init>()V
-
-    const-string v1, "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-
-    .line 2
-    filled-new-array {v1}, [Ljava/lang/String;
-
-    move-result-object v1
-
-    const-string v2, "archive.org"
-
-    const-string v3, "pattern"
-
-    .line 3
-    invoke-static {v2, v3}, Lc/j/b/d;->d(Ljava/lang/Object;Ljava/lang/String;)V
-
-    const-string v3, "pins"
-
-    invoke-static {v1, v3}, Lc/j/b/d;->d(Ljava/lang/Object;Ljava/lang/String;)V
-
-    const/4 v3, 0x0
-
-    const/4 v4, 0x0
+``` html
+<source
+  type="image/webp"
+  media="(min-width: 768px)"   
+  srcSet=https://assets.matters.news/processed/1080w/embed/test 
+  style=animation-name:spinning 
+  onanimationstart=console.log(1337)
+  onerror="this.srcset='${src}'"
+/>
 ```
 
-What should we do after finding it? Do we need to change smali and remove certificate pinner? In fact, there is a simpler way.
+In this way, an XSS vulnerability is created:
 
-From the code, we can guess that the `archive.org` below should be the bound domain, so as long as we change this domain to any other string, other domains will not check whether the certificate matches.
+![](/img/prevent-xss/xss1.png)
+![](/img/prevent-xss/xss2.png)
 
-After changing it, repack the app and install it, and you can listen to the traffic normally.
+There are several ways to fix it:
 
-Like the above, changing where certificatePinner is used, there is another way to directly change the implementation of okhttp. Find `okhttp3/CertificatePinner$Builder.smali` in smali, and there is a function:
-
-``` java
-# virtual methods
-.method public varargs add(Ljava/lang/String;[Ljava/lang/String;)Lokhttp3/CertificatePinner$Builder;
-    .locals 5
-```
-
-This is the method that okhttp uses to handle adding certificate pinner. We just need to change it like this:
-
-``` java
-# virtual methods
-.method public varargs add(Ljava/lang/String;[Ljava/lang/String;)Lokhttp3/CertificatePinner$Builder;
-    .locals 5
-
-    # patch
-    const-string p1, "abc"
-```
-
-So the first parameter (domain) will always be abc and will never take effect.
+1. Add a CSP header to prevent the execution of inline scripts (this is more difficult to achieve because it may conflict with existing things and requires more time to process).
+2. Filter the img url passed in (there is still a risk if the filtering is not done well).
+3. Change the HTML first and then call js-xss to filter out the attributes that should not exist.
 
 ## Summary
 
-In this article, we learned how to modify the app ourselves and remove some anti-man-in-the-middle attack mechanisms, such as changing the network security config and the part of the code that handles certificate pinning.
+We found two vulnerabilities:
 
-For general apps, this should be enough, at least to monitor traffic and see what the app is sending. And compared to the VPN solution, there is another advantage, that is, it can be repackaged twice, and a version that can work by replacing the API address can be produced, with higher flexibility.
+1. Redirect users to any location through `<iframe>`
+2. Execute an XSS attack on the article page through `<source>`
 
-In the next article, we will learn another way to analyze apps.
+What kind of attack can actually be done?
 
-Series link:
+First, use the second vulnerability to publish an article with an XSS attack, and then write a bot to leave a message under all articles, using `<iframe>` to redirect users to the article with XSS. In this way, as long as the user clicks on any article, they will be attacked.
 
-1. [Android App Reverse Engineering Part 1: Disassembling and Reassembling APKs](/2023/04/27/en/android-apk-decompile-intro-1/)
-2. [Android App Reverse Engineering Part 2: Modifying Smali Code](/2023/04/27/en/android-apk-decompile-intro-2/)
-3. [Android App Reverse Engineering Part 3: Intercepting App Packets](/2023/04/27/en/android-apk-decompile-intro-3/) - You are here
-4. [Android App Reverse Engineering Part 4: Dynamic Analysis with Frida](/2023/04/27/en/android-apk-decompile-intro-4/)
+However, the defense of other parts of the website itself is well done. Although there is XSS, the Cookie is HttpOnly, so it cannot be stolen, and the password modification is sent by email, so the password cannot be modified. It seems that it is not possible to do really serious things.
+
+Many libraries that filter XSS are safe (although sometimes there are still vulnerabilities found, such as [bypassing DOMPurify](https://portswigger.net/research/bypassing-dompurify-again-with-mutation-xss)), but people who use the library may ignore some settings or do extra things, resulting in HTML that is still unsafe.
+
+When dealing with user input, every step should be carefully reviewed to avoid negligence.
+
+It is also recommended to set up CSP headers as a last line of defense against XSS attacks. Although some CSP rules can be bypassed, it is still better than having nothing.
+
+Matters has its own Bug Bounty Program, which offers rewards for finding vulnerabilities that can prove harmful. The XSS vulnerability found in this article is classified as High, with a value of $150 USD. The team believes that open source can benefit technical professionals and make websites more secure, so they hope everyone knows about this program.
+
+Finally, thanks to the Matters team for their quick response and handling, and thanks to the colleagues at Cymetrics.
+
+Timeline:
+
+- May 7, 2021: Vulnerability reported
+- May 12, 2021: Received confirmation from the Matters team that they are fixing the vulnerability
+- May 12, 2021: Asked for permission to publish the article after the fix, received permission
+- May 13, 2021: Fix completed

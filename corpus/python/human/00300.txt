@@ -1,73 +1,255 @@
-import pytest
+from typing import ClassVar, Generic, Optional, TypeVar, Union
 
-from pydantic_core import PydanticOmit, SchemaError, SchemaValidator, ValidationError, core_schema
-from pydantic_core import core_schema as cs
-
-from .conftest import PyAndJson
+from pydantic import BaseModel, Field, create_model, field_validator
+from pydantic.dataclasses import dataclass
 
 
-def test_isinstance():
-    v = SchemaValidator(cs.int_schema())
-    assert v.validate_python(123) == 123
-    assert v.isinstance_python(123) is True
-    assert v.validate_python('123') == 123
-    assert v.isinstance_python('123') is True
+class Model(BaseModel):
+    x: float
+    y: str
 
-    with pytest.raises(ValidationError, match='Input should be a valid integer'):
-        v.validate_python('foo')
+    model_config = dict(from_attributes=True)
 
-    assert v.isinstance_python('foo') is False
+    class NotConfig:
+        frozen = True
 
 
-def test_isinstance_strict():
-    v = SchemaValidator(cs.int_schema(strict=True))
-    assert v.validate_python(123) == 123
-    assert v.isinstance_python(123) is True
+class SelfReferencingModel(BaseModel):
+    submodel: Optional['SelfReferencingModel']
 
-    with pytest.raises(ValidationError, match='Input should be a valid integer'):
-        v.validate_python('123')
-
-    assert v.isinstance_python('123') is False
+    @property
+    def prop(self) -> None:
+        ...
 
 
-def test_isinstance_forbid_extra_fn_override():
-    v = SchemaValidator(cs.typed_dict_schema({'f': cs.typed_dict_field(cs.str_schema())}))
+SelfReferencingModel.model_rebuild()
 
-    with pytest.raises(ValidationError, match='Extra inputs are not permitted'):
-        v.validate_python({'f': 'x', 'extra_field': '123'}, extra='forbid')
+model = Model(x=1, y='y')
+Model(x=1, y='y', z='z')
+# MYPY: error: Unexpected keyword argument "z" for "Model"  [call-arg]
+model.x = 2
+model.model_validate(model)
 
-    assert v.isinstance_python({'f': 'x', 'extra_field': '123'}, extra='forbid') is False
-
-
-def test_internal_error():
-    v = SchemaValidator(
-        cs.model_schema(cls=int, schema=cs.model_fields_schema(fields={'f': cs.model_field(schema=cs.int_schema())}))
-    )
-    with pytest.raises(AttributeError, match="'int' object has no attribute '__dict__'"):
-        v.validate_python({'f': 123})
-
-    with pytest.raises(AttributeError, match="'int' object has no attribute '__dict__'"):
-        v.validate_json('{"f": 123}')
-
-    with pytest.raises(AttributeError, match="'int' object has no attribute '__dict__'"):
-        v.isinstance_python({'f': 123})
+self_referencing_model = SelfReferencingModel(submodel=SelfReferencingModel(submodel=None))
 
 
-def test_omit(py_and_json: PyAndJson):
-    def omit(v, info):
-        if v == 'omit':
-            raise PydanticOmit
-        elif v == 'error':
-            raise ValueError('error')
-        else:
-            return v
+class KwargsModel(BaseModel, from_attributes=True):
+    x: float
+    y: str
 
-    v = py_and_json(core_schema.with_info_plain_validator_function(omit))
-    assert v.validate_test('foo') == 'foo'
-    if v.validator_type == 'python':
-        assert v.isinstance_test('foo') is True
+    class NotConfig:
+        frozen = True
 
-    if v.validator_type == 'python':
-        assert v.isinstance_test('error') is False
-    with pytest.raises(SchemaError, match='Uncaught Omit error, please check your usage of `default` validators.'):
-        v.validate_test('omit')
+
+kwargs_model = KwargsModel(x=1, y='y')
+KwargsModel(x=1, y='y', z='z')
+# MYPY: error: Unexpected keyword argument "z" for "KwargsModel"  [call-arg]
+kwargs_model.x = 2
+kwargs_model.model_validate(kwargs_model.__dict__)
+
+
+class InheritingModel(Model):
+    z: int = 1
+
+
+InheritingModel.model_validate(model.__dict__)
+
+
+class ForwardReferencingModel(Model):
+    future: 'FutureModel'
+
+
+class FutureModel(Model):
+    pass
+
+
+ForwardReferencingModel.model_rebuild()
+future_model = FutureModel(x=1, y='a')
+forward_model = ForwardReferencingModel(x=1, y='a', future=future_model)
+
+
+class NoMutationModel(BaseModel):
+    x: int
+
+    model_config = dict(frozen=True)
+
+
+class MutationModel(NoMutationModel):
+    a: int = 1
+
+    model_config = dict(frozen=False, from_attributes=True)
+
+
+MutationModel(x=1).x = 2
+MutationModel.model_validate(model.__dict__)
+
+
+class KwargsNoMutationModel(BaseModel, frozen=True):
+    x: int
+
+
+class KwargsMutationModel(KwargsNoMutationModel, frozen=False, from_attributes=True):
+# MYPY: error: Non-frozen dataclass cannot inherit from a frozen dataclass  [misc]
+    a: int = 1
+
+
+KwargsMutationModel(x=1).x = 2
+# MYPY: error: Property "x" defined in "KwargsNoMutationModel" is read-only  [misc]
+KwargsMutationModel.model_validate(model.__dict__)
+
+
+class OverrideModel(Model):
+    x: int
+
+
+OverrideModel(x=1, y='b')
+
+
+class Mixin:
+    def f(self) -> None:
+        pass
+
+
+class MultiInheritanceModel(BaseModel, Mixin):
+    pass
+
+
+MultiInheritanceModel().f()
+
+
+class AliasModel(BaseModel):
+    x: str = Field(alias='x_alias')
+    y: str = Field(validation_alias='y_alias')
+    z: str = Field(validation_alias='z_alias', alias='unused')
+
+
+alias_model = AliasModel(x_alias='a', y_alias='a', z_alias='a')
+# MYPY: error: Unexpected keyword argument "y_alias" for "AliasModel"; did you mean "x_alias"?  [call-arg]
+# MYPY: error: Unexpected keyword argument "z_alias" for "AliasModel"; did you mean "x_alias"?  [call-arg]
+assert alias_model.x == 'a'
+assert alias_model.y == 'a'
+assert alias_model.z == 'a'
+
+
+class ClassVarModel(BaseModel):
+    x: int
+    y: ClassVar[int] = 1
+
+
+ClassVarModel(x=1)
+
+
+@dataclass(config=dict(validate_assignment=True))
+class AddProject:
+    name: str
+    slug: Optional[str]
+    description: Optional[str]
+
+
+p = AddProject(name='x', slug='y', description='z')
+
+
+class TypeAliasAsAttribute(BaseModel):
+    __type_alias_attribute__ = Union[str, bytes]
+
+
+class NestedModel(BaseModel):
+    class Model(BaseModel):
+        id: str
+
+    model: Model
+
+
+_ = NestedModel.Model
+
+
+DynamicModel = create_model('DynamicModel', __base__=Model)
+
+dynamic_model = DynamicModel(x=1, y='y')
+dynamic_model.x = 2
+
+
+class FrozenModel(BaseModel):
+    x: int
+
+    model_config = dict(frozen=True)
+
+
+class NotFrozenModel(FrozenModel):
+    a: int = 1
+
+    model_config = dict(frozen=False, from_attributes=True)
+
+
+NotFrozenModel(x=1).x = 2
+NotFrozenModel.model_validate(model.__dict__)
+
+
+class KwargsFrozenModel(BaseModel, frozen=True):
+    x: int
+
+
+class KwargsNotFrozenModel(FrozenModel, frozen=False, from_attributes=True):
+    a: int = 1
+
+
+KwargsNotFrozenModel(x=1).x = 2
+KwargsNotFrozenModel.model_validate(model.__dict__)
+
+
+class ModelWithSelfField(BaseModel):
+    self: str
+
+
+def f(name: str) -> str:
+    return name
+
+
+class ModelWithAllowReuseValidator(BaseModel):
+    name: str
+    normalize_name = field_validator('name')(f)
+
+
+model_with_allow_reuse_validator = ModelWithAllowReuseValidator(name='xyz')
+
+
+T = TypeVar('T')
+
+
+class Response(BaseModel, Generic[T]):
+    data: T
+    error: Optional[str]
+
+
+response = Response[Model](data=model, error=None)
+
+
+class ModelWithAnnotatedValidator(BaseModel):
+    name: str
+
+    @field_validator('name')
+    def noop_validator_with_annotations(cls, name: str) -> str:
+        return name
+
+
+def _default_factory_str() -> str:
+    return 'x'
+
+
+def _default_factory_list() -> list[int]:
+    return [1, 2, 3]
+
+
+class FieldDefaultTestingModel(BaseModel):
+    # Required
+    a: int
+    b: int = Field()
+    c: int = Field(...)
+
+    # Default
+    d: int = Field(1)
+
+    # Default factory
+    g: list[int] = Field(default_factory=_default_factory_list)
+    h: str = Field(default_factory=_default_factory_str)
+    i: str = Field(default_factory=lambda: 'test')

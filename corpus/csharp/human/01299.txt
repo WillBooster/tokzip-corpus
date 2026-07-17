@@ -1,67 +1,92 @@
-﻿namespace AutoMapper.IntegrationTests.ExplicitExpansion;
+﻿namespace AutoMapper.IntegrationTests;
 
-public class MembersToExpandExpressions  : AutoMapperSpecBase, IAsyncLifetime
+public class ParameterizedQueries : IntegrationTest<ParameterizedQueries.DatabaseInitializer>
 {
-    public class SourceDeepInner
-    {
-        public int Desc { get; set; }
-        public int Id { get; set; }
-    }
-    public class SourceInner
+    public class Entity
     {
         public int Id { get; set; }
-        public int Desc { get; set; }
-        public SourceDeepInner Deep { get; set; }
+        public string Value { get; set; }
     }
-    public class Source
-    {   
-        public int Id { get; set; }
-        public string Name { get; set; }
-        public int Desc { get; set; }
-        public SourceInner Inner { get; set; }
-    }
-    public class Dto
+
+    public class EntityDto
     {
-        public string Name { get; set; }
-        public int? Desc { get; set; }
-        public int? InnerDescFlattened { get; set; }
-        public int? DeepFlattened { get; set; }
+        public int Id { get; set; }
+        public string Value { get; set; }
+        public string UserName { get; set; }
     }
+
+    public class ClientContext : LocalDbContext
+    {
+        public DbSet<Entity> Entities { get; set; }
+    }
+
+    public class DatabaseInitializer : DropCreateDatabaseAlways<ClientContext>
+    {
+        protected override void Seed(ClientContext context)
+        {
+            context.Entities.AddRange(new[]
+            {
+                new Entity {Value = "Value1"},
+                new Entity {Value = "Value2"}
+            });
+            base.Seed(context);
+        }
+    }
+
     protected override MapperConfiguration CreateConfiguration() => new(cfg =>
-        cfg.CreateProjection<Source, Dto>()
-            .ForMember(dto => dto.InnerDescFlattened, conf => { conf.ExplicitExpansion(); conf.MapFrom(_ => _.Inner     .Desc); })
-            .ForMember(dto => dto.     DeepFlattened, conf => { conf.ExplicitExpansion(); conf.MapFrom(_ => _.Inner.Deep.Desc); }));
-    public class TestContext : LocalDbContext
     {
-        public DbSet<Source> Sources { get; set; }
-    }
-    static Source _source = new Source() { Name = "Name1", Desc = -12, Inner = new SourceInner { Desc = -25, Deep = new SourceDeepInner() { Desc = 28 } } };
-    public class DatabaseInitializer : DropCreateDatabaseAlways<TestContext>
-    {
-        protected override void Seed(TestContext testContext)
-        {
-            testContext.Sources.Add(_source);
-            base.Seed(testContext);
-        }
-    }
+        string username = null;
+        cfg.CreateProjection<Entity, EntityDto>()
+            .ForMember(d => d.UserName, opt => opt.MapFrom(s => username));
+    });
+
     [Fact]
-    public void Should_project_ok()
+    public async Task Should_parameterize_value()
     {
-        using (var context = new TestContext())
+        List<EntityDto> dtos;
+        string username;
+        using (var db = new ClientContext())
         {
-            ProjectTo<Dto>(context.Sources, null, _ => _.Name).First().Name.ShouldBe(_source.Name);
-            ProjectTo<Dto>(context.Sources, null, _ => _.Desc).First().Desc.ShouldBe(_source.Desc);
-            ProjectTo<Dto>(context.Sources, null, _ => _.Name, _ => _.Desc);
-            ProjectTo<Dto>(context.Sources, null, _ => _.InnerDescFlattened).First().InnerDescFlattened.ShouldBe(_source.Inner.Desc);
-            ProjectTo<Dto>(context.Sources, null, _ => _.DeepFlattened).First().DeepFlattened.ShouldBe(_source.Inner.Deep.Desc);
+            username = "Mary";
+            var query = ProjectTo<EntityDto>(db.Entities, new { username });
+            dtos = await query.ToListAsync();
+            var constantVisitor = new ConstantVisitor();
+            constantVisitor.Visit(query.Expression);
+            constantVisitor.HasConstant.ShouldBeFalse();
+            dtos.All(dto => dto.UserName == username).ShouldBeTrue();
+
+            username = "Joe";
+            query = ProjectTo<EntityDto>(db.Entities, new Dictionary<string, object> { { "username", username }});
+            dtos = await query.ToListAsync();
+            constantVisitor = new ConstantVisitor();
+            constantVisitor.Visit(query.Expression);
+            constantVisitor.HasConstant.ShouldBeTrue();
+            dtos.All(dto => dto.UserName == username).ShouldBeTrue();
+
+            username = "Jane";
+            query = db.Entities.Select(e => new EntityDto
+            {
+                Id = e.Id,
+                Value = e.Value,
+                UserName = username
+            });
+            dtos = await query.ToListAsync();
+            dtos.All(dto => dto.UserName == username).ShouldBeTrue();
+            constantVisitor = new ConstantVisitor();
+            constantVisitor.Visit(query.Expression);
+            constantVisitor.HasConstant.ShouldBeFalse();
         }
     }
-    public async Task InitializeAsync()
+
+    private class ConstantVisitor : ExpressionVisitor
     {
-        var initializer = new DatabaseInitializer();
+        public bool HasConstant { get; private set; }
 
-        await initializer.Migrate();
+        protected override Expression VisitConstant(ConstantExpression node)
+        {
+            if (node.Type == typeof(string))
+                HasConstant = true;
+            return base.VisitConstant(node);
+        }
     }
-
-    public Task DisposeAsync() => Task.CompletedTask;
 }

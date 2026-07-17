@@ -1,61 +1,80 @@
-// Formatting library for C++ - formatting library tests
+// Formatting library for C++ - custom Google Test assertions
 //
 // Copyright (c) 2012 - present, Victor Zverovich
 // All rights reserved.
 //
 // For the license information refer to format.h.
 
-#include "fmt/compile.h"
-#include "gmock/gmock.h"
+#include "gtest-extra.h"
 
-#if FMT_USE_CONSTEVAL
+#if FMT_USE_FCNTL
 
-template <size_t max_string_length, typename Char = char> struct test_string {
-  template <typename T> constexpr bool operator==(const T& rhs) const noexcept {
-    return fmt::basic_string_view<Char>(rhs).compare(buffer) == 0;
+using fmt::file;
+
+output_redirect::output_redirect(FILE* f, bool flush) : file_(f) {
+  if (flush) this->flush();
+  int fd = FMT_POSIX(fileno(f));
+  // Create a file object referring to the original file.
+  original_ = file::dup(fd);
+  // Create a pipe.
+  auto pipe = fmt::pipe();
+  read_end_ = std::move(pipe.read_end);
+  // Connect the passed FILE object to the write end of the pipe.
+  pipe.write_end.dup2(fd);
+}
+
+output_redirect::~output_redirect() noexcept {
+  try {
+    restore();
+  } catch (const std::exception& e) {
+    std::fputs(e.what(), stderr);
   }
-  Char buffer[max_string_length]{};
-};
-
-template <size_t max_string_length, typename Char = char, typename... Args>
-consteval auto test_format(auto format, const Args&... args) {
-  test_string<max_string_length, Char> string{};
-  fmt::format_to(string.buffer, format, args...);
-  return string;
 }
 
-TEST(compile_time_formatting_test, floating_point) {
-  EXPECT_EQ("0", test_format<2>(FMT_COMPILE("{}"), 0.0f));
-  EXPECT_EQ("392.500000", test_format<11>(FMT_COMPILE("{0:f}"), 392.5f));
-
-  EXPECT_EQ("0", test_format<2>(FMT_COMPILE("{:}"), 0.0));
-  EXPECT_EQ("0.000000", test_format<9>(FMT_COMPILE("{:f}"), 0.0));
-  EXPECT_EQ("0", test_format<2>(FMT_COMPILE("{:g}"), 0.0));
-  EXPECT_EQ("392.65", test_format<7>(FMT_COMPILE("{:}"), 392.65));
-  EXPECT_EQ("392.65", test_format<7>(FMT_COMPILE("{:g}"), 392.65));
-  EXPECT_EQ("392.65", test_format<7>(FMT_COMPILE("{:G}"), 392.65));
-  EXPECT_EQ("4.9014e+06", test_format<11>(FMT_COMPILE("{:g}"), 4.9014e6));
-  EXPECT_EQ("-392.650000", test_format<12>(FMT_COMPILE("{:f}"), -392.65));
-  EXPECT_EQ("-392.650000", test_format<12>(FMT_COMPILE("{:F}"), -392.65));
-
-  EXPECT_EQ("3.926500e+02", test_format<13>(FMT_COMPILE("{0:e}"), 392.65));
-  EXPECT_EQ("3.926500E+02", test_format<13>(FMT_COMPILE("{0:E}"), 392.65));
-  EXPECT_EQ("+0000392.6", test_format<11>(FMT_COMPILE("{0:+010.4g}"), 392.65));
-  EXPECT_EQ("9223372036854775808.000000",
-            test_format<27>(FMT_COMPILE("{:f}"), 9223372036854775807.0));
-
-  constexpr double nan = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_EQ("nan", test_format<4>(FMT_COMPILE("{}"), nan));
-  EXPECT_EQ("+nan", test_format<5>(FMT_COMPILE("{:+}"), nan));
-  if (std::signbit(-nan))
-    EXPECT_EQ("-nan", test_format<5>(FMT_COMPILE("{}"), -nan));
-  else
-    fmt::print("Warning: compiler doesn't handle negative NaN correctly");
-
-  constexpr double inf = std::numeric_limits<double>::infinity();
-  EXPECT_EQ("inf", test_format<4>(FMT_COMPILE("{}"), inf));
-  EXPECT_EQ("+inf", test_format<5>(FMT_COMPILE("{:+}"), inf));
-  EXPECT_EQ("-inf", test_format<5>(FMT_COMPILE("{}"), -inf));
+void output_redirect::flush() {
+  int result = 0;
+  do {
+    result = fflush(file_);
+  } while (result == EOF && errno == EINTR);
+  if (result != 0) throw fmt::system_error(errno, "cannot flush stream");
 }
 
-#endif  // FMT_USE_CONSTEVAL
+void output_redirect::restore() {
+  if (original_.descriptor() == -1) return;  // Already restored.
+  flush();
+  // Restore the original file.
+  original_.dup2(FMT_POSIX(fileno(file_)));
+  original_.close();
+}
+
+std::string output_redirect::restore_and_read() {
+  // Restore output.
+  restore();
+
+  // Read everything from the pipe.
+  std::string content;
+  if (read_end_.descriptor() == -1) return content;  // Already read.
+  enum { BUFFER_SIZE = 4096 };
+  char buffer[BUFFER_SIZE];
+  size_t count = 0;
+  do {
+    count = read_end_.read(buffer, BUFFER_SIZE);
+    content.append(buffer, count);
+  } while (count != 0);
+  read_end_.close();
+  return content;
+}
+
+std::string read(file& f, size_t count) {
+  std::string buffer(count, '\0');
+  size_t n = 0, offset = 0;
+  do {
+    n = f.read(&buffer[offset], count - offset);
+    // We can't read more than size_t bytes since count has type size_t.
+    offset += n;
+  } while (offset < count && n != 0);
+  buffer.resize(offset);
+  return buffer;
+}
+
+#endif  // FMT_USE_FCNTL

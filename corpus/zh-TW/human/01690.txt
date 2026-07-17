@@ -1,0 +1,99 @@
+內容的話，貼幾個最主要的檔案上來就好，一個是 route：
+
+``` go
+package routes
+
+import (
+  "database/sql"
+
+  "github.com/gin-gonic/gin"
+
+  "membership-api/config"
+  "membership-api/handlers"
+  "membership-api/middleware"
+)
+
+func Setup(db *sql.DB) *gin.Engine {
+  r := gin.Default()
+
+  authHandler := handlers.NewAuthHandler(db)
+  userHandler := handlers.NewUserHandler(db)
+  avatarHandler := handlers.NewAvatarHandler(db)
+
+  authMiddleware := middleware.AuthMiddleware(config.JWTSecret)
+
+  api := r.Group("/api")
+  {
+    // 公開端點
+    api.POST("/register", authHandler.Register)
+    api.POST("/login", authHandler.Login)
+
+    // 需登入端點
+    api.GET("/users/:id", authMiddleware, userHandler.GetUserByID)
+    api.GET("/me/messages", authMiddleware, userHandler.GetMyMessages)
+    api.POST("/me/avatar", authMiddleware, avatarHandler.Upload)
+  }
+
+  return r
+}
+```
+
+再來是刻意埋的兩個漏洞，註冊時的 SQL injection：
+
+``` go
+package handlers
+
+import (
+  "database/sql"
+  "fmt"
+  "net/http"
+  "time"
+
+  "github.com/gin-gonic/gin"
+  "github.com/golang-jwt/jwt/v5"
+
+  "membership-api/config"
+  "membership-api/middleware"
+  "membership-api/models"
+)
+
+type RegisterRequest struct {
+  Username string `json:"username" binding:"required"`
+  Email    string `json:"email" binding:"required"`
+  Password string `json:"password" binding:"required"`
+}
+
+type LoginRequest struct {
+  Username string `json:"username" binding:"required"`
+  Password string `json:"password" binding:"required"`
+}
+
+type AuthHandler struct {
+  DB *sql.DB
+}
+
+func NewAuthHandler(db *sql.DB) *AuthHandler {
+  return &AuthHandler{DB: db}
+}
+
+func (h *AuthHandler) Register(c *gin.Context) {
+  var req RegisterRequest
+  if err := c.ShouldBindJSON(&req); err != nil {
+    c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+    return
+  }
+
+  passwordHash, err := models.HashPassword(req.Password)
+  if err != nil {
+    c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+    return
+  }
+
+  // 刻意保留的 SQL injection 漏洞：使用字串拼接而非參數化查詢
+  query := fmt.Sprintf("INSERT INTO users (username, email, password_hash) VALUES ('%s', '%s', '%s')",
+    req.Username, req.Email, passwordHash)
+  _, err = h.DB.Exec(query)
+  if err != nil {
+    c.JSON(http.StatusConflict, gin.H{"error": "username or email already exists"})
+    return
+  }

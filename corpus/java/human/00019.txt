@@ -1,12 +1,11 @@
 /*
- * Copyright (C) 2010 The Android Open Source Project
- * Copyright (C) 2012 Google Inc.
+ * Copyright (C) 2010 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,666 +14,394 @@
  * limitations under the License.
  */
 
-package com.google.gson.internal;
+package com.google.gson.protobuf;
 
+import static java.util.Objects.requireNonNull;
+
+import com.google.common.base.CaseFormat;
+import com.google.common.collect.MapMaker;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
-import java.io.IOException;
-import java.io.InvalidObjectException;
-import java.io.ObjectInputStream;
-import java.io.ObjectStreamException;
-import java.io.Serializable;
-import java.util.AbstractMap;
-import java.util.AbstractSet;
-import java.util.Comparator;
-import java.util.ConcurrentModificationException;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.NoSuchElementException;
-import java.util.Objects;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonDeserializationContext;
+import com.google.gson.JsonDeserializer;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonSerializationContext;
+import com.google.gson.JsonSerializer;
+import com.google.protobuf.DescriptorProtos.EnumValueOptions;
+import com.google.protobuf.DescriptorProtos.FieldOptions;
+import com.google.protobuf.Descriptors.Descriptor;
+import com.google.protobuf.Descriptors.EnumDescriptor;
+import com.google.protobuf.Descriptors.EnumValueDescriptor;
+import com.google.protobuf.Descriptors.FieldDescriptor;
+import com.google.protobuf.DynamicMessage;
+import com.google.protobuf.Extension;
+import com.google.protobuf.Message;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentMap;
 
 /**
- * A map of comparable keys to values. Unlike {@code TreeMap}, this class uses insertion order for
- * iteration order. Comparison order is only used as an optimization for efficient insertion and
- * removal.
+ * GSON type adapter for protocol buffers that knows how to serialize enums either by using their
+ * values or their names, and also supports custom proto field names.
  *
- * <p>This implementation was derived from Android 4.1's TreeMap class.
+ * <p>You can specify which case representation is used for the proto fields when writing/reading
+ * the JSON payload by calling {@link Builder#setFieldNameSerializationFormat(CaseFormat,
+ * CaseFormat)}.
+ *
+ * <p>An example of default serialization/deserialization using custom proto field names is shown
+ * below:
+ *
+ * <pre>
+ * message MyMessage {
+ *   // Will be serialized as 'osBuildID' instead of the default 'osBuildId'.
+ *   string os_build_id = 1 [(serialized_name) = "osBuildID"];
+ * }
+ * </pre>
+ *
+ * @author Inderjeet Singh
+ * @author Emmanuel Cron
+ * @author Stanley Wang
  */
-@SuppressWarnings("serial") // ignore warning about missing serialVersionUID
-public final class LinkedTreeMap<K, V> extends AbstractMap<K, V> implements Serializable {
-  @SuppressWarnings({"unchecked", "rawtypes"}) // to avoid Comparable<Comparable<Comparable<...>>>
-  private static final Comparator<Comparable> NATURAL_ORDER =
-      new Comparator<Comparable>() {
-        @Override
-        public int compare(Comparable a, Comparable b) {
-          return a.compareTo(b);
-        }
-      };
-
-  private final Comparator<? super K> comparator;
-  private final boolean allowNullValues;
-  Node<K, V> root;
-  int size = 0;
-  int modCount = 0;
-
-  // Used to preserve iteration order
-  final Node<K, V> header;
-
-  /**
-   * Create a natural order, empty tree map whose keys must be mutually comparable and non-null, and
-   * whose values can be {@code null}.
-   */
-  @SuppressWarnings("unchecked") // unsafe! this assumes K is comparable
-  public LinkedTreeMap() {
-    this((Comparator<? super K>) NATURAL_ORDER, true);
+public class ProtoTypeAdapter implements JsonSerializer<Message>, JsonDeserializer<Message> {
+  /** Determines how enum <u>values</u> should be serialized. */
+  public enum EnumSerialization {
+    /**
+     * Serializes and deserializes enum values using their <b>number</b>. When this is used, custom
+     * value names set on enums are ignored.
+     */
+    NUMBER,
+    /** Serializes and deserializes enum values using their <b>name</b>. */
+    NAME;
   }
 
-  /**
-   * Create a natural order, empty tree map whose keys must be mutually comparable and non-null.
-   *
-   * @param allowNullValues whether {@code null} is allowed as entry value
-   */
-  @SuppressWarnings("unchecked") // unsafe! this assumes K is comparable
-  public LinkedTreeMap(boolean allowNullValues) {
-    this((Comparator<? super K>) NATURAL_ORDER, allowNullValues);
-  }
+  /** Builder for {@link ProtoTypeAdapter}s. */
+  public static class Builder {
+    private final Set<Extension<FieldOptions, String>> serializedNameExtensions;
+    private final Set<Extension<EnumValueOptions, String>> serializedEnumValueExtensions;
+    private EnumSerialization enumSerialization;
+    private CaseFormat protoFormat;
+    private CaseFormat jsonFormat;
 
-  /**
-   * Create a tree map ordered by {@code comparator}. This map's keys may only be null if {@code
-   * comparator} permits.
-   *
-   * @param comparator the comparator to order elements with, or {@code null} to use the natural
-   *     ordering.
-   * @param allowNullValues whether {@code null} is allowed as entry value
-   */
-  // unsafe! if comparator is null, this assumes K is comparable
-  @SuppressWarnings({"unchecked", "rawtypes"})
-  public LinkedTreeMap(Comparator<? super K> comparator, boolean allowNullValues) {
-    this.comparator = comparator != null ? comparator : (Comparator) NATURAL_ORDER;
-    this.allowNullValues = allowNullValues;
-    this.header = new Node<>(allowNullValues);
-  }
-
-  @Override
-  public int size() {
-    return size;
-  }
-
-  @Override
-  public V get(Object key) {
-    Node<K, V> node = findByObject(key);
-    return node != null ? node.value : null;
-  }
-
-  @Override
-  public boolean containsKey(Object key) {
-    return findByObject(key) != null;
-  }
-
-  @CanIgnoreReturnValue
-  @Override
-  public V put(K key, V value) {
-    if (key == null) {
-      throw new NullPointerException("key == null");
+    private Builder(
+        EnumSerialization enumSerialization,
+        CaseFormat fromFieldNameFormat,
+        CaseFormat toFieldNameFormat) {
+      this.serializedNameExtensions = new HashSet<>();
+      this.serializedEnumValueExtensions = new HashSet<>();
+      setEnumSerialization(enumSerialization);
+      setFieldNameSerializationFormat(fromFieldNameFormat, toFieldNameFormat);
     }
-    if (value == null && !allowNullValues) {
-      throw new NullPointerException("value == null");
+
+    @CanIgnoreReturnValue
+    public Builder setEnumSerialization(EnumSerialization enumSerialization) {
+      this.enumSerialization = requireNonNull(enumSerialization);
+      return this;
     }
-    Node<K, V> created = find(key, true);
-    V result = created.value;
-    created.value = value;
-    return result;
-  }
 
-  @Override
-  public void clear() {
-    root = null;
-    size = 0;
-    modCount++;
+    /**
+     * Sets the field names serialization format. The first parameter defines how to read the format
+     * of the proto field names you are converting to JSON. The second parameter defines which
+     * format to use when serializing them.
+     *
+     * <p>For example, if you use the following parameters: {@link CaseFormat#LOWER_UNDERSCORE},
+     * {@link CaseFormat#LOWER_CAMEL}, the following conversion will occur:
+     *
+     * <pre>{@code
+     * PROTO     <->  JSON
+     * my_field       myField
+     * foo            foo
+     * n__id_ct       nIdCt
+     * }</pre>
+     */
+    @CanIgnoreReturnValue
+    public Builder setFieldNameSerializationFormat(
+        CaseFormat fromFieldNameFormat, CaseFormat toFieldNameFormat) {
+      this.protoFormat = fromFieldNameFormat;
+      this.jsonFormat = toFieldNameFormat;
+      return this;
+    }
 
-    // Clear iteration order
-    Node<K, V> header = this.header;
-    header.next = header.prev = header;
-  }
+    /**
+     * Adds a field proto annotation that, when set, overrides the default field name
+     * serialization/deserialization. For example, if you add the '{@code serialized_name}'
+     * annotation and you define a field in your proto like the one below:
+     *
+     * <pre>
+     * string client_app_id = 1 [(serialized_name) = "appId"];
+     * </pre>
+     *
+     * ...the adapter will serialize the field using '{@code appId}' instead of the default ' {@code
+     * clientAppId}'. This lets you customize the name serialization of any proto field.
+     */
+    @CanIgnoreReturnValue
+    public Builder addSerializedNameExtension(
+        Extension<FieldOptions, String> serializedNameExtension) {
+      serializedNameExtensions.add(requireNonNull(serializedNameExtension));
+      return this;
+    }
 
-  @Override
-  public V remove(Object key) {
-    Node<K, V> node = removeInternalByKey(key);
-    return node != null ? node.value : null;
+    /**
+     * Adds an enum value proto annotation that, when set, overrides the default <b>enum</b> value
+     * serialization/deserialization of this adapter. For example, if you add the ' {@code
+     * serialized_value}' annotation and you define an enum in your proto like the one below:
+     *
+     * <pre>
+     * enum MyEnum {
+     *   UNKNOWN = 0;
+     *   CLIENT_APP_ID = 1 [(serialized_value) = "APP_ID"];
+     *   TWO = 2 [(serialized_value) = "2"];
+     * }
+     * </pre>
+     *
+     * ...the adapter will serialize the value {@code CLIENT_APP_ID} as "{@code APP_ID}" and the
+     * value {@code TWO} as "{@code 2}". This works for both serialization and deserialization.
+     *
+     * <p>Note that you need to set the enum serialization of this adapter to {@link
+     * EnumSerialization#NAME}, otherwise these annotations will be ignored.
+     */
+    @CanIgnoreReturnValue
+    public Builder addSerializedEnumValueExtension(
+        Extension<EnumValueOptions, String> serializedEnumValueExtension) {
+      serializedEnumValueExtensions.add(requireNonNull(serializedEnumValueExtension));
+      return this;
+    }
+
+    public ProtoTypeAdapter build() {
+      return new ProtoTypeAdapter(
+          enumSerialization,
+          protoFormat,
+          jsonFormat,
+          serializedNameExtensions,
+          serializedEnumValueExtensions);
+    }
   }
 
   /**
-   * Returns the node at or adjacent to the given key, creating it if requested.
-   *
-   * @throws ClassCastException if {@code key} and the tree's keys aren't mutually comparable.
+   * Creates a new {@link ProtoTypeAdapter} builder, defaulting enum serialization to {@link
+   * EnumSerialization#NAME} and converting field serialization from {@link
+   * CaseFormat#LOWER_UNDERSCORE} to {@link CaseFormat#LOWER_CAMEL}.
    */
-  Node<K, V> find(K key, boolean create) {
-    Comparator<? super K> comparator = this.comparator;
-    Node<K, V> nearest = root;
-    int comparison = 0;
+  public static Builder newBuilder() {
+    return new Builder(EnumSerialization.NAME, CaseFormat.LOWER_UNDERSCORE, CaseFormat.LOWER_CAMEL);
+  }
 
-    if (nearest != null) {
-      // Micro-optimization: avoid polymorphic calls to Comparator.compare().
-      @SuppressWarnings("unchecked") // Throws a ClassCastException below if there's trouble.
-      Comparable<Object> comparableKey =
-          (comparator == NATURAL_ORDER) ? (Comparable<Object>) key : null;
+  private static final FieldDescriptor.Type ENUM_TYPE = FieldDescriptor.Type.ENUM;
 
-      while (true) {
-        comparison =
-            (comparableKey != null)
-                ? comparableKey.compareTo(nearest.key)
-                : comparator.compare(key, nearest.key);
+  private static final ConcurrentMap<String, ConcurrentMap<Class<?>, Method>> mapOfMapOfMethods =
+      new MapMaker().makeMap();
 
-        // We found the requested key.
-        if (comparison == 0) {
-          return nearest;
+  private final EnumSerialization enumSerialization;
+  private final CaseFormat protoFormat;
+  private final CaseFormat jsonFormat;
+  private final Set<Extension<FieldOptions, String>> serializedNameExtensions;
+  private final Set<Extension<EnumValueOptions, String>> serializedEnumValueExtensions;
+
+  private ProtoTypeAdapter(
+      EnumSerialization enumSerialization,
+      CaseFormat protoFormat,
+      CaseFormat jsonFormat,
+      Set<Extension<FieldOptions, String>> serializedNameExtensions,
+      Set<Extension<EnumValueOptions, String>> serializedEnumValueExtensions) {
+    this.enumSerialization = enumSerialization;
+    this.protoFormat = protoFormat;
+    this.jsonFormat = jsonFormat;
+    this.serializedNameExtensions = serializedNameExtensions;
+    this.serializedEnumValueExtensions = serializedEnumValueExtensions;
+  }
+
+  @Override
+  public JsonElement serialize(Message src, Type typeOfSrc, JsonSerializationContext context) {
+    JsonObject ret = new JsonObject();
+    final Map<FieldDescriptor, Object> fields = src.getAllFields();
+
+    for (Map.Entry<FieldDescriptor, Object> fieldPair : fields.entrySet()) {
+      final FieldDescriptor desc = fieldPair.getKey();
+      String name = getCustSerializedName(desc.getOptions(), desc.getName());
+
+      if (desc.getType() == ENUM_TYPE) {
+        // Enum collections are also returned as ENUM_TYPE
+        if (fieldPair.getValue() instanceof Collection) {
+          // Build the array to avoid infinite loop
+          JsonArray array = new JsonArray();
+          @SuppressWarnings("unchecked")
+          Collection<EnumValueDescriptor> enumDescs =
+              (Collection<EnumValueDescriptor>) fieldPair.getValue();
+          for (EnumValueDescriptor enumDesc : enumDescs) {
+            array.add(context.serialize(getEnumValue(enumDesc)));
+            ret.add(name, array);
+          }
+        } else {
+          EnumValueDescriptor enumDesc = ((EnumValueDescriptor) fieldPair.getValue());
+          ret.add(name, context.serialize(getEnumValue(enumDesc)));
         }
-
-        // If it exists, the key is in a subtree. Go deeper.
-        Node<K, V> child = (comparison < 0) ? nearest.left : nearest.right;
-        if (child == null) {
-          break;
-        }
-
-        nearest = child;
+      } else {
+        ret.add(name, context.serialize(fieldPair.getValue()));
       }
     }
-
-    // The key doesn't exist in this tree.
-    if (!create) {
-      return null;
-    }
-
-    // Create the node and add it to the tree or the table.
-    Node<K, V> header = this.header;
-    Node<K, V> created;
-    if (nearest == null) {
-      // Check that the value is comparable if we didn't do any comparisons.
-      if (comparator == NATURAL_ORDER && !(key instanceof Comparable)) {
-        throw new ClassCastException(key.getClass().getName() + " is not Comparable");
-      }
-      created = new Node<>(allowNullValues, nearest, key, header, header.prev);
-      root = created;
-    } else {
-      created = new Node<>(allowNullValues, nearest, key, header, header.prev);
-      if (comparison < 0) { // nearest.key is higher
-        nearest.left = created;
-      } else { // comparison > 0, nearest.key is lower
-        nearest.right = created;
-      }
-      rebalance(nearest, true);
-    }
-    size++;
-    modCount++;
-
-    return created;
+    return ret;
   }
 
-  @SuppressWarnings("unchecked")
-  Node<K, V> findByObject(Object key) {
+  @Override
+  public Message deserialize(JsonElement json, Type typeOfT, JsonDeserializationContext context)
+      throws JsonParseException {
     try {
-      return key != null ? find((K) key, false) : null;
-    } catch (ClassCastException e) {
-      return null;
+      JsonObject jsonObject = json.getAsJsonObject();
+      @SuppressWarnings("unchecked")
+      Class<? extends Message> protoClass = (Class<? extends Message>) typeOfT;
+
+      if (DynamicMessage.class.isAssignableFrom(protoClass)) {
+        throw new IllegalStateException("only generated messages are supported");
+      }
+
+      // Invoke the ProtoClass.newBuilder() method
+      Message.Builder protoBuilder =
+          (Message.Builder) getCachedMethod(protoClass, "newBuilder").invoke(null);
+
+      Message defaultInstance =
+          (Message) getCachedMethod(protoClass, "getDefaultInstance").invoke(null);
+
+      Descriptor protoDescriptor =
+          (Descriptor) getCachedMethod(protoClass, "getDescriptor").invoke(null);
+      // Call setters on all of the available fields
+      for (FieldDescriptor fieldDescriptor : protoDescriptor.getFields()) {
+        String jsonFieldName =
+            getCustSerializedName(fieldDescriptor.getOptions(), fieldDescriptor.getName());
+
+        JsonElement jsonElement = jsonObject.get(jsonFieldName);
+        if (jsonElement != null && !jsonElement.isJsonNull()) {
+          // Do not reuse jsonFieldName here, it might have a custom value
+          Object fieldValue;
+          if (fieldDescriptor.getType() == ENUM_TYPE) {
+            if (jsonElement.isJsonArray()) {
+              // Handling array
+              Collection<EnumValueDescriptor> enumCollection =
+                  new ArrayList<>(jsonElement.getAsJsonArray().size());
+              for (JsonElement element : jsonElement.getAsJsonArray()) {
+                enumCollection.add(
+                    findValueByNameAndExtension(fieldDescriptor.getEnumType(), element));
+              }
+              fieldValue = enumCollection;
+            } else {
+              // No array, just a plain value
+              fieldValue = findValueByNameAndExtension(fieldDescriptor.getEnumType(), jsonElement);
+            }
+            protoBuilder.setField(fieldDescriptor, fieldValue);
+          } else if (fieldDescriptor.isRepeated()) {
+            // If the type is an array, then we have to grab the type from the class.
+            // protobuf java field names are always lower camel case
+            String protoArrayFieldName =
+                protoFormat.to(CaseFormat.LOWER_CAMEL, fieldDescriptor.getName()) + "_";
+            Field protoArrayField = protoClass.getDeclaredField(protoArrayFieldName);
+            Type protoArrayFieldType = protoArrayField.getGenericType();
+            fieldValue = context.deserialize(jsonElement, protoArrayFieldType);
+            protoBuilder.setField(fieldDescriptor, fieldValue);
+          } else {
+            Object field = defaultInstance.getField(fieldDescriptor);
+            fieldValue = context.deserialize(jsonElement, field.getClass());
+            protoBuilder.setField(fieldDescriptor, fieldValue);
+          }
+        }
+      }
+      return protoBuilder.build();
+    } catch (Exception e) {
+      throw new JsonParseException("Error while parsing proto", e);
     }
   }
 
   /**
-   * Returns this map's entry that has the same key and value as {@code entry}, or null if this map
-   * has no such entry.
-   *
-   * <p>This method uses the comparator for key equality rather than {@code equals}. If this map's
-   * comparator isn't consistent with equals (such as {@code String.CASE_INSENSITIVE_ORDER}), then
-   * {@code remove()} and {@code contains()} will violate the collections API.
+   * Retrieves the custom field name from the given options, and if not found, returns the specified
+   * default name.
    */
-  Node<K, V> findByEntry(Entry<?, ?> entry) {
-    Node<K, V> mine = findByObject(entry.getKey());
-    boolean valuesEqual = mine != null && equal(mine.value, entry.getValue());
-    return valuesEqual ? mine : null;
-  }
-
-  private static boolean equal(Object a, Object b) {
-    return Objects.equals(a, b);
+  private String getCustSerializedName(FieldOptions options, String defaultName) {
+    for (Extension<FieldOptions, String> extension : serializedNameExtensions) {
+      if (options.hasExtension(extension)) {
+        return options.getExtension(extension);
+      }
+    }
+    return protoFormat.to(jsonFormat, defaultName);
   }
 
   /**
-   * Removes {@code node} from this tree, rearranging the tree's structure as necessary.
-   *
-   * @param unlink true to also unlink this node from the iteration linked list.
+   * Retrieves the custom enum value name from the given options, and if not found, returns the
+   * specified default value.
    */
-  void removeInternal(Node<K, V> node, boolean unlink) {
-    if (unlink) {
-      node.prev.next = node.next;
-      node.next.prev = node.prev;
+  private String getCustSerializedEnumValue(EnumValueOptions options, String defaultValue) {
+    for (Extension<EnumValueOptions, String> extension : serializedEnumValueExtensions) {
+      if (options.hasExtension(extension)) {
+        return options.getExtension(extension);
+      }
     }
+    return defaultValue;
+  }
 
-    Node<K, V> left = node.left;
-    Node<K, V> right = node.right;
-    Node<K, V> originalParent = node.parent;
-    if (left != null && right != null) {
-
-      /*
-       * To remove a node with both left and right subtrees, move an
-       * adjacent node from one of those subtrees into this node's place.
-       *
-       * Removing the adjacent node may change this node's subtrees. This
-       * node may no longer have two subtrees once the adjacent node is
-       * gone!
-       */
-
-      Node<K, V> adjacent = (left.height > right.height) ? left.last() : right.first();
-      removeInternal(adjacent, false); // takes care of rebalance and size--
-
-      int leftHeight = 0;
-      left = node.left;
-      if (left != null) {
-        leftHeight = left.height;
-        adjacent.left = left;
-        left.parent = adjacent;
-        node.left = null;
-      }
-
-      int rightHeight = 0;
-      right = node.right;
-      if (right != null) {
-        rightHeight = right.height;
-        adjacent.right = right;
-        right.parent = adjacent;
-        node.right = null;
-      }
-
-      adjacent.height = Math.max(leftHeight, rightHeight) + 1;
-      replaceInParent(node, adjacent);
-      return;
-    } else if (left != null) {
-      replaceInParent(node, left);
-      node.left = null;
-    } else if (right != null) {
-      replaceInParent(node, right);
-      node.right = null;
+  /**
+   * Returns the enum value to use for serialization, depending on the value of {@link
+   * EnumSerialization} that was given to this adapter.
+   */
+  private Object getEnumValue(EnumValueDescriptor enumDesc) {
+    if (enumSerialization == EnumSerialization.NAME) {
+      return getCustSerializedEnumValue(enumDesc.getOptions(), enumDesc.getName());
     } else {
-      replaceInParent(node, null);
-    }
-
-    rebalance(originalParent, false);
-    size--;
-    modCount++;
-  }
-
-  Node<K, V> removeInternalByKey(Object key) {
-    Node<K, V> node = findByObject(key);
-    if (node != null) {
-      removeInternal(node, true);
-    }
-    return node;
-  }
-
-  @SuppressWarnings("ReferenceEquality")
-  private void replaceInParent(Node<K, V> node, Node<K, V> replacement) {
-    Node<K, V> parent = node.parent;
-    node.parent = null;
-    if (replacement != null) {
-      replacement.parent = parent;
-    }
-
-    if (parent != null) {
-      if (parent.left == node) {
-        parent.left = replacement;
-      } else {
-        assert parent.right == node;
-        parent.right = replacement;
-      }
-    } else {
-      root = replacement;
+      return enumDesc.getNumber();
     }
   }
 
   /**
-   * Rebalances the tree by making any AVL rotations necessary between the newly-unbalanced node and
-   * the tree's root.
+   * Finds an enum value in the given {@link EnumDescriptor} that matches the given JSON element,
+   * either by name if the current adapter is using {@link EnumSerialization#NAME}, otherwise by
+   * number. If matching by name, it uses the extension value if it is defined, otherwise it uses
+   * its default value.
    *
-   * @param insert true if the node was unbalanced by an insert; false if it was by a removal.
+   * @throws IllegalArgumentException if a matching name/number was not found
    */
-  private void rebalance(Node<K, V> unbalanced, boolean insert) {
-    for (Node<K, V> node = unbalanced; node != null; node = node.parent) {
-      Node<K, V> left = node.left;
-      Node<K, V> right = node.right;
-      int leftHeight = left != null ? left.height : 0;
-      int rightHeight = right != null ? right.height : 0;
-
-      int delta = leftHeight - rightHeight;
-      if (delta == -2) {
-        Node<K, V> rightLeft = right.left;
-        Node<K, V> rightRight = right.right;
-        int rightRightHeight = rightRight != null ? rightRight.height : 0;
-        int rightLeftHeight = rightLeft != null ? rightLeft.height : 0;
-
-        int rightDelta = rightLeftHeight - rightRightHeight;
-        if (rightDelta == -1 || (rightDelta == 0 && !insert)) {
-          rotateLeft(node); // AVL right right
-        } else {
-          assert (rightDelta == 1);
-          rotateRight(right); // AVL right left
-          rotateLeft(node);
-        }
-        if (insert) {
-          break; // no further rotations will be necessary
-        }
-
-      } else if (delta == 2) {
-        Node<K, V> leftLeft = left.left;
-        Node<K, V> leftRight = left.right;
-        int leftRightHeight = leftRight != null ? leftRight.height : 0;
-        int leftLeftHeight = leftLeft != null ? leftLeft.height : 0;
-
-        int leftDelta = leftLeftHeight - leftRightHeight;
-        if (leftDelta == 1 || (leftDelta == 0 && !insert)) {
-          rotateRight(node); // AVL left left
-        } else {
-          assert (leftDelta == -1);
-          rotateLeft(left); // AVL left right
-          rotateRight(node);
-        }
-        if (insert) {
-          break; // no further rotations will be necessary
-        }
-
-      } else if (delta == 0) {
-        node.height = leftHeight + 1; // leftHeight == rightHeight
-        if (insert) {
-          break; // the insert caused balance, so rebalancing is done!
-        }
-
-      } else {
-        assert (delta == -1 || delta == 1);
-        node.height = Math.max(leftHeight, rightHeight) + 1;
-        if (!insert) {
-          break; // the height hasn't changed, so rebalancing is done!
+  private EnumValueDescriptor findValueByNameAndExtension(
+      EnumDescriptor desc, JsonElement jsonElement) {
+    if (enumSerialization == EnumSerialization.NAME) {
+      // With enum name
+      for (EnumValueDescriptor enumDesc : desc.getValues()) {
+        String enumValue = getCustSerializedEnumValue(enumDesc.getOptions(), enumDesc.getName());
+        if (enumValue.equals(jsonElement.getAsString())) {
+          return enumDesc;
         }
       }
-    }
-  }
-
-  /** Rotates the subtree so that its root's right child is the new root. */
-  private void rotateLeft(Node<K, V> root) {
-    Node<K, V> left = root.left;
-    Node<K, V> pivot = root.right;
-    Node<K, V> pivotLeft = pivot.left;
-    Node<K, V> pivotRight = pivot.right;
-
-    // move the pivot's left child to the root's right
-    root.right = pivotLeft;
-    if (pivotLeft != null) {
-      pivotLeft.parent = root;
-    }
-
-    replaceInParent(root, pivot);
-
-    // move the root to the pivot's left
-    pivot.left = root;
-    root.parent = pivot;
-
-    // fix heights
-    root.height =
-        Math.max(left != null ? left.height : 0, pivotLeft != null ? pivotLeft.height : 0) + 1;
-    pivot.height = Math.max(root.height, pivotRight != null ? pivotRight.height : 0) + 1;
-  }
-
-  /** Rotates the subtree so that its root's left child is the new root. */
-  private void rotateRight(Node<K, V> root) {
-    Node<K, V> pivot = root.left;
-    Node<K, V> right = root.right;
-    Node<K, V> pivotLeft = pivot.left;
-    Node<K, V> pivotRight = pivot.right;
-
-    // move the pivot's right child to the root's left
-    root.left = pivotRight;
-    if (pivotRight != null) {
-      pivotRight.parent = root;
-    }
-
-    replaceInParent(root, pivot);
-
-    // move the root to the pivot's right
-    pivot.right = root;
-    root.parent = pivot;
-
-    // fixup heights
-    root.height =
-        Math.max(right != null ? right.height : 0, pivotRight != null ? pivotRight.height : 0) + 1;
-    pivot.height = Math.max(root.height, pivotLeft != null ? pivotLeft.height : 0) + 1;
-  }
-
-  private EntrySet entrySet;
-  private KeySet keySet;
-
-  @Override
-  public Set<Entry<K, V>> entrySet() {
-    EntrySet result = entrySet;
-    return result != null ? result : (entrySet = new EntrySet());
-  }
-
-  @Override
-  public Set<K> keySet() {
-    KeySet result = keySet;
-    return result != null ? result : (keySet = new KeySet());
-  }
-
-  static final class Node<K, V> implements Entry<K, V> {
-    Node<K, V> parent;
-    Node<K, V> left;
-    Node<K, V> right;
-    Node<K, V> next;
-    Node<K, V> prev;
-    final K key;
-    final boolean allowNullValue;
-    V value;
-    int height;
-
-    /** Create the header entry */
-    Node(boolean allowNullValue) {
-      key = null;
-      this.allowNullValue = allowNullValue;
-      next = prev = this;
-    }
-
-    /** Create a regular entry */
-    Node(boolean allowNullValue, Node<K, V> parent, K key, Node<K, V> next, Node<K, V> prev) {
-      this.parent = parent;
-      this.key = key;
-      this.allowNullValue = allowNullValue;
-      this.height = 1;
-      this.next = next;
-      this.prev = prev;
-      prev.next = this;
-      next.prev = this;
-    }
-
-    @Override
-    public K getKey() {
-      return key;
-    }
-
-    @Override
-    public V getValue() {
-      return value;
-    }
-
-    @Override
-    public V setValue(V value) {
-      if (value == null && !allowNullValue) {
-        throw new NullPointerException("value == null");
+      throw new IllegalArgumentException(
+          String.format("Unrecognized enum name: %s", jsonElement.getAsString()));
+    } else {
+      // With enum value
+      EnumValueDescriptor fieldValue = desc.findValueByNumber(jsonElement.getAsInt());
+      if (fieldValue == null) {
+        throw new IllegalArgumentException(
+            String.format("Unrecognized enum value: %d", jsonElement.getAsInt()));
       }
-      V oldValue = this.value;
-      this.value = value;
-      return oldValue;
-    }
-
-    @Override
-    public boolean equals(Object o) {
-      if (o instanceof Entry) {
-        Entry<?, ?> other = (Entry<?, ?>) o;
-        return (key == null ? other.getKey() == null : key.equals(other.getKey()))
-            && (value == null ? other.getValue() == null : value.equals(other.getValue()));
-      }
-      return false;
-    }
-
-    @Override
-    public int hashCode() {
-      return (key == null ? 0 : key.hashCode()) ^ (value == null ? 0 : value.hashCode());
-    }
-
-    @Override
-    public String toString() {
-      return key + "=" + value;
-    }
-
-    /** Returns the first node in this subtree. */
-    public Node<K, V> first() {
-      Node<K, V> node = this;
-      Node<K, V> child = node.left;
-      while (child != null) {
-        node = child;
-        child = node.left;
-      }
-      return node;
-    }
-
-    /** Returns the last node in this subtree. */
-    public Node<K, V> last() {
-      Node<K, V> node = this;
-      Node<K, V> child = node.right;
-      while (child != null) {
-        node = child;
-        child = node.right;
-      }
-      return node;
+      return fieldValue;
     }
   }
 
-  private abstract class LinkedTreeMapIterator<T> implements Iterator<T> {
-    Node<K, V> next = header.next;
-    Node<K, V> lastReturned = null;
-    int expectedModCount = modCount;
-
-    LinkedTreeMapIterator() {}
-
-    @Override
-    @SuppressWarnings("ReferenceEquality")
-    public final boolean hasNext() {
-      return next != header;
+  private static Method getCachedMethod(
+      Class<?> clazz, String methodName, Class<?>... methodParamTypes)
+      throws NoSuchMethodException {
+    ConcurrentMap<Class<?>, Method> mapOfMethods = mapOfMapOfMethods.get(methodName);
+    if (mapOfMethods == null) {
+      mapOfMethods = new MapMaker().makeMap();
+      ConcurrentMap<Class<?>, Method> previous =
+          mapOfMapOfMethods.putIfAbsent(methodName, mapOfMethods);
+      mapOfMethods = previous == null ? mapOfMethods : previous;
     }
 
-    @SuppressWarnings("ReferenceEquality")
-    final Node<K, V> nextNode() {
-      Node<K, V> e = next;
-      if (e == header) {
-        throw new NoSuchElementException();
-      }
-      if (modCount != expectedModCount) {
-        throw new ConcurrentModificationException();
-      }
-      next = e.next;
-      return lastReturned = e;
+    Method method = mapOfMethods.get(clazz);
+    if (method == null) {
+      method = clazz.getMethod(methodName, methodParamTypes);
+      mapOfMethods.putIfAbsent(clazz, method);
+      // NB: it doesn't matter which method we return in the event of a race.
     }
-
-    @Override
-    public final void remove() {
-      if (lastReturned == null) {
-        throw new IllegalStateException();
-      }
-      removeInternal(lastReturned, true);
-      lastReturned = null;
-      expectedModCount = modCount;
-    }
-  }
-
-  class EntrySet extends AbstractSet<Entry<K, V>> {
-    @Override
-    public int size() {
-      return size;
-    }
-
-    @Override
-    public Iterator<Entry<K, V>> iterator() {
-      return new LinkedTreeMapIterator<Entry<K, V>>() {
-        @Override
-        public Entry<K, V> next() {
-          return nextNode();
-        }
-      };
-    }
-
-    @Override
-    public boolean contains(Object o) {
-      return o instanceof Entry && findByEntry((Entry<?, ?>) o) != null;
-    }
-
-    @Override
-    public boolean remove(Object o) {
-      if (!(o instanceof Entry)) {
-        return false;
-      }
-
-      Node<K, V> node = findByEntry((Entry<?, ?>) o);
-      if (node == null) {
-        return false;
-      }
-      removeInternal(node, true);
-      return true;
-    }
-
-    @Override
-    public void clear() {
-      LinkedTreeMap.this.clear();
-    }
-  }
-
-  final class KeySet extends AbstractSet<K> {
-    @Override
-    public int size() {
-      return size;
-    }
-
-    @Override
-    public Iterator<K> iterator() {
-      return new LinkedTreeMapIterator<K>() {
-        @Override
-        public K next() {
-          return nextNode().key;
-        }
-      };
-    }
-
-    @Override
-    public boolean contains(Object o) {
-      return containsKey(o);
-    }
-
-    @Override
-    public boolean remove(Object key) {
-      return removeInternalByKey(key) != null;
-    }
-
-    @Override
-    public void clear() {
-      LinkedTreeMap.this.clear();
-    }
-  }
-
-  /**
-   * If somebody is unlucky enough to have to serialize one of these, serialize it as a
-   * LinkedHashMap so that they won't need Gson on the other side to deserialize it. Using
-   * serialization defeats our DoS defence, so most apps shouldn't use it.
-   */
-  private Object writeReplace() throws ObjectStreamException {
-    return new LinkedHashMap<>(this);
-  }
-
-  private void readObject(ObjectInputStream in) throws IOException {
-    // Don't permit directly deserializing this class; writeReplace() should have written a
-    // replacement
-    throw new InvalidObjectException("Deserialization is unsupported");
+    return method;
   }
 }

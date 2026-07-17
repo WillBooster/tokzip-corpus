@@ -1,27 +1,124 @@
-import datetime
-from pathlib import Path
-from typing import Annotated
+import pytest
 
-from pydantic import FilePath, NewPath
-from pydantic.experimental.pipeline import validate_as
+from pydantic_core import SchemaSerializer, core_schema
 
-# TODO: since Pyright 1.1.384, support for PEP 746 was disabled.
-# `a1` and `a2` should have a `pyright: ignore[reportInvalidTypeArguments]` comment.
-a1 = Annotated[str, validate_as(int)]
-a2 = Annotated[str, validate_as(str).transform(lambda x: int(x))]
-a3 = Annotated[float, validate_as(float).gt(0)]  # should be able to compare float to int
 
-a4 = Annotated[datetime.datetime, validate_as(datetime.datetime).datetime_tz_naive()]
-a5 = Annotated[datetime.datetime, validate_as(str).datetime_tz_naive()]  # pyright: ignore[reportAttributeAccessIssue]
-a6 = Annotated[
-    datetime.datetime,
-    (
-        validate_as(str).transform(str.strip).validate_as(datetime.datetime).datetime_tz_naive()
-        | validate_as(int).transform(datetime.datetime.fromtimestamp).datetime_tz_aware()
-    ),
-]
+def test_branch_nullable():
+    s = SchemaSerializer(
+        core_schema.definitions_schema(
+            core_schema.definition_reference_schema('Branch'),
+            [
+                core_schema.typed_dict_schema(
+                    {
+                        'name': core_schema.typed_dict_field(core_schema.str_schema()),
+                        'sub_branch': core_schema.typed_dict_field(
+                            core_schema.nullable_schema(core_schema.definition_reference_schema('Branch'))
+                        ),
+                    },
+                    ref='Branch',
+                )
+            ],
+        )
+    )
+    assert s.to_python({'name': 'root', 'sub_branch': {'name': 'branch', 'sub_branch': None}}) == {
+        'name': 'root',
+        'sub_branch': {'name': 'branch', 'sub_branch': None},
+    }
+    assert s.to_python({'name': 'root', 'sub_branch': {'name': 'branch', 'sub_branch': None}}, exclude_none=True) == {
+        'name': 'root',
+        'sub_branch': {'name': 'branch'},
+    }
 
-# Annotated types (e.g. NewPath, FilePath) should be accepted by validate_as.
-# Fixes https://github.com/pydantic/pydantic/issues/12845
-a7 = Annotated[Path, validate_as(NewPath)]
-a8 = Annotated[Path, validate_as(FilePath)]
+
+def test_cyclic_recursion():
+    s = SchemaSerializer(
+        core_schema.definitions_schema(
+            core_schema.definition_reference_schema('Branch'),
+            [
+                core_schema.typed_dict_schema(
+                    {
+                        'name': core_schema.typed_dict_field(core_schema.str_schema()),
+                        'sub_branch': core_schema.typed_dict_field(
+                            core_schema.nullable_schema(core_schema.definition_reference_schema('Branch'))
+                        ),
+                    },
+                    ref='Branch',
+                )
+            ],
+        )
+    )
+    v = {'name': 'root'}
+    v['sub_branch'] = v
+    with pytest.raises(ValueError, match=r'Circular reference detected \(id repeated\)'):
+        s.to_python(v)
+    with pytest.raises(ValueError, match=r'Circular reference detected \(id repeated\)'):
+        s.to_python(v, mode='json')
+    with pytest.raises(ValueError, match=r'Circular reference detected \(id repeated\)'):
+        s.to_json(v)
+
+
+def test_custom_ser():
+    s = SchemaSerializer(
+        core_schema.definitions_schema(
+            core_schema.definition_reference_schema('Branch'),
+            [
+                core_schema.typed_dict_schema(
+                    {
+                        'name': core_schema.typed_dict_field(core_schema.str_schema()),
+                        'sub_branch': core_schema.typed_dict_field(
+                            core_schema.nullable_schema(
+                                core_schema.definition_reference_schema(
+                                    'Branch', serialization=core_schema.to_string_ser_schema(when_used='always')
+                                )
+                            )
+                        ),
+                    },
+                    ref='Branch',
+                )
+            ],
+        )
+    )
+    assert s.to_python({'name': 'root', 'sub_branch': {'name': 'branch', 'sub_branch': None}}) == {
+        'name': 'root',
+        'sub_branch': "{'name': 'branch', 'sub_branch': None}",
+    }
+
+
+def test_recursive_function():
+    s = SchemaSerializer(
+        core_schema.definitions_schema(
+            core_schema.definition_reference_schema('my_ref'),
+            [
+                core_schema.typed_dict_schema(
+                    {'root': core_schema.typed_dict_field(core_schema.definition_reference_schema('my_ref'))},
+                    ref='my_ref',
+                    serialization=core_schema.wrap_serializer_function_ser_schema(function=lambda x, _handler: x),
+                )
+            ],
+        )
+    )
+    assert s.to_python({'root': {'root': {}}}) == {'root': {'root': {}}}
+
+
+def test_recursive_function_deeper_ref():
+    s = SchemaSerializer(
+        core_schema.typed_dict_schema(
+            {
+                'a': core_schema.typed_dict_field(
+                    core_schema.definitions_schema(
+                        core_schema.definition_reference_schema('my_ref'),
+                        [
+                            core_schema.typed_dict_schema(
+                                {'b': core_schema.typed_dict_field(core_schema.definition_reference_schema('my_ref'))},
+                                ref='my_ref',
+                            )
+                        ],
+                    )
+                )
+            },
+            serialization=core_schema.wrap_serializer_function_ser_schema(
+                function=lambda x, _handler: x, is_field_serializer=False
+            ),
+        )
+    )
+    assert s.to_python({'a': {'b': {'b': {}}}}) == {'a': {'b': {'b': {}}}}

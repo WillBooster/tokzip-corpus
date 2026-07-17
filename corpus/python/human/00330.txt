@@ -1,264 +1,161 @@
-from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple, Type, TypeVar, Union, overload
+import json
+from typing import TYPE_CHECKING, Any, Dict, Generator, List, Optional, Sequence, Tuple, Type, Union
 
-from pydantic.v1 import validator
-from pydantic.v1.config import Extra
-from pydantic.v1.errors import ConfigError
-from pydantic.v1.main import BaseModel, create_model
-from pydantic.v1.typing import get_all_type_hints
-from pydantic.v1.utils import to_camel
-
-__all__ = ('validate_arguments',)
+from pydantic.v1.json import pydantic_encoder
+from pydantic.v1.utils import Representation
 
 if TYPE_CHECKING:
-    from pydantic.v1.typing import AnyCallable
+    from typing_extensions import TypedDict
 
-    AnyCallableT = TypeVar('AnyCallableT', bound=AnyCallable)
-    ConfigType = Union[None, Type[Any], Dict[str, Any]]
+    from pydantic.v1.config import BaseConfig
+    from pydantic.v1.types import ModelOrDc
+    from pydantic.v1.typing import ReprArgs
 
+    Loc = Tuple[Union[int, str], ...]
 
-@overload
-def validate_arguments(func: None = None, *, config: 'ConfigType' = None) -> Callable[['AnyCallableT'], 'AnyCallableT']:
-    ...
+    class _ErrorDictRequired(TypedDict):
+        loc: Loc
+        msg: str
+        type: str
 
-
-@overload
-def validate_arguments(func: 'AnyCallableT') -> 'AnyCallableT':
-    ...
-
-
-def validate_arguments(func: Optional['AnyCallableT'] = None, *, config: 'ConfigType' = None) -> Any:
-    """
-    Decorator to validate the arguments passed to a function.
-    """
-
-    def validate(_func: 'AnyCallable') -> 'AnyCallable':
-        vd = ValidatedFunction(_func, config)
-
-        @wraps(_func)
-        def wrapper_function(*args: Any, **kwargs: Any) -> Any:
-            return vd.call(*args, **kwargs)
-
-        wrapper_function.vd = vd  # type: ignore
-        wrapper_function.validate = vd.init_model_instance  # type: ignore
-        wrapper_function.raw_function = vd.raw_function  # type: ignore
-        wrapper_function.model = vd.model  # type: ignore
-        return wrapper_function
-
-    if func:
-        return validate(func)
-    else:
-        return validate
+    class ErrorDict(_ErrorDictRequired, total=False):
+        ctx: Dict[str, Any]
 
 
-ALT_V_ARGS = 'v__args'
-ALT_V_KWARGS = 'v__kwargs'
-V_POSITIONAL_ONLY_NAME = 'v__positional_only'
-V_DUPLICATE_KWARGS = 'v__duplicate_kwargs'
+__all__ = 'ErrorWrapper', 'ValidationError'
 
 
-class ValidatedFunction:
-    def __init__(self, function: 'AnyCallableT', config: 'ConfigType'):  # noqa C901
-        from inspect import Parameter, signature
+class ErrorWrapper(Representation):
+    __slots__ = 'exc', '_loc'
 
-        parameters: Mapping[str, Parameter] = signature(function).parameters
+    def __init__(self, exc: Exception, loc: Union[str, 'Loc']) -> None:
+        self.exc = exc
+        self._loc = loc
 
-        if parameters.keys() & {ALT_V_ARGS, ALT_V_KWARGS, V_POSITIONAL_ONLY_NAME, V_DUPLICATE_KWARGS}:
-            raise ConfigError(
-                f'"{ALT_V_ARGS}", "{ALT_V_KWARGS}", "{V_POSITIONAL_ONLY_NAME}" and "{V_DUPLICATE_KWARGS}" '
-                f'are not permitted as argument names when using the "{validate_arguments.__name__}" decorator'
-            )
-
-        self.raw_function = function
-        self.arg_mapping: Dict[int, str] = {}
-        self.positional_only_args = set()
-        self.v_args_name = 'args'
-        self.v_kwargs_name = 'kwargs'
-
-        type_hints = get_all_type_hints(function)
-        takes_args = False
-        takes_kwargs = False
-        fields: Dict[str, Tuple[Any, Any]] = {}
-        for i, (name, p) in enumerate(parameters.items()):
-            if p.annotation is p.empty:
-                annotation = Any
-            else:
-                annotation = type_hints[name]
-
-            default = ... if p.default is p.empty else p.default
-            if p.kind == Parameter.POSITIONAL_ONLY:
-                self.arg_mapping[i] = name
-                fields[name] = annotation, default
-                fields[V_POSITIONAL_ONLY_NAME] = List[str], None
-                self.positional_only_args.add(name)
-            elif p.kind == Parameter.POSITIONAL_OR_KEYWORD:
-                self.arg_mapping[i] = name
-                fields[name] = annotation, default
-                fields[V_DUPLICATE_KWARGS] = List[str], None
-            elif p.kind == Parameter.KEYWORD_ONLY:
-                fields[name] = annotation, default
-            elif p.kind == Parameter.VAR_POSITIONAL:
-                self.v_args_name = name
-                fields[name] = Tuple[annotation, ...], None
-                takes_args = True
-            else:
-                assert p.kind == Parameter.VAR_KEYWORD, p.kind
-                self.v_kwargs_name = name
-                fields[name] = Dict[str, annotation], None  # type: ignore
-                takes_kwargs = True
-
-        # these checks avoid a clash between "args" and a field with that name
-        if not takes_args and self.v_args_name in fields:
-            self.v_args_name = ALT_V_ARGS
-
-        # same with "kwargs"
-        if not takes_kwargs and self.v_kwargs_name in fields:
-            self.v_kwargs_name = ALT_V_KWARGS
-
-        if not takes_args:
-            # we add the field so validation below can raise the correct exception
-            fields[self.v_args_name] = List[Any], None
-
-        if not takes_kwargs:
-            # same with kwargs
-            fields[self.v_kwargs_name] = Dict[Any, Any], None
-
-        self.create_model(fields, takes_args, takes_kwargs, config)
-
-    def init_model_instance(self, *args: Any, **kwargs: Any) -> BaseModel:
-        values = self.build_values(args, kwargs)
-        return self.model(**values)
-
-    def call(self, *args: Any, **kwargs: Any) -> Any:
-        m = self.init_model_instance(*args, **kwargs)
-        return self.execute(m)
-
-    def build_values(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        values: Dict[str, Any] = {}
-        if args:
-            arg_iter = enumerate(args)
-            while True:
-                try:
-                    i, a = next(arg_iter)
-                except StopIteration:
-                    break
-                arg_name = self.arg_mapping.get(i)
-                if arg_name is not None:
-                    values[arg_name] = a
-                else:
-                    values[self.v_args_name] = [a] + [a for _, a in arg_iter]
-                    break
-
-        var_kwargs: Dict[str, Any] = {}
-        wrong_positional_args = []
-        duplicate_kwargs = []
-        fields_alias = [
-            field.alias
-            for name, field in self.model.__fields__.items()
-            if name not in (self.v_args_name, self.v_kwargs_name)
-        ]
-        non_var_fields = set(self.model.__fields__) - {self.v_args_name, self.v_kwargs_name}
-        for k, v in kwargs.items():
-            if k in non_var_fields or k in fields_alias:
-                if k in self.positional_only_args:
-                    wrong_positional_args.append(k)
-                if k in values:
-                    duplicate_kwargs.append(k)
-                values[k] = v
-            else:
-                var_kwargs[k] = v
-
-        if var_kwargs:
-            values[self.v_kwargs_name] = var_kwargs
-        if wrong_positional_args:
-            values[V_POSITIONAL_ONLY_NAME] = wrong_positional_args
-        if duplicate_kwargs:
-            values[V_DUPLICATE_KWARGS] = duplicate_kwargs
-        return values
-
-    def execute(self, m: BaseModel) -> Any:
-        d = {k: v for k, v in m._iter() if k in m.__fields_set__ or m.__fields__[k].default_factory}
-        var_kwargs = d.pop(self.v_kwargs_name, {})
-
-        if self.v_args_name in d:
-            args_: List[Any] = []
-            in_kwargs = False
-            kwargs = {}
-            for name, value in d.items():
-                if in_kwargs:
-                    kwargs[name] = value
-                elif name == self.v_args_name:
-                    args_ += value
-                    in_kwargs = True
-                else:
-                    args_.append(value)
-            return self.raw_function(*args_, **kwargs, **var_kwargs)
-        elif self.positional_only_args:
-            args_ = []
-            kwargs = {}
-            for name, value in d.items():
-                if name in self.positional_only_args:
-                    args_.append(value)
-                else:
-                    kwargs[name] = value
-            return self.raw_function(*args_, **kwargs, **var_kwargs)
+    def loc_tuple(self) -> 'Loc':
+        if isinstance(self._loc, tuple):
+            return self._loc
         else:
-            return self.raw_function(**d, **var_kwargs)
+            return (self._loc,)
 
-    def create_model(self, fields: Dict[str, Any], takes_args: bool, takes_kwargs: bool, config: 'ConfigType') -> None:
-        pos_args = len(self.arg_mapping)
+    def __repr_args__(self) -> 'ReprArgs':
+        return [('exc', self.exc), ('loc', self.loc_tuple())]
 
-        class CustomConfig:
-            pass
 
-        if not TYPE_CHECKING:  # pragma: no branch
-            if isinstance(config, dict):
-                CustomConfig = type('Config', (), config)  # noqa: F811
-            elif config is not None:
-                CustomConfig = config  # noqa: F811
+# ErrorList is something like Union[List[Union[List[ErrorWrapper], ErrorWrapper]], ErrorWrapper]
+# but recursive, therefore just use:
+ErrorList = Union[Sequence[Any], ErrorWrapper]
 
-        if hasattr(CustomConfig, 'fields') or hasattr(CustomConfig, 'alias_generator'):
-            raise ConfigError(
-                'Setting the "fields" and "alias_generator" property on custom Config for '
-                '@validate_arguments is not yet supported, please remove.'
-            )
 
-        class DecoratorBaseModel(BaseModel):
-            @validator(self.v_args_name, check_fields=False, allow_reuse=True)
-            def check_args(cls, v: Optional[List[Any]]) -> Optional[List[Any]]:
-                if takes_args or v is None:
-                    return v
+class ValidationError(Representation, ValueError):
+    __slots__ = 'raw_errors', 'model', '_error_cache'
 
-                raise TypeError(f'{pos_args} positional arguments expected but {pos_args + len(v)} given')
+    def __init__(self, errors: Sequence[ErrorList], model: 'ModelOrDc') -> None:
+        self.raw_errors = errors
+        self.model = model
+        self._error_cache: Optional[List['ErrorDict']] = None
 
-            @validator(self.v_kwargs_name, check_fields=False, allow_reuse=True)
-            def check_kwargs(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-                if takes_kwargs or v is None:
-                    return v
+    def errors(self) -> List['ErrorDict']:
+        if self._error_cache is None:
+            try:
+                config = self.model.__config__  # type: ignore
+            except AttributeError:
+                config = self.model.__pydantic_model__.__config__  # type: ignore
+            self._error_cache = list(flatten_errors(self.raw_errors, config))
+        return self._error_cache
 
-                plural = '' if len(v) == 1 else 's'
-                keys = ', '.join(map(repr, v.keys()))
-                raise TypeError(f'unexpected keyword argument{plural}: {keys}')
+    def json(self, *, indent: Union[None, int, str] = 2) -> str:
+        return json.dumps(self.errors(), indent=indent, default=pydantic_encoder)
 
-            @validator(V_POSITIONAL_ONLY_NAME, check_fields=False, allow_reuse=True)
-            def check_positional_only(cls, v: Optional[List[str]]) -> None:
-                if v is None:
-                    return
+    def __str__(self) -> str:
+        errors = self.errors()
+        no_errors = len(errors)
+        return (
+            f'{no_errors} validation error{"" if no_errors == 1 else "s"} for {self.model.__name__}\n'
+            f'{display_errors(errors)}'
+        )
 
-                plural = '' if len(v) == 1 else 's'
-                keys = ', '.join(map(repr, v))
-                raise TypeError(f'positional-only argument{plural} passed as keyword argument{plural}: {keys}')
+    def __repr_args__(self) -> 'ReprArgs':
+        return [('model', self.model.__name__), ('errors', self.errors())]
 
-            @validator(V_DUPLICATE_KWARGS, check_fields=False, allow_reuse=True)
-            def check_duplicate_kwargs(cls, v: Optional[List[str]]) -> None:
-                if v is None:
-                    return
 
-                plural = '' if len(v) == 1 else 's'
-                keys = ', '.join(map(repr, v))
-                raise TypeError(f'multiple values for argument{plural}: {keys}')
+def display_errors(errors: List['ErrorDict']) -> str:
+    return '\n'.join(f'{_display_error_loc(e)}\n  {e["msg"]} ({_display_error_type_and_ctx(e)})' for e in errors)
 
-            class Config(CustomConfig):
-                extra = getattr(CustomConfig, 'extra', Extra.forbid)
 
-        self.model = create_model(to_camel(self.raw_function.__name__), __base__=DecoratorBaseModel, **fields)
+def _display_error_loc(error: 'ErrorDict') -> str:
+    return ' -> '.join(str(e) for e in error['loc'])
+
+
+def _display_error_type_and_ctx(error: 'ErrorDict') -> str:
+    t = 'type=' + error['type']
+    ctx = error.get('ctx')
+    if ctx:
+        return t + ''.join(f'; {k}={v}' for k, v in ctx.items())
+    else:
+        return t
+
+
+def flatten_errors(
+    errors: Sequence[Any], config: Type['BaseConfig'], loc: Optional['Loc'] = None
+) -> Generator['ErrorDict', None, None]:
+    for error in errors:
+        if isinstance(error, ErrorWrapper):
+            if loc:
+                error_loc = loc + error.loc_tuple()
+            else:
+                error_loc = error.loc_tuple()
+
+            if isinstance(error.exc, ValidationError):
+                yield from flatten_errors(error.exc.raw_errors, config, error_loc)
+            else:
+                yield error_dict(error.exc, config, error_loc)
+        elif isinstance(error, list):
+            yield from flatten_errors(error, config, loc=loc)
+        else:
+            raise RuntimeError(f'Unknown error object: {error}')
+
+
+def error_dict(exc: Exception, config: Type['BaseConfig'], loc: 'Loc') -> 'ErrorDict':
+    type_ = get_exc_type(exc.__class__)
+    msg_template = config.error_msg_templates.get(type_) or getattr(exc, 'msg_template', None)
+    ctx = exc.__dict__
+    if msg_template:
+        msg = msg_template.format(**ctx)
+    else:
+        msg = str(exc)
+
+    d: 'ErrorDict' = {'loc': loc, 'msg': msg, 'type': type_}
+
+    if ctx:
+        d['ctx'] = ctx
+
+    return d
+
+
+_EXC_TYPE_CACHE: Dict[Type[Exception], str] = {}
+
+
+def get_exc_type(cls: Type[Exception]) -> str:
+    # slightly more efficient than using lru_cache since we don't need to worry about the cache filling up
+    try:
+        return _EXC_TYPE_CACHE[cls]
+    except KeyError:
+        r = _get_exc_type(cls)
+        _EXC_TYPE_CACHE[cls] = r
+        return r
+
+
+def _get_exc_type(cls: Type[Exception]) -> str:
+    if issubclass(cls, AssertionError):
+        return 'assertion_error'
+
+    base_name = 'type_error' if issubclass(cls, TypeError) else 'value_error'
+    if cls in (TypeError, ValueError):
+        # just TypeError or ValueError, no extra code
+        return base_name
+
+    # if it's not a TypeError or ValueError, we just take the lowercase of the exception name
+    # no chaining or snake case logic, use "code" for more complex error types.
+    code = getattr(cls, 'code', None) or cls.__name__.replace('Error', '').lower()
+    return base_name + '.' + code

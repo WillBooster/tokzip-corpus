@@ -1,58 +1,48 @@
-This page covers advanced TypeScript configuration in Deno, including compiler
-options, `tsconfig.json` compatibility, and library targeting. For an
-introduction to using TypeScript with Deno, see
-[TypeScript support](/runtime/fundamentals/typescript/).
+Currently Deno Deploy runs on Deno 2.5.0
 
-## Configuring TypeScript in Deno
+## Lifecycle
 
-Deno aims to simplify TypeScript configuration based on the following design
-choices:
+Deno Deploy runs applications in a serverless environment. This means that an
+application is not always running and is only started when a request is
+received. When no incoming traffic is received for a period of time, the
+application is stopped.
 
-- Strict and modern defaults for type-checking rules.
-- Allowing the omission of settings relating to the target runtime or
-  compatibility, leveraging direct integration with the execution environment.
-- Project references using `deno.json` directory scopes.
+Applications can be started and stopped at any time. They should start quickly
+to respond to incoming requests without delay.
 
-The last point presents a simpler format than `tsconfig.json`'s
-[`references`](https://www.typescriptlang.org/tsconfig/#references) and
-[`extends`](https://www.typescriptlang.org/tsconfig/#extends) fields, replacing
-them with `deno.json` workspaces and root-member inheritance. See the section on
-[type checking in workspaces](/runtime/fundamentals/workspaces/#type-checking).
+Multiple instances of the same application can run simultaneously. For example,
+one instance could be running in the US and another in Europe. Each instance is
+completely isolated from the others and they do not share CPU, memory, or disk
+resources. Multiple instances can also start in the same region when needed,
+such as to handle high traffic or during infrastructure updates.
 
-## `tsconfig.json` compatibility
+### Startup
 
-While using [`tsconfig.json`](https://www.typescriptlang.org/tsconfig/) files is
-not recommended for Deno-first projects, existing Node.js + TypeScript
-workspaces using them will work out-of-the-box under Deno's type checker and
-LSP.
+When the system decides to start an application, it provisions a new sandbox
+environment for the application. This environment is isolated from all other
+applications.
 
-Each workspace directory containing a `deno.json` or `package.json` is probed
-for a `tsconfig.json`. If it exists, it is added as a 'root' project reference
-and contained references are included recursively.
+It then starts the application using the configured entrypoint and waits for the
+HTTP server to start. If the application crashes before the HTTP server starts,
+the request that triggered the start will fail with a 502 Bad Gateway error.
 
-As with `tsc`, the scope of a TSConfig is determined by its
-[root fields](https://www.typescriptlang.org/tsconfig/#root-fields). In case of
-overlap:
+Once the application is started, incoming requests are routed to it and
+responses are sent back to the client.
 
-- A reference takes precedence over its referrer.
-- For root references, `foo/bar/tsconfig.json` takes precedence over
-  `foo/tsconfig.json`.
-- If a parent `deno.json` contains `compilerOptions`, that will take precedence
-  over any TSConfig.
+### Shutdown
 
-The following fields are supported:
+The application remains alive until no new incoming requests are received or
+responses (including response body bytes) are sent for a period of time. The
+exact timeout is between 5 seconds and 10 minutes. WebSocket connections that
+actively transmit data (including ping/pong frames) also keep the application
+alive.
 
-```json title="tsconfig.json"
-{
-  "extends": "...",
-  "files": ["..."],
-  "include": ["..."],
-  "exclude": ["..."],
-  "references": [
-    { "path": "..." }
-  ],
-  "compilerOptions": {
-    "...": "..."
-  }
-}
-```
+Once the system decides to stop the application, it sends a `SIGINT` signal to
+the application as a trigger to shut down. From this point on, the application
+has 5 seconds to shut down gracefully before it will be forcibly killed with a
+`SIGKILL` signal.
+
+### Eviction
+
+Sometimes an isolate may shut down even if the application is actively receiving
+traffic. Some examples of when this can happen are:

@@ -1,112 +1,217 @@
-import datetime
-from collections import deque
-from decimal import Decimal
-from enum import Enum
-from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
+import json
+import os
+import platform
 from pathlib import Path
-from re import Pattern
-from types import GeneratorType
-from typing import Any, Callable, Dict, Type, Union
-from uuid import UUID
+from typing import Any
 
-from pydantic.v1.color import Color
-from pydantic.v1.networks import NameEmail
-from pydantic.v1.types import SecretBytes, SecretStr
+import pytest
 
-__all__ = 'pydantic_encoder', 'custom_pydantic_encoder', 'timedelta_isoformat'
+from pydantic_core import SchemaSerializer, core_schema
+
+from ..conftest import plain_repr
+
+on_pypy = platform.python_implementation() == 'PyPy'
+# pypy doesn't seem to maintain order of `__dict__`
+if on_pypy:
+    IsStrictDict = dict
+else:
+    pass
 
 
-def isoformat(o: Union[datetime.date, datetime.time]) -> str:
-    return o.isoformat()
+class BaseModel:
+    __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
+
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
-def decimal_encoder(dec_value: Decimal) -> Union[int, float]:
-    """
-    Encodes a Decimal as int of there's no exponent, otherwise float
+class RootModel:
+    __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
+    root: str
 
-    This is useful when we use ConstrainedDecimal to represent Numeric(x,0)
-    where a integer (but not int typed) is used. Encoding this as a float
-    results in failed round-tripping between encode and parse.
-    Our Id type is a prime example of this.
+    def __init__(self, data):
+        self.root = data
 
-    >>> decimal_encoder(Decimal("1.0"))
-    1.0
 
-    >>> decimal_encoder(Decimal("1"))
-    1
-    """
-    if dec_value.as_tuple().exponent >= 0:
-        return int(dec_value)
+class RootSubModel(RootModel):
+    pass
+
+
+def test_model_root():
+    s = SchemaSerializer(core_schema.model_schema(RootModel, core_schema.int_schema(), root_model=True))
+    print(plain_repr(s))
+    # TODO: assert 'mode:RootModel' in plain_repr(s)
+    assert 'has_extra:false' in plain_repr(s)
+    assert s.to_python(RootModel(1)) == 1
+    assert s.to_python(RootSubModel(1)) == 1
+
+    j = s.to_json(RootModel(1))
+    if on_pypy:
+        assert json.loads(j) == 1
     else:
-        return float(dec_value)
+        assert j == b'1'
+
+    assert json.loads(s.to_json(RootSubModel(1))) == 1
 
 
-ENCODERS_BY_TYPE: Dict[Type[Any], Callable[[Any], Any]] = {
-    bytes: lambda o: o.decode(),
-    Color: str,
-    datetime.date: isoformat,
-    datetime.datetime: isoformat,
-    datetime.time: isoformat,
-    datetime.timedelta: lambda td: td.total_seconds(),
-    Decimal: decimal_encoder,
-    Enum: lambda o: o.value,
-    frozenset: list,
-    deque: list,
-    GeneratorType: list,
-    IPv4Address: str,
-    IPv4Interface: str,
-    IPv4Network: str,
-    IPv6Address: str,
-    IPv6Interface: str,
-    IPv6Network: str,
-    NameEmail: str,
-    Path: str,
-    Pattern: lambda o: o.pattern,
-    SecretBytes: str,
-    SecretStr: str,
-    set: list,
-    UUID: str,
-}
+def test_function_plain_field_serializer_to_python():
+    class Model(RootModel):
+        def ser_root(self, v: Any, _) -> str:
+            assert self.root == 1_000
+            return f'{v:_}'
+
+    s = SchemaSerializer(
+        core_schema.model_schema(
+            Model,
+            core_schema.int_schema(
+                serialization=core_schema.plain_serializer_function_ser_schema(
+                    Model.ser_root, is_field_serializer=True, info_arg=True
+                )
+            ),
+            root_model=True,
+        )
+    )
+    assert s.to_python(Model(1000)) == '1_000'
 
 
-def pydantic_encoder(obj: Any) -> Any:
-    from dataclasses import asdict, is_dataclass
+def test_function_wrap_field_serializer_to_python():
+    class Model(RootModel):
+        def ser_root(self, v: Any, serializer: core_schema.SerializerFunctionWrapHandler, _) -> str:
+            root = serializer(v)
+            assert self.root == 1_000
+            return f'{root:_}'
 
-    from pydantic.v1.main import BaseModel
-
-    if isinstance(obj, BaseModel):
-        return obj.dict()
-    elif is_dataclass(obj):
-        return asdict(obj)
-
-    # Check the class type and its superclasses for a matching encoder
-    for base in obj.__class__.__mro__[:-1]:
-        try:
-            encoder = ENCODERS_BY_TYPE[base]
-        except KeyError:
-            continue
-        return encoder(obj)
-    else:  # We have exited the for loop without finding a suitable encoder
-        raise TypeError(f"Object of type '{obj.__class__.__name__}' is not JSON serializable")
-
-
-def custom_pydantic_encoder(type_encoders: Dict[Any, Callable[[Type[Any]], Any]], obj: Any) -> Any:
-    # Check the class type and its superclasses for a matching encoder
-    for base in obj.__class__.__mro__[:-1]:
-        try:
-            encoder = type_encoders[base]
-        except KeyError:
-            continue
-
-        return encoder(obj)
-    else:  # We have exited the for loop without finding a suitable encoder
-        return pydantic_encoder(obj)
+    s = SchemaSerializer(
+        core_schema.model_schema(
+            Model,
+            core_schema.int_schema(
+                serialization=core_schema.wrap_serializer_function_ser_schema(
+                    Model.ser_root, is_field_serializer=True, info_arg=True, schema=core_schema.any_schema()
+                )
+            ),
+            root_model=True,
+        )
+    )
+    assert s.to_python(Model(1000)) == '1_000'
 
 
-def timedelta_isoformat(td: datetime.timedelta) -> str:
-    """
-    ISO 8601 encoding for Python timedelta object.
-    """
-    minutes, seconds = divmod(td.seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    return f'{"-" if td.days < 0 else ""}P{abs(td.days)}DT{hours:d}H{minutes:d}M{seconds:d}.{td.microseconds:06d}S'
+def test_function_plain_field_serializer_to_json():
+    class Model(RootModel):
+        def ser_root(self, v: Any, _) -> str:
+            assert self.root == 1_000
+            return f'{v:_}'
+
+    s = SchemaSerializer(
+        core_schema.model_schema(
+            Model,
+            core_schema.int_schema(
+                serialization=core_schema.plain_serializer_function_ser_schema(
+                    Model.ser_root, is_field_serializer=True, info_arg=True
+                )
+            ),
+            root_model=True,
+        )
+    )
+    assert json.loads(s.to_json(Model(1000))) == '1_000'
+
+
+def test_function_wrap_field_serializer_to_json():
+    class Model(RootModel):
+        def ser_root(self, v: Any, serializer: core_schema.SerializerFunctionWrapHandler, _) -> str:
+            assert self.root == 1_000
+            root = serializer(v)
+            return f'{root:_}'
+
+    s = SchemaSerializer(
+        core_schema.model_schema(
+            Model,
+            core_schema.int_schema(
+                serialization=core_schema.wrap_serializer_function_ser_schema(
+                    Model.ser_root, is_field_serializer=True, info_arg=True, schema=core_schema.any_schema()
+                )
+            ),
+            root_model=True,
+        )
+    )
+    assert json.loads(s.to_json(Model(1000))) == '1_000'
+
+
+@pytest.mark.parametrize('order', ['BR', 'RB'])
+def test_root_model_dump_with_base_model(order):
+    class BModel(BaseModel):
+        value: str
+
+    b_schema = core_schema.model_schema(
+        BModel, core_schema.model_fields_schema({'value': core_schema.model_field(core_schema.str_schema())})
+    )
+
+    class RModel(RootModel):
+        root: int
+
+    r_schema = core_schema.model_schema(RModel, core_schema.int_schema(), root_model=True)
+
+    if order == 'BR':
+
+        class Model(RootModel):
+            root: list[BModel | RModel]
+
+        choices = [b_schema, r_schema]
+
+    elif order == 'RB':
+
+        class Model(RootModel):
+            root: list[RModel | BModel]
+
+        choices = [r_schema, b_schema]
+
+    s = SchemaSerializer(
+        core_schema.model_schema(
+            Model, core_schema.list_schema(core_schema.union_schema(choices=choices)), root_model=True
+        )
+    )
+
+    m = Model([RModel(1), RModel(2), BModel(value='abc')])
+
+    assert s.to_python(m) == [1, 2, {'value': 'abc'}]
+    assert s.to_json(m) == b'[1,2,{"value":"abc"}]'
+
+
+def test_not_root_model():
+    # https://github.com/pydantic/pydantic/issues/8963
+
+    class RootModel:
+        root: int
+
+    v = RootModel()
+    v.root = '123'
+
+    s = SchemaSerializer(
+        core_schema.model_schema(
+            RootModel,
+            core_schema.str_schema(),
+            root_model=True,
+        ),
+    )
+
+    assert s.to_python(v) == '123'
+    assert s.to_json(v) == b'"123"'
+
+    # Path is chosen because it has a .root property
+    # which could look like a root model in bad implementations
+
+    if os.name == 'nt':
+        path_value = Path('C:\\a\\b')
+        path_bytes = b'"C:\\\\a\\\\b"'  # fixme double escaping?
+    else:
+        path_value = Path('/a/b')
+        path_bytes = b'"/a/b"'
+
+    with pytest.warns(UserWarning, match=r'PydanticSerializationUnexpectedValue\(Expected `RootModel`'):
+        assert s.to_python(path_value) == path_value
+
+    with pytest.warns(UserWarning, match=r'PydanticSerializationUnexpectedValue\(Expected `RootModel`'):
+        assert s.to_json(path_value) == path_bytes
+
+    assert s.to_python(path_value, warnings=False) == path_value
+    assert s.to_json(path_value, warnings=False) == path_bytes

@@ -1,505 +1,413 @@
-import platform
-import weakref
+import re
+from typing import Annotated, Generic, TypeVar
 
 import pytest
-from dirty_equals import IsInstance
 
-from pydantic_core import CoreConfig, SchemaValidator, core_schema
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    PydanticDeprecatedSince20,
+    PydanticUserError,
+    ValidationError,
+    create_model,
+    field_validator,
+    validator,
+)
 
-from ..conftest import assert_gc
 
-
-class MyModel:
-    # this is not required, but it avoids `__pydantic_fields_set__` being included in `__dict__`
-    __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
-    field_a: str
-    field_b: int
-
-
-def test_model_init():
-    v = SchemaValidator(
-        core_schema.model_schema(
-            cls=MyModel,
-            schema=core_schema.model_fields_schema(
-                fields={
-                    'field_a': core_schema.model_field(schema=core_schema.str_schema()),
-                    'field_b': core_schema.model_field(schema=core_schema.int_schema()),
-                }
-            ),
-        )
+def test_create_model() -> None:
+    FooModel = create_model(
+        'FooModel',
+        foo=(str, ...),
+        bar=(int, 123),
+        baz=int,
+        qux=Annotated[int, Field(title='QUX')],
     )
-    m = v.validate_python({'field_a': 'test', 'field_b': 12})
-    assert isinstance(m, MyModel)
-    assert m.field_a == 'test'
-    assert m.field_b == 12
-    assert m.__pydantic_fields_set__ == {'field_a', 'field_b'}
+    assert issubclass(FooModel, BaseModel)
+    assert FooModel.model_config == BaseModel.model_config
+    assert FooModel.__name__ == 'FooModel'
+    assert FooModel.__qualname__ == 'FooModel'
+    assert FooModel.model_fields.keys() == {'foo', 'bar', 'baz', 'qux'}
+    assert FooModel.model_fields['foo'].is_required()
+    assert not FooModel.model_fields['bar'].is_required()
+    assert FooModel.model_fields['baz'].is_required()
 
-    m2 = MyModel()
-    validated = v.validate_python({'field_a': 'test', 'field_b': 12}, self_instance=m2)
-    assert validated == m2
-    assert validated.field_a == 'test'
-    assert validated.field_b == 12
-    assert validated.__pydantic_fields_set__ == {'field_a', 'field_b'}
+    assert FooModel.model_fields['qux'].title == 'QUX'
 
+    assert not FooModel.__pydantic_decorators__.validators
+    assert not FooModel.__pydantic_decorators__.root_validators
+    assert not FooModel.__pydantic_decorators__.field_validators
+    assert not FooModel.__pydantic_decorators__.field_serializers
 
-def test_model_init_nested():
-    class MyModel:
-        # this is not required, but it avoids `__pydantic_fields_set__` being included in `__dict__`
-        __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
-
-    v = SchemaValidator(
-        core_schema.model_schema(
-            cls=MyModel,
-            schema=core_schema.model_fields_schema(
-                fields={
-                    'field_a': core_schema.model_field(schema=core_schema.str_schema()),
-                    'field_b': core_schema.model_field(
-                        schema=core_schema.model_schema(
-                            cls=MyModel,
-                            schema=core_schema.model_fields_schema(
-                                fields={
-                                    'x_a': core_schema.model_field(schema=core_schema.str_schema()),
-                                    'x_b': core_schema.model_field(schema=core_schema.int_schema()),
-                                }
-                            ),
-                        )
-                    ),
-                }
-            ),
-        )
-    )
-    m = v.validate_python({'field_a': 'test', 'field_b': {'x_a': 'foo', 'x_b': 12}})
-    assert isinstance(m, MyModel)
-    assert m.field_a == 'test'
-    assert isinstance(m.field_b, MyModel)
-    assert m.field_b.x_a == 'foo'
-    assert m.field_b.x_b == 12
-
-    m2 = MyModel()
-    v.validate_python({'field_a': 'test', 'field_b': {'x_a': 'foo', 'x_b': 12}}, self_instance=m2)
-    assert m2.field_a == 'test'
-    assert isinstance(m2.field_b, MyModel)
-    assert m2.field_b.x_a == 'foo'
-    assert m2.field_b.x_b == 12
-
-    assert m2.__pydantic_fields_set__ == {'field_a', 'field_b'}
+    assert FooModel.__module__ == 'tests.test_create_model'
 
 
-def test_function_before():
-    def f(input_value, _info):
-        assert isinstance(input_value, dict)
-        input_value['field_a'] += b' XX'
-        return input_value
-
-    v = SchemaValidator(
-        {
-            'type': 'function-before',
-            'function': {'type': 'with-info', 'function': f},
-            'schema': core_schema.model_schema(
-                cls=MyModel,
-                schema=core_schema.model_fields_schema(
-                    fields={
-                        'field_a': core_schema.model_field(schema=core_schema.str_schema()),
-                        'field_b': core_schema.model_field(schema=core_schema.int_schema()),
-                    }
-                ),
-            ),
-        }
-    )
-
-    m = v.validate_python({'field_a': b'321', 'field_b': '12'})
-    assert isinstance(m, MyModel)
-    assert m.field_a == '321 XX'
-    assert m.field_b == 12
-
-    m2 = MyModel()
-    v.validate_python({'field_a': b'321', 'field_b': '12'}, self_instance=m2)
-    assert m2.__dict__ == {'field_a': '321 XX', 'field_b': 12}
-    assert m2.__pydantic_fields_set__ == {'field_a', 'field_b'}
+def test_create_model_invalid_tuple():
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'create-model-field-definitions'):
+        create_model('FooModel', foo=(tuple[int, int], (1, 2), 'more'))
 
 
-def test_function_after():
-    def f(input_value, _info):
-        # always a model here, because even with `self_instance` the validator returns a model, e.g. m2 here
-        assert isinstance(input_value, MyModel)
-        input_value.field_a += ' Changed'
-        return input_value
-
-    v = SchemaValidator(
-        {
-            'type': 'function-after',
-            'function': {'type': 'with-info', 'function': f},
-            'schema': core_schema.model_schema(
-                cls=MyModel,
-                schema=core_schema.model_fields_schema(
-                    fields={
-                        'field_a': core_schema.model_field(schema=core_schema.str_schema()),
-                        'field_b': core_schema.model_field(schema=core_schema.int_schema()),
-                    }
-                ),
-            ),
-        }
-    )
-
-    m = v.validate_python({'field_a': b'321', 'field_b': '12'})
-    assert isinstance(m, MyModel)
-    assert m.field_a == '321 Changed'
-    assert m.field_b == 12
-
-    m2 = MyModel()
-    v.validate_python({'field_a': b'321', 'field_b': '12'}, self_instance=m2)
-    assert m2.__dict__ == {'field_a': '321 Changed', 'field_b': 12}
-    assert m2.__pydantic_fields_set__ == {'field_a', 'field_b'}
+def test_create_model_usage():
+    FooModel = create_model('FooModel', foo=(str, ...), bar=(int, 123))
+    m = FooModel(foo='hello')
+    assert m.foo == 'hello'
+    assert m.bar == 123
+    with pytest.raises(ValidationError):
+        FooModel()
+    with pytest.raises(ValidationError):
+        FooModel(foo='hello', bar='xxx')
 
 
-def test_function_wrap():
-    def f(input_value, handler, _info):
-        assert isinstance(input_value, dict)
-        v = handler(input_value)
-        # always a model here, because even with `self_instance` the validator returns a model, e.g. m2 here
-        assert isinstance(v, MyModel)
-        v.field_a += ' Changed'
-        return v
+def test_create_model_private_attr() -> None:
+    FooModel = create_model('FooModel', _priv1=int, _priv2=(int, PrivateAttr(default=2)))
+    assert set(FooModel.__private_attributes__) == {'_priv1', '_priv2'}
 
-    v = SchemaValidator(
-        {
-            'type': 'function-wrap',
-            'function': {'type': 'with-info', 'function': f},
-            'schema': core_schema.model_schema(
-                cls=MyModel,
-                schema=core_schema.model_fields_schema(
-                    fields={
-                        'field_a': core_schema.model_field(schema=core_schema.str_schema()),
-                        'field_b': core_schema.model_field(schema=core_schema.int_schema()),
-                    }
-                ),
-            ),
-        }
-    )
-
-    m = v.validate_python({'field_a': b'321', 'field_b': '12'})
-    assert isinstance(m, MyModel)
-    assert m.field_a == '321 Changed'
-    assert m.field_b == 12
-
-    m2 = MyModel()
-    v.validate_python({'field_a': b'321', 'field_b': '12'}, self_instance=m2)
-    assert m2.__dict__ == {'field_a': '321 Changed', 'field_b': 12}
-    assert m2.__pydantic_fields_set__ == {'field_a', 'field_b'}
+    m = FooModel()
+    m._priv1 = 1
+    assert m._priv1 == 1
+    assert m._priv2 == 2
 
 
-def test_simple():
-    v = SchemaValidator(core_schema.str_schema())
-    assert v.validate_python(b'abc') == 'abc'
-    assert v.isinstance_python(b'abc') is True
+def test_create_model_pickle(create_module):
+    """
+    Pickle will work for dynamically created model only if it was defined globally with its class name
+    and module where it's defined was specified
+    """
 
-    assert v.validate_python(b'abc', self_instance='foobar') == 'abc'
-    assert v.isinstance_python(b'abc', self_instance='foobar') is True
+    @create_module
+    def module():
+        import pickle
 
-    assert v.validate_json('"abc"') == 'abc'
+        from pydantic import create_model
 
-    assert v.validate_json('"abc"', self_instance='foobar') == 'abc'
+        FooModel = create_model('FooModel', foo=(str, ...), bar=(int, 123), __module__=__name__)
 
-
-def test_model_custom_init():
-    calls = []
-
-    class Model:
-        def __init__(self, **kwargs):
-            calls.append(repr(kwargs))
-            if 'a' in kwargs:
-                kwargs['a'] *= 2
-            self.__pydantic_validator__.validate_python(kwargs, self_instance=self)
-            self.c = self.a + 2
-
-    v = SchemaValidator(
-        core_schema.model_schema(
-            Model,
-            core_schema.model_fields_schema(
-                {
-                    'a': core_schema.model_field(core_schema.with_default_schema(core_schema.int_schema(), default=1)),
-                    'b': core_schema.model_field(core_schema.int_schema()),
-                }
-            ),
-            custom_init=True,
-        )
-    )
-    Model.__pydantic_validator__ = v
-
-    m = v.validate_python({'b': 2})
-    assert m.a == 1
-    assert m.b == 2
-    assert m.c == 3
-    assert m.__pydantic_fields_set__ == {'b'}
-    assert calls == ["{'b': 2}"]
-
-    m2 = v.validate_python({'a': 5, 'b': 3})
-    assert m2.a == 10
-    assert m2.b == 3
-    assert m2.c == 12
-    assert m2.__pydantic_fields_set__ == {'a', 'b'}
-    assert calls == ["{'b': 2}", "{'a': 5, 'b': 3}"]
-
-    m3 = v.validate_json('{"a":10, "b": 4}')
-    assert m3.a == 20
-    assert m3.b == 4
-    assert m3.c == 22
-    assert m3.__pydantic_fields_set__ == {'a', 'b'}
-    assert calls == ["{'b': 2}", "{'a': 5, 'b': 3}", "{'a': 10, 'b': 4}"]
+        m = FooModel(foo='hello')
+        d = pickle.dumps(m)
+        m2 = pickle.loads(d)
+        assert m2.foo == m.foo == 'hello'
+        assert m2.bar == m.bar == 123
+        assert m2 == m
+        assert m2 is not m
 
 
-def test_model_custom_init_nested():
-    calls = []
+def test_create_model_multi_inheritance():
+    class Mixin:
+        pass
 
-    class ModelInner:
-        __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
-        a: int
-        b: int
+    Generic_T = Generic[TypeVar('T')]
+    FooModel = create_model('FooModel', value=(int, ...), __base__=(BaseModel, Generic_T))
 
-        def __init__(self, **data):
-            calls.append(f'inner: {data!r}')
-            self.__pydantic_validator__.validate_python(data, self_instance=self)
+    assert FooModel.__orig_bases__ == (BaseModel, Generic_T)
 
-    inner_schema = core_schema.model_schema(
-        ModelInner,
-        core_schema.model_fields_schema(
-            {
-                'a': core_schema.model_field(core_schema.with_default_schema(core_schema.int_schema(), default=1)),
-                'b': core_schema.model_field(core_schema.int_schema()),
-            }
+
+def test_create_model_must_not_reset_parent_namespace():
+    # It's important to use the annotation `'namespace'` as this is a particular string that is present
+    # in the parent namespace if you reset the parent namespace in the call to `create_model`.
+
+    AbcModel = create_model('AbcModel', abc=('namespace', None))
+    with pytest.raises(
+        PydanticUserError,
+        match=re.escape(
+            '`AbcModel` is not fully defined; you should define `namespace`, then call `AbcModel.model_rebuild()`.'
         ),
-        custom_init=True,
-    )
-    ModelInner.__pydantic_validator__ = SchemaValidator(inner_schema)
+    ):
+        AbcModel(abc=1)
 
-    class ModelOuter:
-        __slots__ = '__dict__', '__pydantic_fields_set__'
-        a: int
-        b: ModelInner
+    # Rebuild the model now that `namespace` is defined
+    namespace = int  # noqa F841
+    AbcModel.model_rebuild()
 
-        def __init__(self, **data):
-            calls.append(f'outer: {data!r}')
-            self.__pydantic_validator__.validate_python(data, self_instance=self)
+    assert AbcModel(abc=1).abc == 1
 
-    ModelOuter.__pydantic_validator__ = SchemaValidator(
-        core_schema.model_schema(
-            ModelOuter,
-            core_schema.model_fields_schema(
-                {
-                    'a': core_schema.model_field(core_schema.with_default_schema(core_schema.int_schema(), default=1)),
-                    'b': core_schema.model_field(inner_schema),
-                }
-            ),
-            custom_init=True,
-        )
-    )
-
-    m = ModelOuter(a=2, b={'b': 3})
-    assert m.__pydantic_fields_set__ == {'a', 'b'}
-    assert m.a == 2
-    assert isinstance(m.b, ModelInner)
-    assert m.b.a == 1
-    assert m.b.b == 3
-    # insert_assert(calls)
-    assert calls == ["outer: {'a': 2, 'b': {'b': 3}}", "inner: {'b': 3}"]
-
-
-def test_model_custom_init_extra():
-    calls = []
-
-    class ModelInner:
-        __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
-        a: int
-        b: int
-
-        def __getattr__(self, item):
-            return self.__pydantic_extra__[item]
-
-        def __init__(self, **data):
-            self.__pydantic_validator__.validate_python(data, self_instance=self)
-            calls.append(('inner', self.__dict__, self.__pydantic_fields_set__, self.__pydantic_extra__))
-
-    inner_schema = core_schema.model_schema(
-        ModelInner,
-        core_schema.model_fields_schema(
-            {
-                'a': core_schema.model_field(core_schema.with_default_schema(core_schema.int_schema(), default=1)),
-                'b': core_schema.model_field(core_schema.int_schema()),
-            }
-        ),
-        config=CoreConfig(extra_fields_behavior='allow'),
-        custom_init=True,
-    )
-    ModelInner.__pydantic_validator__ = SchemaValidator(inner_schema)
-
-    class ModelOuter:
-        __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
-        a: int
-        b: ModelInner
-
-        def __getattr__(self, item):
-            return self.__pydantic_extra__[item]
-
-        def __init__(self, **data):
-            data['b']['z'] = 1
-            self.__pydantic_validator__.validate_python(data, self_instance=self)
-            calls.append(('outer', self.__dict__, self.__pydantic_fields_set__, self.__pydantic_extra__))
-
-    ModelOuter.__pydantic_validator__ = SchemaValidator(
-        core_schema.model_schema(
-            ModelOuter,
-            core_schema.model_fields_schema(
-                {
-                    'a': core_schema.model_field(core_schema.with_default_schema(core_schema.int_schema(), default=1)),
-                    'b': core_schema.model_field(inner_schema),
-                }
-            ),
-            config=CoreConfig(extra_fields_behavior='allow'),
-            custom_init=True,
-        )
-    )
-
-    m = ModelOuter(a=2, b={'b': 3}, c=1)
-    assert m.__pydantic_fields_set__ == {'a', 'b', 'c'}
-    assert m.a == 2
-    assert m.c == 1
-    assert isinstance(m.b, ModelInner)
-    assert m.b.a == 1
-    assert m.b.b == 3
-    assert m.b.z == 1
-    # insert_assert(calls)
-    assert calls == [
-        ('inner', {'a': 1, 'b': 3}, {'b', 'z'}, {'z': 1}),
-        ('outer', {'a': 2, 'b': IsInstance(ModelInner)}, {'c', 'a', 'b'}, {'c': 1}),
+    with pytest.raises(ValidationError) as exc_info:
+        AbcModel(abc='a')
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'int_parsing',
+            'loc': ('abc',),
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'input': 'a',
+        }
     ]
 
 
-def test_model_custom_init_revalidate():
-    calls = []
+def test_config_and_base():
+    class Base(BaseModel):
+        a: str
 
-    class Model:
-        __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
+        model_config = {'str_to_lower': True}
 
-        def __init__(self, **kwargs):
-            calls.append(repr(kwargs))
-            self.__dict__.update(kwargs)
-            self.__pydantic_fields_set__ = {'custom'}
-            self.__pydantic_extra__ = None
+    Model = create_model('Model', __base__=Base, __config__={'str_max_length': 3})
 
-    v = SchemaValidator(
-        core_schema.model_schema(
-            Model,
-            core_schema.model_fields_schema({'a': core_schema.model_field(core_schema.int_schema())}),
-            custom_init=True,
-            config=dict(revalidate_instances='always'),
-        )
-    )
+    assert Model(a='AAA').a == 'aaa'
 
-    m = v.validate_python({'a': '1'})
-    assert isinstance(m, Model)
-    assert m.a == '1'
-    assert m.__pydantic_fields_set__ == {'custom'}
-    assert calls == ["{'a': '1'}"]
-    m.x = 4
-
-    m2 = v.validate_python(m)
-    assert m2 is not m
-    assert isinstance(m2, Model)
-    assert m2.a == '1'
-    assert m2.__dict__ == {'a': '1', 'x': 4}
-    assert m2.__pydantic_fields_set__ == {'custom'}
-    assert calls == ["{'a': '1'}", "{'a': '1', 'x': 4}"]
+    with pytest.raises(ValidationError):
+        Model(a='AAAA')
 
 
-@pytest.mark.xfail(
-    condition=platform.python_implementation() == 'PyPy', reason='https://foss.heptapod.net/pypy/pypy/-/issues/3899'
-)
-@pytest.mark.skipif(platform.python_implementation() == 'GraalVM', reason='Cannot reliably trigger GC on GraalPy')
-@pytest.mark.parametrize('validator', [None, 'field', 'model'])
-def test_leak_model(validator):
-    def fn():
-        class Model:
-            a: int
+def test_inheritance():
+    class BarModel(BaseModel):
+        x: int = 1
+        y: int = 2
 
+    model = create_model('FooModel', foo=(str, ...), bar=(int, 123), __base__=BarModel)
+    assert model.model_fields.keys() == {'foo', 'bar', 'x', 'y'}
+    m = model(foo='a', x=4)
+    assert m.model_dump() == {'bar': 123, 'foo': 'a', 'x': 4, 'y': 2}
+
+    # bases as a tuple
+    model = create_model('FooModel', foo=(str, ...), bar=(int, 123), __base__=(BarModel,))
+    assert model.model_fields.keys() == {'foo', 'bar', 'x', 'y'}
+    m = model(foo='a', x=4)
+    assert m.model_dump() == {'bar': 123, 'foo': 'a', 'x': 4, 'y': 2}
+
+
+def test_custom_config():
+    config = ConfigDict(frozen=True)
+    expected_config = BaseModel.model_config.copy()
+    expected_config['frozen'] = True
+
+    model = create_model('FooModel', foo=(int, ...), __config__=config)
+    m = model(**{'foo': '987'})
+    assert m.foo == 987
+    assert model.model_config == expected_config
+    with pytest.raises(ValidationError):
+        m.foo = 654
+
+
+def test_custom_config_inherits():
+    class Config(ConfigDict):
+        custom_config: bool
+
+    config = Config(custom_config=True, validate_assignment=True)
+    expected_config = Config(BaseModel.model_config)
+    expected_config.update(config)
+
+    model = create_model('FooModel', foo=(int, ...), __config__=config)
+    m = model(**{'foo': '987'})
+    assert m.foo == 987
+    assert model.model_config == expected_config
+    with pytest.raises(ValidationError):
+        m.foo = ['123']
+
+
+def test_custom_config_extras():
+    config = ConfigDict(extra='forbid')
+
+    model = create_model('FooModel', foo=(int, ...), __config__=config)
+    assert model(foo=654)
+    with pytest.raises(ValidationError):
+        model(bar=654)
+
+
+def test_inheritance_validators():
+    class BarModel(BaseModel):
+        @field_validator('a', check_fields=False)
+        @classmethod
+        def check_a(cls, v):
+            if 'foobar' not in v:
+                raise ValueError('"foobar" not found in a')
+            return v
+
+    model = create_model('FooModel', a=(str, 'cake'), __base__=BarModel)
+    assert model().a == 'cake'
+    assert model(a='this is foobar good').a == 'this is foobar good'
+    with pytest.raises(ValidationError):
+        model(a='something else')
+
+
+def test_inheritance_validators_always():
+    class BarModel(BaseModel):
+        @field_validator('a', check_fields=False)
+        @classmethod
+        def check_a(cls, v):
+            if 'foobar' not in v:
+                raise ValueError('"foobar" not found in a')
+            return v
+
+    model = create_model('FooModel', a=(str, Field('cake', validate_default=True)), __base__=BarModel)
+    with pytest.raises(ValidationError):
+        model()
+    assert model(a='this is foobar good').a == 'this is foobar good'
+    with pytest.raises(ValidationError):
+        model(a='something else')
+
+
+def test_inheritance_validators_all():
+    with pytest.warns(PydanticDeprecatedSince20, match='Pydantic V1 style `@validator` validators are deprecated'):
+
+        class BarModel(BaseModel):
+            @validator('*')
             @classmethod
-            def _validator(cls, v, info):
-                return v
+            def check_all(cls, v):
+                return v * 2
 
-            @classmethod
-            def _wrap_validator(cls, v, validator, info):
-                return validator(v)
-
-        field_schema = core_schema.int_schema()
-        if validator == 'field':
-            field_schema = core_schema.with_info_before_validator_function(Model._validator, field_schema)
-            field_schema = core_schema.with_info_wrap_validator_function(Model._wrap_validator, field_schema)
-            field_schema = core_schema.with_info_after_validator_function(Model._validator, field_schema)
-
-        model_schema = core_schema.model_schema(
-            Model, core_schema.model_fields_schema({'a': core_schema.model_field(field_schema)})
-        )
-
-        if validator == 'model':
-            model_schema = core_schema.with_info_before_validator_function(Model._validator, model_schema)
-            model_schema = core_schema.with_info_wrap_validator_function(Model._wrap_validator, model_schema)
-            model_schema = core_schema.with_info_after_validator_function(Model._validator, model_schema)
-
-        # If any of the Rust validators don't implement traversal properly,
-        # there will be an undetectable cycle created by this assignment
-        # which will keep Model alive
-        Model.__pydantic_validator__ = SchemaValidator(model_schema)
-
-        return Model
-
-    klass = fn()
-    ref = weakref.ref(klass)
-    assert ref() is not None
-
-    del klass
-
-    assert_gc(lambda: ref() is None)
+    model = create_model('FooModel', a=(int, ...), b=(int, ...), __base__=BarModel)
+    assert model(a=2, b=6).model_dump() == {'a': 4, 'b': 12}
 
 
-def test_model_custom_init_with_union() -> None:
-    class A:
-        def __init__(self, **kwargs):
-            assert 'a' in kwargs
-            self.a = kwargs.get('a')
+def test_field_invalid_identifier() -> None:
+    model = create_model('FooModel', **{'invalid-identifier': (int, ...)})
+    m = model(**{'invalid-identifier': '123'})
+    assert m.model_dump() == {'invalid-identifier': 123}
+    with pytest.raises(ValidationError) as exc_info:
+        model()
+    assert exc_info.value.errors(include_url=False) == [
+        {'input': {}, 'loc': ('invalid-identifier',), 'msg': 'Field required', 'type': 'missing'}
+    ]
 
-    class B:
-        def __init__(self, **kwargs):
-            assert 'b' in kwargs
-            self.b = kwargs.get('b')
 
-    schema = {
-        'type': 'union',
-        'choices': [
-            {
-                'type': 'model',
-                'cls': A,
-                'schema': {
-                    'type': 'model-fields',
-                    'fields': {'a': {'type': 'model-field', 'schema': {'type': 'bool'}}},
-                    'model_name': 'A',
-                },
-                'custom_init': True,
-                'ref': '__main__.A:4947206928',
-            },
-            {
-                'type': 'model',
-                'cls': B,
-                'schema': {
-                    'type': 'model-fields',
-                    'fields': {'b': {'type': 'model-field', 'schema': {'type': 'bool'}}},
-                    'model_name': 'B',
-                },
-                'custom_init': True,
-                'ref': '__main__.B:4679932848',
-            },
-        ],
+def test_repeat_base_usage():
+    class Model(BaseModel):
+        a: str
+
+    assert Model.model_fields.keys() == {'a'}
+
+    model = create_model('FooModel', b=(int, 1), __base__=Model)
+
+    assert Model.model_fields.keys() == {'a'}
+    assert model.model_fields.keys() == {'a', 'b'}
+
+    model2 = create_model('Foo2Model', c=(int, 1), __base__=Model)
+
+    assert Model.model_fields.keys() == {'a'}
+    assert model.model_fields.keys() == {'a', 'b'}
+    assert model2.model_fields.keys() == {'a', 'c'}
+
+    model3 = create_model('Foo2Model', d=(int, 1), __base__=model)
+
+    assert Model.model_fields.keys() == {'a'}
+    assert model.model_fields.keys() == {'a', 'b'}
+    assert model2.model_fields.keys() == {'a', 'c'}
+    assert model3.model_fields.keys() == {'a', 'b', 'd'}
+
+
+def test_dynamic_and_static():
+    class A(BaseModel):
+        x: int
+        y: float
+        z: str
+
+    DynamicA = create_model('A', x=(int, ...), y=(float, ...), z=(str, ...))
+
+    for field_name in ('x', 'y', 'z'):
+        assert A.model_fields[field_name].default == DynamicA.model_fields[field_name].default
+
+
+def test_create_model_field_and_model_title():
+    m = create_model('M', __config__=ConfigDict(title='abc'), a=(str, Field(title='field-title')))
+    assert m.model_json_schema() == {
+        'properties': {'a': {'title': 'field-title', 'type': 'string'}},
+        'required': ['a'],
+        'title': 'abc',
+        'type': 'object',
     }
 
-    validator = SchemaValidator(schema)
 
-    assert validator.validate_python({'a': False}).a is False
-    assert validator.validate_python({'b': True}).b is True
+def test_create_model_field_description():
+    m = create_model('M', a=(str, Field(description='descr')), __doc__='Some doc')
+    assert m.model_json_schema() == {
+        'properties': {'a': {'description': 'descr', 'title': 'A', 'type': 'string'}},
+        'required': ['a'],
+        'title': 'M',
+        'type': 'object',
+        'description': 'Some doc',
+    }
+
+
+def test_create_model_with_doc():
+    model = create_model('FooModel', foo=(str, ...), bar=(int, 123), __doc__='The Foo model')
+    assert model.__name__ == 'FooModel'
+    assert model.__doc__ == 'The Foo model'
+
+
+def test_create_model_protected_namespace_default():
+    with pytest.warns(
+        UserWarning, match="Field 'model_dump_something' in 'Model' conflicts with protected namespace 'model_dump'"
+    ):
+        create_model('Model', model_dump_something=(str, ...))
+
+
+def test_create_model_custom_protected_namespace():
+    with pytest.warns(UserWarning, match="Field 'test_field' in 'Model' conflicts with protected namespace 'test_'"):
+        create_model(
+            'Model',
+            __config__=ConfigDict(protected_namespaces=('test_',)),
+            model_prefixed_field=(str, ...),
+            test_field=(str, ...),
+        )
+
+
+def test_create_model_multiple_protected_namespace():
+    with pytest.warns(
+        UserWarning, match="Field 'also_protect_field' in 'Model' conflicts with protected namespace 'also_protect_'"
+    ):
+        create_model(
+            'Model',
+            __config__=ConfigDict(protected_namespaces=('protect_me_', 'also_protect_')),
+            also_protect_field=(str, ...),
+        )
+
+
+def test_json_schema_with_inner_models_with_duplicate_names():
+    model_a = create_model(
+        'a',
+        inner=(str, ...),
+    )
+    model_b = create_model(
+        'a',
+        outer=(model_a, ...),
+    )
+    assert model_b.model_json_schema() == {
+        '$defs': {
+            'a': {
+                'properties': {'inner': {'title': 'Inner', 'type': 'string'}},
+                'required': ['inner'],
+                'title': 'a',
+                'type': 'object',
+            }
+        },
+        'properties': {'outer': {'$ref': '#/$defs/a'}},
+        'required': ['outer'],
+        'title': 'a',
+        'type': 'object',
+    }
+
+
+def test_resolving_forward_refs_across_modules(create_module):
+    module = create_module(
+        # language=Python
+        """\
+from __future__ import annotations
+from dataclasses import dataclass
+from pydantic import BaseModel
+
+class X(BaseModel):
+    pass
+
+@dataclass
+class Y:
+    x: X
+        """
+    )
+    Z = create_model('Z', y=(module.Y, ...))
+    assert Z(y={'x': {}}).y is not None
+
+
+def test_type_field_in_the_same_module():
+    class A:
+        pass
+
+    B = create_model('B', a_cls=(type, A))
+    b = B()
+    assert b.a_cls == A
+
+
+def test_create_model_qualname() -> None:
+    FooModel = create_model('FooModel', __qualname__='test_create_model_qualname.FooModel')
+    assert FooModel.__name__ == 'FooModel'
+    assert FooModel.__qualname__ == 'test_create_model_qualname.FooModel'

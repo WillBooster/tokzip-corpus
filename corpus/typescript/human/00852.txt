@@ -1,294 +1,192 @@
-import * as collections from "./_namespaces/collections.js";
-import * as documents from "./_namespaces/documents.js";
-import * as fakes from "./_namespaces/fakes.js";
-import * as Harness from "./_namespaces/Harness.js";
-import * as ts from "./_namespaces/ts.js";
-import * as vfs from "./_namespaces/vfs.js";
-import * as vpath from "./_namespaces/vpath.js";
+import {
+    CancellationToken,
+    compareStringsCaseSensitiveUI,
+    compareValues,
+    createPatternMatcher,
+    createTextSpanFromNode,
+    Declaration,
+    emptyArray,
+    Expression,
+    getContainerNode,
+    getNameOfDeclaration,
+    getNodeKind,
+    getNodeModifiers,
+    getTextOfIdentifierOrLiteral,
+    Identifier,
+    ImportClause,
+    ImportEqualsDeclaration,
+    ImportSpecifier,
+    isInsideNodeModules,
+    isPropertyAccessExpression,
+    isPropertyNameLiteral,
+    NavigateToItem,
+    Node,
+    PatternMatcher,
+    PatternMatchKind,
+    ScriptElementKind,
+    SourceFile,
+    SyntaxKind,
+    TypeChecker,
+} from "./_namespaces/ts.js";
 
-/**
- * Test harness compiler functionality.
- */
-
-export interface Project {
-    file: string;
-    config?: ts.ParsedCommandLine;
-    errors?: ts.Diagnostic[];
+interface RawNavigateToItem {
+    readonly name: string;
+    readonly fileName: string;
+    readonly matchKind: PatternMatchKind;
+    readonly isCaseSensitive: boolean;
+    readonly declaration: Declaration;
 }
 
-export function readProject(host: fakes.ParseConfigHost, project: string | undefined, existingOptions?: ts.CompilerOptions): Project | undefined {
-    if (project) {
-        project = vpath.isTsConfigFile(project) ? project : vpath.combine(project, "tsconfig.json");
-    }
-    else {
-        [project] = host.vfs.scanSync(".", "ancestors-or-self", {
-            accept: (path, stats) => stats.isFile() && host.vfs.stringComparer(vpath.basename(path), "tsconfig.json") === 0,
+/** @internal */
+export function getNavigateToItems(sourceFiles: readonly SourceFile[], checker: TypeChecker, cancellationToken: CancellationToken, searchValue: string, maxResultCount: number | undefined, excludeDtsFiles: boolean, excludeLibFiles?: boolean): NavigateToItem[] {
+    const patternMatcher = createPatternMatcher(searchValue);
+    if (!patternMatcher) return emptyArray;
+    const rawItems: RawNavigateToItem[] = [];
+    const singleCurrentFile = sourceFiles.length === 1 ? sourceFiles[0] : undefined;
+    // Search the declarations in all files and output matched NavigateToItem into array of NavigateToItem[]
+    for (const sourceFile of sourceFiles) {
+        cancellationToken.throwIfCancellationRequested();
+
+        if (excludeDtsFiles && sourceFile.isDeclarationFile) {
+            continue;
+        }
+
+        if (shouldExcludeFile(sourceFile, !!excludeLibFiles, singleCurrentFile)) {
+            continue;
+        }
+
+        sourceFile.getNamedDeclarations().forEach((declarations, name) => {
+            getItemsFromNamedDeclaration(patternMatcher, name, declarations, checker, sourceFile.fileName, !!excludeLibFiles, singleCurrentFile, rawItems);
         });
     }
 
-    if (project) {
-        // TODO(rbuckton): Do we need to resolve this? Resolving breaks projects tests.
-        // project = vpath.resolve(host.vfs.currentDirectory, project);
-
-        // read the config file
-        const readResult = ts.readConfigFile(project, path => host.readFile(path));
-        if (readResult.error) {
-            return { file: project, errors: [readResult.error] };
-        }
-
-        // parse the config file
-        const config = ts.parseJsonConfigFileContent(readResult.config, host, vpath.dirname(project), existingOptions);
-        return { file: project, errors: config.errors, config };
-    }
+    rawItems.sort(compareNavigateToItems);
+    return (maxResultCount === undefined ? rawItems : rawItems.slice(0, maxResultCount)).map(createNavigateToItem);
 }
 
 /**
- * Correlates compilation inputs and outputs
+ * Exclude 'node_modules/' files and standard library files if 'excludeLibFiles' is true.
+ * If we're in current file only mode, we don't exclude the current file, even if it is a library file.
  */
-export interface CompilationOutput {
-    readonly inputs: readonly documents.TextDocument[];
-    readonly js: documents.TextDocument | undefined;
-    readonly dts: documents.TextDocument | undefined;
-    readonly map: documents.TextDocument | undefined;
+function shouldExcludeFile(file: SourceFile, excludeLibFiles: boolean, singleCurrentFile: SourceFile | undefined): boolean {
+    return file !== singleCurrentFile && excludeLibFiles && (isInsideNodeModules(file.path) || file.hasNoDefaultLib);
 }
 
-export class CompilationResult {
-    public readonly host: fakes.CompilerHost;
-    public readonly program: ts.Program | undefined;
-    public readonly result: ts.EmitResult | undefined;
-    public readonly options: ts.CompilerOptions;
-    public readonly diagnostics: readonly ts.Diagnostic[];
-    public readonly js: ReadonlyMap<string, documents.TextDocument>;
-    public readonly dts: ReadonlyMap<string, documents.TextDocument>;
-    public readonly maps: ReadonlyMap<string, documents.TextDocument>;
-    public symlinks?: vfs.FileSet; // Location to store original symlinks so they may be used in both original and declaration file compilations
+function getItemsFromNamedDeclaration(
+    patternMatcher: PatternMatcher,
+    name: string,
+    declarations: readonly Declaration[],
+    checker: TypeChecker,
+    fileName: string,
+    excludeLibFiles: boolean,
+    singleCurrentFile: SourceFile | undefined,
+    rawItems: RawNavigateToItem[],
+): void {
+    // First do a quick check to see if the name of the declaration matches the
+    // last portion of the (possibly) dotted name they're searching for.
+    const match = patternMatcher.getMatchForLastSegmentOfPattern(name);
+    if (!match) {
+        return; // continue to next named declarations
+    }
 
-    private _inputs: documents.TextDocument[] = [];
-    private _inputsAndOutputs: collections.SortedMap<string, CompilationOutput>;
+    for (const declaration of declarations) {
+        if (!shouldKeepItem(declaration, checker, excludeLibFiles, singleCurrentFile)) continue;
 
-    constructor(host: fakes.CompilerHost, options: ts.CompilerOptions, program: ts.Program | undefined, result: ts.EmitResult | undefined, diagnostics: readonly ts.Diagnostic[]) {
-        this.host = host;
-        this.program = program;
-        this.result = result;
-        this.diagnostics = diagnostics;
-        this.options = program ? program.getCompilerOptions() : options;
-
-        // collect outputs
-        const js = this.js = new collections.SortedMap<string, documents.TextDocument>({ comparer: this.vfs.stringComparer, sort: "insertion" });
-        const dts = this.dts = new collections.SortedMap<string, documents.TextDocument>({ comparer: this.vfs.stringComparer, sort: "insertion" });
-        const maps = this.maps = new collections.SortedMap<string, documents.TextDocument>({ comparer: this.vfs.stringComparer, sort: "insertion" });
-        for (const document of this.host.outputs) {
-            if (vpath.isJavaScript(document.file) || ts.fileExtensionIs(document.file, ts.Extension.Json)) {
-                js.set(document.file, document);
+        if (patternMatcher.patternContainsDots) {
+            // If the pattern has dots in it, then also see if the declaration container matches as well.
+            const fullMatch = patternMatcher.getFullMatch(getContainers(declaration), name);
+            if (fullMatch) {
+                rawItems.push({ name, fileName, matchKind: fullMatch.kind, isCaseSensitive: fullMatch.isCaseSensitive, declaration });
             }
-            else if (vpath.isDeclaration(document.file)) {
-                dts.set(document.file, document);
-            }
-            else if (vpath.isSourceMap(document.file)) {
-                maps.set(document.file, document);
-            }
-        }
-
-        // correlate inputs and outputs
-        this._inputsAndOutputs = new collections.SortedMap<string, CompilationOutput>({ comparer: this.vfs.stringComparer, sort: "insertion" });
-        if (program) {
-            if (this.options.outFile) {
-                const outFile = vpath.resolve(this.vfs.cwd(), this.options.outFile);
-                const inputs: documents.TextDocument[] = [];
-                for (const sourceFile of program.getSourceFiles()) {
-                    if (sourceFile) {
-                        const input = new documents.TextDocument(sourceFile.fileName, sourceFile.text);
-                        this._inputs.push(input);
-                        if (!vpath.isDeclaration(sourceFile.fileName)) {
-                            inputs.push(input);
-                        }
-                    }
-                }
-
-                const outputs: CompilationOutput = {
-                    inputs,
-                    js: js.get(outFile),
-                    dts: dts.get(vpath.changeExtension(outFile, ".d.ts")),
-                    map: maps.get(outFile + ".map"),
-                };
-
-                if (outputs.js) this._inputsAndOutputs.set(outputs.js.file, outputs);
-                if (outputs.dts) this._inputsAndOutputs.set(outputs.dts.file, outputs);
-                if (outputs.map) this._inputsAndOutputs.set(outputs.map.file, outputs);
-
-                for (const input of inputs) {
-                    this._inputsAndOutputs.set(input.file, outputs);
-                }
-            }
-            else {
-                for (const sourceFile of program.getSourceFiles()) {
-                    if (sourceFile) {
-                        const input = new documents.TextDocument(sourceFile.fileName, sourceFile.text);
-                        this._inputs.push(input);
-                        if (!vpath.isDeclaration(sourceFile.fileName)) {
-                            const extname = ts.getOutputExtension(sourceFile.fileName, this.options);
-                            const outputs: CompilationOutput = {
-                                inputs: [input],
-                                js: js.get(this.getOutputPath(sourceFile.fileName, extname)),
-                                dts: dts.get(this.getOutputPath(sourceFile.fileName, ts.getDeclarationEmitExtensionForPath(sourceFile.fileName))),
-                                map: maps.get(this.getOutputPath(sourceFile.fileName, extname + ".map")),
-                            };
-
-                            this._inputsAndOutputs.set(sourceFile.fileName, outputs);
-                            if (outputs.js) this._inputsAndOutputs.set(outputs.js.file, outputs);
-                            if (outputs.dts) this._inputsAndOutputs.set(outputs.dts.file, outputs);
-                            if (outputs.map) this._inputsAndOutputs.set(outputs.map.file, outputs);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    public get vfs(): vfs.FileSystem {
-        return this.host.vfs;
-    }
-
-    public get inputs(): readonly documents.TextDocument[] {
-        return this._inputs;
-    }
-
-    public get outputs(): readonly documents.TextDocument[] {
-        return this.host.outputs;
-    }
-
-    public get traces(): readonly string[] {
-        return this.host.traces;
-    }
-
-    public get emitSkipped(): boolean {
-        return this.result && this.result.emitSkipped || false;
-    }
-
-    public get singleFile(): boolean {
-        return !!this.options.outFile;
-    }
-
-    public get commonSourceDirectory(): string {
-        const common = this.program && this.program.getCommonSourceDirectory() || "";
-        return common && vpath.combine(this.vfs.cwd(), common);
-    }
-
-    public getInputsAndOutputs(path: string): CompilationOutput | undefined {
-        return this._inputsAndOutputs.get(vpath.resolve(this.vfs.cwd(), path));
-    }
-
-    public getInputs(path: string): readonly documents.TextDocument[] | undefined {
-        const outputs = this.getInputsAndOutputs(path);
-        return outputs && outputs.inputs;
-    }
-
-    public getOutput(path: string, kind: "js" | "dts" | "map"): documents.TextDocument | undefined {
-        const outputs = this.getInputsAndOutputs(path);
-        return outputs && outputs[kind];
-    }
-
-    public getSourceMapRecord(): string | undefined {
-        const maps = this.result!.sourceMaps;
-        if (maps && maps.length > 0) {
-            return Harness.SourceMapRecorder.getSourceMapRecord(maps, this.program!, ts.arrayFrom(this.js.values()).filter(d => !ts.fileExtensionIs(d.file, ts.Extension.Json)), ts.arrayFrom(this.dts.values()));
-        }
-    }
-
-    public getSourceMap(path: string): documents.SourceMap | undefined {
-        if (this.options.noEmit || vpath.isDeclaration(path)) return undefined;
-        if (this.options.inlineSourceMap) {
-            const document = this.getOutput(path, "js");
-            return document && documents.SourceMap.fromSource(document.text);
-        }
-        if (this.options.sourceMap) {
-            const document = this.getOutput(path, "map");
-            return document && new documents.SourceMap(document.file, document.text);
-        }
-    }
-
-    public getOutputPath(path: string, ext: string): string {
-        if (this.options.outFile) {
-            path = vpath.resolve(this.vfs.cwd(), this.options.outFile);
         }
         else {
-            path = vpath.resolve(this.vfs.cwd(), path);
-            const outDir = ext === ".d.ts" || ext === ".d.mts" || ext === ".d.cts" || (ext.endsWith(".ts") || ext.includes(".d.")) ? this.options.declarationDir || this.options.outDir : this.options.outDir;
-            if (outDir) {
-                const common = this.commonSourceDirectory;
-                if (common) {
-                    path = vpath.relative(common, path, this.vfs.ignoreCase);
-                    path = vpath.combine(vpath.resolve(this.vfs.cwd(), this.options.outDir), path);
-                }
-            }
-        }
-        return vpath.changeExtension(path, ext);
-    }
-
-    public getNumberOfJsFiles(includeJson: boolean) {
-        if (includeJson) {
-            return this.js.size;
-        }
-        else {
-            let count = this.js.size;
-            this.js.forEach(document => {
-                if (ts.fileExtensionIs(document.file, ts.Extension.Json)) {
-                    count--;
-                }
-            });
-            return count;
+            rawItems.push({ name, fileName, matchKind: match.kind, isCaseSensitive: match.isCaseSensitive, declaration });
         }
     }
 }
 
-export function compileFiles(host: fakes.CompilerHost, rootFiles: string[] | undefined, compilerOptions: ts.CompilerOptions, typeScriptVersion?: string): CompilationResult {
-    if (compilerOptions.project || !rootFiles || rootFiles.length === 0) {
-        const project = readProject(host.parseConfigHost, compilerOptions.project, compilerOptions);
-        if (project) {
-            if (project.errors && project.errors.length > 0) {
-                return new CompilationResult(host, compilerOptions, /*program*/ undefined, /*result*/ undefined, project.errors);
-            }
-            if (project.config) {
-                rootFiles = project.config.fileNames;
-                compilerOptions = project.config.options;
-            }
+function shouldKeepItem(
+    declaration: Declaration,
+    checker: TypeChecker,
+    excludeLibFiles: boolean,
+    singleCurrentFile: SourceFile | undefined,
+): boolean {
+    switch (declaration.kind) {
+        case SyntaxKind.ImportClause:
+        case SyntaxKind.ImportSpecifier:
+        case SyntaxKind.ImportEqualsDeclaration:
+            const importer = checker.getSymbolAtLocation((declaration as ImportClause | ImportSpecifier | ImportEqualsDeclaration).name!)!; // TODO: GH#18217
+            const imported = checker.getAliasedSymbol(importer);
+            return importer.escapedName !== imported.escapedName
+                && !imported.declarations?.every(d => shouldExcludeFile(d.getSourceFile(), excludeLibFiles, singleCurrentFile));
+        default:
+            return true;
+    }
+}
+
+function tryAddSingleDeclarationName(declaration: Declaration, containers: string[]): boolean {
+    const name = getNameOfDeclaration(declaration);
+    return !!name && (pushLiteral(name, containers) || name.kind === SyntaxKind.ComputedPropertyName && tryAddComputedPropertyName(name.expression, containers));
+}
+
+// Only added the names of computed properties if they're simple dotted expressions, like:
+//
+//      [X.Y.Z]() { }
+function tryAddComputedPropertyName(expression: Expression, containers: string[]): boolean {
+    return pushLiteral(expression, containers)
+        || isPropertyAccessExpression(expression) && (containers.push(expression.name.text), true) && tryAddComputedPropertyName(expression.expression, containers);
+}
+
+function pushLiteral(node: Node, containers: string[]): boolean {
+    return isPropertyNameLiteral(node) && (containers.push(getTextOfIdentifierOrLiteral(node)), true);
+}
+
+function getContainers(declaration: Declaration): readonly string[] {
+    const containers: string[] = [];
+
+    // First, if we started with a computed property name, then add all but the last
+    // portion into the container array.
+    const name = getNameOfDeclaration(declaration);
+    if (name && name.kind === SyntaxKind.ComputedPropertyName && !tryAddComputedPropertyName(name.expression, containers)) {
+        return emptyArray;
+    }
+    // Don't include the last portion.
+    containers.shift();
+
+    // Now, walk up our containers, adding all their names to the container array.
+    let container = getContainerNode(declaration);
+
+    while (container) {
+        if (!tryAddSingleDeclarationName(container, containers)) {
+            return emptyArray;
         }
-        delete compilerOptions.project;
+
+        container = getContainerNode(container);
     }
 
-    // establish defaults (aligns with old harness)
-    if (compilerOptions.newLine === undefined) compilerOptions.newLine = ts.NewLineKind.CarriageReturnLineFeed;
-    if (compilerOptions.skipDefaultLibCheck === undefined) compilerOptions.skipDefaultLibCheck = true;
-    if (compilerOptions.noErrorTruncation === undefined) compilerOptions.noErrorTruncation = true;
+    return containers.reverse();
+}
 
-    // pre-emit/post-emit error comparison requires declaration emit twice, which can be slow. If it's unlikely to flag any error consistency issues
-    // and if the test is running `skipLibCheck` - an indicator that we want the tets to run quickly - skip the before/after error comparison, too
-    const skipErrorComparison = ts.length(rootFiles) >= 100 || (!!compilerOptions.skipLibCheck && !!compilerOptions.declaration);
-    const preProgram = !skipErrorComparison ? ts.createProgram({ rootNames: rootFiles || [], options: { ...compilerOptions, configFile: compilerOptions.configFile, traceResolution: false }, host, typeScriptVersion }) : undefined;
-    const preErrors = preProgram && ts.getPreEmitDiagnostics(preProgram);
+function compareNavigateToItems(i1: RawNavigateToItem, i2: RawNavigateToItem) {
+    // TODO(cyrusn): get the gamut of comparisons that VS already uses here.
+    return compareValues(i1.matchKind, i2.matchKind)
+        || compareStringsCaseSensitiveUI(i1.name, i2.name);
+}
 
-    const program = ts.createProgram({ rootNames: rootFiles || [], options: compilerOptions, host, typeScriptVersion });
-    const emitResult = program.emit();
-    const postErrors = ts.getPreEmitDiagnostics(program);
-    const longerErrors = ts.length(preErrors) > postErrors.length ? preErrors : postErrors;
-    const shorterErrors = longerErrors === preErrors ? postErrors : preErrors;
-    const errors = preErrors && (preErrors.length !== postErrors.length) ? [
-        ...shorterErrors!,
-        ts.addRelatedInfo(
-            ts.createCompilerDiagnostic({
-                category: ts.DiagnosticCategory.Error,
-                code: -1,
-                key: "-1",
-                message: `Pre-emit (${preErrors.length}) and post-emit (${postErrors.length}) diagnostic counts do not match! This can indicate that a semantic _error_ was added by the emit resolver - such an error may not be reflected on the command line or in the editor, but may be captured in a baseline here!`,
-            }),
-            ts.createCompilerDiagnostic({
-                category: ts.DiagnosticCategory.Error,
-                code: -1,
-                key: "-1",
-                message: `The excess diagnostics are:`,
-            }),
-            ...ts.filter(longerErrors!, p => !ts.some(shorterErrors, p2 => ts.compareDiagnostics(p, p2) === ts.Comparison.EqualTo)),
-        ),
-    ] : postErrors;
-    return new CompilationResult(host, compilerOptions, program, emitResult, errors);
+function createNavigateToItem(rawItem: RawNavigateToItem): NavigateToItem {
+    const declaration = rawItem.declaration;
+    const container = getContainerNode(declaration);
+    const containerName = container && getNameOfDeclaration(container);
+    return {
+        name: rawItem.name,
+        kind: getNodeKind(declaration),
+        kindModifiers: getNodeModifiers(declaration),
+        matchKind: PatternMatchKind[rawItem.matchKind] as keyof typeof PatternMatchKind,
+        isCaseSensitive: rawItem.isCaseSensitive,
+        fileName: rawItem.fileName,
+        textSpan: createTextSpanFromNode(declaration),
+        // TODO(jfreeman): What should be the containerName when the container has a computed name?
+        containerName: containerName ? (containerName as Identifier).text : "",
+        containerKind: containerName ? getNodeKind(container) : ScriptElementKind.unknown,
+    };
 }

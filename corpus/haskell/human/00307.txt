@@ -1,141 +1,138 @@
 {-# LANGUAGE NoImplicitPrelude #-}
-{-# LANGUAGE NoFieldSelectors  #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ViewPatterns      #-}
 
--- | Versions for packages.
-module Stack.Types.Version
-  ( Cabal.VersionRange -- TODO in the future should have a newtype wrapper
-  , IntersectingVersionRange (..)
-  , VersionCheck (..)
-  , versionRangeText
-  , Cabal.withinRange
-  , Stack.Types.Version.intersectVersionRanges
-  , toMajorVersion
-  , latestApplicableVersion
-  , checkVersion
-  , nextMajorVersion
-  , minorVersion
-  , stackVersion
-  , showStackVersion
-  , stackMajorVersion
-  , stackMinorVersion
+-- | Module exporting the 'NamedComponent' type and related functions.
+module Stack.Types.NamedComponent
+  ( NamedComponent (..)
+  , renderComponent
+  , renderComponentTo
+  , renderPkgComponents
+  , renderPkgComponent
+  , exeComponents
+  , testComponents
+  , benchComponents
+  , subLibComponents
+  , isCLib
+  , isCSubLib
+  , isCExe
+  , isCTest
+  , isCBench
+  , isPotentialDependency
+  , splitComponents
   ) where
 
-import           Data.Aeson.Types
-                   ( FromJSON (..), ToJSON (..), Value (..), withText )
-import           Data.List ( find )
 import qualified Data.Set as Set
 import qualified Data.Text as T
-import           Data.Version ( showVersion )
-import           Distribution.Pretty ( pretty )
-import qualified Distribution.Version as Cabal
-import qualified Paths_stack as Meta
-import           Stack.Prelude hiding ( Vector, pretty )
-import           Text.PrettyPrint ( render )
+import           Stack.Prelude
 
-newtype IntersectingVersionRange = IntersectingVersionRange
-  { intersectingVersionRange :: Cabal.VersionRange }
-  deriving Show
-
-instance Semigroup IntersectingVersionRange where
-  IntersectingVersionRange l <> IntersectingVersionRange r =
-    IntersectingVersionRange (l `Cabal.intersectVersionRanges` r)
-
-instance Monoid IntersectingVersionRange where
-  mempty = IntersectingVersionRange Cabal.anyVersion
-  mappend = (<>)
-
--- | Display a version range
-versionRangeText :: Cabal.VersionRange -> Text
-versionRangeText = T.pack . render . pretty
-
--- | A modified intersection which also simplifies, for better display.
-intersectVersionRanges ::
-     Cabal.VersionRange
-  -> Cabal.VersionRange
-  -> Cabal.VersionRange
-intersectVersionRanges x y =
-  Cabal.simplifyVersionRange $ Cabal.intersectVersionRanges x y
-
--- | Returns the first two components, defaulting to 0 if not present
-toMajorVersion :: Version -> Version
-toMajorVersion v =
-  case Cabal.versionNumbers v of
-    []    -> Cabal.mkVersion [0, 0]
-    [a]   -> Cabal.mkVersion [a, 0]
-    a:b:_ -> Cabal.mkVersion [a, b]
-
--- | Given a version range and a set of versions, find the latest version from
--- the set that is within the range.
-latestApplicableVersion :: Cabal.VersionRange -> Set Version -> Maybe Version
-latestApplicableVersion r = find (`Cabal.withinRange` r) . Set.toDescList
-
--- | Get the next major version number for the given version
-nextMajorVersion :: Version -> Version
-nextMajorVersion v =
-  case Cabal.versionNumbers v of
-    []    -> Cabal.mkVersion [0, 1]
-    [a]   -> Cabal.mkVersion [a, 1]
-    a:b:_ -> Cabal.mkVersion [a, b + 1]
-
-data VersionCheck
-  = MatchMinor
-  | MatchExact
-  | NewerMinor
+-- | Type representing components of a fully-resolved Cabal package.
+data NamedComponent
+  = CLib
+    -- The \'main\' unnamed library component.
+  | CSubLib !Text
+    -- A named \'subsidiary\' or \'ancillary\` library component (sub-library).
+  | CFlib !Text
+    -- A foreign library.
+  | CExe !Text
+    -- A named executable component.
+  | CTest !Text
+    -- A named test-suite component.
+  | CBench !Text
+    -- A named benchmark component.
   deriving (Eq, Ord, Show)
 
-instance ToJSON VersionCheck where
-  toJSON MatchMinor = String "match-minor"
-  toJSON MatchExact = String "match-exact"
-  toJSON NewerMinor = String "newer-minor"
+-- | Render a component to anything with an "IsString" instance. For 'Text'
+-- prefer 'renderComponent'.
+renderComponentTo :: IsString a => NamedComponent -> a
+renderComponentTo = fromString . T.unpack . renderComponent
 
-instance FromJSON VersionCheck where
-  parseJSON = withText expected $ \t ->
-    case t of
-      "match-minor" -> pure MatchMinor
-      "match-exact" -> pure MatchExact
-      "newer-minor" -> pure NewerMinor
-      _ -> fail ("Expected " ++ expected ++ ", but got " ++ show t)
-   where
-    expected = "VersionCheck value (match-minor, match-exact, or newer-minor)"
+renderComponent :: NamedComponent -> Text
+renderComponent CLib = "lib"
+renderComponent (CSubLib x) = "sub-lib:" <> x
+renderComponent (CFlib x) = "flib:" <> x
+renderComponent (CExe x) = "exe:" <> x
+renderComponent (CTest x) = "test:" <> x
+renderComponent (CBench x) = "bench:" <> x
 
-checkVersion :: VersionCheck -> Version -> Version -> Bool
-checkVersion check (Cabal.versionNumbers -> wanted) (Cabal.versionNumbers -> actual) =
-  case check of
-    MatchMinor -> and (take 3 matching)
-    MatchExact -> length wanted == length actual && and matching
-    NewerMinor -> and (take 2 matching) && newerMinor
+renderPkgComponents :: [(PackageName, NamedComponent)] -> Text
+renderPkgComponents = T.intercalate " " . map renderPkgComponent
+
+renderPkgComponent :: (PackageName, NamedComponent) -> Text
+renderPkgComponent (pkg, comp) =
+  fromPackageName pkg <> ":" <> renderComponent comp
+
+exeComponents :: Set NamedComponent -> Set Text
+exeComponents = Set.fromList . mapMaybe mExeName . Set.toList
  where
-  matching = zipWith (==) wanted actual
+  mExeName (CExe name) = Just name
+  mExeName _ = Nothing
 
-  getMinor (_a:_b:c:_) = Just c
-  getMinor _ = Nothing
+testComponents :: Set NamedComponent -> Set Text
+testComponents = Set.fromList . mapMaybe mTestName . Set.toList
+ where
+  mTestName (CTest name) = Just name
+  mTestName _ = Nothing
 
-  newerMinor =
-    case (getMinor wanted, getMinor actual) of
-      (Nothing, _) -> True
-      (Just _, Nothing) -> False
-      (Just w, Just a) -> a >= w
+benchComponents :: Set NamedComponent -> Set Text
+benchComponents = Set.fromList . mapMaybe mBenchName . Set.toList
+ where
+  mBenchName (CBench name) = Just name
+  mBenchName _ = Nothing
 
--- | Get minor version (excludes any patchlevel)
-minorVersion :: Version -> Version
-minorVersion = Cabal.mkVersion . take 3 . Cabal.versionNumbers
+subLibComponents :: Set NamedComponent -> Set Text
+subLibComponents = Set.fromList . mapMaybe mSubLibName . Set.toList
+ where
+  mSubLibName (CSubLib name) = Just name
+  mSubLibName _ = Nothing
 
--- | Current Stack version
-stackVersion :: Version
-stackVersion = Cabal.mkVersion' Meta.version
+isCLib :: NamedComponent -> Bool
+isCLib CLib{} = True
+isCLib _ = False
 
--- | Current Stack version in the same format as yielded by
--- 'Data.Version.showVersion'.
-showStackVersion :: String
-showStackVersion = showVersion Meta.version
+isCSubLib :: NamedComponent -> Bool
+isCSubLib CSubLib{} = True
+isCSubLib _ = False
 
--- | Current Stack minor version (excludes patchlevel)
-stackMinorVersion :: Version
-stackMinorVersion = minorVersion stackVersion
+isCExe :: NamedComponent -> Bool
+isCExe CExe{} = True
+isCExe _ = False
 
--- | Current Stack major version. Returns the first two components, defaulting
--- to 0 if not present
-stackMajorVersion :: Version
-stackMajorVersion = toMajorVersion stackVersion
+isCTest :: NamedComponent -> Bool
+isCTest CTest{} = True
+isCTest _ = False
+
+isCBench :: NamedComponent -> Bool
+isCBench CBench{} = True
+isCBench _ = False
+
+isPotentialDependency :: NamedComponent -> Bool
+isPotentialDependency v = isCLib v || isCSubLib v || isCExe v
+
+-- | A function to split the given list of components into sets of the names of
+-- the named components by the type of component (sub-libraries, executables,
+-- test-suites, benchmarks), ignoring any 'main' unnamed library component or
+-- foreign library component. This function should be used very sparingly; more
+-- often than not, you can keep/parse the components split from the start.
+splitComponents ::
+     [NamedComponent]
+  -> ( Set Text
+       -- ^ Sub-libraries.
+     , Set Text
+       -- ^ Executables.
+     , Set Text
+       -- ^ Test-suites.
+     , Set Text
+       -- ^ Benchmarks.
+     )
+splitComponents =
+  go id id id id
+ where
+  run c = Set.fromList $ c []
+  go s e t b [] = (run s, run e, run t, run b)
+  go s e t b (CLib : xs) = go s e t b xs
+  go s e t b (CSubLib x : xs) = go (s . (x:)) e t b xs
+  -- Ignore foreign libraries, for now.
+  go s e t b (CFlib _ : xs) = go s e t b xs
+  go s e t b (CExe x : xs) = go s (e . (x:)) t b xs
+  go s e t b (CTest x : xs) = go s e (t . (x:)) b xs
+  go s e t b (CBench x : xs) = go s e t (b . (x:)) xs

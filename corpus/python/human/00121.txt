@@ -1,293 +1,703 @@
+"""Experimental pipeline API functionality. Be careful with this API, it's subject to change."""
+
 from __future__ import annotations
 
-import sys
-from collections.abc import Callable, Generator, Iterator, Mapping
-from contextlib import contextmanager
-from functools import cached_property
-from typing import Any, NamedTuple, TypeAlias, TypeVar
+import datetime
+import operator
+import re
+from collections import deque
+from collections.abc import Callable, Container
+from dataclasses import dataclass
+from decimal import Decimal
+from functools import cached_property, partial
+from re import Pattern
+from types import EllipsisType
+from typing import TYPE_CHECKING, Annotated, Any, Generic, Protocol, TypeAlias, TypeVar, overload
 
-from typing_extensions import ParamSpec, TypeAliasType, TypeVarTuple
+import annotated_types
 
-GlobalsNamespace: TypeAlias = 'dict[str, Any]'
-"""A global namespace.
+if TYPE_CHECKING:
+    from pydantic import GetCoreSchemaHandler
 
-In most cases, this is a reference to the `__dict__` attribute of a module.
-This namespace type is expected as the `globals` argument during annotations evaluation.
-"""
+from pydantic_core import PydanticCustomError
+from pydantic_core import core_schema as cs
 
-MappingNamespace: TypeAlias = Mapping[str, Any]
-"""Any kind of namespace.
+from pydantic import Strict
 
-In most cases, this is a local namespace (e.g. the `__dict__` attribute of a class,
-the [`f_locals`][frame.f_locals] attribute of a frame object, when dealing with types
-defined inside functions).
-This namespace type is expected as the `locals` argument during annotations evaluation.
-"""
-
-_TypeVarLike: TypeAlias = 'TypeVar | ParamSpec | TypeVarTuple'
+__all__ = ['validate_as', 'validate_as_deferred', 'transform']
 
 
-class NamespacesTuple(NamedTuple):
-    """A tuple of globals and locals to be used during annotations evaluation.
-
-    This datastructure is defined as a named tuple so that it can easily be unpacked:
-
-    ```python {lint="skip" test="skip"}
-    def eval_type(typ: type[Any], ns: NamespacesTuple) -> None:
-        return eval(typ, *ns)
-    ```
-    """
-
-    globals: GlobalsNamespace
-    """The namespace to be used as the `globals` argument during annotations evaluation."""
-
-    locals: MappingNamespace
-    """The namespace to be used as the `locals` argument during annotations evaluation."""
+@dataclass(frozen=True, slots=True)
+class _ValidateAs:
+    tp: type[Any]
+    strict: bool = False
 
 
-def get_module_ns_of(obj: Any) -> dict[str, Any]:
-    """Get the namespace of the module where the object is defined.
-
-    Caution: this function does not return a copy of the module namespace, so the result
-    should not be mutated. The burden of enforcing this is on the caller.
-    """
-    module_name = getattr(obj, '__module__', None)
-    if module_name:
-        try:
-            return sys.modules[module_name].__dict__
-        except KeyError:
-            # happens occasionally, see https://github.com/pydantic/pydantic/issues/2363
-            return {}
-    return {}
-
-
-# Note that this class is almost identical to `collections.ChainMap`, but need to enforce
-# immutable mappings here:
-class LazyLocalNamespace(Mapping[str, Any]):
-    """A lazily evaluated mapping, to be used as the `locals` argument during annotations evaluation.
-
-    While the [`eval`][eval] function expects a mapping as the `locals` argument, it only
-    performs `__getitem__` calls. The [`Mapping`][collections.abc.Mapping] abstract base class
-    is fully implemented only for type checking purposes.
-
-    Args:
-        *namespaces: The namespaces to consider, in ascending order of priority.
-
-    Example:
-        ```python {lint="skip" test="skip"}
-        ns = LazyLocalNamespace({'a': 1, 'b': 2}, {'a': 3})
-        ns['a']
-        #> 3
-        ns['b']
-        #> 2
-        ```
-    """
-
-    def __init__(self, *namespaces: MappingNamespace) -> None:
-        self._namespaces = namespaces
+@dataclass
+class _ValidateAsDefer:
+    func: Callable[[], type[Any]]
 
     @cached_property
-    def data(self) -> dict[str, Any]:
-        return {k: v for ns in self._namespaces for k, v in ns.items()}
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, key: str) -> Any:
-        return self.data[key]
-
-    def __contains__(self, key: object) -> bool:
-        return key in self.data
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.data)
+    def tp(self) -> type[Any]:
+        return self.func()
 
 
-def ns_for_function(obj: Callable[..., Any], parent_namespace: MappingNamespace | None = None) -> NamespacesTuple:
-    """Return the global and local namespaces to be used when evaluating annotations for the provided function.
-
-    The global namespace will be the `__dict__` attribute of the module the function was defined in.
-    The local namespace will contain the `__type_params__` introduced by PEP 695.
-
-    Args:
-        obj: The object to use when building namespaces.
-        parent_namespace: Optional namespace to be added with the lowest priority in the local namespace.
-            If the passed function is a method, the `parent_namespace` will be the namespace of the class
-            the method is defined in. Thus, we also fetch type `__type_params__` from there (i.e. the
-            class-scoped type variables).
-    """
-    locals_list: list[MappingNamespace] = []
-    if parent_namespace is not None:
-        locals_list.append(parent_namespace)
-
-    # Get the `__type_params__` attribute introduced by PEP 695.
-    # Note that the `typing._eval_type` function expects type params to be
-    # passed as a separate argument. However, internally, `_eval_type` calls
-    # `ForwardRef._evaluate` which will merge type params with the localns,
-    # essentially mimicking what we do here.
-    type_params: tuple[_TypeVarLike, ...] = getattr(obj, '__type_params__', ())
-    if parent_namespace is not None:
-        # We also fetch type params from the parent namespace. If present, it probably
-        # means the function was defined in a class. This is to support the following:
-        # https://github.com/python/cpython/issues/124089.
-        type_params += parent_namespace.get('__type_params__', ())
-
-    locals_list.append({t.__name__: t for t in type_params})
-
-    # What about short-circuiting to `obj.__globals__`?
-    globalns = get_module_ns_of(obj)
-
-    return NamespacesTuple(globalns, LazyLocalNamespace(*locals_list))
+@dataclass(frozen=True, slots=True)
+class _Transform:
+    func: Callable[[Any], Any]
 
 
-class NsResolver:
-    """A class responsible for the namespaces resolving logic for annotations evaluation.
+@dataclass(frozen=True, slots=True)
+class _PipelineOr:
+    left: _Pipeline[Any, Any]
+    right: _Pipeline[Any, Any]
 
-    This class handles the namespace logic when evaluating annotations mainly for class objects.
 
-    It holds a stack of classes that are being inspected during the core schema building,
-    and the `types_namespace` property exposes the globals and locals to be used for
-    type annotation evaluation. Additionally -- if no class is present in the stack -- a
-    fallback globals and locals can be provided using the `namespaces_tuple` argument
-    (this is useful when generating a schema for a simple annotation, e.g. when using
-    `TypeAdapter`).
+@dataclass(frozen=True, slots=True)
+class _PipelineAnd:
+    left: _Pipeline[Any, Any]
+    right: _Pipeline[Any, Any]
 
-    The namespace creation logic is unfortunately flawed in some cases, for backwards
-    compatibility reasons and to better support valid edge cases. See the description
-    for the `parent_namespace` argument and the example for more details.
 
-    Args:
-        namespaces_tuple: The default globals and locals to use if no class is present
-            on the stack. This can be useful when using the `GenerateSchema` class
-            with `TypeAdapter`, where the "type" being analyzed is a simple annotation.
-        parent_namespace: An optional parent namespace that will be added to the locals
-            with the lowest priority. For a given class defined in a function, the locals
-            of this function are usually used as the parent namespace:
+@dataclass(frozen=True, slots=True)
+class _Eq:
+    value: Any
 
-            ```python {lint="skip" test="skip"}
-            from pydantic import BaseModel
 
-            def func() -> None:
-                SomeType = int
+@dataclass(frozen=True, slots=True)
+class _NotEq:
+    value: Any
 
-                class Model(BaseModel):
-                    f: 'SomeType'
 
-                # when collecting fields, an namespace resolver instance will be created
-                # this way:
-                # ns_resolver = NsResolver(parent_namespace={'SomeType': SomeType})
-            ```
+@dataclass(frozen=True, slots=True)
+class _In:
+    values: Container[Any]
 
-            For backwards compatibility reasons and to support valid edge cases, this parent
-            namespace will be used for *every* type being pushed to the stack. In the future,
-            we might want to be smarter by only doing so when the type being pushed is defined
-            in the same module as the parent namespace.
 
-    Example:
-        ```python {lint="skip" test="skip"}
-        ns_resolver = NsResolver(
-            parent_namespace={'fallback': 1},
-        )
+@dataclass(frozen=True, slots=True)
+class _NotIn:
+    values: Container[Any]
 
-        class Sub:
-            m: 'Model'
 
-        class Model:
-            some_local = 1
-            sub: Sub
+_ConstraintAnnotation: TypeAlias = (
+    annotated_types.Le
+    | annotated_types.Ge
+    | annotated_types.Lt
+    | annotated_types.Gt
+    | annotated_types.Len
+    | annotated_types.MultipleOf
+    | annotated_types.Timezone
+    | annotated_types.Interval
+    | annotated_types.Predicate
+    |
+    # common predicates not included in annotated_types
+    _Eq
+    | _NotEq
+    | _In
+    | _NotIn
+    |
+    # regular expressions
+    Pattern[str]
+)
 
-        ns_resolver = NsResolver()
 
-        # This is roughly what happens when we build a core schema for `Model`:
-        with ns_resolver.push(Model):
-            ns_resolver.types_namespace
-            #> NamespacesTuple({'Sub': Sub}, {'Model': Model, 'some_local': 1})
-            # First thing to notice here, the model being pushed is added to the locals.
-            # Because `NsResolver` is being used during the model definition, it is not
-            # yet added to the globals. This is useful when resolving self-referencing annotations.
+@dataclass(frozen=True, slots=True)
+class _Constraint:
+    constraint: _ConstraintAnnotation
 
-            with ns_resolver.push(Sub):
-                ns_resolver.types_namespace
-                #> NamespacesTuple({'Sub': Sub}, {'Sub': Sub, 'Model': Model})
-                # Second thing to notice: `Sub` is present in both the globals and locals.
-                # This is not an issue, just that as described above, the model being pushed
-                # is added to the locals, but it happens to be present in the globals as well
-                # because it is already defined.
-                # Third thing to notice: `Model` is also added in locals. This is a backwards
-                # compatibility workaround that allows for `Sub` to be able to resolve `'Model'`
-                # correctly (as otherwise models would have to be rebuilt even though this
-                # doesn't look necessary).
-        ```
-    """
 
-    def __init__(
+_Step: TypeAlias = _ValidateAs | _ValidateAsDefer | _Transform | _PipelineOr | _PipelineAnd | _Constraint
+
+_InT = TypeVar('_InT')
+_OutT = TypeVar('_OutT')
+_NewOutT = TypeVar('_NewOutT')
+
+
+class _FieldTypeMarker:
+    pass
+
+
+# TODO: ultimately, make this public, see https://github.com/pydantic/pydantic/pull/9459#discussion_r1628197626
+# Also, make this frozen eventually, but that doesn't work right now because of the generic base
+# Which attempts to modify __orig_base__ and such.
+# We could go with a manual freeze, but that seems overkill for now.
+@dataclass(slots=True)
+class _Pipeline(Generic[_InT, _OutT]):
+    """Abstract representation of a chain of validation, transformation, and parsing steps."""
+
+    _steps: tuple[_Step, ...]
+
+    def transform(
         self,
-        namespaces_tuple: NamespacesTuple | None = None,
-        parent_namespace: MappingNamespace | None = None,
-    ) -> None:
-        self._base_ns_tuple = namespaces_tuple or NamespacesTuple({}, {})
-        self._parent_ns = parent_namespace
-        self._types_stack: list[type[Any] | TypeAliasType] = []
+        func: Callable[[_OutT], _NewOutT],
+    ) -> _Pipeline[_InT, _NewOutT]:
+        """Transform the output of the previous step.
 
-    @cached_property
-    def types_namespace(self) -> NamespacesTuple:
-        """The current global and local namespaces to be used for annotations evaluation."""
-        if not self._types_stack:
-            # TODO: should we merge the parent namespace here?
-            # This is relevant for TypeAdapter, where there are no types on the stack, and we might
-            # need access to the parent_ns. Right now, we sidestep this in `type_adapter.py` by passing
-            # locals to both parent_ns and the base_ns_tuple, but this is a bit hacky.
-            # we might consider something like:
-            # if self._parent_ns is not None:
-            #     # Hacky workarounds, see class docstring:
-            #     # An optional parent namespace that will be added to the locals with the lowest priority
-            #     locals_list: list[MappingNamespace] = [self._parent_ns, self._base_ns_tuple.locals]
-            #     return NamespacesTuple(self._base_ns_tuple.globals, LazyLocalNamespace(*locals_list))
-            return self._base_ns_tuple
+        If used as the first step in a pipeline, the type of the field is used.
+        That is, the transformation is applied to after the value is parsed to the field's type.
+        """
+        return _Pipeline[_InT, _NewOutT](self._steps + (_Transform(func),))
 
-        typ = self._types_stack[-1]
+    @overload
+    def validate_as(self, tp: type[_NewOutT], *, strict: bool = False) -> _Pipeline[_InT, _NewOutT]: ...
 
-        globalns = get_module_ns_of(typ)
+    @overload
+    def validate_as(
+        self,
+        tp: EllipsisType,
+        *,
+        strict: bool = False,
+    ) -> _Pipeline[_InT, Any]: ...
 
-        locals_list: list[MappingNamespace] = []
-        # Hacky workarounds, see class docstring:
-        # An optional parent namespace that will be added to the locals with the lowest priority
-        if self._parent_ns is not None:
-            locals_list.append(self._parent_ns)
-        if len(self._types_stack) > 1:
-            first_type = self._types_stack[0]
-            locals_list.append({first_type.__name__: first_type})
+    # TODO PEP 747: use TypeForm to properly type Annotated aliases (e.g. NewPath, FilePath).
+    # This fallback accepts any type expression but loses generic type inference.
+    @overload
+    def validate_as(self, tp: Any, *, strict: bool = ...) -> _Pipeline[_InT, Any]: ...
 
-        # Adding `__type_params__` *before* `vars(typ)`, as the latter takes priority
-        # (see https://github.com/python/cpython/pull/120272).
-        # TODO `typ.__type_params__` when we drop support for Python 3.11:
-        type_params: tuple[_TypeVarLike, ...] = getattr(typ, '__type_params__', ())
-        if type_params:
-            # Adding `__type_params__` is mostly useful for generic classes defined using
-            # PEP 695 syntax *and* using forward annotations (see the example in
-            # https://github.com/python/cpython/issues/114053). For TypeAliasType instances,
-            # it is way less common, but still required if using a string annotation in the alias
-            # value, e.g. `type A[T] = 'T'` (which is not necessary in most cases).
-            locals_list.append({t.__name__: t for t in type_params})
+    def validate_as(self, tp: type[_NewOutT] | EllipsisType | Any, *, strict: bool = False) -> _Pipeline[_InT, Any]:  # type: ignore
+        """Validate / parse the input into a new type.
 
-        # TypeAliasType instances don't have a `__dict__` attribute, so the check
-        # is necessary:
-        if hasattr(typ, '__dict__'):
-            locals_list.append(vars(typ))
+        If no type is provided, the type of the field is used.
 
-        # The `len(self._types_stack) > 1` check above prevents this from being added twice:
-        locals_list.append({typ.__name__: typ})
+        Types are parsed in Pydantic's `lax` mode by default,
+        but you can enable `strict` mode by passing `strict=True`.
+        """
+        if isinstance(tp, EllipsisType):
+            return _Pipeline[_InT, Any](self._steps + (_ValidateAs(_FieldTypeMarker, strict=strict),))
+        return _Pipeline[_InT, _NewOutT](self._steps + (_ValidateAs(tp, strict=strict),))
 
-        return NamespacesTuple(globalns, LazyLocalNamespace(*locals_list))
+    def validate_as_deferred(self, func: Callable[[], type[_NewOutT]]) -> _Pipeline[_InT, _NewOutT]:
+        """Parse the input into a new type, deferring resolution of the type until the current class
+        is fully defined.
 
-    @contextmanager
-    def push(self, typ: type[Any] | TypeAliasType, /) -> Generator[None]:
-        """Push a type to the stack."""
-        self._types_stack.append(typ)
-        # Reset the cached property:
-        self.__dict__.pop('types_namespace', None)
-        try:
-            yield
-        finally:
-            self._types_stack.pop()
-            self.__dict__.pop('types_namespace', None)
+        This is useful when you need to reference the class in it's own type annotations.
+        """
+        return _Pipeline[_InT, _NewOutT](self._steps + (_ValidateAsDefer(func),))
+
+    # constraints
+    @overload
+    def constrain(self: _Pipeline[_InT, _NewOutGe], constraint: annotated_types.Ge) -> _Pipeline[_InT, _NewOutGe]: ...
+
+    @overload
+    def constrain(self: _Pipeline[_InT, _NewOutGt], constraint: annotated_types.Gt) -> _Pipeline[_InT, _NewOutGt]: ...
+
+    @overload
+    def constrain(self: _Pipeline[_InT, _NewOutLe], constraint: annotated_types.Le) -> _Pipeline[_InT, _NewOutLe]: ...
+
+    @overload
+    def constrain(self: _Pipeline[_InT, _NewOutLt], constraint: annotated_types.Lt) -> _Pipeline[_InT, _NewOutLt]: ...
+
+    @overload
+    def constrain(
+        self: _Pipeline[_InT, _NewOutLen], constraint: annotated_types.Len
+    ) -> _Pipeline[_InT, _NewOutLen]: ...
+
+    @overload
+    def constrain(
+        self: _Pipeline[_InT, _NewOutT], constraint: annotated_types.MultipleOf
+    ) -> _Pipeline[_InT, _NewOutT]: ...
+
+    @overload
+    def constrain(
+        self: _Pipeline[_InT, _NewOutDatetime], constraint: annotated_types.Timezone
+    ) -> _Pipeline[_InT, _NewOutDatetime]: ...
+
+    @overload
+    def constrain(self: _Pipeline[_InT, _OutT], constraint: annotated_types.Predicate) -> _Pipeline[_InT, _OutT]: ...
+
+    @overload
+    def constrain(
+        self: _Pipeline[_InT, _NewOutInterval], constraint: annotated_types.Interval
+    ) -> _Pipeline[_InT, _NewOutInterval]: ...
+
+    @overload
+    def constrain(self: _Pipeline[_InT, _OutT], constraint: _Eq) -> _Pipeline[_InT, _OutT]: ...
+
+    @overload
+    def constrain(self: _Pipeline[_InT, _OutT], constraint: _NotEq) -> _Pipeline[_InT, _OutT]: ...
+
+    @overload
+    def constrain(self: _Pipeline[_InT, _OutT], constraint: _In) -> _Pipeline[_InT, _OutT]: ...
+
+    @overload
+    def constrain(self: _Pipeline[_InT, _OutT], constraint: _NotIn) -> _Pipeline[_InT, _OutT]: ...
+
+    @overload
+    def constrain(self: _Pipeline[_InT, _NewOutT], constraint: Pattern[str]) -> _Pipeline[_InT, _NewOutT]: ...
+
+    def constrain(self, constraint: _ConstraintAnnotation) -> Any:
+        """Constrain a value to meet a certain condition.
+
+        We support most conditions from `annotated_types`, as well as regular expressions.
+
+        Most of the time you'll be calling a shortcut method like `gt`, `lt`, `len`, etc
+        so you don't need to call this directly.
+        """
+        return _Pipeline[_InT, _OutT](self._steps + (_Constraint(constraint),))
+
+    def predicate(self: _Pipeline[_InT, _NewOutT], func: Callable[[_NewOutT], bool]) -> _Pipeline[_InT, _NewOutT]:
+        """Constrain a value to meet a certain predicate."""
+        return self.constrain(annotated_types.Predicate(func))
+
+    def gt(self: _Pipeline[_InT, _NewOutGt], gt: _NewOutGt) -> _Pipeline[_InT, _NewOutGt]:
+        """Constrain a value to be greater than a certain value."""
+        return self.constrain(annotated_types.Gt(gt))
+
+    def lt(self: _Pipeline[_InT, _NewOutLt], lt: _NewOutLt) -> _Pipeline[_InT, _NewOutLt]:
+        """Constrain a value to be less than a certain value."""
+        return self.constrain(annotated_types.Lt(lt))
+
+    def ge(self: _Pipeline[_InT, _NewOutGe], ge: _NewOutGe) -> _Pipeline[_InT, _NewOutGe]:
+        """Constrain a value to be greater than or equal to a certain value."""
+        return self.constrain(annotated_types.Ge(ge))
+
+    def le(self: _Pipeline[_InT, _NewOutLe], le: _NewOutLe) -> _Pipeline[_InT, _NewOutLe]:
+        """Constrain a value to be less than or equal to a certain value."""
+        return self.constrain(annotated_types.Le(le))
+
+    def len(self: _Pipeline[_InT, _NewOutLen], min_len: int, max_len: int | None = None) -> _Pipeline[_InT, _NewOutLen]:
+        """Constrain a value to have a certain length."""
+        return self.constrain(annotated_types.Len(min_len, max_len))
+
+    @overload
+    def multiple_of(self: _Pipeline[_InT, _NewOutDiv], multiple_of: _NewOutDiv) -> _Pipeline[_InT, _NewOutDiv]: ...
+
+    @overload
+    def multiple_of(self: _Pipeline[_InT, _NewOutMod], multiple_of: _NewOutMod) -> _Pipeline[_InT, _NewOutMod]: ...
+
+    def multiple_of(self: _Pipeline[_InT, Any], multiple_of: Any) -> _Pipeline[_InT, Any]:
+        """Constrain a value to be a multiple of a certain number."""
+        return self.constrain(annotated_types.MultipleOf(multiple_of))
+
+    def eq(self: _Pipeline[_InT, _OutT], value: _OutT) -> _Pipeline[_InT, _OutT]:
+        """Constrain a value to be equal to a certain value."""
+        return self.constrain(_Eq(value))
+
+    def not_eq(self: _Pipeline[_InT, _OutT], value: _OutT) -> _Pipeline[_InT, _OutT]:
+        """Constrain a value to not be equal to a certain value."""
+        return self.constrain(_NotEq(value))
+
+    def in_(self: _Pipeline[_InT, _OutT], values: Container[_OutT]) -> _Pipeline[_InT, _OutT]:
+        """Constrain a value to be in a certain set."""
+        return self.constrain(_In(values))
+
+    def not_in(self: _Pipeline[_InT, _OutT], values: Container[_OutT]) -> _Pipeline[_InT, _OutT]:
+        """Constrain a value to not be in a certain set."""
+        return self.constrain(_NotIn(values))
+
+    # timezone methods
+    def datetime_tz_naive(self: _Pipeline[_InT, datetime.datetime]) -> _Pipeline[_InT, datetime.datetime]:
+        """Constrain a datetime value to be timezone-naive (i.e. have no tzinfo)."""
+        return self.constrain(annotated_types.Timezone(None))
+
+    def datetime_tz_aware(self: _Pipeline[_InT, datetime.datetime]) -> _Pipeline[_InT, datetime.datetime]:
+        """Constrain a datetime value to be timezone-aware (i.e. have a non-None tzinfo)."""
+        return self.constrain(annotated_types.Timezone(...))
+
+    def datetime_tz(
+        self: _Pipeline[_InT, datetime.datetime], tz: datetime.tzinfo
+    ) -> _Pipeline[_InT, datetime.datetime]:
+        """Constrain a datetime value to have a specific timezone.
+
+        Args:
+            tz: The required timezone.
+        """
+        return self.constrain(annotated_types.Timezone(tz))  # type: ignore
+
+    def datetime_with_tz(
+        self: _Pipeline[_InT, datetime.datetime], tz: datetime.tzinfo | None
+    ) -> _Pipeline[_InT, datetime.datetime]:
+        """Transform a datetime value by replacing its timezone with the given value.
+
+        Unlike `datetime_tz()`, this does not validate the existing timezone, it
+        unconditionally sets [`tzinfo`][datetime.datetime.tzinfo] to `tz`.
+
+        Args:
+            tz: The timezone to attach to the datetime, or `None` to make it naive.
+        """
+        return self.transform(partial(datetime.datetime.replace, tzinfo=tz))
+
+    # string methods
+    def str_lower(self: _Pipeline[_InT, str]) -> _Pipeline[_InT, str]:
+        """Transform a string value to [lowercase][str.lower]."""
+        return self.transform(str.lower)
+
+    def str_upper(self: _Pipeline[_InT, str]) -> _Pipeline[_InT, str]:
+        """Transform a string value to [uppercase][str.upper]."""
+        return self.transform(str.upper)
+
+    def str_title(self: _Pipeline[_InT, str]) -> _Pipeline[_InT, str]:
+        """Transform a string value to [title case][str.title]."""
+        return self.transform(str.title)
+
+    def str_strip(self: _Pipeline[_InT, str]) -> _Pipeline[_InT, str]:
+        """Strip leading and trailing whitespace from a string value."""
+        return self.transform(str.strip)
+
+    def str_pattern(self: _Pipeline[_InT, str], pattern: str) -> _Pipeline[_InT, str]:
+        """Constrain a string value to match a regular expression pattern.
+
+        Args:
+            pattern: The regular expression pattern the string must match.
+        """
+        return self.constrain(re.compile(pattern))
+
+    def str_contains(self: _Pipeline[_InT, str], substring: str) -> _Pipeline[_InT, str]:
+        """Constrain a string value to contain a given substring.
+
+        Args:
+            substring: The substring that must be present in the string.
+        """
+        return self.predicate(lambda v: substring in v)
+
+    def str_starts_with(self: _Pipeline[_InT, str], prefix: str) -> _Pipeline[_InT, str]:
+        """Constrain a string value to start with a given prefix.
+
+        Args:
+            prefix: The prefix the string must start with.
+        """
+        return self.predicate(lambda v: v.startswith(prefix))
+
+    def str_ends_with(self: _Pipeline[_InT, str], suffix: str) -> _Pipeline[_InT, str]:
+        """Constrain a string value to end with a given suffix.
+
+        Args:
+            suffix: The suffix the string must end with.
+        """
+        return self.predicate(lambda v: v.endswith(suffix))
+
+    # operators
+    def otherwise(self, other: _Pipeline[_OtherIn, _OtherOut]) -> _Pipeline[_InT | _OtherIn, _OutT | _OtherOut]:
+        """Combine two validation chains, returning the result of the first chain if it succeeds, and the second chain if it fails."""
+        return _Pipeline((_PipelineOr(self, other),))
+
+    __or__ = otherwise
+
+    def then(self, other: _Pipeline[_OutT, _OtherOut]) -> _Pipeline[_InT, _OtherOut]:
+        """Pipe the result of one validation chain into another."""
+        return _Pipeline((_PipelineAnd(self, other),))
+
+    __and__ = then
+
+    def __get_pydantic_core_schema__(self, source_type: Any, handler: GetCoreSchemaHandler) -> cs.CoreSchema:
+        return self._apply_pipeline(handler, source_type)
+
+    def _apply_pipeline(self, handler: GetCoreSchemaHandler, source_type: Any) -> cs.CoreSchema:
+        queue = deque(self._steps)
+
+        s = None
+
+        while queue:
+            step = queue.popleft()
+            s = _apply_step(step, s, handler, source_type)
+
+        s = s or cs.any_schema()
+        return s
+
+    def __supports_type__(self, _: _OutT) -> bool:
+        raise NotImplementedError
+
+
+validate_as = _Pipeline[Any, Any](()).validate_as
+validate_as_deferred = _Pipeline[Any, Any](()).validate_as_deferred
+transform = _Pipeline[Any, Any]((_ValidateAs(_FieldTypeMarker),)).transform
+
+
+def _check_func(
+    func: Callable[[Any], bool], predicate_err: str | Callable[[], str], s: cs.CoreSchema | None
+) -> cs.CoreSchema:
+    def handler(v: Any) -> Any:
+        if func(v):
+            return v
+        raise ValueError(f'Expected {predicate_err if isinstance(predicate_err, str) else predicate_err()}')
+
+    if s is None:
+        return cs.no_info_plain_validator_function(handler)
+    else:
+        return cs.no_info_after_validator_function(handler, s)
+
+
+def _apply_step(step: _Step, s: cs.CoreSchema | None, handler: GetCoreSchemaHandler, source_type: Any) -> cs.CoreSchema:
+    if isinstance(step, _ValidateAs):
+        s = _apply_parse(s, step.tp, step.strict, handler, source_type)
+    elif isinstance(step, _ValidateAsDefer):
+        s = _apply_parse(s, step.tp, False, handler, source_type)
+    elif isinstance(step, _Transform):
+        s = _apply_transform(s, step.func, handler)
+    elif isinstance(step, _Constraint):
+        s = _apply_constraint(s, step.constraint)
+    elif isinstance(step, _PipelineOr):
+        s = cs.union_schema(
+            [step.left._apply_pipeline(handler, source_type), step.right._apply_pipeline(handler, source_type)]
+        )
+    else:
+        assert isinstance(step, _PipelineAnd)
+        s = cs.chain_schema(
+            [step.left._apply_pipeline(handler, source_type), step.right._apply_pipeline(handler, source_type)]
+        )
+    return s
+
+
+def _apply_parse(
+    s: cs.CoreSchema | None,
+    tp: type[Any],
+    strict: bool,
+    handler: GetCoreSchemaHandler,
+    source_type: Any,
+) -> cs.CoreSchema:
+    if tp is _FieldTypeMarker:
+        return cs.chain_schema([s, handler(source_type)]) if s else handler(source_type)
+
+    if strict:
+        tp = Annotated[tp, Strict()]  # type: ignore
+
+    if s and s['type'] == 'any':
+        return handler(tp)
+    else:
+        return cs.chain_schema([s, handler(tp)]) if s else handler(tp)
+
+
+def _apply_transform(
+    s: cs.CoreSchema | None, func: Callable[[Any], Any], handler: GetCoreSchemaHandler
+) -> cs.CoreSchema:
+    if s is None:
+        return cs.no_info_plain_validator_function(func)
+
+    if s['type'] == 'str':
+        if func is str.strip:
+            s = s.copy()
+            s['strip_whitespace'] = True
+            return s
+        elif func is str.lower:
+            s = s.copy()
+            s['to_lower'] = True
+            return s
+        elif func is str.upper:
+            s = s.copy()
+            s['to_upper'] = True
+            return s
+
+    return cs.no_info_after_validator_function(func, s)
+
+
+def _apply_constraint(  # noqa: C901
+    s: cs.CoreSchema | None, constraint: _ConstraintAnnotation
+) -> cs.CoreSchema:
+    """Apply a single constraint to a schema."""
+    if isinstance(constraint, annotated_types.Gt):
+        gt = constraint.gt
+        if s and s['type'] in {'int', 'float', 'decimal'}:
+            s = s.copy()
+            if s['type'] == 'int' and isinstance(gt, int):
+                s['gt'] = gt
+            elif s['type'] == 'float' and isinstance(gt, float):
+                s['gt'] = gt
+            elif s['type'] == 'decimal' and isinstance(gt, Decimal):
+                s['gt'] = gt
+        else:
+
+            def check_gt(v: Any) -> bool:
+                return v > gt
+
+            s = _check_func(check_gt, f'> {gt}', s)
+    elif isinstance(constraint, annotated_types.Ge):
+        ge = constraint.ge
+        if s and s['type'] in {'int', 'float', 'decimal'}:
+            s = s.copy()
+            if s['type'] == 'int' and isinstance(ge, int):
+                s['ge'] = ge
+            elif s['type'] == 'float' and isinstance(ge, float):
+                s['ge'] = ge
+            elif s['type'] == 'decimal' and isinstance(ge, Decimal):
+                s['ge'] = ge
+
+        def check_ge(v: Any) -> bool:
+            return v >= ge
+
+        s = _check_func(check_ge, f'>= {ge}', s)
+    elif isinstance(constraint, annotated_types.Lt):
+        lt = constraint.lt
+        if s and s['type'] in {'int', 'float', 'decimal'}:
+            s = s.copy()
+            if s['type'] == 'int' and isinstance(lt, int):
+                s['lt'] = lt
+            elif s['type'] == 'float' and isinstance(lt, float):
+                s['lt'] = lt
+            elif s['type'] == 'decimal' and isinstance(lt, Decimal):
+                s['lt'] = lt
+
+        def check_lt(v: Any) -> bool:
+            return v < lt
+
+        s = _check_func(check_lt, f'< {lt}', s)
+    elif isinstance(constraint, annotated_types.Le):
+        le = constraint.le
+        if s and s['type'] in {'int', 'float', 'decimal'}:
+            s = s.copy()
+            if s['type'] == 'int' and isinstance(le, int):
+                s['le'] = le
+            elif s['type'] == 'float' and isinstance(le, float):
+                s['le'] = le
+            elif s['type'] == 'decimal' and isinstance(le, Decimal):
+                s['le'] = le
+
+        def check_le(v: Any) -> bool:
+            return v <= le
+
+        s = _check_func(check_le, f'<= {le}', s)
+    elif isinstance(constraint, annotated_types.Len):
+        min_len = constraint.min_length
+        max_len = constraint.max_length
+
+        if s and s['type'] in {'str', 'list', 'tuple', 'set', 'frozenset', 'dict'}:
+            assert (
+                s['type'] == 'str'
+                or s['type'] == 'list'
+                or s['type'] == 'tuple'
+                or s['type'] == 'set'
+                or s['type'] == 'dict'
+                or s['type'] == 'frozenset'
+            )
+            s = s.copy()
+            if min_len != 0:
+                s['min_length'] = min_len
+            if max_len is not None:
+                s['max_length'] = max_len
+
+        def check_len(v: Any) -> bool:
+            if max_len is not None:
+                return (min_len <= len(v)) and (len(v) <= max_len)
+            return min_len <= len(v)
+
+        s = _check_func(check_len, f'length >= {min_len} and length <= {max_len}', s)
+    elif isinstance(constraint, annotated_types.MultipleOf):
+        multiple_of = constraint.multiple_of
+        if s and s['type'] in {'int', 'float', 'decimal'}:
+            s = s.copy()
+            if s['type'] == 'int' and isinstance(multiple_of, int):
+                s['multiple_of'] = multiple_of
+            elif s['type'] == 'float' and isinstance(multiple_of, float):
+                s['multiple_of'] = multiple_of
+            elif s['type'] == 'decimal' and isinstance(multiple_of, Decimal):
+                s['multiple_of'] = multiple_of
+
+        def check_multiple_of(v: Any) -> bool:
+            return v % multiple_of == 0
+
+        s = _check_func(check_multiple_of, f'% {multiple_of} == 0', s)
+    elif isinstance(constraint, annotated_types.Timezone):
+        tz = constraint.tz
+
+        if tz is ...:
+            if s and s['type'] == 'datetime':
+                s = s.copy()
+                s['tz_constraint'] = 'aware'
+            else:
+
+                def check_tz_aware(v: object) -> bool:
+                    assert isinstance(v, datetime.datetime)
+                    return v.tzinfo is not None
+
+                s = _check_func(check_tz_aware, 'timezone aware', s)
+        elif tz is None:
+            if s and s['type'] == 'datetime':
+                s = s.copy()
+                s['tz_constraint'] = 'naive'
+            else:
+
+                def check_tz_naive(v: object) -> bool:
+                    assert isinstance(v, datetime.datetime)
+                    return v.tzinfo is None
+
+                s = _check_func(check_tz_naive, 'timezone naive', s)
+        else:
+            raise NotImplementedError('Constraining to a specific timezone is not yet supported')
+    elif isinstance(constraint, annotated_types.Interval):
+        if constraint.ge:
+            s = _apply_constraint(s, annotated_types.Ge(constraint.ge))
+        if constraint.gt:
+            s = _apply_constraint(s, annotated_types.Gt(constraint.gt))
+        if constraint.le:
+            s = _apply_constraint(s, annotated_types.Le(constraint.le))
+        if constraint.lt:
+            s = _apply_constraint(s, annotated_types.Lt(constraint.lt))
+        assert s is not None
+    elif isinstance(constraint, annotated_types.Predicate):
+        func = constraint.func
+        # Same logic as in `_known_annotated_metadata.apply_known_metadata()`:
+        predicate_name = f'{func.__qualname__!r} ' if hasattr(func, '__qualname__') else ''
+
+        def predicate_func(v: Any) -> Any:
+            if not func(v):
+                raise PydanticCustomError(
+                    'predicate_failed',
+                    f'Predicate {predicate_name}failed',  # pyright: ignore[reportArgumentType]
+                )
+            return v
+
+        if s is None:
+            s = cs.no_info_plain_validator_function(predicate_func)
+        else:
+            s = cs.no_info_after_validator_function(predicate_func, s)
+    elif isinstance(constraint, _NotEq):
+        value = constraint.value
+
+        def check_not_eq(v: Any) -> bool:
+            return operator.__ne__(v, value)
+
+        s = _check_func(check_not_eq, f'!= {value}', s)
+    elif isinstance(constraint, _Eq):
+        value = constraint.value
+
+        def check_eq(v: Any) -> bool:
+            return operator.__eq__(v, value)
+
+        s = _check_func(check_eq, f'== {value}', s)
+    elif isinstance(constraint, _In):
+        values = constraint.values
+
+        def check_in(v: Any) -> bool:
+            return operator.__contains__(values, v)
+
+        s = _check_func(check_in, f'in {values}', s)
+    elif isinstance(constraint, _NotIn):
+        values = constraint.values
+
+        def check_not_in(v: Any) -> bool:
+            return operator.__not__(operator.__contains__(values, v))
+
+        s = _check_func(check_not_in, f'not in {values}', s)
+    else:
+        assert isinstance(constraint, Pattern)
+        if s and s['type'] == 'str':
+            s = s.copy()
+            s['pattern'] = constraint.pattern
+        else:
+
+            def check_pattern(v: object) -> bool:
+                assert isinstance(v, str)
+                return constraint.match(v) is not None
+
+            s = _check_func(check_pattern, f'~ {constraint.pattern}', s)
+    return s
+
+
+class _SupportsRange(annotated_types.SupportsLe, annotated_types.SupportsGe, Protocol):
+    pass
+
+
+class _SupportsLen(Protocol):
+    def __len__(self) -> int: ...
+
+
+_NewOutGt = TypeVar('_NewOutGt', bound=annotated_types.SupportsGt)
+_NewOutGe = TypeVar('_NewOutGe', bound=annotated_types.SupportsGe)
+_NewOutLt = TypeVar('_NewOutLt', bound=annotated_types.SupportsLt)
+_NewOutLe = TypeVar('_NewOutLe', bound=annotated_types.SupportsLe)
+_NewOutLen = TypeVar('_NewOutLen', bound=_SupportsLen)
+_NewOutDiv = TypeVar('_NewOutDiv', bound=annotated_types.SupportsDiv)
+_NewOutMod = TypeVar('_NewOutMod', bound=annotated_types.SupportsMod)
+_NewOutDatetime = TypeVar('_NewOutDatetime', bound=datetime.datetime)
+_NewOutInterval = TypeVar('_NewOutInterval', bound=_SupportsRange)
+_OtherIn = TypeVar('_OtherIn')
+_OtherOut = TypeVar('_OtherOut')

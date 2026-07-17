@@ -1,24 +1,59 @@
----
-title: GoogleCTF + zer0ptsCTF + ImaginaryCTF 2023 筆記
-catalog: true
-date: 2023-07-28 14:10:44
-tags: [Security]
-categories: [Security]
-photos: /img/google-zer0pts-imaginary-ctf-2023-writeup/cover.png
----
+如果是 navigate 的話，就會回傳 VIEWER_HTML，在這裡面會做各種 sanitize，所以沒辦法 XSS。
 
-前陣子忙著旅遊，沒什麼時間在打 CTF，就算有打也有點懶得寫 writeup，導致上一篇 writeup 已經是 3 月份的時候了。覺得這樣斷掉其實有點可惜，就趕快再寫一篇補回來。
+繞過方式是利用 bfcache，在 [SECCON CTF 2022 Quals - spanote](https://blog.huli.tw/2022/12/08/ctf-js-notes/#seccon-ctf-2022-quals-spanote) 有出現過，簡單來講呢，我們先造訪 target.html，此時的 response 會是 VIEWER_HTML，而在 VIEWER_HTML 內會執行 `fetch('target.html')` 去把內容抓回來，這時候 response 就會被放在 cache 中
 
-標題提到的這三個 CTF，我只有打 GoogleCTF 2023，其他兩場都只有稍微看一下題目而已，所以這篇也只是對題目以及解法做個筆記。
+再來，我們把同個分頁導到自己的 origin，接著執行 `history.go(-1)`，把 URL 導回去 `target.html`，此時因為 bfcache 的關係，就會載入用 `fetch('target.html')` 所抓取的 HTML，繞過了原本的限制，可以載入任意 HTML。
 
-關鍵字列表：
+但下一個問題是 CSP：`default-src 'self';`，因此 script 只能載入 same-origin 的，但 proxy 那邊有限制：
+ 
+``` js
+if (
+    res.headers['content-type'].toLowerCase().includes('script') ||
+    req.headers['sec-fetch-dest'] === 'script'
+) {
+    res.headers['content-length'] = '0'
+    delete res.headers['transfer-encoding']
+}
+```
 
-1. Flask 跟 PHP 解析 POST data 的順序不一致
-2. iframe csp 阻止部分 script 載入
-3. HEAD 繞 CSRF
-4. location.ancestorOrigins 拿 parent origin
-5. iframe 改 location 不會改到 src
-6. recaptcha URL 的 Angular CSP bypass gadget
-7. document.execCommand('undo'); 還原 input
-8. X-HTTP-Method-Override
-9. HTML 與 XHTML 的 parser 差異
+如果 content type 包含 script，直接把 content-length 變成 0，因此沒辦法載入 script。
+
+這時候就要用到 response splitting 了，因為 proxy 那邊會直接把收到的 response pipe 出去，因此可以構造出這樣的流程：
+
+1. 在 browser 那端發出第一個請求，就叫請求 A 吧
+2. 在請求 A 的 response 中先輸出 `expect: '100-continue'` header，讓 proxy server 那邊把 header 輸出，此時對瀏覽器來說第一個請求已經結束，拿到了 response，
+3. browser 發出第二個請求 B，延用同一個 connection
+4. 這時輸出請求 B 的 response（但是對 proxy 來說還是請求 A 的 response），繞過 content type 的限制，因為 proxy 認為這是 response content
+
+簡單來講就是類似 request smuggling 那樣，不過是反過來做。
+
+這邊的細節有兩個：
+
+1. 透過 Chrome 對同一個 domain 有 6 個 concurrent 的限制，確保其中兩個請求會用到同一個 connection
+2. Node.js server 在收到 `Expect: 100-continue` 的時候，會先 flush，這一步是必要的，要繞過 Chrome 的限制
+
+可以載入 JS 之後，就再用一樣的方法載入 service worker，並且用 `Service-Worker-Allowed: /` header 來擴大 scope，可以註冊到整個 origin。
+
+更多細節可以參考 maple 的 writeup: https://github.com/maple3142/My-CTF-Challenges/tree/master/HITCON%20CTF%202024/Private%20Browsing%2B
+
+## corCTF 2024
+
+### web/corctf-challenge-dev - 17 solves
+Author: drakon
+
+一個跟 Chrome extension 有關的題目，但作者已經寫得很詳細了，就不多寫了：[corCTF 2024 - corctf-challenge-dev](https://cor.team/posts/corctf-2024-corctf-challenge-dev/)
+
+### web/iframe-note - 2 solves
+Author: sterllic
+
+這題的核心程式碼是底下這段：
+
+``` html
+<iframe id="iframe"></iframe>
+<script src="{{ url_for('static', filename='axios.min.js') }}"></script>
+<script src="{{ url_for('static', filename='can.min.js') }}"></script>
+<script>
+  window.onload = () => {
+    if (["__proto__", "constructor", "prototype"].some(d => location.search.includes(d))) {
+      return;
+    }

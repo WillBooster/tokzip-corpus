@@ -1,379 +1,477 @@
-{-# LANGUAGE NoImplicitPrelude     #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE OverloadedRecordDot   #-}
-{-# LANGUAGE OverloadedStrings     #-}
+{- HLINT ignore -}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE UnliftedFFITypes         #-}
 
--- | Build the project.
-
-module Stack.Build
-  ( buildCmd
-  , build
-  , buildLocalTargets
-  , loadPackage
-  , mkBaseConfigOpts
-  , splitObjsWarning
-  ) where
-
-import           Data.Attoparsec.Args ( EscapingMode (Escaping), parseArgs )
-import           Data.List ( (\\) )
-import           Data.List.Extra ( groupSort )
-import qualified Data.Map as Map
-import qualified Data.Set as Set
-import qualified Data.Text as T
--- import qualified Distribution.PackageDescription as C
--- import           Distribution.Types.Dependency ( Dependency (..), depLibraries )
-import           Distribution.Version ( mkVersion )
-import           RIO.NonEmpty ( nonEmpty )
-import qualified RIO.NonEmpty as NE
-import           Stack.Build.ConstructPlan ( constructPlan )
-import           Stack.Build.Execute ( executePlan, preFetch, printPlan )
-import           Stack.Build.Installed ( getInstalled, toInstallMap )
-import           Stack.Build.Source ( localDependencies, projectLocalPackages )
-import           Stack.Build.Target ( NeedTargets (..) )
-import           Stack.FileWatch ( fileWatch, fileWatchPoll )
-import           Stack.Package ( buildableExes, resolvePackage )
-import           Stack.Prelude hiding ( loadPackage )
-import           Stack.Runners ( ShouldReexec (..), withConfig, withEnvConfig )
-import           Stack.Setup ( withNewLocalBuildTargets )
-import           Stack.Types.Build
-                   ( Plan (..), Task (..), TaskType (..), taskLocation
-                   , taskProvides
-                   )
-import           Stack.Types.Build.Exception
-                   ( BuildException (..), BuildPrettyException (..) )
-import           Stack.Types.BuildConfig ( HasBuildConfig, stackYamlL )
-import           Stack.Types.BuildOpts ( BuildOpts (..) )
-import           Stack.Types.BuildOptsCLI
-                   ( BuildCommand (..), BuildOptsCLI (..), FileWatchOpts (..) )
-import           Stack.Types.BuildOptsMonoid
-                   ( buildOptsMonoidBenchmarksL, buildOptsMonoidHaddockL
-                   , buildOptsMonoidInstallExesL, buildOptsMonoidTestsL
-                   )
-import           Stack.Types.Compiler ( getGhcVersion )
-import           Stack.Types.CompilerPaths ( cabalVersionL )
-import           Stack.Types.Config
-                   ( Config (..), HasConfig (..), buildOptsL
-                   )
-import           Stack.Types.ConfigureOpts ( BaseConfigOpts (..) )
-import           Stack.Types.EnvConfig
-                   ( EnvConfig (..), HasEnvConfig (..), HasSourceMap
-                   , actualCompilerVersionL, installationRootDeps
-                   , installationRootLocal, packageDatabaseDeps
-                   , packageDatabaseExtra, packageDatabaseLocal
-                   )
-import           Stack.Types.GlobalOpts ( globalOptsBuildOptsMonoidL )
-import           Stack.Types.NamedComponent ( exeComponents )
-import           Stack.Types.Package
-                   ( InstallLocation (..), LocalPackage (..), Package (..)
-                   , PackageConfig (..), lpFiles, lpFilesForComponents
-                   )
-import           Stack.Types.Platform ( HasPlatform (..) )
-import           Stack.Types.Runner ( Runner, globalOptsL )
-import           Stack.Types.SourceMap
-                   ( SMTargets (..)
-                   , SourceMap (..), Target (..) )
-import           System.Terminal ( fixCodePage )
-
-newtype CabalVersionPrettyException
-  = CabalVersionNotSupported Version
-  deriving (Show, Typeable)
-
-instance Pretty CabalVersionPrettyException where
-  pretty (CabalVersionNotSupported cabalVer) =
-    "[S-5973]"
-    <> line
-    <> fillSep
-         [ flow "Stack does not support Cabal versions before 1.24, but \
-                \version"
-         , fromString $ versionString cabalVer
-         , flow "was found. To fix this, consider updating the snapshot to"
-         , style Shell "lts-7.0"
-         , flow "or later or to"
-         , style Shell "nightly-2016-05-26"
-         , flow "or later."
-         ]
-
-instance Exception CabalVersionPrettyException
-
--- | Helper for build and install commands
-buildCmd :: BuildOptsCLI -> RIO Runner ()
-buildCmd opts = do
-  when (any (("-prof" `elem`) . fromRight [] . parseArgs Escaping) opts.ghcOptions) $
-    prettyThrowIO GHCProfOptionInvalid
-  local (over globalOptsL modifyGO) $
-    case opts.fileWatch of
-      FileWatchPoll -> fileWatchPoll (inner . Just)
-      FileWatch -> fileWatch (inner . Just)
-      NoFileWatch -> inner Nothing
- where
-  inner ::
-       Maybe (Set (Path Abs File) -> IO ())
-    -> RIO Runner ()
-  inner setLocalFiles = withConfig YesReexec $ withEnvConfig NeedTargets opts $
-      Stack.Build.build setLocalFiles
-  -- Read the build command from the CLI and enable it to run
-  modifyGO =
-    case opts.command of
-      Test -> set
-        (globalOptsBuildOptsMonoidL . buildOptsMonoidTestsL)
-        (Just True)
-      Haddock -> set
-        (globalOptsBuildOptsMonoidL . buildOptsMonoidHaddockL)
-        (Just True)
-      Bench -> set
-        (globalOptsBuildOptsMonoidL . buildOptsMonoidBenchmarksL)
-        (Just True)
-      Install -> set
-        (globalOptsBuildOptsMonoidL . buildOptsMonoidInstallExesL)
-        (Just True)
-      Build -> id -- Default case is just Build
-
--- | Build.
+-- |
+-- Module      :  System.OsPath.Data.ByteString.Short.Internal
+-- Copyright   :  © 2022 Julian Ospald
+-- License     :  MIT
 --
---   If a buildLock is passed there is an important contract here.  That lock must
---   protect the snapshot, and it must be safe to unlock it if there are no further
---   modifications to the snapshot to be performed by this build.
-build :: HasEnvConfig env
-      => Maybe (Set (Path Abs File) -> IO ()) -- ^ callback after discovering all local files
-      -> RIO env ()
-build msetLocalFiles = do
-  mcp <- view $ configL . to (.modifyCodePage)
-  ghcVersion <- view $ actualCompilerVersionL . to getGhcVersion
-  fixCodePage mcp ghcVersion $ do
-    bopts <- view buildOptsL
-    sourceMap <- view $ envConfigL . to (.sourceMap)
-    locals <- projectLocalPackages
-    depsLocals <- localDependencies
-    let allLocals = locals <> depsLocals
+-- Maintainer  :  Julian Ospald <hasufell@posteo.de>
+-- Stability   :  experimental
+-- Portability :  portable
+--
+-- Internal low-level utilities mostly for 'System.OsPath.Data.ByteString.Short.Word16',
+-- such as byte-array operations and other stuff not meant to be exported from Word16 module.
+module System.OsPath.Data.ByteString.Short.Internal where
 
-    boptsCli <- view $ envConfigL . to (.buildOptsCLI)
-    -- Set local files, necessary for file watching
-    stackYaml <- view stackYamlL
-    for_ msetLocalFiles $ \setLocalFiles -> do
-      files <-
-        if boptsCli.watchAll
-        then sequence [lpFiles lp | lp <- allLocals]
-        else forM allLocals $ \lp -> do
-          let pn = lp.package.name
-          case Map.lookup pn sourceMap.targets.targets of
-            Nothing ->
-              pure Set.empty
-            Just (TargetAll _) ->
-              lpFiles lp
-            Just (TargetComps components) ->
-              lpFilesForComponents components lp
-      liftIO $ setLocalFiles $ Set.insert stackYaml $ Set.unions files
+import Control.Monad.ST
+import Control.Exception (assert, throwIO)
+import Data.Bits (Bits(..))
+import Data.ByteString.Short.Internal (ShortByteString(..), length)
+#if !MIN_VERSION_base(4,11,0)
+import Data.Semigroup
+  ( Semigroup((<>)) )
+import Foreign.C.Types
+  ( CSize(..)
+  , CInt(..)
+  )
+import Data.ByteString.Internal
+  ( accursedUnutterablePerformIO
+  )
+#endif
+#if !MIN_VERSION_bytestring(0,10,9)
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.C.String ( CString, CStringLen )
+import Foreign.C.Types ( CSize(..) )
+import Foreign.Storable (pokeByteOff)
+#endif
+import Foreign.Marshal.Array (withArray0, peekArray0, newArray0, withArrayLen, peekArray)
+import GHC.Exts
+import GHC.Word
+import GHC.ST
+    ( ST (ST) )
+import GHC.Stack ( HasCallStack )
+import Prelude hiding
+    ( length )
 
-    checkComponentsBuildable allLocals
+import qualified Data.ByteString.Short.Internal as BS
+import qualified Data.Char as C
+import qualified Data.List as List
 
-    installMap <- toInstallMap sourceMap
-    (installedMap, globalDumpPkgs, snapshotDumpPkgs, localDumpPkgs) <-
-        getInstalled installMap
 
-    baseConfigOpts <- mkBaseConfigOpts boptsCli
-    plan <- constructPlan
-              baseConfigOpts
-              localDumpPkgs
-              loadPackage
-              sourceMap
-              installedMap
-              boptsCli.initialBuildSteps
+_nul :: Word16
+_nul = 0x00
 
-    allowLocals <- view $ configL . to (.allowLocals)
-    unless allowLocals $ case justLocals plan of
-      [] -> pure ()
-      localsIdents -> throwM $ LocalPackagesPresent localsIdents
+isSpace :: Word16 -> Bool
+isSpace = C.isSpace . word16ToChar
 
-    checkCabalVersion
-    warnAboutSplitObjs bopts
-    warnIfExecutablesWithSameNameCouldBeOverwritten locals plan
+-- | Total conversion to char.
+word16ToChar :: Word16 -> Char
+word16ToChar = C.chr . fromIntegral
 
-    when bopts.preFetch $
-        preFetch plan
+create :: Int -> (forall s. MBA s -> ST s ()) -> ShortByteString
+create len fill =
+    runST $ do
+      mba <- newByteArray len
+      fill mba
+      BA# ba# <- unsafeFreezeByteArray mba
+      return (SBS ba#)
+{-# INLINE create #-}
 
-    if boptsCli.dryrun
-      then printPlan plan
-      else executePlan
-             boptsCli
-             baseConfigOpts
-             locals
-             globalDumpPkgs
-             snapshotDumpPkgs
-             localDumpPkgs
-             installedMap
-             sourceMap.targets.targets
-             plan
 
-buildLocalTargets ::
-     HasEnvConfig env
-  => NonEmpty Text
-  -> RIO env (Either SomeException ())
-buildLocalTargets targets =
-  tryAny $ withNewLocalBuildTargets (NE.toList targets) $ build Nothing
+asBA :: ShortByteString -> BA
+asBA (SBS ba#) = BA# ba#
 
-justLocals :: Plan -> [PackageIdentifier]
-justLocals =
-  map taskProvides .
-  filter ((== Local) . taskLocation) .
-  Map.elems .
-  (.tasks)
 
-checkCabalVersion :: HasEnvConfig env => RIO env ()
-checkCabalVersion = do
-  cabalVer <- view cabalVersionL
-  when (cabalVer < mkVersion [1, 24]) $
-    prettyThrowM $ CabalVersionNotSupported cabalVer
 
--- | See https://github.com/commercialhaskell/stack/issues/1198.
-warnIfExecutablesWithSameNameCouldBeOverwritten ::
-     HasTerm env
-  => [LocalPackage]
-  -> Plan
-  -> RIO env ()
-warnIfExecutablesWithSameNameCouldBeOverwritten locals plan = do
-  logDebug "Checking if we are going to build multiple executables with the same name"
-  forM_ (Map.toList warnings) $ \(exe, (toBuild, otherLocals)) -> do
-    let exe_s
-          | length toBuild > 1 = flow "several executables with the same name:"
-          | otherwise = "executable"
-        exesText pkgs =
-          fillSep $ punctuate
-            ","
-            [ style
-                PkgComponent
-                (fromString $ packageNameString p <> ":" <> T.unpack exe)
-            | p <- pkgs
-            ]
-    prettyWarnL $
-         [ "Building"
-         , exe_s
-         , exesText toBuild <> "."
-         ]
-      <> [ fillSep
-             [ flow "Only one of them will be available via"
-             , style Shell "stack exec"
-             , flow "or locally installed."
-             ]
-         | length toBuild > 1
-         ]
-      <> [ fillSep
-             [ flow "Other executables with the same name might be overwritten:"
-             , exesText otherLocals <> "."
-             ]
-         | not (null otherLocals)
-         ]
- where
-  -- Cases of several local packages having executables with the same name.
-  -- The Map entries have the following form:
-  --
-  --  executable name: ( package names for executables that are being built
-  --                   , package names for other local packages that have an
-  --                     executable with the same name
-  --                   )
-  warnings :: Map Text ([PackageName],[PackageName])
-  warnings =
-    Map.mapMaybe
-      (\(pkgsToBuild, localPkgs) ->
-        case (pkgsToBuild, NE.toList localPkgs \\ NE.toList pkgsToBuild) of
-          (_ :| [], []) ->
-            -- We want to build the executable of single local package
-            -- and there are no other local packages with an executable of
-            -- the same name. Nothing to warn about, ignore.
-            Nothing
-          (_, otherLocals) ->
-            -- We could be here for two reasons (or their combination):
-            -- 1) We are building two or more executables with the same
-            --    name that will end up overwriting each other.
-            -- 2) In addition to the executable(s) that we want to build
-            --    there are other local packages with an executable of the
-            --    same name that might get overwritten.
-            -- Both cases warrant a warning.
-            Just (NE.toList pkgsToBuild, otherLocals))
-      (Map.intersectionWith (,) exesToBuild localExes)
-  exesToBuild :: Map Text (NonEmpty PackageName)
-  exesToBuild =
-    collect
-      [ (exe, pkgName')
-      | (pkgName', task) <- Map.toList plan.tasks
-      , TTLocalMutable lp <- [task.taskType]
-      , exe <- (Set.toList . exeComponents . (.components)) lp
-      ]
-  localExes :: Map Text (NonEmpty PackageName)
-  localExes =
-    collect
-      [ (exe, pkg.name)
-      | pkg <- map (.package) locals
-      , exe <- Set.toList (buildableExes pkg)
-      ]
-  collect :: Ord k => [(k, v)] -> Map k (NonEmpty v)
-  collect = Map.mapMaybe nonEmpty . Map.fromDistinctAscList . groupSort
+data BA    = BA# ByteArray#
+data MBA s = MBA# (MutableByteArray# s)
 
-warnAboutSplitObjs :: HasTerm env => BuildOpts -> RIO env ()
-warnAboutSplitObjs bopts |  bopts.splitObjs =
-  prettyWarnL
-    [ flow "Building with"
-    , style Shell "--split-objs"
-    , flow "is enabled."
-    , flow splitObjsWarning
-    ]
-warnAboutSplitObjs _ = pure ()
 
-splitObjsWarning :: String
-splitObjsWarning =
-  "Note that this feature is EXPERIMENTAL, and its behavior may be changed and \
-  \improved. You will need to clean your workdirs before use. If you want to \
-  \compile all dependencies with split-objs, you will need to delete the \
-  \snapshot (and all snapshots that could reference that snapshot)."
+newPinnedByteArray :: Int -> ST s (MBA s)
+newPinnedByteArray (I# len#) =
+    ST $ \s -> case newPinnedByteArray# len# s of
+                 (# s', mba# #) -> (# s', MBA# mba# #)
 
--- | Get the @BaseConfigOpts@ necessary for constructing configure options
-mkBaseConfigOpts :: (HasEnvConfig env)
-                 => BuildOptsCLI -> RIO env BaseConfigOpts
-mkBaseConfigOpts buildOptsCLI = do
-  buildOpts <- view buildOptsL
-  snapDB <- packageDatabaseDeps
-  localDB <- packageDatabaseLocal
-  snapInstallRoot <- installationRootDeps
-  localInstallRoot <- installationRootLocal
-  extraDBs <- packageDatabaseExtra
-  pure BaseConfigOpts
-    { snapDB
-    , localDB
-    , snapInstallRoot
-    , localInstallRoot
-    , buildOpts
-    , buildOptsCLI
-    , extraDBs
-    }
+newByteArray :: Int -> ST s (MBA s)
+newByteArray (I# len#) =
+    ST $ \s -> case newByteArray# len# s of
+                 (# s', mba# #) -> (# s', MBA# mba# #)
 
--- | Provide a function for loading package information from the package index
-loadPackage ::
-     (HasBuildConfig env, HasSourceMap env)
-  => PackageLocationImmutable
-  -> Map FlagName Bool
-  -> [Text] -- ^ GHC options
-  -> [Text] -- ^ Cabal configure options
-  -> RIO env Package
-loadPackage loc flags ghcOptions cabalConfigOpts = do
-  compilerVersion <- view actualCompilerVersionL
-  platform <- view platformL
-  let pkgConfig = PackageConfig
-        { enableTests = False
-        , enableBenchmarks = False
-        , flags
-        , ghcOptions
-        , cabalConfigOpts
-        , compilerVersion
-        , platform
-        }
-  resolvePackage pkgConfig <$> loadCabalFileImmutable loc
+copyByteArray :: BA -> Int -> MBA s -> Int -> Int -> ST s ()
+copyByteArray (BA# src#) (I# src_off#) (MBA# dst#) (I# dst_off#) (I# len#) =
+    ST $ \s -> case copyByteArray# src# src_off# dst# dst_off# len# s of
+                 s' -> (# s', () #)
 
-checkComponentsBuildable :: MonadThrow m => [LocalPackage] -> m ()
-checkComponentsBuildable lps =
-  unless (null unbuildable) $
-    prettyThrowM $ SomeTargetsNotBuildable unbuildable
- where
-  unbuildable =
-    [ (lp.package.name, c)
-    | lp <- lps
-    , c <- Set.toList lp.unbuildable
-    ]
+unsafeFreezeByteArray :: MBA s -> ST s BA
+unsafeFreezeByteArray (MBA# mba#) =
+    ST $ \s -> case unsafeFreezeByteArray# mba# s of
+                 (# s', ba# #) -> (# s', BA# ba# #)
+
+copyAddrToByteArray :: Ptr a -> MBA RealWorld -> Int -> Int -> ST RealWorld ()
+copyAddrToByteArray (Ptr src#) (MBA# dst#) (I# dst_off#) (I# len#) =
+    ST $ \s -> case copyAddrToByteArray# src# dst# dst_off# len# s of
+                 s' -> (# s', () #)
+
+
+-- this is a copy-paste from bytestring
+#if !MIN_VERSION_bytestring(0,10,9)
+------------------------------------------------------------------------
+-- Primop replacements
+
+-- ---------------------------------------------------------------------
+--
+-- Standard C functions
+--
+
+foreign import ccall unsafe "string.h strlen" c_strlen
+    :: CString -> IO CSize
+
+
+-- ---------------------------------------------------------------------
+--
+-- Uses our C code
+--
+
+-- | /O(n)./ Construct a new @ShortByteString@ from a @CString@. The
+-- resulting @ShortByteString@ is an immutable copy of the original
+-- @CString@, and is managed on the Haskell heap. The original
+-- @CString@ must be null terminated.
+--
+-- @since 0.10.10.0
+packCString :: CString -> IO ShortByteString
+packCString cstr = do
+  len <- c_strlen cstr
+  packCStringLen (cstr, fromIntegral len)
+
+-- | /O(n)./ Construct a new @ShortByteString@ from a @CStringLen@. The
+-- resulting @ShortByteString@ is an immutable copy of the original @CStringLen@.
+-- The @ShortByteString@ is a normal Haskell value and will be managed on the
+-- Haskell heap.
+--
+-- @since 0.10.10.0
+packCStringLen :: CStringLen -> IO ShortByteString
+packCStringLen (cstr, len) | len >= 0 = BS.createFromPtr cstr len
+packCStringLen (_, len) =
+  moduleErrorIO "packCStringLen" ("negative length: " ++ show len)
+
+-- | /O(n) construction./ Use a @ShortByteString@ with a function requiring a
+-- null-terminated @CString@.  The @CString@ is a copy and will be freed
+-- automatically; it must not be stored or used after the
+-- subcomputation finishes.
+--
+-- @since 0.10.10.0
+useAsCString :: ShortByteString -> (CString -> IO a) -> IO a
+useAsCString bs action =
+  allocaBytes (l+1) $ \buf -> do
+      BS.copyToPtr bs 0 buf (fromIntegral l)
+      pokeByteOff buf l (0::Word8)
+      action buf
+  where l = length bs
+
+-- | /O(n) construction./ Use a @ShortByteString@ with a function requiring a @CStringLen@.
+-- As for @useAsCString@ this function makes a copy of the original @ShortByteString@.
+-- It must not be stored or used after the subcomputation finishes.
+--
+-- @since 0.10.10.0
+useAsCStringLen :: ShortByteString -> (CStringLen -> IO a) -> IO a
+useAsCStringLen bs action =
+  allocaBytes l $ \buf -> do
+      BS.copyToPtr bs 0 buf (fromIntegral l)
+      action (buf, l)
+  where l = length bs
+
+
+#endif
+
+
+-- | /O(n)./ Construct a new @ShortByteString@ from a @CWString@. The
+-- resulting @ShortByteString@ is an immutable copy of the original
+-- @CWString@, and is managed on the Haskell heap. The original
+-- @CWString@ must be null terminated.
+--
+-- @since 0.10.10.0
+packCWString :: Ptr Word16 -> IO ShortByteString
+packCWString cwstr = do
+  cs <- peekArray0 _nul cwstr
+  return (packWord16 cs)
+
+-- | /O(n)./ Construct a new @ShortByteString@ from a @CWStringLen@. The
+-- resulting @ShortByteString@ is an immutable copy of the original @CWStringLen@.
+-- The @ShortByteString@ is a normal Haskell value and will be managed on the
+-- Haskell heap.
+--
+-- @since 0.10.10.0
+packCWStringLen :: (Ptr Word16, Int) -> IO ShortByteString
+packCWStringLen (cp, len) = do
+  cs <- peekArray len cp
+  return (packWord16 cs)
+
+
+-- | /O(n) construction./ Use a @ShortByteString@ with a function requiring a
+-- null-terminated @CWString@.  The @CWString@ is a copy and will be freed
+-- automatically; it must not be stored or used after the
+-- subcomputation finishes.
+--
+-- @since 0.10.10.0
+useAsCWString :: ShortByteString -> (Ptr Word16 -> IO a) -> IO a
+useAsCWString = withArray0 _nul . unpackWord16
+
+-- | /O(n) construction./ Use a @ShortByteString@ with a function requiring a @CWStringLen@.
+-- As for @useAsCWString@ this function makes a copy of the original @ShortByteString@.
+-- It must not be stored or used after the subcomputation finishes.
+--
+-- @since 0.10.10.0
+useAsCWStringLen :: ShortByteString -> ((Ptr Word16, Int) -> IO a) -> IO a
+useAsCWStringLen bs action = withArrayLen (unpackWord16 bs) $ \ len ptr -> action (ptr, len)
+
+-- | /O(n) construction./ Use a @ShortByteString@ with a function requiring a @CWStringLen@.
+-- As for @useAsCWString@ this function makes a copy of the original @ShortByteString@.
+-- It must not be stored or used after the subcomputation finishes.
+--
+-- @since 0.10.10.0
+newCWString :: ShortByteString -> IO (Ptr Word16)
+newCWString = newArray0 _nul . unpackWord16
+
+
+
+
+ -- ---------------------------------------------------------------------
+-- Internal utilities
+
+moduleErrorIO :: String -> String -> IO a
+moduleErrorIO fun msg = throwIO . userError $ moduleErrorMsg fun msg
+{-# NOINLINE moduleErrorIO #-}
+
+moduleErrorMsg :: String -> String -> String
+moduleErrorMsg fun msg = "System.OsPath.Data.ByteString.Short." ++ fun ++ ':':' ':msg
+
+packWord16 :: [Word16] -> ShortByteString
+packWord16 cs = packLenWord16 (List.length cs) cs
+
+packLenWord16 :: Int -> [Word16] -> ShortByteString
+packLenWord16 len ws0 =
+    create (len * 2) (\mba -> go mba 0 ws0)
+  where
+    go :: MBA s -> Int -> [Word16] -> ST s ()
+    go !_   !_ []     = return ()
+    go !mba !i (w:ws) = do
+      writeWord16Array mba i w
+      go mba (i+2) ws
+
+
+unpackWord16 :: ShortByteString -> [Word16]
+unpackWord16 sbs = go len []
+  where
+    len = length sbs
+    go !i !acc
+      | i < 1     = acc
+      | otherwise = let !w = indexWord16Array (asBA sbs) (i - 2)
+                    in go (i - 2) (w:acc)
+
+packWord16Rev :: [Word16] -> ShortByteString
+packWord16Rev cs = packLenWord16Rev (List.length cs * 2) cs
+
+packLenWord16Rev :: Int -> [Word16] -> ShortByteString
+packLenWord16Rev len ws0 =
+    create len (\mba -> go mba len ws0)
+  where
+    go :: MBA s -> Int -> [Word16] -> ST s ()
+    go !_   !_ []     = return ()
+    go !mba !i (w:ws) = do
+      writeWord16Array mba (i - 2) w
+      go mba (i - 2) ws
+
+
+-- | This isn't strictly Word16 array write. Instead it's two consecutive Word8 array
+-- writes to avoid endianness issues due to primops doing automatic alignment based
+-- on host platform. We want to always write LE to the byte array.
+writeWord16Array :: MBA s
+                 -> Int      -- ^ Word8 index (not Word16)
+                 -> Word16
+                 -> ST s ()
+writeWord16Array (MBA# mba#) (I# i#) (W16# w#) =
+  case encodeWord16LE# w# of
+    (# lsb#, msb# #) ->
+      ST (\s -> case writeWord8Array# mba# i# lsb# s of
+          s' -> (# s', () #)) >>
+      ST (\s -> case writeWord8Array# mba# (i# +# 1#) msb# s of
+          s' -> (# s', () #))
+
+indexWord8Array :: BA
+                -> Int      -- ^ Word8 index
+                -> Word8
+indexWord8Array (BA# ba#) (I# i#) = W8# (indexWord8Array# ba# i#)
+
+-- | This isn't strictly Word16 array read. Instead it's two Word8 array reads
+-- to avoid endianness issues due to primops doing automatic alignment based
+-- on host platform. We expect the byte array to be LE always.
+indexWord16Array :: BA
+                 -> Int      -- ^ Word8 index (not Word16)
+                 -> Word16
+indexWord16Array ba i = fromIntegral lsb .|. (fromIntegral msb `shiftL` 8)
+  where
+    lsb = indexWord8Array ba i
+    msb = indexWord8Array ba (i + 1)
+
+#if !MIN_VERSION_base(4,16,0)
+
+encodeWord16LE# :: Word#              -- ^ Word16
+                -> (# Word#, Word# #) -- ^ Word8 (LSB, MSB)
+encodeWord16LE# x# = (# x# `and#` int2Word# 0xff#
+                     ,  x# `and#` int2Word# 0xff00# `shiftRL#` 8# #)
+
+decodeWord16LE# :: (# Word#, Word# #) -- ^ Word8 (LSB, MSB)
+                -> Word#              -- ^ Word16
+decodeWord16LE# (# lsb#, msb# #) = msb# `shiftL#` 8# `or#` lsb#
+
+#else
+
+encodeWord16LE# :: Word16#              -- ^ Word16
+                -> (# Word8#, Word8# #) -- ^ Word8 (LSB, MSB)
+encodeWord16LE# x# = (# word16ToWord8# x#
+                     ,  word16ToWord8# (x# `uncheckedShiftRLWord16#` 8#) #)
+  where
+    word16ToWord8# y = wordToWord8# (word16ToWord# y)
+
+decodeWord16LE# :: (# Word8#, Word8# #) -- ^ Word8 (LSB, MSB)
+                -> Word16#              -- ^ Word16
+decodeWord16LE# (# lsb#, msb# #) = ((word8ToWord16# msb# `uncheckedShiftLWord16#` 8#) `orWord16#` word8ToWord16# lsb#)
+  where
+    word8ToWord16# y = wordToWord16# (word8ToWord# y)
+
+#endif
+
+setByteArray :: MBA s -> Int -> Int -> Int -> ST s ()
+setByteArray (MBA# dst#) (I# off#) (I# len#) (I# c#) =
+    ST $ \s -> case setByteArray# dst# off# len# c# s of
+                 s' -> (# s', () #)
+
+copyMutableByteArray :: MBA s -> Int -> MBA s -> Int -> Int -> ST s ()
+copyMutableByteArray (MBA# src#) (I# src_off#) (MBA# dst#) (I# dst_off#) (I# len#) =
+    ST $ \s -> case copyMutableByteArray# src# src_off# dst# dst_off# len# s of
+                 s' -> (# s', () #)
+
+-- | Given the maximum size needed and a function to make the contents
+-- of a ShortByteString, createAndTrim makes the 'ShortByteString'.
+-- The generating function is required to return the actual final size
+-- (<= the maximum size) and the result value. The resulting byte array
+-- is realloced to this size.
+createAndTrim :: Int -> (forall s. MBA s -> ST s (Int, a)) -> (ShortByteString, a)
+createAndTrim l fill =
+    runST $ do
+      mba <- newByteArray l
+      (l', res) <- fill mba
+      if assert (l' <= l) $ l' >= l
+          then do
+            BA# ba# <- unsafeFreezeByteArray mba
+            return (SBS ba#, res)
+          else do
+            mba2 <- newByteArray l'
+            copyMutableByteArray mba 0 mba2 0 l'
+            BA# ba# <- unsafeFreezeByteArray mba2
+            return (SBS ba#, res)
+{-# INLINE createAndTrim #-}
+
+createAndTrim' :: Int -> (forall s. MBA s -> ST s Int) -> ShortByteString
+createAndTrim' l fill =
+    runST $ do
+      mba <- newByteArray l
+      l' <- fill mba
+      if assert (l' <= l) $ l' >= l
+          then do
+            BA# ba# <- unsafeFreezeByteArray mba
+            return (SBS ba#)
+          else do
+            mba2 <- newByteArray l'
+            copyMutableByteArray mba 0 mba2 0 l'
+            BA# ba# <- unsafeFreezeByteArray mba2
+            return (SBS ba#)
+{-# INLINE createAndTrim' #-}
+
+createAndTrim'' :: Int -> (forall s. MBA s -> MBA s -> ST s (Int, Int)) -> (ShortByteString, ShortByteString)
+createAndTrim'' l fill =
+    runST $ do
+      mba1 <- newByteArray l
+      mba2 <- newByteArray l
+      (l1, l2) <- fill mba1 mba2
+      sbs1 <- freeze' l1 mba1
+      sbs2 <- freeze' l2 mba2
+      pure (sbs1, sbs2)
+  where
+    freeze' :: Int -> MBA s -> ST s ShortByteString
+    freeze' l' mba =
+      if assert (l' <= l) $ l' >= l
+          then do
+            BA# ba# <- unsafeFreezeByteArray mba
+            return (SBS ba#)
+          else do
+            mba2 <- newByteArray l'
+            copyMutableByteArray mba 0 mba2 0 l'
+            BA# ba# <- unsafeFreezeByteArray mba2
+            return (SBS ba#)
+{-# INLINE createAndTrim'' #-}
+
+-- Returns the index of the first match or the length of the whole
+-- bytestring if nothing matched.
+findIndexOrLength :: (Word16 -> Bool) -> ShortByteString -> Int
+findIndexOrLength k (assertEven -> sbs) = go 0
+  where
+    l = BS.length sbs
+    ba = asBA sbs
+    w = indexWord16Array ba
+    go !n | n >= l     = l `div` 2
+          | k (w n)    = n `div` 2
+          | otherwise  = go (n + 2)
+{-# INLINE findIndexOrLength #-}
+
+
+-- | Returns the length of the substring matching, not the index.
+-- If no match, returns 0.
+findFromEndUntil :: (Word16 -> Bool) -> ShortByteString -> Int
+findFromEndUntil k sbs = go (BS.length sbs - 2)
+  where
+    ba = asBA sbs
+    w = indexWord16Array ba
+    go !n | n < 0     = 0
+          | k (w n)   = (n `div` 2) + 1
+          | otherwise = go (n - 2)
+{-# INLINE findFromEndUntil #-}
+
+
+assertEven :: ShortByteString -> ShortByteString
+assertEven sbs@(SBS barr#)
+  | even (I# (sizeofByteArray# barr#)) = sbs
+  | otherwise = error ("Uneven number of bytes: " <> show (BS.length sbs) <> ". This is not a Word16 bytestream.")
+
+
+-- Common up near identical calls to `error' to reduce the number
+-- constant strings created when compiled:
+errorEmptySBS :: HasCallStack => String -> a
+errorEmptySBS fun = moduleError fun "empty ShortByteString"
+{-# NOINLINE errorEmptySBS #-}
+
+moduleError :: HasCallStack => String -> String -> a
+moduleError fun msg = error (moduleErrorMsg fun msg)
+{-# NOINLINE moduleError #-}
+
+compareByteArraysOff :: BA  -- ^ array 1
+                     -> Int -- ^ offset for array 1
+                     -> BA  -- ^ array 2
+                     -> Int -- ^ offset for array 2
+                     -> Int -- ^ length to compare
+                     -> Int -- ^ like memcmp
+#if MIN_VERSION_base(4,11,0)
+compareByteArraysOff (BA# ba1#) (I# ba1off#) (BA# ba2#) (I# ba2off#) (I# len#) =
+  I# (compareByteArrays#  ba1# ba1off# ba2# ba2off# len#)
+#else
+compareByteArraysOff (BA# ba1#) ba1off (BA# ba2#) ba2off len =
+  assert (ba1off + len <= (I# (sizeofByteArray# ba1#)))
+  $ assert (ba2off + len <= (I# (sizeofByteArray# ba2#)))
+  $ fromIntegral $ accursedUnutterablePerformIO $
+    c_memcmp_ByteArray ba1#
+                       ba1off
+                       ba2#
+                       ba2off
+                       (fromIntegral len)
+
+
+foreign import ccall unsafe "static sbs_memcmp_off"
+  c_memcmp_ByteArray :: ByteArray# -> Int -> ByteArray# -> Int -> CSize -> IO CInt
+#endif

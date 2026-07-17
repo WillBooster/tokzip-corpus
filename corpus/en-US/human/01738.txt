@@ -1,70 +1,69 @@
-This tutorial will walk you through setting up a simple Deno application with
-OpenTelemetry instrumentation.
+## Spies
 
-## Prerequisites
+A spy wraps a function and records every call: how many times it ran and which
+arguments it received. Spies do not change the function's behavior, so they are
+the lightest-touch double available.
 
-- Deno 2.3 or later
+Here we test a `saveUser()` function that hands a user off to a database object.
+Instead of a real database, we pass an object whose `save` method is a spy:
 
-## Step 1: Create a Simple HTTP Server
+```ts
+import { assertEquals } from "jsr:@std/assert";
+import { assertSpyCall, assertSpyCalls, spy } from "jsr:@std/testing/mock";
 
-Let's start by creating a basic HTTP server that simulates a small web
-application:
+interface User {
+  name: string;
+}
 
-```ts title="server.ts"
-import { metrics, SpanStatusCode, trace } from "npm:@opentelemetry/api@1";
+interface Database {
+  save: (user: User) => Promise<User & { id: number }>;
+}
 
-// Create a tracer and meter for our application
-const tracer = trace.getTracer("my-server", "1.0.0");
-const meter = metrics.getMeter("my-server", "1.0.0");
+// Function to test
+function saveUser(
+  user: User,
+  database: Database,
+): Promise<User & { id: number }> {
+  return database.save(user);
+}
 
-// Create some metrics
-const requestCounter = meter.createCounter("http_requests_total", {
-  description: "Total number of HTTP requests",
+Deno.test("saveUser calls database.save", async () => {
+  // A stand-in database whose save method is wrapped in a spy
+  const mockDatabase = {
+    save: spy((user: User) => Promise.resolve({ id: 1, ...user })),
+  };
+
+  const user: User = { name: "Test User" };
+  const result = await saveUser(user, mockDatabase);
+
+  // The save method was called exactly once
+  assertSpyCalls(mockDatabase.save, 1);
+
+  // The first call (index 0) received our user object
+  assertSpyCall(mockDatabase.save, 0, { args: [user] });
+
+  assertEquals(result, { id: 1, name: "Test User" });
 });
+```
 
-const requestDuration = meter.createHistogram("http_request_duration_ms", {
-  description: "HTTP request duration in milliseconds",
-  unit: "ms",
-});
+`assertSpyCalls` checks the total number of calls, while `assertSpyCall`
+inspects a single call by index: its arguments, and optionally what it returned.
+We verified the whole interaction without setting up or tearing down any
+database state.
 
-// Start the server
-Deno.serve({ port: 8000 }, (req) => {
-  // Record the start time for measuring request duration
-  const startTime = performance.now();
+You can also spy on an existing method of an object. Method spies are
+disposable, so declare them with the `using` keyword and they restore the
+original method automatically when the test ends. No `try`/`finally` cleanup is
+needed:
 
-  // Create a span for this request
-  return tracer.startActiveSpan("handle_request", async (span) => {
-    try {
-      // Extract the path from the URL
-      const url = new URL(req.url);
-      const path = url.pathname;
+```ts
+import { assertEquals } from "jsr:@std/assert";
+import { assertSpyCalls, spy } from "jsr:@std/testing/mock";
 
-      // Add attributes to the span
-      span.setAttribute("http.route", path);
-      span.setAttribute("http.method", req.method);
-      span.updateName(`${req.method} ${path}`);
+Deno.test("using disposable spies", () => {
+  const calculator = {
+    add: (a: number, b: number) => a + b,
+  };
 
-      // Add an event to the span
-      span.addEvent("request_started", {
-        timestamp: startTime,
-        request_path: path,
-      });
-
-      // Simulate some processing time
-      const waitTime = Math.random() * 100;
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
-
-      // Add another event to the span
-      span.addEvent("processing_completed");
-
-      // Create the response
-      const response = new Response(`Hello from ${path}!`, {
-        headers: { "Content-Type": "text/plain" },
-      });
-
-      // Record metrics
-      requestCounter.add(1, {
-        method: req.method,
-        path,
-        status: 200,
-      });
+  // Restored automatically when it goes out of scope
+  using addSpy = spy(calculator, "add");

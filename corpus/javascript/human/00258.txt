@@ -1,140 +1,107 @@
-import { jQuery } from "./core.js";
-import { toType } from "./core/toType.js";
-import { rcheckableType } from "./var/rcheckableType.js";
+import { jQuery } from "../core.js";
+import { flat } from "../var/flat.js";
+import { rscriptType } from "./var/rscriptType.js";
+import { getAll } from "./getAll.js";
+import { buildFragment } from "./buildFragment.js";
+import { dataPriv } from "../data/var/dataPriv.js";
+import { DOMEval } from "../core/DOMEval.js";
 
-import "./core/init.js";
-import "./traversing.js"; // filter
-import "./attributes/prop.js";
-
-var
-	rbracket = /\[\]$/,
-	rCRLF = /\r?\n/g,
-	rsubmitterTypes = /^(?:submit|button|image|reset|file)$/i,
-	rsubmittable = /^(?:input|select|textarea|keygen)/i;
-
-function buildParams( prefix, obj, traditional, add ) {
-	var name;
-
-	if ( Array.isArray( obj ) ) {
-
-		// Serialize array item.
-		jQuery.each( obj, function( i, v ) {
-			if ( traditional || rbracket.test( prefix ) ) {
-
-				// Treat each array item as a scalar.
-				add( prefix, v );
-
-			} else {
-
-				// Item is non-scalar (array or object), encode its numeric index.
-				buildParams(
-					prefix + "[" + ( typeof v === "object" && v != null ? i : "" ) + "]",
-					v,
-					traditional,
-					add
-				);
-			}
-		} );
-
-	} else if ( !traditional && toType( obj ) === "object" ) {
-
-		// Serialize object item.
-		for ( name in obj ) {
-			buildParams( prefix + "[" + name + "]", obj[ name ], traditional, add );
-		}
-
+// Replace/restore the type attribute of script elements for safe DOM manipulation
+function disableScript( elem ) {
+	elem.type = ( elem.getAttribute( "type" ) !== null ) + "/" + elem.type;
+	return elem;
+}
+function restoreScript( elem ) {
+	if ( ( elem.type || "" ).slice( 0, 5 ) === "true/" ) {
+		elem.type = elem.type.slice( 5 );
 	} else {
-
-		// Serialize scalar item.
-		add( prefix, obj );
+		elem.removeAttribute( "type" );
 	}
+
+	return elem;
 }
 
-// Serialize an array of form elements or a set of
-// key/values into a query string
-jQuery.param = function( a, traditional ) {
-	var prefix,
-		s = [],
-		add = function( key, valueOrFunction ) {
+export function domManip( collection, args, callback, ignored ) {
 
-			// If value is a function, invoke it and use its return value
-			var value = typeof valueOrFunction === "function" ?
-				valueOrFunction() :
-				valueOrFunction;
+	// Flatten any nested arrays
+	args = flat( args );
 
-			s[ s.length ] = encodeURIComponent( key ) + "=" +
-				encodeURIComponent( value == null ? "" : value );
-		};
+	var fragment, first, scripts, hasScripts, node, doc,
+		i = 0,
+		l = collection.length,
+		iNoClone = l - 1,
+		value = args[ 0 ],
+		valueIsFunction = typeof value === "function";
 
-	if ( a == null ) {
-		return "";
+	if ( valueIsFunction ) {
+		return collection.each( function( index ) {
+			var self = collection.eq( index );
+			args[ 0 ] = value.call( this, index, self.html() );
+			domManip( self, args, callback, ignored );
+		} );
 	}
 
-	// If an array was passed in, assume that it is an array of form elements.
-	if ( Array.isArray( a ) || ( a.jquery && !jQuery.isPlainObject( a ) ) ) {
+	if ( l ) {
+		fragment = buildFragment( args, collection[ 0 ].ownerDocument, false, collection, ignored );
+		first = fragment.firstChild;
 
-		// Serialize the form elements
-		jQuery.each( a, function() {
-			add( this.name, this.value );
-		} );
+		if ( fragment.childNodes.length === 1 ) {
+			fragment = first;
+		}
 
-	} else {
+		// Require either new content or an interest in ignored elements to invoke the callback
+		if ( first || ignored ) {
+			scripts = jQuery.map( getAll( fragment, "script" ), disableScript );
+			hasScripts = scripts.length;
 
-		// If traditional, encode the "old" way (the way 1.3.2 or older
-		// did it), otherwise encode params recursively.
-		for ( prefix in a ) {
-			buildParams( prefix, a[ prefix ], traditional, add );
+			// Use the original fragment for the last item
+			// instead of the first because it can end up
+			// being emptied incorrectly in certain situations (trac-8070).
+			for ( ; i < l; i++ ) {
+				node = fragment;
+
+				if ( i !== iNoClone ) {
+					node = jQuery.clone( node, true, true );
+
+					// Keep references to cloned scripts for later restoration
+					if ( hasScripts ) {
+						jQuery.merge( scripts, getAll( node, "script" ) );
+					}
+				}
+
+				callback.call( collection[ i ], node, i );
+			}
+
+			if ( hasScripts ) {
+				doc = scripts[ scripts.length - 1 ].ownerDocument;
+
+				// Re-enable scripts
+				jQuery.map( scripts, restoreScript );
+
+				// Evaluate executable scripts on first document insertion
+				for ( i = 0; i < hasScripts; i++ ) {
+					node = scripts[ i ];
+					if ( rscriptType.test( node.type || "" ) &&
+						!dataPriv.get( node, "globalEval" ) &&
+						jQuery.contains( doc, node ) ) {
+
+						if ( node.src && ( node.type || "" ).toLowerCase()  !== "module" ) {
+
+							// Optional AJAX dependency, but won't run scripts if not present
+							if ( jQuery._evalUrl && !node.noModule ) {
+								jQuery._evalUrl( node.src, {
+									nonce: node.nonce,
+									crossOrigin: node.crossOrigin
+								}, doc );
+							}
+						} else {
+							DOMEval( node.textContent, node, doc );
+						}
+					}
+				}
+			}
 		}
 	}
 
-	// Return the resulting serialization
-	return s.join( "&" );
-};
-
-jQuery.fn.extend( {
-	serialize: function() {
-		return jQuery.param( this.serializeArray() );
-	},
-	serializeArray: function() {
-		return this.map( function() {
-
-			// Can add propHook for "elements" to filter or add form elements
-			var elements = jQuery.prop( this, "elements" );
-			if ( elements ) {
-				return jQuery.makeArray( elements );
-			}
-
-			// Only ensure a submittable nodeName for individual elements.
-			// Don't run this check when running `serializeArray` on a form
-			// so that form-associated custom elements can be reported.
-			if ( rsubmittable.test( this.nodeName ) ) {
-				return this;
-			}
-
-			return [];
-		} ).filter( function() {
-			var type = this.type;
-
-			// Use .is( ":disabled" ) so that fieldset[disabled] works
-			return this.name && !jQuery( this ).is( ":disabled" ) &&
-				!rsubmitterTypes.test( type ) &&
-				( this.checked || !rcheckableType.test( type ) );
-		} ).map( function( _i, elem ) {
-			var val = jQuery( this ).val();
-
-			if ( val == null ) {
-				return null;
-			}
-
-			if ( Array.isArray( val ) ) {
-				return jQuery.map( val, function( val ) {
-					return { name: elem.name, value: val.replace( rCRLF, "\r\n" ) };
-				} );
-			}
-
-			return { name: elem.name, value: val.replace( rCRLF, "\r\n" ) };
-		} ).get();
-	}
-} );
-
-export { jQuery, jQuery as $ };
+	return collection;
+}

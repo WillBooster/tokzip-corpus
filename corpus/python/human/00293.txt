@@ -1,321 +1,494 @@
-from typing import Any, Generic, Optional, Set, TypeVar, Union
+import re
+import typing
+from typing import Any
 
-from pydantic import BaseModel, Extra, Field, field_validator
-from pydantic.dataclasses import dataclass
+import pytest
+import typing_extensions
+from _pytest.mark.structures import ParameterSet
+
+import pydantic
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, computed_field
+from pydantic.fields import FieldInfo
+from pydantic.json_schema import model_json_schema
+
+from .test_types_typeddict import fixture_typed_dict, fixture_typed_dict_all  # noqa
 
 
-class Model(BaseModel):
-    x: int
-    y: str
+@pytest.fixture(
+    name='Annotated',
+    params=[
+        pytest.param(typing, id='typing.Annotated'),
+        pytest.param(typing_extensions, id='t_e.Annotated'),
+    ],
+)
+def fixture_annotated(request):
+    try:
+        return request.param.Annotated
+    except AttributeError:
+        pytest.skip(f'Annotated is not available from {request.param}')
 
-    def method(self) -> None:
+
+def make_title(name: str, _):
+    def _capitalize(v: str):
+        return v[0].upper() + v[1:]
+
+    return re.sub(r'(?<=[a-z])([A-Z])', r' \1', _capitalize(name))
+
+
+FIELD_TITLE_GENERATORS: list[ParameterSet] = [
+    pytest.param(lambda t, _: t.lower(), id='lower'),
+    pytest.param(lambda t, _: t * 2, id='t * 2'),
+    pytest.param(lambda t, _: 'My Title', id='My Title'),
+    pytest.param(make_title, id='make_title'),
+]
+
+MODEL_TITLE_GENERATORS: list[ParameterSet] = [
+    pytest.param(lambda m: m.__name__.upper(), id='upper'),
+    pytest.param(lambda m: m.__name__ * 2, id='name * 2'),
+    pytest.param(lambda m: 'My Model', id='My Model'),
+]
+
+
+@pytest.mark.parametrize('model_title_generator', MODEL_TITLE_GENERATORS)
+def test_model_model_title_generator(model_title_generator):
+    class Model(BaseModel):
+        model_config = ConfigDict(model_title_generator=model_title_generator)
+
+    assert Model.model_json_schema() == {
+        'properties': {},
+        'title': model_title_generator(Model),
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('model_title_generator', MODEL_TITLE_GENERATORS)
+def test_model_title_generator_in_submodel(model_title_generator):
+    class SubModel(BaseModel):
+        model_config = ConfigDict(model_title_generator=model_title_generator)
+
+    class Model(BaseModel):
+        sub: SubModel
+
+    assert Model.model_json_schema() == {
+        '$defs': {'SubModel': {'properties': {}, 'title': model_title_generator(SubModel), 'type': 'object'}},
+        'properties': {'sub': {'$ref': '#/$defs/SubModel'}},
+        'required': ['sub'],
+        'title': 'Model',
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('field_title_generator', FIELD_TITLE_GENERATORS)
+def test_field_title_generator_in_model_fields(field_title_generator):
+    class Model(BaseModel):
+        field_a: str = Field(field_title_generator=field_title_generator)
+        field_b: int = Field(field_title_generator=field_title_generator)
+
+        @computed_field(field_title_generator=field_title_generator)
+        def field_c(self) -> str:
+            return self.field_a
+
+    assert Model.model_json_schema(mode='serialization') == {
+        'properties': {
+            'field_a': {'title': field_title_generator('field_a', Model.model_fields['field_a']), 'type': 'string'},
+            'field_b': {'title': field_title_generator('field_b', Model.model_fields['field_b']), 'type': 'integer'},
+            'field_c': {
+                'readOnly': True,
+                'title': field_title_generator('field_c', Model.model_computed_fields['field_c']),
+                'type': 'string',
+            },
+        },
+        'required': ['field_a', 'field_b', 'field_c'],
+        'title': 'Model',
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('field_title_generator', FIELD_TITLE_GENERATORS)
+def test_model_config_field_title_generator(field_title_generator):
+    class Model(BaseModel):
+        model_config = ConfigDict(field_title_generator=field_title_generator)
+
+        field_a: str
+        field_b: int
+        field___c: bool
+
+        @computed_field
+        def field_d(self) -> str:
+            return self.field_a
+
+    assert Model.model_json_schema(mode='serialization') == {
+        'properties': {
+            'field_a': {'title': field_title_generator('field_a', Model.model_fields['field_a']), 'type': 'string'},
+            'field_b': {'title': field_title_generator('field_b', Model.model_fields['field_b']), 'type': 'integer'},
+            'field___c': {
+                'title': field_title_generator('field___c', Model.model_fields['field___c']),
+                'type': 'boolean',
+            },
+            'field_d': {
+                'readOnly': True,
+                'title': field_title_generator('field_d', Model.model_computed_fields['field_d']),
+                'type': 'string',
+            },
+        },
+        'required': ['field_a', 'field_b', 'field___c', 'field_d'],
+        'title': 'Model',
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('model_title_generator', MODEL_TITLE_GENERATORS)
+def test_dataclass_model_title_generator(model_title_generator):
+    @pydantic.dataclasses.dataclass(config=ConfigDict(model_title_generator=model_title_generator))
+    class MyDataclass:
+        field_a: int
+
+    assert model_json_schema(MyDataclass) == {
+        'properties': {'field_a': {'title': 'Field A', 'type': 'integer'}},
+        'required': ['field_a'],
+        'title': model_title_generator(MyDataclass),
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('field_title_generator', FIELD_TITLE_GENERATORS)
+def test_field_title_generator_in_dataclass_fields(field_title_generator):
+    @pydantic.dataclasses.dataclass
+    class MyDataclass:
+        field_a: str = Field(field_title_generator=field_title_generator)
+        field_b: int = Field(field_title_generator=field_title_generator)
+
+    assert model_json_schema(MyDataclass) == {
+        'properties': {
+            'field_a': {
+                'title': field_title_generator('field_a', MyDataclass.__pydantic_fields__['field_a']),
+                'type': 'string',
+            },
+            'field_b': {
+                'title': field_title_generator('field_b', MyDataclass.__pydantic_fields__['field_b']),
+                'type': 'integer',
+            },
+        },
+        'required': ['field_a', 'field_b'],
+        'title': 'MyDataclass',
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('field_title_generator', FIELD_TITLE_GENERATORS)
+def test_dataclass_config_field_title_generator(field_title_generator):
+    @pydantic.dataclasses.dataclass(config=ConfigDict(field_title_generator=field_title_generator))
+    class MyDataclass:
+        field_a: str
+        field_b: int
+        field___c: bool
+
+    assert model_json_schema(MyDataclass) == {
+        'properties': {
+            'field_a': {
+                'title': field_title_generator('field_a', MyDataclass.__pydantic_fields__['field_a']),
+                'type': 'string',
+            },
+            'field_b': {
+                'title': field_title_generator('field_b', MyDataclass.__pydantic_fields__['field_b']),
+                'type': 'integer',
+            },
+            'field___c': {
+                'title': field_title_generator('field___c', MyDataclass.__pydantic_fields__['field___c']),
+                'type': 'boolean',
+            },
+        },
+        'required': ['field_a', 'field_b', 'field___c'],
+        'title': 'MyDataclass',
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('model_title_generator', MODEL_TITLE_GENERATORS)
+def test_typeddict_model_title_generator(model_title_generator, TypedDict):
+    class MyTypedDict(TypedDict):
+        __pydantic_config__ = ConfigDict(model_title_generator=model_title_generator)
+
+    assert TypeAdapter(MyTypedDict).json_schema() == {
+        'properties': {},
+        'title': model_title_generator(MyTypedDict),
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('field_title_generator', FIELD_TITLE_GENERATORS)
+def test_field_title_generator_in_typeddict_fields(field_title_generator, TypedDict, Annotated):
+    class MyTypedDict(TypedDict):
+        field_a: Annotated[str, Field(field_title_generator=field_title_generator)]
+        field_b: Annotated[int, Field(field_title_generator=field_title_generator)]
+
+    assert TypeAdapter(MyTypedDict).json_schema() == {
+        'properties': {
+            'field_a': {
+                'title': field_title_generator(
+                    'field_a', FieldInfo.from_annotation(MyTypedDict.__annotations__['field_a'])
+                ),
+                'type': 'string',
+            },
+            'field_b': {
+                'title': field_title_generator(
+                    'field_b', FieldInfo.from_annotation(MyTypedDict.__annotations__['field_a'])
+                ),
+                'type': 'integer',
+            },
+        },
+        'required': ['field_a', 'field_b'],
+        'title': 'MyTypedDict',
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('field_title_generator', FIELD_TITLE_GENERATORS)
+def test_typeddict_config_field_title_generator(field_title_generator, TypedDict):
+    class MyTypedDict(TypedDict):
+        __pydantic_config__ = ConfigDict(field_title_generator=field_title_generator)
+        field_a: str
+        field_b: int
+        field___c: bool
+
+    assert TypeAdapter(MyTypedDict).json_schema() == {
+        'properties': {
+            'field_a': {
+                'title': field_title_generator(
+                    'field_a', FieldInfo.from_annotation(MyTypedDict.__annotations__['field_a'])
+                ),
+                'type': 'string',
+            },
+            'field_b': {
+                'title': field_title_generator(
+                    'field_b', FieldInfo.from_annotation(MyTypedDict.__annotations__['field_b'])
+                ),
+                'type': 'integer',
+            },
+            'field___c': {
+                'title': field_title_generator(
+                    'field___c', FieldInfo.from_annotation(MyTypedDict.__annotations__['field___c'])
+                ),
+                'type': 'boolean',
+            },
+        },
+        'required': ['field_a', 'field_b', 'field___c'],
+        'title': 'MyTypedDict',
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize(
+    'field_level_title_generator,config_level_title_generator',
+    ((lambda f, _: f.lower(), lambda f, _: f.upper()), (lambda f, _: f, make_title)),
+)
+def test_field_level_field_title_generator_precedence_over_config_level(
+    field_level_title_generator, config_level_title_generator, TypedDict, Annotated
+):
+    class MyModel(BaseModel):
+        model_config = ConfigDict(field_title_generator=field_level_title_generator)
+        field_a: str = Field(field_title_generator=field_level_title_generator)
+
+    assert MyModel.model_json_schema() == {
+        'properties': {
+            'field_a': {
+                'title': field_level_title_generator('field_a', MyModel.model_fields['field_a']),
+                'type': 'string',
+            }
+        },
+        'required': ['field_a'],
+        'title': 'MyModel',
+        'type': 'object',
+    }
+
+    @pydantic.dataclasses.dataclass(config=ConfigDict(field_title_generator=field_level_title_generator))
+    class MyDataclass:
+        field_a: str = Field(field_title_generator=field_level_title_generator)
+
+    assert model_json_schema(MyDataclass) == {
+        'properties': {
+            'field_a': {
+                'title': field_level_title_generator('field_a', MyDataclass.__pydantic_fields__['field_a']),
+                'type': 'string',
+            }
+        },
+        'required': ['field_a'],
+        'title': 'MyDataclass',
+        'type': 'object',
+    }
+
+    class MyTypedDict(TypedDict):
+        __pydantic_config__ = ConfigDict(field_title_generator=field_level_title_generator)
+        field_a: Annotated[str, Field(field_title_generator=field_level_title_generator)]
+
+    assert TypeAdapter(MyTypedDict).json_schema() == {
+        'properties': {
+            'field_a': {
+                'title': field_level_title_generator(
+                    'field_a', FieldInfo.from_annotation(MyTypedDict.__annotations__['field_a'])
+                ),
+                'type': 'string',
+            }
+        },
+        'required': ['field_a'],
+        'title': 'MyTypedDict',
+        'type': 'object',
+    }
+
+
+def test_field_title_precedence_over_generators(TypedDict, Annotated):
+    class Model(BaseModel):
+        model_config = ConfigDict(field_title_generator=lambda f, _: f.upper())
+
+        field_a: str = Field(title='MyFieldA', field_title_generator=lambda f, _: f.upper())
+
+        @computed_field(title='MyFieldB', field_title_generator=lambda f, _: f.upper())
+        def field_b(self) -> str:
+            return self.field_a
+
+    assert Model.model_json_schema(mode='serialization') == {
+        'properties': {
+            'field_a': {'title': 'MyFieldA', 'type': 'string'},
+            'field_b': {'readOnly': True, 'title': 'MyFieldB', 'type': 'string'},
+        },
+        'required': ['field_a', 'field_b'],
+        'title': 'Model',
+        'type': 'object',
+    }
+
+    @pydantic.dataclasses.dataclass(config=ConfigDict(field_title_generator=lambda f, _: f.upper()))
+    class MyDataclass:
+        field_a: str = Field(title='MyTitle', field_title_generator=lambda f, _: f.upper())
+
+    assert model_json_schema(MyDataclass) == {
+        'properties': {'field_a': {'title': 'MyTitle', 'type': 'string'}},
+        'required': ['field_a'],
+        'title': 'MyDataclass',
+        'type': 'object',
+    }
+
+    class MyTypedDict(TypedDict):
+        __pydantic_config__ = ConfigDict(field_title_generator=lambda f, _: f.upper())
+        field_a: Annotated[str, Field(title='MyTitle', field_title_generator=lambda f, _: f.upper())]
+
+    assert TypeAdapter(MyTypedDict).json_schema() == {
+        'properties': {'field_a': {'title': 'MyTitle', 'type': 'string'}},
+        'required': ['field_a'],
+        'title': 'MyTypedDict',
+        'type': 'object',
+    }
+
+
+def test_class_title_precedence_over_generator():
+    class Model(BaseModel):
+        model_config = ConfigDict(title='MyTitle', model_title_generator=lambda m: m.__name__.upper())
+
+    assert Model.model_json_schema() == {
+        'properties': {},
+        'title': 'MyTitle',
+        'type': 'object',
+    }
+
+    @pydantic.dataclasses.dataclass(
+        config=ConfigDict(title='MyTitle', model_title_generator=lambda m: m.__name__.upper())
+    )
+    class MyDataclass:
         pass
 
-    class Config:
-        alias_generator = None
-        frozen = True
-        extra = Extra.forbid
+    assert model_json_schema(MyDataclass) == {
+        'properties': {},
+        'title': 'MyTitle',
+        'type': 'object',
+    }
 
-        def config_method(self) -> None:
-            ...
 
+@pytest.mark.parametrize('invalid_return_value', (1, 2, 3, tuple(), list(), object()))
+def test_model_title_generator_returns_invalid_type(invalid_return_value, TypedDict):
+    with pytest.raises(
+        TypeError, match=f'model_title_generator .* must return str, not {invalid_return_value.__class__}'
+    ):
 
-model = Model(x=1, y='y', z='z')
-# MYPY: error: Unexpected keyword argument "z" for "Model"  [call-arg]
-model = Model(x=1)
-# MYPY: error: Missing named argument "y" for "Model"  [call-arg]
-model.y = 'a'
-# MYPY: error: Property "y" defined in "Model" is read-only  [misc]
-Model.from_orm({})
-# MYPY: error: "Model" does not have from_attributes=True  [pydantic-orm]
+        class Model(BaseModel):
+            model_config = ConfigDict(model_title_generator=lambda m: invalid_return_value)
 
+        Model.model_json_schema()
 
-class KwargsModel(BaseModel, alias_generator=None, frozen=True, extra=Extra.forbid):
-    x: int
-    y: str
+    with pytest.raises(
+        TypeError, match=f'model_title_generator .* must return str, not {invalid_return_value.__class__}'
+    ):
 
-    def method(self) -> None:
-        pass
+        @pydantic.dataclasses.dataclass(config=ConfigDict(model_title_generator=lambda m: invalid_return_value))
+        class MyDataclass:
+            pass
 
+        TypeAdapter(MyDataclass).json_schema()
 
-kwargs_model = KwargsModel(x=1, y='y', z='z')
-# MYPY: error: Unexpected keyword argument "z" for "KwargsModel"  [call-arg]
-kwargs_model = KwargsModel(x=1)
-# MYPY: error: Missing named argument "y" for "KwargsModel"  [call-arg]
-kwargs_model.y = 'a'
-# MYPY: error: Property "y" defined in "KwargsModel" is read-only  [misc]
-KwargsModel.from_orm({})
-# MYPY: error: "KwargsModel" does not have from_attributes=True  [pydantic-orm]
+    with pytest.raises(
+        TypeError, match=f'model_title_generator .* must return str, not {invalid_return_value.__class__}'
+    ):
 
+        class MyTypedDict(TypedDict):
+            __pydantic_config__ = ConfigDict(model_title_generator=lambda m: invalid_return_value)
 
-class ForbidExtraModel(BaseModel):
-    class Config:
-        extra = 'forbid'
+        TypeAdapter(MyTypedDict).json_schema()
 
 
-ForbidExtraModel(x=1)
-# MYPY: error: Unexpected keyword argument "x" for "ForbidExtraModel"  [call-arg]
+@pytest.mark.parametrize('invalid_return_value', (1, 2, 3, tuple(), list(), object()))
+def test_config_field_title_generator_returns_invalid_type(invalid_return_value, TypedDict):
+    with pytest.raises(
+        TypeError, match=f'field_title_generator .* must return str, not {invalid_return_value.__class__}'
+    ):
 
+        class Model(BaseModel):
+            model_config = ConfigDict(field_title_generator=lambda f, _: invalid_return_value)
 
-class KwargsForbidExtraModel(BaseModel, extra='forbid'):
-    pass
+            field_a: str
 
+    with pytest.raises(
+        TypeError, match=f'field_title_generator .* must return str, not {invalid_return_value.__class__}'
+    ):
 
-KwargsForbidExtraModel(x=1)
-# MYPY: error: Unexpected keyword argument "x" for "KwargsForbidExtraModel"  [call-arg]
+        @pydantic.dataclasses.dataclass(config=ConfigDict(field_title_generator=lambda f, _: invalid_return_value))
+        class MyDataclass:
+            field_a: str
 
+    with pytest.raises(
+        TypeError, match=f'field_title_generator .* must return str, not {invalid_return_value.__class__}'
+    ):
 
-class BadExtraModel(BaseModel):
-    class Config:
-        extra = 1  # type: ignore[pydantic-config]
-        extra = 1
-# MYPY: error: Invalid value for "Config.extra"  [pydantic-config]
+        class MyTypedDict(TypedDict):
+            __pydantic_config__ = ConfigDict(field_title_generator=lambda f, _: invalid_return_value)
+            field_a: str
 
+        TypeAdapter(MyTypedDict)
 
-class KwargsBadExtraModel(BaseModel, extra=1):
-# MYPY: error: Invalid value for "Config.extra"  [pydantic-config]
-    pass
 
+@pytest.mark.parametrize('invalid_return_value', (1, 2, 3, tuple(), list(), object()))
+def test_field_title_generator_returns_invalid_type(invalid_return_value, TypedDict, Annotated):
+    with pytest.raises(
+        TypeError, match=f'field_title_generator .* must return str, not {invalid_return_value.__class__}'
+    ):
 
-class BadConfig1(BaseModel):
-    class Config:
-        from_attributes: Any = {}  # not sensible, but should still be handled gracefully
-# MYPY: error: Invalid value for "Config.from_attributes"  [pydantic-config]
+        class Model(BaseModel):
+            field_a: Any = Field(field_title_generator=lambda f, _: invalid_return_value)
 
+        Model(field_a=invalid_return_value).model_json_schema()
 
-class KwargsBadConfig1(BaseModel, from_attributes={}):
-# MYPY: error: Invalid value for "Config.from_attributes"  [pydantic-config]
-    pass
+    with pytest.raises(
+        TypeError, match=f'field_title_generator .* must return str, not {invalid_return_value.__class__}'
+    ):
 
+        @pydantic.dataclasses.dataclass
+        class MyDataclass:
+            field_a: Any = Field(field_title_generator=lambda f, _: invalid_return_value)
 
-class BadConfig2(BaseModel):
-    class Config:
-        from_attributes = list  # not sensible, but should still be handled gracefully
-# MYPY: error: Invalid value for "Config.from_attributes"  [pydantic-config]
+        model_json_schema(MyDataclass)
 
+    with pytest.raises(
+        TypeError, match=f'field_title_generator .* must return str, not {invalid_return_value.__class__}'
+    ):
 
-class KwargsBadConfig2(BaseModel, from_attributes=list):
-# MYPY: error: Invalid value for "Config.from_attributes"  [pydantic-config]
-    pass
+        class MyTypedDict(TypedDict):
+            field_a: Annotated[str, Field(field_title_generator=lambda f, _: invalid_return_value)]
 
-
-class InheritingModel(Model):
-    class Config:
-        frozen = False
-
-
-class KwargsInheritingModel(KwargsModel, frozen=False):
-    pass
-
-
-class DefaultTestingModel(BaseModel):
-    # Required
-    a: int
-    b: int = ...
-# MYPY: error: Incompatible types in assignment (expression has type "EllipsisType", variable has type "int")  [assignment]
-    c: int = Field(...)
-    d: Union[int, str]
-    e = ...
-# MYPY: error: Untyped fields disallowed  [pydantic-field]
-
-    # Not required
-    f: Optional[int]
-    g: int = 1
-    h: int = Field(1)
-    i: int = Field(None)
-# MYPY: error: Incompatible types in assignment (expression has type "None", variable has type "int")  [assignment]
-    j = 1
-# MYPY: error: Untyped fields disallowed  [pydantic-field]
-
-
-DefaultTestingModel()
-# MYPY: error: Missing named argument "a" for "DefaultTestingModel"  [call-arg]
-# MYPY: error: Missing named argument "b" for "DefaultTestingModel"  [call-arg]
-# MYPY: error: Missing named argument "c" for "DefaultTestingModel"  [call-arg]
-# MYPY: error: Missing named argument "d" for "DefaultTestingModel"  [call-arg]
-# MYPY: error: Missing named argument "f" for "DefaultTestingModel"  [call-arg]
-
-
-class UndefinedAnnotationModel(BaseModel):
-    undefined: Undefined  # noqa F821
-# MYPY: error: Name "Undefined" is not defined  [name-defined]
-
-
-UndefinedAnnotationModel()
-# MYPY: error: Missing named argument "undefined" for "UndefinedAnnotationModel"  [call-arg]
-
-
-Model.model_construct(x=1)
-# MYPY: error: Missing named argument "y" for "model_construct" of "Model"  [call-arg]
-Model.model_construct(_fields_set={'x'}, x=1, y='2')
-Model.model_construct(x='1', y='2')
-# MYPY: error: Argument "x" to "model_construct" of "Model" has incompatible type "str"; expected "int"  [arg-type]
-
-# Strict mode fails
-inheriting = InheritingModel(x='1', y='1')
-Model(x='1', y='2')
-
-
-class Blah(BaseModel):
-    fields_set: Optional[Set[str]] = None
-
-
-# (comment to keep line numbers unchanged)
-T = TypeVar('T')
-
-
-class Response(BaseModel, Generic[T]):
-    data: T
-    error: Optional[str]
-
-
-response = Response[Model](data=model, error=None)
-response = Response[Model](data=1, error=None)
-
-
-class AliasModel(BaseModel):
-    x: str = Field(..., alias='y')
-    z: int
-
-
-AliasModel(y=1, z=2)
-
-x_alias = 'y'
-
-
-class DynamicAliasModel(BaseModel):
-    x: str = Field(..., alias=x_alias)
-    z: int
-
-
-DynamicAliasModel(y='y', z='1')
-
-
-class DynamicAliasModel2(BaseModel):
-    x: str = Field(..., alias=x_alias)
-    z: int
-
-    class Config:
-        validate_by_name = True
-
-
-DynamicAliasModel2(y='y', z=1)
-# MYPY: error: Missing named argument "x" for "DynamicAliasModel2"  [call-arg]
-DynamicAliasModel2(x='y', z=1)
-
-
-class KwargsDynamicAliasModel(BaseModel, validate_by_name=True):
-    x: str = Field(..., alias=x_alias)
-    z: int
-
-
-KwargsDynamicAliasModel(y='y', z=1)
-# MYPY: error: Missing named argument "x" for "KwargsDynamicAliasModel"  [call-arg]
-KwargsDynamicAliasModel(x='y', z=1)
-
-
-class AliasGeneratorModel(BaseModel):
-    x: int
-
-    class Config:
-        alias_generator = lambda x: x + '_'  # noqa E731
-
-
-AliasGeneratorModel(x=1)
-AliasGeneratorModel(x_=1)
-AliasGeneratorModel(z=1)
-
-
-class AliasGeneratorModel2(BaseModel):
-    x: int = Field(..., alias='y')
-
-    class Config:  # type: ignore[pydantic-alias]
-# MYPY: error: Unused "type: ignore" comment  [unused-ignore]
-        alias_generator = lambda x: x + '_'  # noqa E731
-
-
-class UntypedFieldModel(BaseModel):
-    x: int = 1
-    y = 2
-# MYPY: error: Untyped fields disallowed  [pydantic-field]
-    z = 2  # type: ignore[pydantic-field]
-
-
-AliasGeneratorModel2(x=1)
-AliasGeneratorModel2(y=1, z=1)
-
-
-class KwargsAliasGeneratorModel(BaseModel, alias_generator=lambda x: x + '_'):
-    x: int
-
-
-KwargsAliasGeneratorModel(x=1)
-KwargsAliasGeneratorModel(x_=1)
-KwargsAliasGeneratorModel(z=1)
-
-
-class KwargsAliasGeneratorModel2(BaseModel, alias_generator=lambda x: x + '_'):
-    x: int = Field(..., alias='y')
-
-
-KwargsAliasGeneratorModel2(x=1)
-KwargsAliasGeneratorModel2(y=1, z=1)
-
-
-class CoverageTester(Missing):  # noqa F821
-# MYPY: error: Name "Missing" is not defined  [name-defined]
-    def from_orm(self) -> None:
-        pass
-
-
-CoverageTester().from_orm()
-
-
-@dataclass(config={})
-class AddProject:
-    name: str
-    slug: Optional[str]
-    description: Optional[str]
-
-
-p = AddProject(name='x', slug='y', description='z')
-
-
-# Same as Model, but with frozen = True
-class FrozenModel(BaseModel):
-    x: int
-    y: str
-
-    class Config:
-        alias_generator = None
-        frozen = True
-        extra = Extra.forbid
-
-
-frozenmodel = FrozenModel(x=1, y='b')
-frozenmodel.y = 'a'
-# MYPY: error: Property "y" defined in "FrozenModel" is read-only  [misc]
-
-
-class InheritingModel2(FrozenModel):
-    class Config:
-        frozen = False
-
-
-inheriting2 = InheritingModel2(x=1, y='c')
-inheriting2.y = 'd'
-
-
-class ModelWithAnnotatedValidator(BaseModel):
-    name: str
-
-    @field_validator('name')
-    def noop_validator_with_annotations(self, name: str) -> str:
-        # This is a mistake: the first argument to a validator is the class itself,
-        # like a classmethod.
-        self.instance_method()
-# MYPY: error: Missing positional argument "self" in call to "instance_method" of "ModelWithAnnotatedValidator"  [call-arg]
-        return name
-
-    def instance_method(self) -> None:
-        ...
+        TypeAdapter(MyTypedDict)

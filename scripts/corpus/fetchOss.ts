@@ -422,7 +422,7 @@ function sampleFiles(
       (a, b) => hashOf(a.relative) - hashOf(b.relative) || (a.relative < b.relative ? -1 : 1),
     );
   const balanced: SampledFile[] = [];
-  const bucketOrder = ["0.5k", "2k", "8k", "24k"];
+  const bucketOrder = ["0.25k", "0.5k", "2k", "8k", "24k"];
   for (let index = 0; bucketOrder.some((bucket) => index < (buckets.get(bucket)?.length ?? 0)); index++) {
     for (const bucket of bucketOrder) {
       const file = buckets.get(bucket)?.[index];

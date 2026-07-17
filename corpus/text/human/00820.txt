@@ -1,123 +1,196 @@
-<!--
-Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+## Basic model usage
 
-SPDX-License-Identifier: curl
--->
+!!! note
 
-# curl client writers
+    Pydantic relies heavily on the existing Python typing constructs to define models. If you are not familiar with those, the following resources
+    can be useful:
 
-Client writers is a design in the internals of libcurl, not visible in its public API. They were started
-in curl v8.5.0. This document describes the concepts, its high level implementation and the motivations.
+    * The [Type System Guides](https://typing.readthedocs.io/en/latest/guides/index.html)
+    * The [mypy documentation](https://mypy.readthedocs.io/en/latest/)
 
-## Naming
+```python {group="basic-model"}
+from pydantic import BaseModel, ConfigDict
 
-`libcurl` operates between clients and servers. A *client* is the application using libcurl, like the command line tool `curl` itself. Data to be uploaded to a server is **read** from the client and **send** to the server, the servers response is **received** by `libcurl` and then **written** to the client.
 
-With this naming established, client writers are concerned with writing responses from the server to the application. Applications register callbacks via `CURLOPT_WRITEFUNCTION` and `CURLOPT_HEADERFUNCTION` to be invoked by `libcurl` when the response is received.
+class User(BaseModel):
+    id: int
+    name: str = 'Jane Doe'
 
-## Invoking
-
-All code in `libcurl` that handles response data is ultimately expected to forward this data via `Curl_client_write()` to the application. The exact prototype of this function is:
-
-```
-CURLcode Curl_client_write(struct Curl_easy *data, int type, const char *buf, size_t blen);
-```
-The `type` argument specifies what the bytes in `buf` actually are. The following bits are defined:
-
-```
-#define CLIENTWRITE_BODY    (1<<0) /* non-meta information, BODY */
-#define CLIENTWRITE_INFO    (1<<1) /* meta information, not a HEADER */
-#define CLIENTWRITE_HEADER  (1<<2) /* meta information, HEADER */
-#define CLIENTWRITE_STATUS  (1<<3) /* a special status HEADER */
-#define CLIENTWRITE_CONNECT (1<<4) /* a CONNECT related HEADER */
-#define CLIENTWRITE_1XX     (1<<5) /* a 1xx response related HEADER */
-#define CLIENTWRITE_TRAILER (1<<6) /* a trailer HEADER */
+    model_config = ConfigDict(str_max_length=10)  # (1)!
 ```
 
-The main types here are `CLIENTWRITE_BODY` and `CLIENTWRITE_HEADER`. They are
-mutually exclusive. The other bits are enhancements to `CLIENTWRITE_HEADER` to
-specify what the header is about. They are only used in HTTP and related
-protocols (RTSP and WebSocket).
+1. Pydantic models support a variety of [configuration values](./config.md)
+   (see [here][pydantic.ConfigDict] for the available configuration values).
 
-The implementation of `Curl_client_write()` uses a chain of *client writer* instances to process the call and make sure that the bytes reach the proper application callbacks. This is similar to the design of connection filters: client writers can be chained to process the bytes written through them. The definition is:
+In this example, `User` is a model with two fields:
 
-```
-struct Curl_cwtype {
-  const char *name;
-  CURLcode (*do_init)(struct Curl_easy *data,
-                      struct Curl_cwriter *writer);
-  CURLcode (*do_write)(struct Curl_easy *data,
-                       struct Curl_cwriter *writer, int type,
-                       const char *buf, size_t nbytes);
-  void (*do_close)(struct Curl_easy *data,
-                   struct Curl_cwriter *writer);
-};
+* `id`, which is an integer (defined using the [`int`][] type) and is required
+* `name`, which is a string (defined using the [`str`][] type) and is not required (it has a default value).
 
-struct Curl_cwriter {
-  const struct Curl_cwtype *cwt;  /* type implementation */
-  struct Curl_cwriter *next;  /* Downstream writer. */
-  Curl_cwriter_phase phase; /* phase at which it operates */
-};
+The documentation on [types](./types.md) expands on the supported types.
+
+Fields can be customized in a number of ways using the [`Field()`][pydantic.Field] function.
+See the [documentation on fields](./fields.md) for more information.
+
+The model can then be instantiated:
+
+```python {group="basic-model"}
+user = User(id='123')
 ```
 
-`Curl_cwriter` is a writer instance with a `next` pointer to form the chain. It has a type `cwt` which provides the implementation. The main callback is `do_write()` that processes the data and calls then the `next` writer. The others are for setup and tear down.
+`user` is an instance of `User`. Initialization of the object will perform all parsing and validation.
+If no [`ValidationError`][pydantic_core.ValidationError] exception is raised,
+you know the resulting model instance is valid.
 
-## Phases and Ordering
+Fields of a model can be accessed as normal attributes of the `user` object:
 
-Since client writers may transform the bytes written through them, the order in which the are called is relevant for the outcome. When a writer is created, one property it gets is the `phase` in which it operates. Writer phases are defined like:
-
-```
-typedef enum {
-  CURL_CW_RAW,  /* raw data written, before any decoding */
-  CURL_CW_TRANSFER_DECODE, /* remove transfer-encodings */
-  CURL_CW_PROTOCOL, /* after transfer, but before content decoding */
-  CURL_CW_CONTENT_DECODE, /* remove content-encodings */
-  CURL_CW_CLIENT  /* data written to client */
-} Curl_cwriter_phase;
+```python {group="basic-model"}
+assert user.name == 'Jane Doe'  # (1)!
+assert user.id == 123  # (2)!
+assert isinstance(user.id, int)
 ```
 
-If a writer for phase `PROTOCOL` is added to the chain, it is always added *after* any `RAW` or `TRANSFER_DECODE` and *before* any `CONTENT_DECODE` and `CLIENT` phase writer. If there is already a writer for the same phase present, the new writer is inserted just before that one.
+1. `name` wasn't set when `user` was initialized, so the default value was used.
+   The [`model_fields_set`][pydantic.BaseModel.model_fields_set] attribute can be
+   inspected to check the field names explicitly set during instantiation.
+2. Note that the string `'123'` was coerced to an integer and its value is `123`.
+   More details on Pydantic's coercion logic can be found in the [data conversion](#data-conversion) section.
 
-All transfers have a chain of 3 writers by default. A specific protocol handler may alter that by adding additional writers. The 3 standard writers are (name, phase):
+The model instance can be serialized using the [`model_dump()`][pydantic.BaseModel.model_dump] method:
 
-1. `"raw", CURL_CW_RAW `: if the transfer is verbose, it forwards the body data to the debug function.
-1. `"download", CURL_CW_PROTOCOL`: checks that protocol limits are kept and updates progress counters. When a download has a known length, it checks that it is not exceeded and errors otherwise.
-1. `"client", CURL_CW_CLIENT`: the main work horse. It invokes the application callbacks or writes to the configured file handles. It chops large writes into smaller parts, as documented for `CURLOPT_WRITEFUNCTION`. If also handles *pausing* of transfers when the application callback returns `CURL_WRITEFUNC_PAUSE`.
+```python {group="basic-model"}
+assert user.model_dump() == {'id': 123, 'name': 'Jane Doe'}
+```
 
-With these writers always in place, libcurl's protocol handlers automatically have these implemented.
+Calling [dict][] on the instance will also provide a dictionary, but nested fields will not be
+recursively converted into dictionaries. [`model_dump()`][pydantic.BaseModel.model_dump] also
+provides numerous arguments to customize the serialization result.
 
-## Enhanced Use
+By default, models are mutable and field values can be changed through attribute assignment:
 
-HTTP is the protocol in curl that makes use of the client writer chain by
-adding writers to it. When the `libcurl` application set
-`CURLOPT_ACCEPT_ENCODING` (as `curl` does with `--compressed`), the server is
-offered an `Accept-Encoding` header with the algorithms supported. The server
-then may choose to send the response body compressed. For example using `gzip`
-or `brotli` or even both.
+```python {group="basic-model"}
+user.id = 321
+assert user.id == 321
+```
 
-In the server's response, if there is a `Content-Encoding` header listing the
-encoding applied. If supported by `libcurl` it then decompresses the content
-before writing it out to the client. How does it do that?
+!!! warning
+    When defining your models, watch out for naming collisions between your field name and its type annotation.
 
-The HTTP protocol adds client writers in phase `CURL_CW_CONTENT_DECODE` on
-seeing such a header. For each encoding listed, it adds the corresponding
-writer. The response from the server is then passed through
-`Curl_client_write()` to the writers that decode it. If several encodings had
-been applied the writer chain decodes them in the proper order.
+    For example, the following will not behave as expected and would yield a validation error:
 
-When the server provides a `Content-Length` header, that value applies to the
-*compressed* content. Length checks on the response bytes must happen *before*
-it gets decoded. That is why this check happens in phase `CURL_CW_PROTOCOL`
-which always is ordered before writers in phase `CURL_CW_CONTENT_DECODE`.
+    ```python {test="skip"}
+    from pydantic import BaseModel
 
-What else?
 
-Well, HTTP servers may also apply a `Transfer-Encoding` to the body of a response. The most well-known one is `chunked`, but algorithms like `gzip` and friends could also be applied. The difference to content encodings is that decoding needs to happen *before* protocol checks, for example on length, are done.
+    class Boo(BaseModel):
+        int: int | None = None
 
-That is why transfer decoding writers are added for phase `CURL_CW_TRANSFER_DECODE`. Which makes their operation happen *before* phase `CURL_CW_PROTOCOL` where length may be checked.
 
-## Summary
+    m = Boo(int=123)  # Will fail to validate.
+    ```
 
-By adding the common behavior of all protocols into `Curl_client_write()` we make sure that they do apply everywhere. Protocol handler have less to worry about. Changes to default behavior can be done without affecting handler implementations.
+    Because of how Python evaluates [annotated assignment statements][annassign], the statement is equivalent to `int: None = None`, thus
+    leading to a validation error.
 
-Having a writer chain as implementation allows protocol handlers with extra needs, like HTTP, to add to this for special behavior. The common way of writing the actual response data stays the same.
+### Model methods and properties
+
+The example above only shows the tip of the iceberg of what models can do.
+Model classes possess the following methods and attributes:
+
+* [`model_validate()`][pydantic.main.BaseModel.model_validate]: Validates the given object against the Pydantic model. See [Validating data](#validating-data).
+* [`model_validate_json()`][pydantic.main.BaseModel.model_validate_json]: Validates the given JSON data against the Pydantic model. See
+    [Validating data](#validating-data).
+* [`model_construct()`][pydantic.main.BaseModel.model_construct]: Creates models without running validation. See
+    [Creating models without validation](#creating-models-without-validation).
+* [`model_dump()`][pydantic.main.BaseModel.model_dump]: Returns a dictionary of the model's fields and values. See
+    [Serialization](serialization.md#python-mode).
+* [`model_dump_json()`][pydantic.main.BaseModel.model_dump_json]: Returns a JSON string representation of [`model_dump()`][pydantic.main.BaseModel.model_dump]. See [Serialization](serialization.md#json-mode).
+* [`model_copy()`][pydantic.main.BaseModel.model_copy]: Returns a copy (by default, shallow copy) of the model. See
+    [Model copy](#model-copy).
+* [`model_json_schema()`][pydantic.main.BaseModel.model_json_schema]: Returns a jsonable dictionary representing the model's JSON Schema. See [JSON Schema](json_schema.md).
+* [`model_fields`][pydantic.main.BaseModel.model_fields]: A mapping between field names and their definitions ([`FieldInfo`][pydantic.fields.FieldInfo] instances).
+* [`model_computed_fields`][pydantic.main.BaseModel.model_computed_fields]: A mapping between computed field names and their definitions ([`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] instances).
+* [`model_parametrized_name()`][pydantic.main.BaseModel.model_parametrized_name]: Computes the class name for parametrizations of generic classes.
+* [`model_post_init()`][pydantic.main.BaseModel.model_post_init]: Performs additional actions after the model is instantiated and all field validators are applied.
+* [`model_rebuild()`][pydantic.main.BaseModel.model_rebuild]: Rebuilds the model schema, which also supports building recursive generic models.
+    See [Rebuilding model schema](#rebuilding-model-schema).
+
+Model instances possess the following attributes:
+
+* [`model_extra`][pydantic.main.BaseModel.model_extra]: The extra fields set during validation.
+* [`model_fields_set`][pydantic.main.BaseModel.model_fields_set]: The set of fields which were explicitly provided when the model was initialized.
+
+!!! note
+    See the API documentation of [`BaseModel`][pydantic.main.BaseModel] for the class definition including a full list of methods and attributes.
+
+!!! tip
+    See [Changes to `pydantic.BaseModel`](../migration.md#changes-to-pydanticbasemodel) in the
+    [Migration Guide](../migration.md) for details on changes from Pydantic V1.
+
+## Data conversion
+
+Pydantic may cast input data to force it to conform to model field types,
+and in some cases this may result in a loss of information.
+For example:
+
+```python
+from pydantic import BaseModel
+
+
+class Model(BaseModel):
+    a: int
+    b: float
+    c: str
+
+
+print(Model(a=3.000, b='2.72', c=b'binary data').model_dump())
+#> {'a': 3, 'b': 2.72, 'c': 'binary data'}
+```
+
+This is a deliberate decision of Pydantic, and is frequently the most useful approach. See
+[this issue](https://github.com/pydantic/pydantic/issues/578) for a longer discussion on the subject.
+
+Nevertheless, Pydantic provides a [strict mode](strict_mode.md), where no data conversion is performed.
+Values must be of the same type as the declared field type.
+
+This is also the case for collections. In most cases, you shouldn't make use of abstract container classes
+and just use a concrete type, such as [`list`][]:
+
+```python
+from pydantic import BaseModel
+
+
+class Model(BaseModel):
+    items: list[int]  # (1)!
+
+
+print(Model(items=(1, 2, 3)))
+#> items=[1, 2, 3]
+```
+
+1. In this case, you might be tempted to use the abstract [`Sequence`][collections.abc.Sequence] type
+   to allow both lists and tuples. But Pydantic takes care of converting the tuple input to a list, so
+   in most cases this isn't necessary.
+
+Besides, using these abstract types can also lead to [poor validation performance](./performance.md#sequence-vs-list-or-tuple-with-mapping-vs-dict), and in general using concrete container types
+will avoid unnecessary checks.
+
+<!-- old anchor added for backwards compatibility -->
+<!-- markdownlint-disable-next-line no-empty-links -->
+[](){#extra-fields}
+
+## Extra data
+
+By default, Pydantic models **won't error when you provide extra data**, and these values will simply be ignored:
+
+```python
+from pydantic import BaseModel
+
+
+class Model(BaseModel):
+    x: int
+
+
+m = Model(x=1, y='a')
+assert m.model_dump() == {'x': 1}
+```

@@ -1,13 +1,102 @@
----
-title: ångstromCTF 2022 Writeup
-date: 2022-05-05 17:43:37
-tags: [Security]
-categories: [Security]
-translator: huli
-photos: /img/angstrom-ctf-2022-writeup-en/cover-en.png
----
-<img src="/img/angstrom-ctf-2022-writeup-en/cover-en.png" style="display:none">
+This attack can succeed because the user's input becomes part of the code, causing unexpected behavior.
 
-I didn't check all the challenges this time because when I joined the competition, most of the challenges already solved by my teammates lol
+To prevent this behavior, escaping should be done when rendering. For example, `<` should be converted to `&lt`, so that what is seen on the screen is still `<`, but for the parser, it is not the symbol that starts the tag, but the `<` of the text, which will not be parsed as an HTML tag.
 
-I love JavaScript(yep, including those weird features) and XS-leak, so this writeup will talk about only two challenges:
+In this way, attackers can be prevented from injecting code.
+
+However, this is only a superficial understanding of escaping. What really needs to be noted is that different situations may require different ways of escaping, as discussed in these two articles:
+
+1. [Re: [Discussion] Why are SQL injection and XSS vulnerabilities so rampant? (1)](https://www.ptt.cc/bbs/Soft_Job/M.1582437563.A.6F7.html)
+2. [Re: [Discussion] Why are SQL injection and XSS vulnerabilities so rampant? (2)](https://www.ptt.cc/bbs/Soft_Job/M.1582441681.A.A7B.html)
+
+If you only think of escaping tags and escape `<>`, then it is indeed impossible to directly insert tags. However, what if the nickname is rendered like this?
+
+``` html
+<img src="<?= avatar_url ?>" alt="<?= nickname ?>" /><div><?= nickname ?></div>
+```
+
+In addition to outputting the nickname in the div, the nickname is also rendered in the alt tag of the img. At this time, if you only escape `<>`, it is not enough, because if I make the nickname `" onload="alert(1)`, it will become:
+
+``` html
+<img src="avatar_url" alt="" onload="alert(1)" /><div>" onload="alert(1)</div>
+```
+
+Attackers can use `"` to close the previous attribute and then create a new attribute `onload`, achieving XSS through HTML tag attribute manipulation.
+
+Therefore, common special characters such as `"'<>` need to be escaped to ensure defense effectiveness in different places. Many programming languages or frameworks have implemented this, such as PHP's htmlspecialchars:
+
+![](/img/xss-defense/xss1.png)
+
+Is that all we need to do? Not yet.
+
+Because the content in the link is another matter, for example: `<a href="<?= link ?>">my website</a>`
+
+There is something called JavaScript pseudo-protocol, which can use `javascript:` to execute JS code, like this: `<a href="javascript:alert(1)">my website</a>`. When the user clicks on this link, an alert will pop up.
+
+And the characters `javascript:alert(1)` do not contain the special characters `"'<>&` that we need to escape, so in this case, we need a different escape method or directly check the content and specify that the beginning must be `http://` or `http://`.
+
+This is what I just mentioned, different methods are needed to escape and defend in different places. If the same method is used, some places will be ineffective.
+
+Some people may say, "Don't worry! The front-end framework I use has already done it for me, and it will escape by default! It won't be XSS."
+
+This claim is mostly correct. Nowadays, many front-end frameworks handle this, but pay special attention to the href example I just mentioned, because the characters `javascript:alert(1)` are not special characters, so they remain the same after escaping, and there are still vulnerabilities.
+
+React added a warning for this case in v16.9: [Deprecating javascript: URLs](https://reactjs.org/blog/2019/08/08/react-v16.9.0.html#deprecating-javascript-urls), and will automatically block this behavior in later releases. However, according to test results, the current version v17.0.2 only warns and does not block.
+
+There are some related discussions: [React@16.9 block javascript:void(0); #16592](https://github.com/facebook/react/issues/16592) and [False-positive security precaution warning (javascript: URLs) #16382](https://github.com/facebook/react/issues/16382), if you want to see the code, it is here: [react/packages/react-dom/src/shared/sanitizeURL.js ](https://github.com/facebook/react/blob/v17.0.2/packages/react-dom/src/shared/sanitizeURL.js).
+
+In addition to understanding that escaping in different situations is not an easy task, it is not as simple as imagined to realize which parts are user-input.
+
+Because in addition to the database or API being your data source, the URL may also be. Some code directly puts a certain query string on the URL bar into JS, and then outputs this variable directly to the screen. This is unintentionally trusting data that should not be trusted.
+
+For example, the search page URL may look like this: `https://example.com/search?q=hello`, and it is written like this in the program:
+
+``` js
+const q = 'hello' // parameter taken from the URL bar
+document.querySelector('.search').innerHTML = q
+```
+
+At this time, if you replace q with HTML: `<script>alert(1)</script>`, if you output it without escaping, an XSS vulnerability will occur.
+
+Finally, some websites allow some HTML content, the most common of which is blogs, because blogs need styles, unless it is a custom data format, some websites directly store the content as HTML, and then use [DOMPurify](https://github.com/cure53/DOMPurify) or [js-xss](https://github.com/leizongmin/js-xss) and other packages to filter out illegal tags or attributes.
+
+Although using these libraries is relatively safe, it is important to note that the versions must be updated regularly because these types of packages may also have vulnerabilities ([Mutation XSS via namespace confusion – DOMPurify < 2.0.17 bypass](https://research.securitum.com/mutation-xss-via-mathml-mutation-dompurify-2-0-17-bypass/)). In addition, it is also important to pay attention to the settings when using them, as incorrect settings may also cause problems. For actual cases, please refer to: [Prevent XSS Might Be Harder Than You Thought](https://medium.com/cymetrics/prevent-xss-might-be-harder-than-you-thought-ce8c422540b).
+
+To summarize, to do a good job of preventing XSS attacks in the first level, the following things need to be considered:
+
+1. Be aware of where users can enter data themselves.
+2. Defend against XSS in different contexts.
+
+You can also consider introducing a ready-made [WAF](https://www.cloudflare.com/zh-tw/learning/ddos/glossary/web-application-firewall-waf/) (Web Application Firewall), which can directly block some suspicious payloads for you. However, WAF is not 100% effective, it is just an additional line of defense. Alternatively, you can also pay attention to this relatively new thing: [Trusted Types](https://web.dev/trusted-types/).
+
+## Second Level: Preventing Malicious Code from Being Executed
+
+Assuming that the first level has been breached, attackers can insert arbitrary code on the website. At this point, the focus is on CSP, Content Security Policy.
+
+CSP is a series of rules used to tell the browser which sources of resources can be loaded and which cannot. It can be used to specify the CSP rules of a page using response headers or `<meta>` tags.
+
+For example, if I am sure that all the JS on the website comes from the same origin, then my CSP can be written like this:
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self'
+```
+
+`self` means same origin. If you try to load JS that is not from the current origin, or execute script directly on the page using inline, you will see a browser error:
+
+![](/img/xss-defense/xss2.png)
+
+CSP can specify rules for many different resources. For a more detailed explanation, you can refer to [Content Security Policy Reference](https://content-security-policy.com/). If you want to find a more complete CSP, it is fastest to look at the implementation of some large companies. Next, let's take a look at what GitHub's CSP looks like (reformatted for readability):
+
+```
+default-src 'none'
+
+base-uri 'self';
+
+block-all-mixed-content;
+
+connect-src 'self' uploads.github.com www.githubstatus.com collector.githubapp.com
+api.github.com github-cloud.s3.amazonaws.com github-production-repository-file-5c1aeb.s3.amazonaws.com
+github-production-upload-manifest-file-7fdce7.s3.amazonaws.com github-production-user-asset-6210df.s3.amazonaws.com
+html-translator.herokuapp.com cdn.optimizely.com logx.optimizely.com/v1/events wss://alive.github.com
+*.actions.githubusercontent.com wss://*.actions.githubusercontent.com online.visualstudio.com/api/v1/locations
+insights.github.com;

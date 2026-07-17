@@ -1,11 +1,143 @@
----
-title: 'A Deep Dive into Parameter Passing in JavaScript: Call by Value or Reference?'
-date: 2018-06-23 22:10
-tags: [Front-end,JavaScript]
-categories:
-  - JavaScript
----
+Continuing down the line, in the HTTP fetch process, it will be determined whether this flag has been set, and if so, a CORS-preflight fetch will be performed.
 
-# Introduction
+All of the above can be found in the spec:
 
-Originally, I was planning to write about the differences and implementations of shallow and deep copying. However, while researching, I stumbled upon articles related to call by value and call by reference, and the more I delved into it, the more interesting it became. I thought I had understood this issue, but the more I read, the more confused I became.
+> 2.2.1 Methods
+> 
+> A CORS-safelisted method is a method that is `GET`, `HEAD`, or `POST`.
+
+Only these three methods will not trigger a preflight.
+
+As for CORS-unsafe request-header names, it will check whether the headers are all "CORS-safelisted request-header". The definition of this can be found in section 2.2.2. Headers, and basically only the following will pass:
+
+1. accept
+2. accept-language
+3. content-language
+4. content-type
+
+However, it should be noted that content-type has additional conditions and can only be:
+
+1. application/x-www-form-urlencoded
+2. multipart/form-data
+3. text/plain
+
+The corresponding value of the above headers must also be valid characters. The definition of what constitutes valid characters varies for each header, so we won't go into detail here.
+
+If the request exceeds this range when sent, a preflight request will be sent.
+
+Therefore, if you want to send JSON format data with a POST request, it will also trigger a preflight request, unless you use text/plain as the content-type (but it is not recommended to do so).
+
+## CORS check
+
+Regarding the request part, we should have finished reading it. Next, let's take a look at the response-related part. There is one thing I am curious about, which is how to verify that the CORS result has passed.
+
+This can be seen in section 4.10. CORS check:
+
+![](/img/cors/part4/cors-check.png)
+
+If the origin in `Access-Control-Allow-Origin` is null, it fails (it is emphasized here that it is null, not "null", which we will discuss later).
+
+Next, if the origin is * and the credentials mode is not include, it will pass.
+
+Then compare the origin of the request with the one in the header. If they are different, it will return a failure.
+
+If the origin is the same at this point, check the credentials mode again. If it is not include, it will pass.
+
+Otherwise, check `Access-Control-Allow-Credentials`. If it is true, it will pass; otherwise, it will return a failure.
+
+This series of checks has an early return flavor, which may be because it is easier to write in a list format and try to flatten the nesting as much as possible.
+
+The above is almost all the specifications related to CORS. Chapter 6 mainly talks about the `fetch` API, and Chapter 7 talks about websockets.
+
+Next, let's focus on some other important content.
+
+## Misleading no-cors mode and fetch process
+
+As mentioned earlier, fetch can set a `mode: no-cors`. Next, let's take a look at what it actually does from the perspective of the specification.
+
+Because this is a parameter of the fetch request, we need to start with `5.4 Request class`, where there is a paragraph: `The new Request(input, init) constructor steps are:`
+
+In step 30, you can see:
+
+![](/img/cors/part4/fetch-01.png)
+
+If the request method is not GET, HEAD, or POST, a TypeError will be thrown. In addition, the `header's guard` will also be set to `request-no-cors`.
+
+The above is just creating a new request. Next, you can refer to `5.6. Fetch method` to see the actual process of sending the request:
+
+![](/img/cors/part4/fetch-02.png)
+
+The previous steps were just setting some parameters. The real action is in step ten:
+
+> Fetch request with processResponse given response being these substeps
+
+That "Fetch" is a hyperlink that can be linked to the section `4. Fetching`, and what we are concerned about here is the last step:
+
+![](/img/cors/part4/fetch-03.png)
+
+> 12. Run main fetch given fetchParams.
+
+Main fetch is also a hyperlink that will take you to `4.1. Main fetch`, where there is a whole section dedicated to handling the case when the mode is no-cors:
+
+![](/img/cors/part4/fetch-04.png)
+
+There are several things worth noting here:
+
+1. In step two, the response tainting of the request is set to opaque.
+2. In step three, the "scheme fetch" is executed.
+3. In step five, a new response is created with only status and CSP list.
+4. The warning below.
+
+You can continue to trace back to the scheme fetch, just like before, and then follow different fetch methods, and the deeper you go, the more complicated it becomes. However, I have already traced it for you here, so assuming that step four is not valid, it will execute step five: "Return a new response whose status is noCorsResponse’s status, and CSP list is noCorsResponse’s CSP list."
+
+The warning part is actually quite important:
+
+> This is only an effective defense against side channel attacks if noCorsResponse is kept isolated from the process that initiated the request.
+
+The reason for creating a new response here is that we don't want to return the original response, we want to separate the original response from the process that initiated this request. Why do we do this? We will discuss this in the next article.
+
+Next, let's continue to look down, and you can see step fourteen:
+
+![](/img/cors/part4/fetch-05.png)
+
+The response tainting has been set to opaque, so according to step two, the response is set to [opaque filtered response](https://fetch.spec.whatwg.org/#concept-filtered-response-opaque).
+
+So what is this opaque filtered response?
+
+> An opaque filtered response is a filtered response whose type is "opaque", URL list is the empty list, status is 0, status message is the empty byte sequence, header list is empty, and body is null.
+
+This is the response we got when we used `mode: 'no-cors'`, with a status of 0, no header, and no body.
+
+In the specification, we have confirmed what I said earlier, that once the mode is set to no-cors, you cannot get the response, even if the backend sets the header.
+
+## Precautions when using CORS and cache
+
+There is a paragraph in the specification: [CORS protocol and HTTP caches](https://fetch.spec.whatwg.org/#cors-protocol-and-http-caches) that specifically discusses this.
+
+Assume a scenario where the server only responds to requests with an origin header with the `Access-Control-Allow-Origin` header, and does not respond if there is no origin header (Amazon S3 does this). Then this response is cached, so the browser caches it.
+
+Then let's say we want to display an image, which is on S3, so it is cross-origin.
+
+We put `<img src="https://s3.xxx.com/a.png">` on the page, and the browser loads the image and caches the response. Because it is an img tag, the browser does not send an origin header, so the response naturally does not have `Access-Control-Allow-Origin`.
+
+But then we also need to get this image in JS, so we use fetch to get it: `fetch('https://s3.xxx.com/a.png')`. At this point, it becomes a CORS request, so the request header will include the origin.
+
+However, since we have already cached the response of this URL earlier, the browser will directly use the cached response that has not yet expired.
+
+This is where the tragedy happens. The cached response we had earlier does not have the `Access-Control-Allow-Origin` header, so the CORS verification fails, and we cannot get the content of the image.
+
+So how do we solve this situation? In the HTTP response header, there is a `Vary` that determines that the cache of this response may be different from some request headers.
+
+For example, if `Vary: Origin` is passed, it means that if the origin header in the request I send later is different, then the previous cache should not be used.
+
+In the case mentioned earlier, after setting this header, the request we send using fetch should not use the previously cached response because the Origin header is different from the one used with img earlier. Instead, it should send a new request.
+
+I actually encountered this problem myself... please refer to: [CORS is not as simple as I thought](https://blog.techbridge.cc/2018/08/18/cors-issue/).
+
+## Conclusion
+
+In this article, we looked at the fetch spec and looked at fetching resources from a specification perspective. We also confirmed many of the statements made in the previous articles from the specification. I highly recommend that you take some time to scan the spec, at least to have some impression of many things, which will make it easier to find information later.
+
+In addition, you can also see some interesting parts of the specification, such as the caching problem mentioned at the end, which I actually encountered. If I had looked at the spec earlier, I would have been able to think of a solution faster when I encountered the problem.
+
+When looking at the spec, you can also see that many things are done for security considerations. Next, let's take a look at the penultimate article in this series: [CORS Complete Manual (5): Security Issues Across Sources](/2021/02/19/cors-guide-5).

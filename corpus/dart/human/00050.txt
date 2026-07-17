@@ -1,47 +1,130 @@
 import 'dart:async';
 
-import 'dio_exception.dart';
-import 'options.dart';
+import 'package:dio/dio.dart';
+import 'package:test/test.dart';
 
-/// {@template dio.CancelToken}
-/// Controls cancellation of [Dio]'s requests.
-///
-/// The same token can be shared between different requests.
-/// When [cancel] is invoked, requests bound to this token will be cancelled.
-/// {@endtemplate}
-class CancelToken {
-  CancelToken();
+import '../../util.dart';
 
-  final Completer<DioException> _completer = Completer<DioException>();
+void cancellationTests(
+  Dio Function(String baseUrl) create,
+) {
+  late Dio dio;
 
-  /// Whether the [error] is thrown by [cancel].
-  static bool isCancel(DioException error) =>
-      error.type == DioExceptionType.cancel;
+  setUp(() {
+    dio = create(httpbunBaseUrl);
+  });
 
-  /// If request have been canceled, save the cancel error.
-  DioException? get cancelError => _cancelError;
-  DioException? _cancelError;
+  group('cancellation', () {
+    test('basic', () {
+      final token = CancelToken();
 
-  /// Corresponding request options for the request.
-  ///
-  /// This field can be null if the request was never submitted.
-  RequestOptions? requestOptions;
+      Future.delayed(const Duration(milliseconds: 250), () {
+        token.cancel('cancelled');
+      });
 
-  /// Whether the token is cancelled.
-  bool get isCancelled => _cancelError != null;
+      expectLater(
+        dio.get('/drip-lines?delay=0', cancelToken: token),
+        throwsDioException(
+          DioExceptionType.cancel,
+          stackTraceContains: kIsWeb
+              ? 'test/test_suite_test.dart'
+              : 'test/cancellation_tests.dart',
+          matcher: allOf([
+            isA<DioException>().having(
+              (e) => e.error,
+              'error',
+              'cancelled',
+            ),
+            isA<DioException>().having(
+              (e) => e.message,
+              'message',
+              'The request was manually cancelled by the user.',
+            ),
+          ]),
+        ),
+      );
+    });
 
-  /// When cancelled, this future will be resolved.
-  Future<DioException> get whenCancel => _completer.future;
+    test('cancel multiple requests with single token', () async {
+      final token = CancelToken();
 
-  /// Cancel the request with the given [reason].
-  void cancel([Object? reason]) {
-    _cancelError = DioException.requestCancelled(
-      requestOptions: requestOptions ?? RequestOptions(),
-      reason: reason,
-      stackTrace: StackTrace.current,
+      final receiveSuccess1 = Completer();
+      final receiveSuccess2 = Completer();
+      final futures = [
+        dio.get(
+          '/drip-lines?delay=0&duration=5&numbytes=100',
+          cancelToken: token,
+          onReceiveProgress: (count, total) {
+            if (!receiveSuccess1.isCompleted) {
+              receiveSuccess1.complete();
+            }
+          },
+        ),
+        dio.get(
+          '/drip-lines?delay=0&duration=5&numbytes=100',
+          cancelToken: token,
+          onReceiveProgress: (count, total) {
+            if (!receiveSuccess2.isCompleted) {
+              receiveSuccess2.complete();
+            }
+          },
+        ),
+      ];
+
+      for (final future in futures) {
+        expectLater(
+          future,
+          throwsDioException(
+            DioExceptionType.cancel,
+            stackTraceContains: kIsWeb
+                ? 'test/test_suite_test.dart'
+                : 'test/cancellation_tests.dart',
+            matcher: allOf([
+              isA<DioException>().having(
+                (e) => e.error,
+                'error',
+                'cancelled',
+              ),
+              isA<DioException>().having(
+                (e) => e.message,
+                'message',
+                'The request was manually cancelled by the user.',
+              ),
+            ]),
+          ),
+        );
+      }
+
+      await Future.wait([
+        receiveSuccess1.future,
+        receiveSuccess2.future,
+      ]);
+
+      token.cancel('cancelled');
+
+      expect(receiveSuccess1.isCompleted, isTrue);
+      expect(receiveSuccess2.isCompleted, isTrue);
+      expect(token.isCancelled, isTrue);
+      expect(
+        token.cancelError,
+        isA<DioException>().having(
+          (e) => e.type,
+          'type',
+          DioExceptionType.cancel,
+        ),
+      );
+    });
+
+    // Regression: https://github.com/cfug/dio/issues/2170
+    test(
+      'not closing sockets with requests that have same hosts',
+      () async {
+        final token = CancelToken();
+        await expectLater(dio.get('/get', cancelToken: token), completes);
+        expectLater(dio.get('/drip?duration=3'), completes);
+        Future.delayed(const Duration(seconds: 1), token.cancel);
+      },
+      testOn: '!browser',
     );
-    if (!_completer.isCompleted) {
-      _completer.complete(_cancelError);
-    }
-  }
+  });
 }

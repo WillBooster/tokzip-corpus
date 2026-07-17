@@ -10,460 +10,566 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Package\Loader;
+namespace Composer\DependencyResolver;
 
-use Composer\Package\BasePackage;
-use Composer\Package\CompleteAliasPackage;
-use Composer\Package\CompletePackage;
-use Composer\Package\RootPackage;
-use Composer\Package\PackageInterface;
 use Composer\Package\CompletePackageInterface;
+use Composer\Package\AliasPackage;
+use Composer\Package\BasePackage;
 use Composer\Package\Link;
-use Composer\Package\RootAliasPackage;
-use Composer\Package\Version\VersionParser;
+use Composer\Package\PackageInterface;
+use Composer\Package\RootPackageInterface;
 use Composer\Pcre\Preg;
+use Composer\Repository\RepositorySet;
+use Composer\Repository\LockArrayRepository;
+use Composer\Semver\Constraint\Constraint;
+use Composer\Semver\Constraint\ConstraintInterface;
+use Composer\Package\Version\VersionParser;
+use Composer\Repository\PlatformRepository;
 
 /**
- * @author Konstantin Kudryashiv <ever.zet@gmail.com>
- * @author Jordi Boggiano <j.boggiano@seld.be>
+ * Represents a problem detected while solving dependencies
+ *
+ * @author Nils Adermann <naderman@naderman.de>
  */
-class ArrayLoader implements LoaderInterface
+class Problem
 {
-    /** @var VersionParser */
-    protected $versionParser;
-    /** @var bool */
-    protected $loadOptions;
+    /**
+     * A map containing the id of each rule part of this problem as a key
+     * @var array<string, true>
+     */
+    protected $reasonSeen;
 
-    public function __construct(?VersionParser $parser = null, bool $loadOptions = false)
+    /**
+     * A set of reasons for the problem, each is a rule or a root require and a rule
+     * @var array<int, array<int, Rule>>
+     */
+    protected $reasons = [];
+
+    /** @var int */
+    protected $section = 0;
+
+    /**
+     * Add a rule as a reason
+     *
+     * @param Rule $rule A rule which is a reason for this problem
+     */
+    public function addRule(Rule $rule): void
     {
-        if (!$parser) {
-            $parser = new VersionParser;
-        }
-        $this->versionParser = $parser;
-        $this->loadOptions = $loadOptions;
+        $this->addReason(spl_object_hash($rule), $rule);
     }
 
     /**
-     * @inheritDoc
+     * Retrieve all reasons for this problem
+     *
+     * @return array<int, array<int, Rule>> The problem's reasons
      */
-    public function load(array $config, string $class = 'Composer\Package\CompletePackage'): BasePackage
+    public function getReasons(): array
     {
-        if ($class !== 'Composer\Package\CompletePackage' && $class !== 'Composer\Package\RootPackage') {
-            trigger_error('The $class arg is deprecated, please reach out to Composer maintainers ASAP if you still need this.', E_USER_DEPRECATED);
-        }
-
-        $package = $this->createObject($config, $class);
-
-        foreach (BasePackage::$supportedLinkTypes as $type => $opts) {
-            if (!isset($config[$type]) || !is_array($config[$type])) {
-                continue;
-            }
-            $method = 'set'.ucfirst($opts['method']);
-            $package->{$method}(
-                $this->parseLinks(
-                    $package->getName(),
-                    $package->getPrettyVersion(),
-                    $opts['method'],
-                    $config[$type]
-                )
-            );
-        }
-
-        $package = $this->configureObject($package, $config);
-
-        return $package;
+        return $this->reasons;
     }
 
     /**
-     * @param array<array<mixed>> $versions
+     * A human readable textual representation of the problem's reasons
      *
-     * @return list<CompletePackage|CompleteAliasPackage>
+     * @param array<int|string, BasePackage> $installedMap A map of all present packages
+     * @param array<Rule[]> $learnedPool
      */
-    public function loadPackages(array $versions): array
+    public function getPrettyString(RepositorySet $repositorySet, Request $request, Pool $pool, bool $isVerbose, array $installedMap = [], array $learnedPool = []): string
     {
-        $packages = [];
-        $linkCache = [];
+        // TODO doesn't this entirely defeat the purpose of the problem sections? what's the point of sections?
+        $reasons = array_merge(...array_reverse($this->reasons));
 
-        foreach ($versions as $version) {
-            $package = $this->createObject($version, 'Composer\Package\CompletePackage');
+        if (count($reasons) === 1) {
+            reset($reasons);
+            $rule = current($reasons);
 
-            $this->configureCachedLinks($linkCache, $package, $version);
-            $package = $this->configureObject($package, $version);
+            if ($rule->getReason() !== Rule::RULE_ROOT_REQUIRE) {
+                throw new \LogicException("Single reason problems must contain a root require rule.");
+            }
 
-            $packages[] = $package;
+            $reasonData = $rule->getReasonData();
+            $packageName = $reasonData['packageName'];
+            $constraint = $reasonData['constraint'];
+
+            $packages = $pool->whatProvides($packageName, $constraint);
+            if (count($packages) === 0) {
+                return "\n    ".implode(self::getMissingPackageReason($repositorySet, $request, $pool, $isVerbose, $packageName, $constraint));
+            }
         }
 
-        return $packages;
+        return self::formatDeduplicatedRules($reasons, '    ', $repositorySet, $request, $pool, $isVerbose, $installedMap, $learnedPool);
     }
 
     /**
-     * @template PackageClass of CompletePackage
-     *
-     * @param mixed[] $config package data
-     * @param string  $class  FQCN to be instantiated
-     *
-     * @return CompletePackage|RootPackage
-     *
-     * @phpstan-param class-string<PackageClass> $class
+     * @param Rule[] $rules
+     * @param array<int|string, BasePackage> $installedMap A map of all present packages
+     * @param array<Rule[]> $learnedPool
+     * @internal
      */
-    private function createObject(array $config, string $class): CompletePackage
+    public static function formatDeduplicatedRules(array $rules, string $indent, RepositorySet $repositorySet, Request $request, Pool $pool, bool $isVerbose, array $installedMap = [], array $learnedPool = []): string
     {
-        if (!isset($config['name'])) {
-            throw new \UnexpectedValueException('Unknown package has no name defined ('.json_encode($config).').');
-        }
-        if (!isset($config['version']) || !is_scalar($config['version'])) {
-            throw new \UnexpectedValueException('Package '.$config['name'].' has no version defined.');
-        }
-        if (!is_string($config['version'])) {
-            $config['version'] = (string) $config['version'];
-        }
-
-        // handle already normalized versions
-        if (isset($config['version_normalized']) && is_string($config['version_normalized'])) {
-            $version = $config['version_normalized'];
-
-            // handling of existing repos which need to remain composer v1 compatible, in case the version_normalized contained VersionParser::DEFAULT_BRANCH_ALIAS, we renormalize it
-            if ($version === VersionParser::DEFAULT_BRANCH_ALIAS) {
-                $version = $this->versionParser->normalize($config['version']);
-            }
-        } else {
-            $version = $this->versionParser->normalize($config['version']);
-        }
-
-        return new $class($config['name'], $version, $config['version']);
-    }
-
-    /**
-     * @param CompletePackage $package
-     * @param mixed[]         $config package data
-     *
-     * @return RootPackage|RootAliasPackage|CompletePackage|CompleteAliasPackage
-     */
-    private function configureObject(PackageInterface $package, array $config): BasePackage
-    {
-        if (!$package instanceof CompletePackage) {
-            throw new \LogicException('ArrayLoader expects instances of the Composer\Package\CompletePackage class to function correctly');
-        }
-
-        $package->setType(isset($config['type']) ? strtolower($config['type']) : 'library');
-
-        if (isset($config['target-dir'])) {
-            $package->setTargetDir($config['target-dir']);
-        }
-
-        if (isset($config['extra']) && \is_array($config['extra'])) {
-            $package->setExtra($config['extra']);
-        }
-
-        if (isset($config['bin'])) {
-            if (!\is_array($config['bin'])) {
-                $config['bin'] = [$config['bin']];
-            }
-            foreach ($config['bin'] as $key => $bin) {
-                $config['bin'][$key] = ltrim($bin, '/');
-            }
-            $package->setBinaries($config['bin']);
-        }
-
-        if (isset($config['installation-source'])) {
-            $package->setInstallationSource($config['installation-source']);
-        }
-
-        if (isset($config['default-branch']) && $config['default-branch'] === true) {
-            $package->setIsDefaultBranch(true);
-        }
-
-        if (isset($config['source'])) {
-            if (!isset($config['source']['type'], $config['source']['url'], $config['source']['reference'])) {
-                throw new \UnexpectedValueException(sprintf(
-                    "Package %s's source key should be specified as {\"type\": ..., \"url\": ..., \"reference\": ...},\n%s given.",
-                    $config['name'],
-                    json_encode($config['source'])
-                ));
-            }
-            $package->setSourceType($config['source']['type']);
-            $package->setSourceUrl($config['source']['url']);
-            $package->setSourceReference(isset($config['source']['reference']) ? (string) $config['source']['reference'] : null);
-            if (isset($config['source']['mirrors'])) {
-                $package->setSourceMirrors($config['source']['mirrors']);
-            }
-        }
-
-        if (isset($config['dist'])) {
-            if (!isset($config['dist']['type'], $config['dist']['url'])) {
-                throw new \UnexpectedValueException(sprintf(
-                    "Package %s's dist key should be specified as ".
-                    "{\"type\": ..., \"url\": ..., \"reference\": ..., \"shasum\": ...},\n%s given.",
-                    $config['name'],
-                    json_encode($config['dist'])
-                ));
-            }
-            $package->setDistType($config['dist']['type']);
-            $package->setDistUrl($config['dist']['url']);
-            $package->setDistReference(isset($config['dist']['reference']) ? (string) $config['dist']['reference'] : null);
-            $package->setDistSha1Checksum($config['dist']['shasum'] ?? null);
-            if (isset($config['dist']['mirrors'])) {
-                $package->setDistMirrors($config['dist']['mirrors']);
-            }
-        }
-
-        if (isset($config['suggest']) && \is_array($config['suggest'])) {
-            foreach ($config['suggest'] as $target => $reason) {
-                if ('self.version' === trim($reason)) {
-                    $config['suggest'][$target] = $package->getPrettyVersion();
+        $messages = [];
+        $templates = [];
+        $parser = new VersionParser;
+        $deduplicatableRuleTypes = [Rule::RULE_PACKAGE_REQUIRES, Rule::RULE_PACKAGE_CONFLICT];
+        foreach ($rules as $rule) {
+            $message = $rule->getPrettyString($repositorySet, $request, $pool, $isVerbose, $installedMap, $learnedPool);
+            if (in_array($rule->getReason(), $deduplicatableRuleTypes, true) && Preg::isMatchStrictGroups('{^(?P<package>\S+) (?P<version>\S+) (?P<type>requires|conflicts)}', $message, $m)) {
+                $message = str_replace('%', '%%', $message);
+                $template = Preg::replace('{^\S+ \S+ }', '%s%s ', $message);
+                $messages[] = $template;
+                $templates[$template][$m[1]][$parser->normalize($m[2])] = $m[2];
+                $sourcePackage = $rule->getSourcePackage($pool);
+                foreach ($pool->getRemovedVersionsByPackage(spl_object_hash($sourcePackage)) as $version => $prettyVersion) {
+                    $templates[$template][$m[1]][$version] = $prettyVersion;
                 }
-            }
-            $package->setSuggests($config['suggest']);
-        }
-
-        if (isset($config['autoload'])) {
-            $package->setAutoload($config['autoload']);
-        }
-
-        if (isset($config['autoload-dev'])) {
-            $package->setDevAutoload($config['autoload-dev']);
-        }
-
-        if (isset($config['include-path'])) {
-            $package->setIncludePaths($config['include-path']);
-        }
-
-        if (isset($config['php-ext'])) {
-            $package->setPhpExt($config['php-ext']);
-        }
-
-        if (!empty($config['time'])) {
-            $time = Preg::isMatch('/^\d++$/D', $config['time']) ? '@'.$config['time'] : $config['time'];
-
-            try {
-                $date = new \DateTime($time, new \DateTimeZone('UTC'));
-                $package->setReleaseDate($date);
-            } catch (\Exception $e) {
+            } elseif ($message !== '') {
+                $messages[] = $message;
             }
         }
 
-        if (!empty($config['notification-url'])) {
-            $package->setNotificationUrl($config['notification-url']);
-        }
-
-        if ($package instanceof CompletePackageInterface) {
-            if (!empty($config['archive']['name'])) {
-                $package->setArchiveName($config['archive']['name']);
-            }
-            if (!empty($config['archive']['exclude'])) {
-                $package->setArchiveExcludes($config['archive']['exclude']);
-            }
-
-            if (isset($config['scripts']) && \is_array($config['scripts'])) {
-                foreach ($config['scripts'] as $event => $listeners) {
-                    $config['scripts'][$event] = (array) $listeners;
-                }
-                foreach (['composer', 'php', 'putenv'] as $reserved) {
-                    if (isset($config['scripts'][$reserved])) {
-                        trigger_error('The `'.$reserved.'` script name is reserved for internal use, please avoid defining it', E_USER_DEPRECATED);
+        $result = [];
+        foreach (array_unique($messages) as $message) {
+            if (isset($templates[$message])) {
+                foreach ($templates[$message] as $package => $versions) {
+                    uksort($versions, 'version_compare');
+                    if (!$isVerbose) {
+                        $versions = self::condenseVersionList($versions, 1);
                     }
-                }
-                $package->setScripts($config['scripts']);
-            }
-
-            if (!empty($config['description']) && \is_string($config['description'])) {
-                $package->setDescription($config['description']);
-            }
-
-            if (!empty($config['homepage']) && \is_string($config['homepage'])) {
-                $package->setHomepage($config['homepage']);
-            }
-
-            if (!empty($config['keywords']) && \is_array($config['keywords'])) {
-                $package->setKeywords(array_map('strval', $config['keywords']));
-            }
-
-            if (!empty($config['license'])) {
-                $package->setLicense(\is_array($config['license']) ? $config['license'] : [$config['license']]);
-            }
-
-            if (!empty($config['authors']) && \is_array($config['authors'])) {
-                $package->setAuthors($config['authors']);
-            }
-
-            if (isset($config['support']) && \is_array($config['support'])) {
-                $package->setSupport($config['support']);
-            }
-
-            if (!empty($config['funding']) && \is_array($config['funding'])) {
-                $package->setFunding($config['funding']);
-            }
-
-            if (isset($config['abandoned'])) {
-                $package->setAbandoned($config['abandoned']);
-            }
-        }
-
-        if ($this->loadOptions && isset($config['transport-options'])) {
-            $package->setTransportOptions($config['transport-options']);
-        }
-
-        if ($aliasNormalized = $this->getBranchAlias($config)) {
-            $prettyAlias = Preg::replace('{(\.9{7})+}', '.x', $aliasNormalized);
-
-            if ($package instanceof RootPackage) {
-                return new RootAliasPackage($package, $aliasNormalized, $prettyAlias);
-            }
-
-            return new CompleteAliasPackage($package, $aliasNormalized, $prettyAlias);
-        }
-
-        return $package;
-    }
-
-    /**
-     * @param array<string, array<string, array<int|string, array<int|string, array{string, Link}>>>> $linkCache
-     * @param mixed[]                                                                             $config
-     */
-    private function configureCachedLinks(array &$linkCache, PackageInterface $package, array $config): void
-    {
-        $name = $package->getName();
-        $prettyVersion = $package->getPrettyVersion();
-
-        foreach (BasePackage::$supportedLinkTypes as $type => $opts) {
-            if (isset($config[$type])) {
-                $method = 'set'.ucfirst($opts['method']);
-
-                $links = [];
-                foreach ($config[$type] as $prettyTarget => $constraint) {
-                    $target = strtolower($prettyTarget);
-
-                    // recursive links are not supported
-                    if ($target === $name) {
-                        continue;
-                    }
-
-                    if ($constraint === 'self.version') {
-                        $links[$target] = $this->createLink($name, $prettyVersion, $opts['method'], $target, $constraint);
+                    if (count($versions) > 1) {
+                        // remove the s from requires/conflicts to correct grammar
+                        $message = Preg::replace('{^(%s%s (?:require|conflict))s}', '$1', $message);
+                        $result[] = sprintf($message, $package, '['.implode(', ', $versions).']');
                     } else {
-                        if (!isset($linkCache[$name][$type][$target][$constraint])) {
-                            $linkCache[$name][$type][$target][$constraint] = [$target, $this->createLink($name, $prettyVersion, $opts['method'], $target, $constraint)];
-                        }
-
-                        [$target, $link] = $linkCache[$name][$type][$target][$constraint];
-                        $links[$target] = $link;
+                        $result[] = sprintf($message, $package, ' '.reset($versions));
                     }
                 }
-
-                $package->{$method}($links);
+            } else {
+                $result[] = $message;
             }
         }
+
+        return "\n$indent- ".implode("\n$indent- ", $result);
+    }
+
+    public function isCausedByLock(RepositorySet $repositorySet, Request $request, Pool $pool): bool
+    {
+        foreach ($this->reasons as $sectionRules) {
+            foreach ($sectionRules as $rule) {
+                if ($rule->isCausedByLock($repositorySet, $request, $pool)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**
-     * @param  string                    $source        source package name
-     * @param  string                    $sourceVersion source package version (pretty version ideally)
-     * @param  string                    $description   link description (e.g. requires, replaces, ..)
-     * @param  array<string|int, string> $links         array of package name => constraint mappings
+     * Store a reason descriptor but ignore duplicates
      *
-     * @return Link[]
-     *
-     * @phpstan-param Link::TYPE_* $description
+     * @param string $id     A canonical identifier for the reason
+     * @param Rule   $reason The reason descriptor
      */
-    public function parseLinks(string $source, string $sourceVersion, string $description, array $links): array
+    protected function addReason(string $id, Rule $reason): void
     {
-        $res = [];
-        foreach ($links as $target => $constraint) {
-            if (!is_string($constraint)) {
-                continue;
-            }
-            $target = strtolower((string) $target);
-            $res[$target] = $this->createLink($source, $sourceVersion, $description, $target, $constraint);
-        }
+        // TODO: if a rule is part of a problem description in two sections, isn't this going to remove a message
+        // that is important to understand the issue?
 
-        return $res;
+        if (!isset($this->reasonSeen[$id])) {
+            $this->reasonSeen[$id] = true;
+            $this->reasons[$this->section][] = $reason;
+        }
+    }
+
+    public function nextSection(): void
+    {
+        $this->section++;
     }
 
     /**
-     * @param  string       $source           source package name
-     * @param  string       $sourceVersion    source package version (pretty version ideally)
-     * @param  Link::TYPE_* $description      link description (e.g. requires, replaces, ..)
-     * @param  string       $target           target package name
-     * @param  string       $prettyConstraint constraint string
+     * @internal
+     * @return array{0: string, 1: string}
      */
-    private function createLink(string $source, string $sourceVersion, string $description, string $target, string $prettyConstraint): Link
+    public static function getMissingPackageReason(RepositorySet $repositorySet, Request $request, Pool $pool, bool $isVerbose, string $packageName, ?ConstraintInterface $constraint = null): array
     {
-        if (!\is_string($prettyConstraint)) {
-            throw new \UnexpectedValueException('Link constraint in '.$source.' '.$description.' > '.$target.' should be a string, got '.\gettype($prettyConstraint) . ' (' . var_export($prettyConstraint, true) . ')');
+        if (PlatformRepository::isPlatformPackage($packageName)) {
+            // handle php/php-*/hhvm
+            if (0 === stripos($packageName, 'php') || $packageName === 'hhvm') {
+                $version = self::getPlatformPackageVersion($pool, $packageName, phpversion());
+
+                $msg = "- Root composer.json requires ".$packageName.self::constraintToText($constraint).' but ';
+
+                if (defined('HHVM_VERSION') || ($packageName === 'hhvm' && count($pool->whatProvides($packageName)) > 0)) {
+                    return [$msg, 'your HHVM version does not satisfy that requirement.'];
+                }
+
+                if ($packageName === 'hhvm') {
+                    return [$msg, 'HHVM was not detected on this machine, make sure it is in your PATH.'];
+                }
+
+                if (null === $version) {
+                    return [$msg, 'the '.$packageName.' package is disabled by your platform config. Enable it again with "composer config platform.'.$packageName.' --unset".'];
+                }
+
+                return [$msg, 'your '.$packageName.' version ('. $version .') does not satisfy that requirement.'];
+            }
+
+            // handle php extensions
+            if (0 === stripos($packageName, 'ext-')) {
+                if (false !== strpos($packageName, ' ')) {
+                    return ['- ', "PHP extension ".$packageName.' should be required as '.str_replace(' ', '-', $packageName).'.'];
+                }
+
+                $ext = substr($packageName, 4);
+                $msg = "- Root composer.json requires PHP extension ".$packageName.self::constraintToText($constraint).' but ';
+
+                $version = self::getPlatformPackageVersion($pool, $packageName, phpversion($ext) ?: '0');
+                if (null === $version) {
+                    if (extension_loaded($ext)) {
+                        return [
+                            $msg,
+                            'the '.$packageName.' package is disabled by your platform config. Enable it again with "composer config platform.'.$packageName.' --unset".',
+                        ];
+                    }
+
+                    return [$msg, 'it is missing from your system. Install or enable PHP\'s '.$ext.' extension.'];
+                }
+
+                return [$msg, 'it has the wrong version installed ('.$version.').'];
+            }
+
+            // handle linked libs
+            if (0 === stripos($packageName, 'lib-')) {
+                if (strtolower($packageName) === 'lib-icu') {
+                    $error = extension_loaded('intl') ? 'it has the wrong version installed, try upgrading the intl extension.' : 'it is missing from your system, make sure the intl extension is loaded.';
+
+                    return ["- Root composer.json requires linked library ".$packageName.self::constraintToText($constraint).' but ', $error];
+                }
+
+                return ["- Root composer.json requires linked library ".$packageName.self::constraintToText($constraint).' but ', 'it has the wrong version installed or is missing from your system, make sure to load the extension providing it.'];
+            }
         }
-        if ('self.version' === $prettyConstraint) {
-            $parsedConstraint = $this->versionParser->parseConstraints($sourceVersion);
+
+        $lockedPackage = null;
+        foreach ($request->getLockedPackages() as $package) {
+            if ($package->getName() === $packageName) {
+                $lockedPackage = $package;
+                if ($pool->isUnacceptableFixedOrLockedPackage($package)) {
+                    return ["- ", $package->getPrettyName().' is fixed to '.$package->getPrettyVersion().' (lock file version) by a partial update but that version is rejected by your minimum-stability. Make sure you list it as an argument for the update command.'];
+                }
+                break;
+            }
+        }
+
+        // first check if the actual requested package is found in normal conditions
+        // if so it must mean it is rejected by another constraint than the one given here
+        if ($packages = $repositorySet->findPackages($packageName, $constraint)) {
+            $rootReqs = $repositorySet->getRootRequires();
+            if (isset($rootReqs[$packageName])) {
+                $filtered = array_filter($packages, static function ($p) use ($rootReqs, $packageName): bool {
+                    return $rootReqs[$packageName]->matches(new Constraint('==', $p->getVersion()));
+                });
+                if (0 === count($filtered)) {
+                    return ["- Root composer.json requires $packageName".self::constraintToText($constraint) . ', ', 'found '.self::getPackageList($packages, $isVerbose, $pool, $constraint).' but '.(self::hasMultipleNames($packages) ? 'these conflict' : 'it conflicts').' with your root composer.json require ('.$rootReqs[$packageName]->getPrettyString().').'];
+                }
+            }
+
+            $tempReqs = $repositorySet->getTemporaryConstraints();
+            if (isset($tempReqs[$packageName])) {
+                $filtered = array_filter($packages, static function ($p) use ($tempReqs, $packageName): bool {
+                    return $tempReqs[$packageName]->matches(new Constraint('==', $p->getVersion()));
+                });
+                if (0 === count($filtered)) {
+                    return ["- Root composer.json requires $packageName".self::constraintToText($constraint) . ', ', 'found '.self::getPackageList($packages, $isVerbose, $pool, $constraint).' but '.(self::hasMultipleNames($packages) ? 'these conflict' : 'it conflicts').' with your temporary update constraint ('.$packageName.':'.$tempReqs[$packageName]->getPrettyString().').'];
+                }
+            }
+
+            if ($lockedPackage) {
+                $fixedConstraint = new Constraint('==', $lockedPackage->getVersion());
+                $filtered = array_filter($packages, static function ($p) use ($fixedConstraint): bool {
+                    return $fixedConstraint->matches(new Constraint('==', $p->getVersion()));
+                });
+                if (0 === count($filtered)) {
+                    return ["- Root composer.json requires $packageName".self::constraintToText($constraint) . ', ', 'found '.self::getPackageList($packages, $isVerbose, $pool, $constraint).' but the package is fixed to '.$lockedPackage->getPrettyVersion().' (lock file version) by a partial update and that version does not match. Make sure you list it as an argument for the update command.'];
+                }
+            }
+
+            $nonLockedPackages = array_filter($packages, static function ($p): bool {
+                return !$p->getRepository() instanceof LockArrayRepository;
+            });
+
+            if (!$nonLockedPackages) {
+                return ["- Root composer.json requires $packageName".self::constraintToText($constraint) . ', ', 'found '.self::getPackageList($packages, $isVerbose, $pool, $constraint).' in the lock file but not in remote repositories, make sure you avoid updating this package to keep the one from the lock file.'];
+            }
+
+            return ["- Root composer.json requires $packageName".self::constraintToText($constraint) . ', ', 'found '.self::getPackageList($packages, $isVerbose, $pool, $constraint).' but these were not loaded, likely because '.(self::hasMultipleNames($packages) ? 'they conflict' : 'it conflicts').' with another require.'];
+        }
+
+        // check if the package is found when bypassing stability checks
+        if ($packages = $repositorySet->findPackages($packageName, $constraint, RepositorySet::ALLOW_UNACCEPTABLE_STABILITIES)) {
+            // we must first verify if a valid package would be found in a lower priority repository
+            if ($allReposPackages = $repositorySet->findPackages($packageName, $constraint, RepositorySet::ALLOW_SHADOWED_REPOSITORIES)) {
+                return self::computeCheckForLowerPrioRepo($pool, $isVerbose, $packageName, $packages, $allReposPackages, 'minimum-stability', $constraint);
+            }
+
+            return ["- Root composer.json requires $packageName".self::constraintToText($constraint) . ', ', 'found '.self::getPackageList($packages, $isVerbose, $pool, $constraint).' but '.(self::hasMultipleNames($packages) ? 'these do' : 'it does').' not match your minimum-stability.'];
+        }
+
+        // check if the package is found when bypassing the constraint and stability checks
+        if ($packages = $repositorySet->findPackages($packageName, null, RepositorySet::ALLOW_UNACCEPTABLE_STABILITIES)) {
+            // we must first verify if a valid package would be found in a lower priority repository
+            if ($allReposPackages = $repositorySet->findPackages($packageName, $constraint, RepositorySet::ALLOW_SHADOWED_REPOSITORIES)) {
+                return self::computeCheckForLowerPrioRepo($pool, $isVerbose, $packageName, $packages, $allReposPackages, 'constraint', $constraint);
+            }
+
+            $suffix = '';
+            if ($constraint instanceof Constraint && $constraint->getVersion() === 'dev-master') {
+                foreach ($packages as $candidate) {
+                    if (in_array($candidate->getVersion(), ['dev-default', 'dev-main'], true)) {
+                        $suffix = ' Perhaps dev-master was renamed to '.$candidate->getPrettyVersion().'?';
+                        break;
+                    }
+                }
+            }
+
+            // check if the root package is a name match and hint the dependencies on root troubleshooting article
+            $allReposPackages = $packages;
+            $topPackage = reset($allReposPackages);
+            if ($topPackage instanceof RootPackageInterface) {
+                $suffix = ' See https://getcomposer.org/dep-on-root for details and assistance.';
+            }
+
+            return ["- Root composer.json requires $packageName".self::constraintToText($constraint) . ', ', 'found '.self::getPackageList($packages, $isVerbose, $pool, $constraint).' but '.(self::hasMultipleNames($packages) ? 'these do' : 'it does').' not match the constraint.' . $suffix];
+        }
+
+        if (!Preg::isMatch('{^[A-Za-z0-9_./-]+$}', $packageName)) {
+            $illegalChars = Preg::replace('{[A-Za-z0-9_./-]+}', '', $packageName);
+
+            return ["- Root composer.json requires $packageName, it ", 'could not be found, it looks like its name is invalid, "'.$illegalChars.'" is not allowed in package names.'];
+        }
+
+        if ($providers = $repositorySet->getProviders($packageName)) {
+            $maxProviders = 20;
+            $providersStr = implode(array_map(static function ($p): string {
+                $description = $p['description'] ? ' '.substr($p['description'], 0, 100) : '';
+
+                return '      - '.$p['name'].$description."\n";
+            }, count($providers) > $maxProviders + 1 ? array_slice($providers, 0, $maxProviders) : $providers));
+            if (count($providers) > $maxProviders + 1) {
+                $providersStr .= '      ... and '.(count($providers) - $maxProviders).' more.'."\n";
+            }
+
+            return ["- Root composer.json requires $packageName".self::constraintToText($constraint).", it ", "could not be found in any version, but the following packages provide it:\n".$providersStr."      Consider requiring one of these to satisfy the $packageName requirement."];
+        }
+
+        return ["- Root composer.json requires $packageName, it ", "could not be found in any version, there may be a typo in the package name."];
+    }
+
+    /**
+     * @internal
+     * @param PackageInterface[] $packages
+     */
+    public static function getPackageList(array $packages, bool $isVerbose, ?Pool $pool = null, ?ConstraintInterface $constraint = null, bool $useRemovedVersionGroup = false): string
+    {
+        $prepared = [];
+        $hasDefaultBranch = [];
+        foreach ($packages as $package) {
+            $prepared[$package->getName()]['name'] = $package->getPrettyName();
+            $prepared[$package->getName()]['versions'][$package->getVersion()] = $package->getPrettyVersion().($package instanceof AliasPackage ? ' (alias of '.$package->getAliasOf()->getPrettyVersion().')' : '');
+            if ($pool && $constraint) {
+                foreach ($pool->getRemovedVersions($package->getName(), $constraint) as $version => $prettyVersion) {
+                    $prepared[$package->getName()]['versions'][$version] = $prettyVersion;
+                }
+            }
+            if ($pool && $useRemovedVersionGroup) {
+                foreach ($pool->getRemovedVersionsByPackage(spl_object_hash($package)) as $version => $prettyVersion) {
+                    $prepared[$package->getName()]['versions'][$version] = $prettyVersion;
+                }
+            }
+            if ($package->isDefaultBranch()) {
+                $hasDefaultBranch[$package->getName()] = true;
+            }
+        }
+
+        $preparedStrings = [];
+        foreach ($prepared as $name => $package) {
+            // remove the implicit default branch alias to avoid cruft in the display
+            if (isset($package['versions'][VersionParser::DEFAULT_BRANCH_ALIAS], $hasDefaultBranch[$name])) {
+                unset($package['versions'][VersionParser::DEFAULT_BRANCH_ALIAS]);
+            }
+
+            uksort($package['versions'], 'version_compare');
+
+            if (!$isVerbose) {
+                $package['versions'] = self::condenseVersionList($package['versions'], 4);
+            }
+            $preparedStrings[] = $package['name'].'['.implode(', ', $package['versions']).']';
+        }
+
+        return implode(', ', $preparedStrings);
+    }
+
+    /**
+     * @param  string $version the effective runtime version of the platform package
+     * @return ?string a version string or null if it appears the package was artificially disabled
+     */
+    private static function getPlatformPackageVersion(Pool $pool, string $packageName, string $version): ?string
+    {
+        $available = $pool->whatProvides($packageName);
+
+        if (count($available)) {
+            $selected = null;
+            foreach ($available as $pkg) {
+                if ($pkg->getRepository() instanceof PlatformRepository) {
+                    $selected = $pkg;
+                    break;
+                }
+            }
+            if ($selected === null) {
+                $selected = reset($available);
+            }
+
+            // must be a package providing/replacing and not a real platform package
+            if ($selected->getName() !== $packageName) {
+                /** @var Link $link */
+                foreach (array_merge(array_values($selected->getProvides()), array_values($selected->getReplaces())) as $link) {
+                    if ($link->getTarget() === $packageName) {
+                        return $link->getPrettyConstraint().' '.substr($link->getDescription(), 0, -1).'d by '.$selected->getPrettyString();
+                    }
+                }
+            }
+
+            $version = $selected->getPrettyVersion();
+            $extra = $selected->getExtra();
+            if ($selected instanceof CompletePackageInterface && isset($extra['config.platform']) && $extra['config.platform'] === true) {
+                $version .= '; ' . str_replace('Package ', '', $selected->getDescription());
+            }
         } else {
-            $parsedConstraint = $this->versionParser->parseConstraints($prettyConstraint);
-        }
-
-        return new Link($source, $target, $parsedConstraint, $description, $prettyConstraint);
-    }
-
-    /**
-     * Retrieves a branch alias (dev-master => 1.0.x-dev for example) if it exists
-     *
-     * @param mixed[] $config the entire package config
-     *
-     * @return string|null normalized version of the branch alias or null if there is none
-     */
-    public function getBranchAlias(array $config): ?string
-    {
-        if (!isset($config['version']) || !is_scalar($config['version'])) {
-            throw new \UnexpectedValueException('no/invalid version defined');
-        }
-        if (!is_string($config['version'])) {
-            $config['version'] = (string) $config['version'];
-        }
-
-        if (strpos($config['version'], 'dev-') !== 0 && '-dev' !== substr($config['version'], -4)) {
             return null;
         }
 
-        if (isset($config['extra']['branch-alias']) && \is_array($config['extra']['branch-alias'])) {
-            foreach ($config['extra']['branch-alias'] as $sourceBranch => $targetBranch) {
-                $sourceBranch = (string) $sourceBranch;
+        return $version;
+    }
 
-                // ensure it is an alias to a -dev package
-                if ('-dev' !== substr($targetBranch, -4)) {
-                    continue;
-                }
+    /**
+     * @param array<string|int, string> $versions an array of pretty versions, with normalized versions as keys
+     * @return list<string> a list of pretty versions and '...' where versions were removed
+     */
+    private static function condenseVersionList(array $versions, int $max, int $maxDev = 16): array
+    {
+        if (count($versions) <= $max) {
+            return array_values($versions);
+        }
 
-                // normalize without -dev and ensure it's a numeric branch that is parseable
-                if ($targetBranch === VersionParser::DEFAULT_BRANCH_ALIAS) {
-                    $validatedTargetBranch = VersionParser::DEFAULT_BRANCH_ALIAS;
-                } else {
-                    $validatedTargetBranch = $this->versionParser->normalizeBranch(substr($targetBranch, 0, -4));
-                }
-                if ('-dev' !== substr($validatedTargetBranch, -4)) {
-                    continue;
-                }
-
-                // ensure that it is the current branch aliasing itself
-                if (strtolower($config['version']) !== strtolower($sourceBranch)) {
-                    continue;
-                }
-
-                // If using numeric aliases ensure the alias is a valid subversion
-                if (($sourcePrefix = $this->versionParser->parseNumericAliasPrefix($sourceBranch))
-                    && ($targetPrefix = $this->versionParser->parseNumericAliasPrefix($targetBranch))
-                    && (stripos($targetPrefix, $sourcePrefix) !== 0)
-                ) {
-                    continue;
-                }
-
-                return $validatedTargetBranch;
+        $filtered = [];
+        $byMajor = [];
+        foreach ($versions as $version => $pretty) {
+            if (0 === stripos((string) $version, 'dev-')) {
+                $byMajor['dev'][] = $pretty;
+            } else {
+                $byMajor[Preg::replace('{^(\d+)\..*}', '$1', (string) $version)][] = $pretty;
+            }
+        }
+        foreach ($byMajor as $majorVersion => $versionsForMajor) {
+            $maxVersions = $majorVersion === 'dev' ? $maxDev : $max;
+            if (count($versionsForMajor) > $maxVersions) {
+                // output only 1st and last versions
+                $filtered[] = $versionsForMajor[0];
+                $filtered[] = '...';
+                $filtered[] = $versionsForMajor[count($versionsForMajor) - 1];
+            } else {
+                $filtered = array_merge($filtered, $versionsForMajor);
             }
         }
 
-        if (
-            isset($config['default-branch'])
-            && $config['default-branch'] === true
-            && false === $this->versionParser->parseNumericAliasPrefix(Preg::replace('{^v}', '', $config['version']))
-        ) {
-            return VersionParser::DEFAULT_BRANCH_ALIAS;
+        return $filtered;
+    }
+
+    /**
+     * @param PackageInterface[] $packages
+     */
+    private static function hasMultipleNames(array $packages): bool
+    {
+        $name = null;
+        foreach ($packages as $package) {
+            if ($name === null || $name === $package->getName()) {
+                $name = $package->getName();
+            } else {
+                return true;
+            }
         }
 
-        return null;
+        return false;
+    }
+
+    /**
+     * @param PackageInterface[] $higherRepoPackages
+     * @param PackageInterface[] $allReposPackages
+     * @return array{0: string, 1: string}
+     */
+    private static function computeCheckForLowerPrioRepo(Pool $pool, bool $isVerbose, string $packageName, array $higherRepoPackages, array $allReposPackages, string $reason, ?ConstraintInterface $constraint = null): array
+    {
+        $nextRepoPackages = [];
+        $nextRepo = null;
+
+        foreach ($allReposPackages as $package) {
+            if ($nextRepo === null || $nextRepo === $package->getRepository()) {
+                $nextRepoPackages[] = $package;
+                $nextRepo = $package->getRepository();
+            } else {
+                break;
+            }
+        }
+
+        if ($higherRepoPackages) {
+            $topPackage = reset($higherRepoPackages);
+            if ($topPackage instanceof RootPackageInterface) {
+                return [
+                    "- Root composer.json requires $packageName".self::constraintToText($constraint).', it is ',
+                    'satisfiable by '.self::getPackageList($nextRepoPackages, $isVerbose, $pool, $constraint).' from '.$nextRepo->getRepoName().' but '.$topPackage->getPrettyName().' is the root package and cannot be modified. See https://getcomposer.org/dep-on-root for details and assistance.',
+                ];
+            }
+        }
+
+        if ($nextRepo instanceof LockArrayRepository) {
+            $singular = count($higherRepoPackages) === 1;
+
+            $suggestion = 'Make sure you either fix the '.$reason.' or avoid updating this package to keep the one present in the lock file ('.self::getPackageList($nextRepoPackages, $isVerbose, $pool, $constraint).').';
+            // symlinked path repos cannot be locked so do not suggest keeping it locked
+            if ($nextRepoPackages[0]->getDistType() === 'path') {
+                $transportOptions = $nextRepoPackages[0]->getTransportOptions();
+                if (!isset($transportOptions['symlink']) || $transportOptions['symlink'] !== false) {
+                    $suggestion = 'Make sure you fix the '.$reason.' as packages installed from symlinked path repos are updated even in partial updates and the one from the lock file can thus not be used.';
+                }
+            }
+
+            return ["- Root composer.json requires $packageName".self::constraintToText($constraint) . ', ',
+                'found ' . self::getPackageList($higherRepoPackages, $isVerbose, $pool, $constraint).' but ' . ($singular ? 'it does' : 'these do') . ' not match your '.$reason.' and ' . ($singular ? 'is' : 'are') . ' therefore not installable. '.$suggestion,
+            ];
+        }
+
+        return ["- Root composer.json requires $packageName".self::constraintToText($constraint) . ', it is ', 'satisfiable by '.self::getPackageList($nextRepoPackages, $isVerbose, $pool, $constraint).' from '.$nextRepo->getRepoName().' but '.self::getPackageList($higherRepoPackages, $isVerbose, $pool, $constraint).' from '.reset($higherRepoPackages)->getRepository()->getRepoName().' has higher repository priority. The packages from the higher priority repository do not match your '.$reason.' and are therefore not installable. That repository is canonical so the lower priority repo\'s packages are not installable. See https://getcomposer.org/repoprio for details and assistance.'];
+    }
+
+    /**
+     * Turns a constraint into text usable in a sentence describing a request
+     */
+    protected static function constraintToText(?ConstraintInterface $constraint = null): string
+    {
+        if ($constraint instanceof Constraint && $constraint->getOperator() === Constraint::STR_OP_EQ && !str_starts_with($constraint->getVersion(), 'dev-')) {
+            if (!Preg::isMatch('{^\d+(?:\.\d+)*$}', $constraint->getPrettyString())) {
+                return ' '.$constraint->getPrettyString() .' (exact version match)';
+            }
+
+            $versions = [$constraint->getPrettyString()];
+            for ($i = 3 - substr_count($versions[0], '.'); $i > 0; $i--) {
+                $versions[] = end($versions) . '.0';
+            }
+
+            return ' ' . $constraint->getPrettyString() . ' (exact version match: ' . (count($versions) > 1 ? implode(', ', array_slice($versions, 0, -1)) . ' or ' . end($versions) : $versions[0]) . ')';
+        }
+
+        return $constraint ? ' '.$constraint->getPrettyString() : '';
     }
 }

@@ -10,86 +10,143 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Repository;
+namespace Composer\Package\Comparer;
 
-use Composer\Package\PackageInterface;
-use Composer\Repository\RepositoryUtils;
-use Composer\Test\TestCase;
-use Generator;
+use Composer\Util\Platform;
 
-class RepositoryUtilsTest extends TestCase
+/**
+ * class Comparer
+ *
+ * @author Hector Prats <hectorpratsortega@gmail.com>
+ */
+class Comparer
 {
-    /**
-     * @dataProvider provideFilterRequireTests
-     * @param PackageInterface[] $pkgs
-     * @param string[] $expected
-     */
-    public function testFilterRequiredPackages(array $pkgs, PackageInterface $requirer, array $expected, bool $includeRequireDev = false): void
-    {
-        $expected = array_map(static function (string $name) use ($pkgs): PackageInterface {
-            return $pkgs[$name];
-        }, $expected);
+    /** @var string Source directory */
+    private $source;
+    /** @var string Target directory */
+    private $update;
+    /** @var array{changed?: string[], removed?: string[], added?: string[]} */
+    private $changed;
 
-        self::assertSame($expected, RepositoryUtils::filterRequiredPackages($pkgs, $requirer, $includeRequireDev));
+    public function setSource(string $source): void
+    {
+        $this->source = $source;
+    }
+
+    public function setUpdate(string $update): void
+    {
+        $this->update = $update;
     }
 
     /**
-     * @return array<PackageInterface>
+     * @return array{changed?: string[], removed?: string[], added?: string[]}|false false if no change
      */
-    private static function getPackages(): array
+    public function getChanged(bool $explicated = false)
     {
-        $packageA = self::getPackage('required/a');
-        $packageB = self::getPackage('required/b');
-        self::configureLinks($packageB, ['require' => ['required/c' => '*']]);
-        $packageC = self::getPackage('required/c');
-        $packageCAlias = self::getAliasPackage($packageC, '2.0.0');
+        $changed = $this->changed;
+        if (!count($changed)) {
+            return false;
+        }
+        if ($explicated) {
+            foreach ($changed as $sectionKey => $itemSection) {
+                foreach ($itemSection as $itemKey => $item) {
+                    $changed[$sectionKey][$itemKey] = $item.' ('.$sectionKey.')';
+                }
+            }
+        }
 
-        $packageCircular = self::getPackage('required/circular');
-        self::configureLinks($packageCircular, ['require' => ['required/circular-b' => '*']]);
-        $packageCircularB = self::getPackage('required/circular-b');
-        self::configureLinks($packageCircularB, ['require' => ['required/circular' => '*']]);
-
-        return [
-            self::getPackage('dummy/pkg'),
-            self::getPackage('dummy/pkg2', '2.0.0'),
-            'a' => $packageA,
-            'b' => $packageB,
-            'c' => $packageC,
-            'c-alias' => $packageCAlias,
-            'circular' => $packageCircular,
-            'circular-b' => $packageCircularB,
-        ];
+        return $changed;
     }
 
-    public static function provideFilterRequireTests(): Generator
+    /**
+     * @return string empty string if no changes
+     */
+    public function getChangedAsString(bool $toString = false, bool $explicated = false): string
     {
-        $pkgs = self::getPackages();
+        $changed = $this->getChanged($explicated);
+        if (false === $changed) {
+            return '';
+        }
 
-        $requirer = self::getPackage('requirer/pkg');
-        yield 'no require' => [$pkgs, $requirer, []];
+        $strings = [];
+        foreach ($changed as $sectionKey => $itemSection) {
+            foreach ($itemSection as $itemKey => $item) {
+                $strings[] = $item."\r\n";
+            }
+        }
 
-        $requirer = self::getPackage('requirer/pkg');
-        self::configureLinks($requirer, ['require-dev' => ['required/a' => '*']]);
-        yield 'require-dev has no effect' => [$pkgs, $requirer, []];
+        return trim(implode("\r\n", $strings));
+    }
 
-        $requirer = self::getPackage('requirer/pkg');
-        self::configureLinks($requirer, ['require-dev' => ['required/a' => '*']]);
-        yield 'require-dev works if called with it enabled' => [$pkgs, $requirer, ['a'], true];
+    public function doCompare(): void
+    {
+        $source = [];
+        $destination = [];
+        $this->changed = [];
+        $currentDirectory = Platform::getCwd();
+        chdir($this->source);
+        $source = $this->doTree('.', $source);
+        if (!is_array($source)) {
+            return;
+        }
+        chdir($currentDirectory);
+        chdir($this->update);
+        $destination = $this->doTree('.', $destination);
+        if (!is_array($destination)) {
+            exit;
+        }
+        chdir($currentDirectory);
+        foreach ($source as $dir => $value) {
+            foreach ($value as $file => $hash) {
+                if (isset($destination[$dir][$file])) {
+                    if ($hash !== $destination[$dir][$file]) {
+                        $this->changed['changed'][] = $dir.'/'.$file;
+                    }
+                } else {
+                    $this->changed['removed'][] = $dir.'/'.$file;
+                }
+            }
+        }
+        foreach ($destination as $dir => $value) {
+            foreach ($value as $file => $hash) {
+                if (!isset($source[$dir][$file])) {
+                    $this->changed['added'][] = $dir.'/'.$file;
+                }
+            }
+        }
+    }
 
-        $requirer = self::getPackage('requirer/pkg');
-        self::configureLinks($requirer, ['require' => ['required/a' => '*']]);
-        yield 'simple require' => [$pkgs, $requirer, ['a']];
+    /**
+     * @param mixed[] $array
+     *
+     * @return array<string, array<string, string|false>>|false
+     */
+    private function doTree(string $dir, array &$array)
+    {
+        if ($dh = opendir($dir)) {
+            while ($file = readdir($dh)) {
+                if ($file !== '.' && $file !== '..') {
+                    if (is_link($dir.'/'.$file)) {
+                        $array[$dir][$file] = readlink($dir.'/'.$file);
+                    } elseif (is_dir($dir.'/'.$file)) {
+                        if (!count($array)) {
+                            $array[0] = 'Temp';
+                        }
+                        if (!$this->doTree($dir.'/'.$file, $array)) {
+                            return false;
+                        }
+                    } elseif (is_file($dir.'/'.$file) && filesize($dir.'/'.$file)) {
+                        $array[$dir][$file] = md5_file($dir.'/'.$file);
+                    }
+                }
+            }
+            if (count($array) > 1 && isset($array['0'])) {
+                unset($array['0']);
+            }
 
-        $requirer = self::getPackage('requirer/pkg');
-        self::configureLinks($requirer, ['require' => ['required/a' => 'dev-lala']]);
-        yield 'require constraint is irrelevant' => [$pkgs, $requirer, ['a']];
+            return $array;
+        }
 
-        $requirer = self::getPackage('requirer/pkg');
-        self::configureLinks($requirer, ['require' => ['required/b' => '*']]);
-        yield 'require transitive deps and aliases are included' => [$pkgs, $requirer, ['b', 'c', 'c-alias']];
-
-        $requirer = self::getPackage('requirer/pkg');
-        self::configureLinks($requirer, ['require' => ['required/circular' => '*']]);
-        yield 'circular deps are no problem' => [$pkgs, $requirer, ['circular', 'circular-b']];
+        return false;
     }
 }

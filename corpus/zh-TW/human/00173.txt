@@ -1,90 +1,66 @@
-類似的題目也曾出現在中國的 CTF，像是這篇就有寫到：[PHP无参数RCE](https://xz.aliyun.com/t/9360)
+先幫大家再做個背景說明，我們這些靜態檔案都是放在 Amazon S3，然後前面再掛 Cloudfront，我們已經有乖乖按照 [Amazon 的指示](https://docs.aws.amazon.com/AmazonS3/latest/dev/cors.html)加上該加的東西，所以只要 request header 有 origin，response 就一定會有 CORS 的 header，所以一定不會發生這個錯誤。
 
-而 Culinary Class Room 的解法是找到一個 list，往裡面 push 很多數字，最後轉成 bytes 然後丟到 eval 裡面去執行。
+而 SW 在快取檔案的時候是用 fetch，所以也一定會加上 origin 這個 header，沒理由出問題。
 
-舉例來說，底下的程式碼會 push 112 這個數字到 `copyright._Printer__filenames`：
+大概卡了一兩個小時還是還無頭緒，於是我決定看一下 network 的 tab，發現了更多線索：
 
-``` py
-@copyright._Printer__filenames.append
-@memoryview.__basicsize__.__sub__
-@staticmethod.__basicsize__.__mul__
-@object.__instancecheck__
-class a:pass
-```
+下面這一張是從 SW 裡面發出的 request，header 裡面確實有 origin，可是 response 卻沒有 `Access-Control-Allow-Origin`！
+![sw-r1](https://user-images.githubusercontent.com/2755720/49351843-382f2d80-f6f0-11e8-964e-faeb9e786ff7.png)
 
-當初看到這題以後，我就想說有沒有可能弄一個 JavaScript 的版本？於是 Math jail 就誕生了。
+除此之外，發現更早以前也有一個相同的 request，因為這個 request 是由 `<script>` 發出的，所以不會帶上 origin，因此 response 也就沒有 CORS 的 header。
+![sw-r2](https://user-images.githubusercontent.com/2755720/49351854-44b38600-f6f0-11e8-8a11-b8b63248c8a8.png)
 
-原本其實沒有限制一定要由 `Math.` 開頭，但後來發現這樣做比較有趣，而且如果不這樣做的話，直接 `alert(document.domain.toString())` 就結束了，要過濾掉很多關鍵字才能封住，而且還可能會有 unintended。
+而這邊值得注意的事情是，第二個 response 是 from disk cache（雖然上面兩個都是，但那是因為我截圖的時候東西沒清空，事實上應該只有第二個是）
+![sw-tab](https://user-images.githubusercontent.com/2755720/49351857-4715e000-f6f0-11e8-8a25-f597a0aa6ab3.png)
 
-接下來就講一下 Math jail 解法大概的思路是什麼。
+查線索查到這裡，大概有點頭緒了。
 
-<!-- more -->
+# 深入追查
 
-## 解法的整體概念
+好，讓我先來解釋一下。
 
-概念就跟前面提到的 Python 版本一樣，找一個 list 然後 push 東西進去，最後 join 然後拿去給 eval 執行，大概會像這樣：
+SW 所要快取的那個檔案是頁面會載入的其中一個 JavaScript，而因為頁面會載入，所以在 HTML 裡面我們放了一個 `<script>` 的 tag 來載入這個檔案，從上面的圖片看起來，瀏覽器先載入了這個 JavaScript 檔案，然後因為這個檔案不是用 ajax 發出，所以沒有 origin，根據 S3 的規定，也就自然沒有 `Access-Control-Allow-Origin`。
 
-``` js
-var arr = []
-eval(arr.join(''.toString(arr.push('a'.toString()))))
-// Uncaught ReferenceError: a is not defined
-```
+再來呢，SW 註冊成功，開始執行裡面的程式碼把我們預先準備好的清單給快取住，其中一個就是這個 JavaScript 的檔案，但是當我們用 fetch 來抓這個檔案時，瀏覽器直接用了快取住的前一個的 response（因為 URL、method 都一樣），而這個 response 是沒有 `Access-Control-Allow-Origin` 的！因此就跳出了我們最前面看到的跨網域的錯誤。
 
-上面的程式碼最後會執行 `a`，只要照著這個概念繼續做，就可以拼出 `alert()`，簡單舉個例子像是這樣：
+到這邊真相大白了，都是瀏覽器快取的問題。
 
-``` js
-var arr = ['a','l','e','r']
-eval(
-  arr.join(
-    ''.toString(
-        arr.push(
-          ')'.toString(
-            arr.push(
-              '('.toString(
-                arr.push('t'.toString())
-              )
-            )
-          )
-        )
-      )
-  )
-)
-```
+那為什麼我之前自己測都測不出來呢？因為身為一個前端工程師，devtool 有把「Disable cache」打勾是很合情合理的事，所以我怎麼試都試不出來這個問題。
 
-因為我們每一個 function call 都不能有參數，所以像是 `arr.join('')` 這種的，可以改成 `arr.join(''.toString())`，就能夠符合規則。
+知道問題的成因之後就比較簡單了，拜了 Google 大神查到了這一篇 Chromium 的 ticket：[CORS Preflight Cache Does not Consider Origin](https://bugs.chromium.org/p/chromium/issues/detail?id=260239)
 
-有了這個基本概念以後，接下來的問題就可以分成幾個部分：
+裡面碰到的問題基本上跟我碰到的差不多，最後給的解法是 response 加上一個 `Vary: Origin`，讓瀏覽器知道如果 Origin 不一樣的話就不要用快取，可是我發現我們早就加了但不知道為什麼沒用。
 
-1. 怎麼找到一個可以用的陣列？
-2. 怎麼找到想要的字元？
-3. 怎麼 join？
-4. 怎麼不用 eval 來執行？
+除此之外也找到幾個類似的問題：
 
-## 1. 找到陣列
+1. [Chrome S3 Cloudfront: No 'Access-Control-Allow-Origin' header on initial XHR request](https://serverfault.com/questions/856904/chrome-s3-cloudfront-no-access-control-allow-origin-header-on-initial-xhr-req)
+2. [S3 CORS, always send Vary: Origin](https://stackoverflow.com/questions/31732533/s3-cors-always-send-vary-origin)
 
-在題目中有特別給了一個陣列 `Math.seeds`，我們只要先 pop 就可以把它清空，像是這樣：
+後來採用裡面其中一個的解法：「既然 S3 要有 origin header 才能開啟 CORS，那就用 Cloudfront 傳一個固定的 origin 給它吧！這樣每個 response 都一定會有 `Access-Control-Allow-Origin` 了！」
 
-``` js
-Math.seeds = [1,2,3,4]
-Math.seeds.pop(Math.seeds.pop(Math.seeds.pop(Math.seeds.pop())))
-console.log(Math.seeds) // []
-```
+可以參考這篇：[AWS CloudFront + S3 + Allow all CORS](http://strd6.com/2017/05/aws-cloudfront-s3-allow-all-cors/)，基本上就是調一個設定而已。
 
-如此一來，我們就有一個可以放東西的陣列能夠使用。
+這招聽起來滿有效的，但其實不是最好的解法，感覺有點骯髒，畢竟 origin 這東西不是這樣用的，為了 S3 的機制硬要這樣做總覺得不是太好。
 
-## 2. 找到想要的字元
+於是最後我就想到一個東西，同時也解決了心中的一個疑惑。
 
-首先，我們可以看看我們想要的字元是否存在於 `Math` 當中，例如說 `Math.abs.name` 就可以拿到 `"abs"` 這個字元，搭配 `at` 來使用的話，`Math.abs.name.at()` 就會是 `"a"`。
+那就是在`<script>`加上 `crossorigin="anonymous"`，讓`<script>`發出去的 request 也有 origin header！
 
-所以呢，`Math.seeds.push(Math.abs.name.at())`，就可以讓 `Math.seeds` 的內容變成 `["a"]`。
+我以前就看到某些地方會加這個，但始終不懂為什麼要加，因為 script 本來就可以不限制網域，為什麼還要特地加一個 tag 讓它變成像 ajax 那樣的 request？
 
-而 `Arrar.prototype.push` 的回傳值會是陣列的長度，因此目前是 1，所以如果能找到某個函式的第二個字是 l，就能減少函式呼叫的次數，是最好的方法。
+但沒想到我居然被這個屬性幫助到了，一旦我加了這個，那 script 的載入就會附上 Origin，S3 就會回傳 `Access-Control-Allow-Origin`，也就不會碰到之後的跨網域問題了！
 
-講到這裡，你應該已經意識到這一題如果用手動的方式大概會累死，自動化會是更好的方式，因此就來寫個函式吧！
+至於這個屬性其他的功用，可參考：[Purpose of the crossorigin attribute …?](https://stackoverflow.com/questions/18336789/purpose-of-the-crossorigin-attribute)
 
-我們可以用遞迴的方式去尋找能接觸到的物件的每一個屬性是否符合我們想要的規則，並且回傳路徑是什麼，實作如下：
+# 總結
 
-``` js
-function findTargetFromScope(scope, matchFn, initPath='') {
-  let visited = new Set()
-  let result = []
+要碰到我所碰到的這個問題，你必須同時滿足下面四個條件：
+
+1. 你把靜態檔案放在 S3 上面
+2. 你沒有勾選瀏覽器的 Disable cache
+3. 你用 script 跟 SW 載入同一個檔案
+4. 瀏覽器用快取的 script 的 response 回應 SW 的請求
+
+只要任何一個條件沒有滿足，就不會碰到這問題。換句話說，要踩到這個坑其實也挺困難的。
+
+但坑踩的越多就越強，解決了一個問題就代表你未來會碰到的問題又少了一個。解決掉這個 CORS 相關的問題，我想我以後應該不會再碰到相關的問題了...吧。

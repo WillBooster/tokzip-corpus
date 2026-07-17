@@ -1,0 +1,58 @@
+#### 多线程和多所有权
+
+在第 15 章中，我们用智能指针 `Rc<T>` 来创建引用计数，使得一个值有了多个所有者。让我们做同样的事，看看会发生什么。将示例 16-14 中的 `Mutex<T>` 封装进 `Rc<T>` 中，并在将所有权移入线程之前克隆（clone）`Rc<T>`。
+
+<span class="filename">文件名：src/main.rs</span>
+
+```rust,ignore,does_not_compile
+{{#rustdoc_include ../listings/ch16-fearless-concurrency/listing-16-14/src/main.rs}}
+```
+
+<span class="caption">示例 16-14: 尝试使用 `Rc<T>` 来允许多个线程拥有 `Mutex<T>`</span>
+
+再一次编译并...出现了不同的错误！编译器真是教会了我们很多！
+
+```console
+{{#include ../listings/ch16-fearless-concurrency/listing-16-14/output.txt}}
+```
+
+哇哦，错误信息太长不看！下面是重点要关注的内容：`` `Rc<Mutex<i32>>` cannot be sent between threads safely ``。编译器也指出了原因：`` the trait `Send` is not implemented for `Rc<Mutex<i32>>` ``。下一节我们会讲到 `Send`：这是一个确保所使用的类型可以用于并发环境的 trait。
+
+不幸的是，`Rc<T>` 并不能安全的在线程间共享。当 `Rc<T>` 管理引用计数时，它必须在每一个 `clone` 调用时增加计数，并在每一个克隆体被丢弃时减少计数。`Rc<T>` 并没有使用任何并发原语，无法确保改变计数的操作不会被其他线程打断。这可能使计数出错，并导致诡异的 bug，比如可能会造成内存泄漏，或在使用结束之前就丢弃一个值。我们所需要的是一个与 `Rc<T>` 完全一致，又以线程安全的方式改变引用计数的类型。
+
+#### 原子引用计数 `Arc<T>`
+
+所幸 `Arc<T>` 正是这么一个类似 `Rc<T>` 并可以安全地用于并发环境的类型。字母 _a_ 代表 **原子性**（_atomic_），所以这是一个**原子引用计数**（_atomically reference counted_）类型。**原子类型** (Atomics) 是另一类这里还未涉及到的并发原语：请查看标准库中 [`std::sync::atomic`][atomic] 的文档来获取更多细节。目前我们只需要知道：原子类型就像基本类型一样，可以安全地在线程间共享。
+
+你可能会好奇，为什么不是所有的基本类型都是原子性的？为什么标准库中的类型没有全部默认使用 `Arc<T>` 实现？原因在于，线程安全会造成性能损失，我们希望只在必要时才为此买单。如果只是在单线程中对值进行操作，不必强制原子性所提供的保证可以使代码运行得更快。
+
+
+回到之前的例子：`Arc<T>` 和 `Rc<T>` 有着相同的 API，所以我们只需修改程序中的 `use` 行、`new` 调用和 `clone` 调用。示例 16-15 中的代码最终可以编译并运行。
+
+<span class="filename">文件名：src/main.rs</span>
+
+```rust
+{{#rustdoc_include ../listings/ch16-fearless-concurrency/listing-16-15/src/main.rs}}
+```
+
+<span class="caption">示例 16-15: 使用 `Arc<T>` 包装一个 `Mutex<T>` 能够实现在多线程之间共享所有权</span>
+
+这段代码会打印出如下：
+
+```text
+Result: 10
+```
+
+成功了！我们从 0 数到了 10，这好像没啥大不了的，不过一路上我们确实学习了很多关于 `Mutex<T>` 和线程安全的知识！这个例子中构建的结构可以用于比增加计数更为复杂的操作。使用这个策略，我们可将计算任务分成独立的部分，并分散到多个线程中，接着使用 `Mutex<T>` 使用各自的运算结果来更新最终的结果。
+
+注意，对于简单的数值运算，[标准库中 `std::sync::atomic` 模块][atomic] 提供了比 `Mutex<T>` 更简单的类型。针对基本类型，这些类型提供了安全、并发、原子的操作。在上面的例子中，为了专注于讲明白 `Mutex<T>` 的用法，我们才选择在基本类型上使用 `Mutex<T>`。（译注：对于上面例子中出现的 `i32` 加法操作，更好的做法是使用 `AtomicI32` 类型来完成。具体参考文档。）
+
+### 比较 `RefCell<T>`/`Rc<T>` 和 `Mutex<T>`/`Arc<T>`
+
+你可能注意到了，尽管 `counter` 是不可变的，我们仍然可以获取其内部值的可变引用；这意味着 `Mutex<T>` 提供了内部可变性，就像 `Cell` 系列类型那样。使用 `RefCell<T>` 可以改变 `Rc<T>` 中内容（在 15 章中讲到过），同样地，使用 `Mutex<T>` 我们也可以改变 `Arc<T>` 中的内容。
+
+另一个值得注意的细节是，Rust 不能完全避免使用 `Mutex<T>` 所带来的逻辑错误。回忆一下，第 15 章中讲过，使用 `Rc<T>` 就有造成引用循环的风险：两个 `Rc<T>` 值相互引用，造成内存泄漏。同理，`Mutex<T>` 也有造成**死锁**（_deadlock_）的风险：当某个操作需要锁住两个资源，而两个线程分别持有两个资源的其中一个锁时，它们会永远相互等待。如果你对这个话题感兴趣，尝试编写一个带有死锁的 Rust 程序，接着研究其它语言中使用互斥器的死锁规避策略，并尝试在 Rust 中实现它们。标准库中 `Mutex<T>` 和 `MutexGuard` 的 API 文档会提供有用的信息。
+
+作为本章的最后，我们将讨论 `Send` 和 `Sync` trait，以及如何将它们用于自定义类型。
+
+[atomic]: https://doc.rust-lang.org/std/sync/atomic/index.html

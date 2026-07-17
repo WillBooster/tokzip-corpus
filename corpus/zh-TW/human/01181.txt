@@ -1,247 +1,194 @@
-``` C
-// PhaseType
-const unsigned short      CAPTURING_PHASE                = 1;
-const unsigned short      AT_TARGET                      = 2;
-const unsigned short      BUBBLING_PHASE                 = 3;
-```
+But in the end, when the fade-in transition disappeared, it meant that when it appeared on the screen, `open` should be 1, otherwise we wouldn't see this result.
 
-These three stages are the focus of our discussion today.
-
-When the DOM event propagates, it starts from the root node and goes down to the `target`. If you add an event here, it will be in the `CAPTURING_PHASE`, the capturing phase.
-
-`target` is the target you clicked on. At this time, the `eventListenr` added to `target` will be `AT_TARGET` phase.
-
-Finally, the event is propagated back up from the child node to the root node, and this is called the `BUBBLING_PHASE`, which is also the more familiar bubbling phase.
-
-You may find it confusing to understand the text, so I'll directly quote a [w3c diagram about event flow](https://www.w3.org/TR/DOM-Level-3-Events/#event-flow), which should make it clear for everyone.
-
-![](/img/dom-event-capture-and-propagation/eventflow.png)
-
-When you click on a `td`, the click event will start from the `window` and propagate down to the `td`, which is called the `CAPTURING_PHASE`. 
-
-Then the event is dispatched to the `td` itself, which is called the `AT_TARGET`.
-
-Finally, the event bubbles up from the `td` to the `window`, which is called the `BUBBLING_PHASE`.
-
-Therefore, when reading articles about event mechanisms, you will often see a slogan:
-
-> Capture first, bubble later.
-
-That's how it works.
-
-But how do I decide whether to listen to this event in the capturing phase or the bubbling phase?
-
-Actually, we still use the familiar `addEventListener`, but this function actually has a third parameter. `true` means adding this listener to the capturing phase, `false` or not passing it means adding this listener to the bubbling phase.
-
-# Practice
-
-After understanding the event propagation mechanism, let's take the simple example we wrote above to demonstrate it. First, let's attach the event to each element in each phase and see if the result is the same as expected:
+After debugging for a while without any clues, I began to suspect that it might be due to some asynchronous or React rendering mechanism that caused `open` to be true during the first render. So I added an rAF to delay the `open` attribute from becoming true:
 
 ``` js
-const get = (id) => document.getElementById(id);
-const $list = get('list');
-const $list_item = get('list_item');
-const $list_item_link = get('list_item_link');
-  
-// list capturing
-$list.addEventListener('click', (e) => {
-  console.log('list capturing', e.eventPhase);
-}, true)
-  
-// list bubbling
-$list.addEventListener('click', (e) => {
-  console.log('list bubbling', e.eventPhase);
-}, false)
-  
-// list_item capturing
-$list_item.addEventListener('click', (e) => {
-  console.log('list_item capturing', e.eventPhase);
-}, true)
-  
-// list_item bubbling
-$list_item.addEventListener('click', (e) => {
-  console.log('list_item bubbling', e.eventPhase);
-}, false)
-  
-// list_item_link capturing
-$list_item_link.addEventListener('click', (e) => {
-  console.log('list_item_link capturing', e.eventPhase);
-}, true)
-  
-// list_item_link bubbling
-$list_item_link.addEventListener('click', (e) => {
-  console.log('list_item_link bubbling', e.eventPhase);
-}, false)
+export function AutoHideSnackbar({ children, onClose }) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    // 原本是直接 setOpen(true)，我包了 rAF 在外面
+    window.requestAnimationFrame(() => setOpen(true));
+    const timer = setTimeout(() => {
+      setOpen(false);
+    }, duration);
+
+    const timer2 = setTimeout(() => {
+      onClose();
+    }, duration + transitionDuration);
+    return () => {
+      clearTimeout(timer);
+      clearTimeout(timer2);
+    };
+  }, [onClose]);
+  return <Snackbar open={open}>{children}</Snackbar>;
+}
 ```
 
-Click on the hyperlink and the console will output the following results:
+After adding it, I found that there was no problem and I could successfully see the fade-in effect. However, even so, I still didn't know why it happened in the first place.
 
-``` 
-list capturing
-1
-list_item capturing
-1
-list_item_link capturing
-2
-list_item_link bubbling
-2
-list_item bubbling
-3
-list bubbling
-3
-```
+Then I tested it again and found a very serious problem!
 
-1 is `CAPTURING_PHASE`, 2 is `AT_TARGET`, and 3 is `BUBBLING_PHASE`.
+I didn't handle the experimental variables properly. I always thought that it was because of the tricky method I used that caused this problem, so I kept looking in that direction to find the answer and see what was different between the static method and the normal render. However, I ignored the fact that there was another variable in the example above, which was whether to render SVG. When I removed the SVG from the static method example, I found that there was a fade-in effect!
 
-From here, it is clear that the event does propagate from the top to the target, and during this propagation process, we use the third parameter of `addEventListenr` to add the listener to the `CAPTURING_PHASE`.
+Damn it, I spent two or three hours doing nothing but looking in the wrong direction, and it was still because I missed something and didn't define the problem scope properly. After knowing this, the progress became much faster.
 
-Then the event is passed to the hyperlink (`a#list_item_link`) that we clicked on. Here, regardless of whether you use the third parameter of `addEventListener` as `true` or `false`, `e.eventPhase` will become `AT_TARGET`. 
+First, I replaced the `react-inlinesvg` library with a normal `img` tag and found that it still worked properly, and the fade-in effect disappeared when I added the `react-inlinesvg` to the normal render method. Therefore, the reason was almost certain to be caused by the `react-inlinesvg` library.
 
-Finally, it bubbles back from the target, first to the parent `#list_item`, then to the grandparent `#list`.
+But why exactly? I looked at its source code and didn't see anything suspicious. In the absence of other methods, I used the most violent but also the most effective method: "changing the code in node_modules". This is actually similar to my usual debugging method. When you are helpless and have no idea where the problem is, you start deleting code.
 
-# A small trap of capturing and bubbling
+If you delete a section and the problem still exists, it means that the code is not the culprit. If the problem disappears after deleting a certain section of code, you know that it must be related to that section of code, which is a bit like binary search on the code. If you are familiar with the execution process, it is actually quite fast to do, just keep deleting code. However, the trouble with doing this to third-party libraries is that you have to directly modify the code in node_modules, and those codes are transpiled by bable, so the readability is lower, but you can still understand it.
 
-Since it is capturing first and then bubbling, it means that no matter how the order of `addEventListener` changes, the output should still be the same. Let's switch the order of capturing and bubbling and see if the output is still the same.
+After deleting and modifying for a while, I finally found the problematic place here: https://github.com/gilbarbara/react-inlinesvg/blob/v2.1.1/src/index.tsx#L209
+
+When the `SVG` component is mounted, it will call `this.load()` in `componentDidMount`, and `this.load` will call `this.setState()`. After several tests, I found that commenting out `this.setState()` would solve the problem, so I can infer that the problem should be here.
+
+Then I suddenly remembered that I had seen something about what would happen when `setState` was called in `componentDidMount` in the official documentation before, so I Googled "componentDidMount setState" and found many related examples.
+
+To make sure I didn't find the wrong place, I wrote a simple component myself, added `this.setState` in `componentDidMount`, and let the `Snackbar` render it. I did reproduce the same problem, which was that the fade-in effect disappeared.
+
+The code would look like this:
 
 ``` js
-const get = (id) => document.getElementById(id);
-const $list = get('list');
-const $list_item = get('list_item');
-const $list_item_link = get('list_item_link');
-  
-// list bubbling
-$list.addEventListener('click', (e) => {
-  console.log('list bubbling', e.eventPhase);
-}, false)
-  
-// list capturing
-$list.addEventListener('click', (e) => {
-  console.log('list capturing', e.eventPhase);
-}, true)
-  
-// list_item bubbling
-$list_item.addEventListener('click', (e) => {
-  console.log('list_item bubbling', e.eventPhase);
-}, false)
-  
-// list_item capturing
-$list_item.addEventListener('click', (e) => {
-  console.log('list_item capturing', e.eventPhase);
-}, true)
-  
-// list_item_link bubbling
-$list_item_link.addEventListener('click', (e) => {
-  console.log('list_item_link bubbling', e.eventPhase);
-}, false)
-  
-// list_item_link capturing
-$list_item_link.addEventListener('click', (e) => {
-  console.log('list_item_link capturing', e.eventPhase);
-}, true)
+class Comp extends React.Component {
+  componentDidMount() {
+    this.setState({
+      a: 1
+    });
+  }
+
+  render() {
+    return <div>hello</div>;
+  }
+}
+
+// render 的時候
+<AutoHideSnackbar onClose={handleClose}>
+    <Comp />
+</AutoHideSnackbar>
 ```
 
-Clicking on the hyperlink will output:
+After going through many difficulties, the cause of the problem was finally found, which was that calling `setState` in `componentDidMount` would cause some unexpected consequences.
 
-```
-list capturing
-1
-list_item capturing
-1
-list_item_link bubbling
-2
-list_item_link capturing
-2
-list_item bubbling
-3
-list bubbling
-3
-```
+But what exactly are these unexpected consequences?
 
-It can be seen that something magical happened, which is that the listener added in the bubbling phase was executed before the listener added in the capturing phase.
+## Check the official documentation
 
-Why is this?
+Just by using the very straightforward keywords "componentdidmount setstate", you can find a lot of information, such as what I have seen before: [Some Good Habits for Writing React - Lifecycle Method and State Management](https://medium.com/@as790726/%E4%B8%80%E4%BA%9B%E8%87%AA%E5%B7%B1%E5%AF%AB-react-%E7%9A%84%E5%A5%BD%E7%BF%92%E6%85%A3-lifecycle-method-%E8%B7%9F-state-%E7%AE%A1%E7%90%86-b37a12da968b), or the main topic of this article: [Official Documentation](https://reactjs.org/docs/react-component.html#componentdidmount).
 
-In fact, as mentioned earlier, when the event is passed to the actual target, which is `e.target`, regardless of whether you use the third parameter of `addEventListener` as `true` or `false`, `e.eventPhase` will become `AT_TARGET`.
+The content of the file is written as follows:
 
-Since it has become `AT_TARGET` here, there is no distinction between capturing and bubbling, so the execution order will be determined by the order in which you added the `addEventListener`, with the first added being executed first and the last added being executed last.
+> You may call setState() immediately in componentDidMount(). It will trigger an extra rendering, but it will happen before the browser updates the screen. This guarantees that even though the render() will be called twice in this case, the user won’t see the intermediate state.
 
-Therefore, this is why when we switched the order of capturing and bubbling, `list_item_link bubbling` appeared first.
+If you call setState synchronously in componentDidMount, it will immediately trigger a second render, and it will happen before the browser updates the screen. Therefore, the user won't see the result of the first render, only the second one.
 
-Regarding the order of event propagation, just remember two principles:
+This explains why our fade-in feature is broken.
 
-1. Capturing first, then bubbling
-2. When the event is passed to the target itself, there is no distinction between capturing and bubbling
-
-[jsbin example code](https://jsbin.com/mogujivera/edit?html,js,console,output)
-
-# Cancel event propagation
-
-Next, what we are going to talk about is that since this event chain is so long, there must be a way to interrupt this chain and stop the event propagation from continuing. And this method should be familiar to everyone, which is: `e.stopPropagation`.
-
-Wherever you add it, the event propagation will stop there and will not continue to propagate downward.
-
-For example, using the example above, if I add a capture phase to `#list`:
+Assuming our code looks like this ([CodeSandbox example](https://codesandbox.io/s/setstate-in-componentdidmount-4ncr8?file=/src/App.js)):
 
 ``` js
-// list 的捕獲
-$list.addEventListener('click', (e) => {
-  console.log('list capturing', e.eventPhase);
-  e.stopPropagation();
-}, true)
+class Comp extends React.Component {
+  componentDidMount() {
+    console.log("Comp componentDidMount");
+    this.setState({
+      a: 1
+    });
+  }
+
+  render() {
+    console.log("Comp render");
+    return <div>hello</div>;
+  }
+}
+
+export function Snackbar({ children, open }) {
+  console.log("Snackbar render:", { open });
+  return (
+    <div
+      style={{
+        background: "black",
+        color: "white",
+        transition: "all 0.3s",
+        opacity: open ? 1 : 0
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+export function AutoHideSnackbar({ children, onClose }) {
+  const [open, setOpen] = useState(false);
+  console.log("AutoHideSnackbar render:", { open });
+  useEffect(() => {
+    console.log("AutoHideSnackbar useEffect");
+    setOpen(true);
+    const timer = setTimeout(() => {
+      setOpen(false);
+    }, duration);
+
+    const timer2 = setTimeout(() => {
+      onClose();
+    }, duration + transitionDuration);
+    return () => {
+      clearTimeout(timer);
+      clearTimeout(timer2);
+    };
+  }, [onClose]);
+  return <Snackbar open={open}>{children}</Snackbar>;
+}
 ```
 
-Then, the console will only output:
+We can determine the execution order by observing the log, which looks like this:
 
-```
-list capturing
-1
-```
+1. AutoHideSnackbar render: {open: false}
+2. Snackbar render: {open: false}
+3. Comp render 
+4. Comp componentDidMount 
+5. AutoHideSnackbar useEffect 
+6. AutoHideSnackbar render: {open: true}
+7. Snackbar render: {open: true}
+8. Comp render 
 
-Because the event propagation is stopped, the remaining listeners will not receive any more events.
+It can be seen that there are a total of two renders. The first one is:
 
-However, there is still one thing to note here.
+1. AutoHideSnackbar render: {open: false}
+2. Snackbar render: {open: false}
+3. Comp render 
+4. Comp componentDidMount 
+5. AutoHideSnackbar useEffect 
 
-The "event propagation is stopped" here means that the event will not be passed to the "next node", but if you have more than one listener on the same node, they will still be executed.
+During the first render, Snackbar's open is false, so the opacity is 0. Then, its children, Comp, are rendered. After rendering, Comp's componentDidMount executes setState. Because it is executed here, according to the documentation, the user won't see the result of the first render.
 
-For example:
+After Comp's didMount, AutoHideSnackbar's useEffect is executed, which sets open to true.
 
-``` js
-// list 的捕獲
-$list.addEventListener('click', (e) => {
-  console.log('list capturing');
-  e.stopPropagation();
-}, true)
-  
-// list 的捕獲 2
-$list.addEventListener('click', (e) => {
-  console.log('list capturing2');
-}, true)
-```
+One thing worth noting here is that React's official website [states](https://reactjs.org/docs/hooks-reference.html#useeffect):
 
-The output is:
+> The function passed to useEffect will run after the render is committed to the screen.
 
-```
-list capturing
-list capturing2
-```
+It seems that "after the render is committed to the screen" is correct in most cases, and useEffect will be executed after the browser updates the screen (`render is committed to the screen` can be understood in this way?). However, if there is a class component below and synchronous setState is performed in componentDidMount, it will not be like this. It cannot be guaranteed that the user has seen the last render when useEffect is executed.
 
-Even though `e.stopPropagation` has been used, the remaining listeners on the same level will still be executed.
+After this is executed, the second render will be executed:
 
-If you want to prevent other listeners on the same level from being executed, you can use `e.stopImmediatePropagation();` instead.
+1. AutoHideSnackbar render: {open: true}
+2. Snackbar render: {open: true}
+3. Comp render 
 
-For example:
+In the second render, the opacity will be 1, and according to the official documentation, the user won't see the result of the first render, so the opacity will be 1 when it first appears on the screen, and the fade-in effect will naturally disappear.
 
-``` js
-// list 的捕獲
-$list.addEventListener('click', (e) => {
-  console.log('list capturing');
-  e.stopImmediatePropagation();
-}, true)
-  
-// list 的捕獲 2
-$list.addEventListener('click', (e) => {
-  console.log('list capturing2');
-}, true)
-```
+## Postscript
 
-The output is:
+Although the above behavior has been explained, I still couldn't figure out one thing at first, that is, since componentDidMount means that something has been placed on the DOM, won't the user always see it? How can you "mount but not let the user see the result"?
+
+Later, I went to Twitter to [ask](https://twitter.com/aszx87410/status/1304234775398416385), and thanks to Chen Guanlin's answer, I directly broke through the blind spot:
+
+> Updating the DOM and updating the screen are two different things. The pixel pipeline waits for all JavaScript to finish running before rendering. For example, if you use a for loop to update the DOM many times, only the final result will be displayed on the screen.
+
+After reading this, I realized that updating the DOM and updating the screen are two different things. Updating the DOM does not mean that the browser will immediately paint the changes. Therefore, it is possible to update the DOM twice in one cycle, and the first result will not be displayed on the screen, only the second one will.
+
+Before encountering these React problems, I always thought that I had a certain level of understanding of React or how the DOM works. However, I was repeatedly struck by the fact that I had overlooked many important parts. Every time I write about it, I feel like saying, "Am I really so unfamiliar with React?".
+
+But there is no other way. Whenever I encounter something I don't know, I learn it. After encountering more problems, I will also know more solutions, and I will gradually understand these operating mechanisms.
+
+The above is the first article of "I don't know React". I spent a morning on it and even went to ask my colleagues. At first, I was always entangled in the problems caused by the static method, and I went in the wrong direction until I suddenly realized that the difference was not there, but in the things rendered.
+
+Once the cause of the problem is correctly identified during debugging, finding a solution is usually not far away, and you will know how to search for keywords. Because this experience also reminded me that when debugging, remember to clean up unrelated things so that you can truly confirm the root cause of the problem.

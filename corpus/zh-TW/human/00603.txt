@@ -1,13 +1,252 @@
----
-title: 'I know you understand hoisting, but how deep do you know?'
-date: 2018-11-10 22:10
-tags: [Front-end,JavaScript]
-categories:
-  - JavaScript
----
+為了因應這個改變，後端又多出了一個 API：`POST /form`，而且這次後端已經很自動地把 `Access-Control-Allow-Origin` 的 header 加上去了：
 
-# Preface
+``` js
+app.post('/form', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*')
+  // 省略寫到 db 的程式碼
+  res.json({
+    success: true
+  })
+})
+```
 
-Supplement on June 9, 2021:
+小明之前已經做過類似的事情，因此很快就把程式碼寫好了：
 
-Thanks to the reader blackr1234 for leaving a comment. This article was published in November 2018, and the output results of the code below are probably based on Node.js v8.17.0, so the output of some situations may be different from now. For example, accessing the let variable before declaration, the result at that time was: `ReferenceError: a is not defined`, and the result using Node.js v14 now is: `ReferenceError: Cannot access 'a' before initialization`.
+``` js
+document.querySelector('.contact-us-form')
+  .addEventListener('submit', (e) => {
+    // 阻止表單送出
+    e.preventDefault()
+
+    // 設置參數
+    var data = new URLSearchParams();
+    data.append('email', 'test@test.com')
+    data.append('source', 'search')
+
+    // 送出 request
+    fetch('http://localhost:3000/form', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: data
+    }).then(res => res.json())
+      .then(res => console.log(res))
+  })
+```
+
+測試之後也沒有問題，正當小明要跟主管報告做好的時候，後端走過來跟小明說：「不好意思，我們後端最近做了一些改動，未來要統一改成用 JSON 當作資料格式，所以你那邊也要改一下，要送 JSON 過來而不是 urlencoded 的資料」
+
+小明聽了之後心想：「這簡單嘛，不就是改一下資料格式嗎？」，於是改成這樣：
+
+``` js
+document.querySelector('.contact-us-form')
+  .addEventListener('submit', (e) => {
+    // 阻止表單送出
+    e.preventDefault()
+
+    // 設置參數
+    var data = {
+      email: 'test@test.com',
+      soruce: 'search'
+    }
+
+    // 送出 request
+    fetch('http://localhost:3000/form', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(data)
+    }).then(res => res.json())
+      .then(res => console.log(res))
+  })
+```
+
+就只是換一下資料格式而已，改成用 JSON 的方式傳資料到後端。改完之後小明再測試了一遍，發現這一次居然掛掉了，而且出現錯誤訊息：
+
+![](/img/cors/story/05-preflight-error.png)
+
+> Access to fetch at 'http://localhost:3000/form' from origin 'null' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource. If an opaque response serves your needs, set the request's mode to 'no-cors' to fetch the resource with CORS disabled.
+
+切到 network tab 去看 request 的狀況，發現除了原本預期的 POST 以外，還多了一個 OPTIONS 的 request：
+
+![](/img/cors/story/06-preflight-tab.png)
+
+小明上網用錯誤訊息給的關鍵字：`preflight request` 找了一下資料，發現 CORS 沒有他想像中的簡單。
+
+原來之前發送的那些請求都叫做「簡單請求」，只要 method 是 GET、POST 或是 HEAD 然後不要帶自訂的 header，Content-Type 也不要超出：`application/x-www-form-urlencoded`、`multipart/form-data` 或是 `text/plain` 這三種，基本上就可以被視為是「簡單請求」（更詳細的定義下一篇會說）。
+
+一開始串 API 的時候沒有碰到錯誤，是因為 Content-Type 是 `application/x-www-form-urlencoded`，所以被視為是簡單請求。後來改成 `application/json` 就不符合簡單請求的定義了，就變成是「非簡單請求」。
+
+那非簡單請求會怎麼樣呢？會多送出一個東西，叫做 preflight request，中文翻作「預檢請求」。這個請求就是小明在 network tab 看到的那個 OPTIONS 的 request，針對這個 request，瀏覽器會幫忙帶上兩個 header：
+
+1. Access-Control-Request-Headers
+2. Access-Control-Request-Method
+
+以剛剛我們看到的 `/form` 的 preflight request 來說，內容是：
+
+1. Access-Control-Request-Headers: content-type
+2. Access-Control-Request-Method: POST
+
+前者會帶上不屬於簡單請求的 header，後者會帶上 HTTP Method，讓後端對前端想送出的 request 有更多的資訊。
+
+如果後端願意放行，就跟之前一樣，回一個 `Access-Control-Allow-Origin` 就好了。知道這點以後，小明馬上請後端同事補了一下，後端程式碼變成：
+
+``` js
+
+app.post('/form', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*')
+  res.json({
+    success: true
+  })
+})
+
+// 多加這個，讓 preflight 通過
+app.options('/form', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*')
+  res.end()
+})
+```
+
+改好以後小明重新試了一下，發現居然還是有錯誤：
+
+> Access to fetch at 'http://localhost:3000/form' from origin 'null' has been blocked by CORS policy: Request header field content-type is not allowed by Access-Control-Allow-Headers in preflight response.
+
+當你的 CORS request 含有自訂的 header 的時候，preflight response 需要明確用 `Access-Control-Allow-Headers` 來表明：「我願意接受這個 header」，瀏覽器才會判斷預檢通過。
+
+而在這個案例中，`content-type` 就屬於自訂 header，所以後端必須明確表示願意接受這個 header：
+
+``` js
+app.options('/form', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*')
+  res.header('Access-Control-Allow-Headers', 'content-type')
+  res.end()
+})
+```
+
+如此一來，小明那邊就可以順利通過 preflight request，只有在通過 preflight 之後，真正的那個 request 才會發出。
+
+流程會像是這樣：
+
+1. 我們要送出 POST 的 request 到 http://localhost:3000/form
+2. 瀏覽器發現是非簡單請求，因此先發出一個 preflight request
+3. 檢查 response，preflight 通過
+4. 送出 POST 的 request 到 http://localhost:3000/form
+
+所以如果 preflight 沒有過，第一個步驟的 request 是不會被送出的。
+
+經歷過一番波折之後，這個改動總算也順利完成了。現在我們可以成功在前端用 AJAX 的方式送出表單資料了。
+
+### Day2 總結
+
+CORS request 分成兩種：簡單請求與非簡單請求，無論是哪一種，後端都需要給 `Access-Control-Allow-Origin` 這個 header。而最大的差別在於非簡單請求在發送正式的 request 之前，會先發送一個 preflight request，如果 preflight 沒有通過，是不會發出正式的 request 的。
+
+針對 preflight request，我們也必須給  `Access-Control-Allow-Origin` 這個 header 才能通過。
+
+除此之外，有些產品可能會想要送一些自訂的 header，例如說`X-App-Version` 好了，帶上目前網站的版本，這樣後端可以做個紀錄：
+
+``` js
+fetch('http://localhost:3000/form', {
+      method: 'POST',
+      headers: {
+        'X-App-Version': "v0.1",
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(data)
+    }).then(res => res.json())
+      .then(res => console.log(res))
+```
+
+當你這樣做以後，後端也必須新增 `Access-Control-Allow-Headers`，才能通過 preflight：
+
+``` js
+app.options('/form', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*')
+  res.header('Access-Control-Allow-Headers', 'X-App-Version, content-type')
+  res.end()
+})
+```
+
+簡單來說，preflight 就是一個驗證機制，確保後端知道前端要送出的 request 是預期的，瀏覽器才會放行。我之前所說的「跨來源請求擋的是 response 而不是 request」，只適用於簡單請求。對於有 preflight 的非簡單請求來說，你真正想送出的 request 確實會被擋下來。
+
+那為什麼會需要 preflight request 呢？這邊可以從兩個角度去思考：
+
+1. 相容性
+2. 安全性
+
+針對第一點，你可能有發現如果一個請求是非簡單請求，那你絕對不可能用 HTML 的 form 元素做出一樣的 request，反之亦然。舉例來說，`<form>` 的 enctype 不支援 `application/json`，所以這個 content type 是非簡單請求；enctype 支援 `multipart/form`，所以這個 content type 屬於簡單請求。
+
+對於那些古老的網站，甚至於是在 XMLHttpRequest 出現之前就存在的網站，他們的後端沒有預期到瀏覽器能夠發出 method 是 `DELETE` 或是 `PATCH` 的 request，也沒有預期到瀏覽器會發出 content-type 是 `application/json` 的 request，因為在那個時代 `<form>` 跟 `<img>` 等等的元素是唯一能發出 request 的方法。
+
+那時候根本沒有 fetch，甚至連 XMLHttpRequest 都沒有。所以為了不讓這些後端接收到預期外的 request，就先發一個 preflight request 出去，古老的後端沒有針對這個 preflight 做處理，因此就不會通過，瀏覽器就不會把真正的 request 給送出去。
+
+這就是我所說的相容性，通過預檢請求，讓早期的網站不受到傷害，不接收到預期外的 request。
+
+而第二點安全性的話，還記得在第一篇問過大家的問題嗎？送出 POST request 刪除文章的那個問題。刪除的 API 一般來說會用 DELETE 這個 HTTP method，如果沒有 preflight request 先擋住的話，瀏覽器就會真的直接送這個 request 出去，就有可能對後端造成未預期的行為（沒有想到瀏覽器會送這個出來）。
+
+所以才需要 preflight request，確保後端知道待會要送的這個 request 是合法的，才把真正的 request 送出去。
+
+## Day3：帶上 Cookie
+
+昨天改的那版受到上層的極力讚賞，主管也請小明跟小華喝了手搖飲來慶祝。只是正當他們開心之時，行銷部門的人跑來了，問說：「為什麼這些 request 都沒有 cookie？我們需要使用者的 cookie 來做分析，請把這些 cookie 帶上」。
+
+此時小明才突然想起來：「對欸，跨來源的請求，預設是不會帶 cookie 的」，查了一下 MDN 之後，發現只要帶：`credentials: 'include'` 應該就行了：
+
+``` js
+fetch('http://localhost:3000/form', {
+  method: 'POST',
+  credentials: 'include', // 新增這個
+  headers: {
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify(data)
+}).then(res => res.json())
+  .then(res => console.log(res))
+```
+
+可是沒想到前端卻出現了錯誤訊息：
+
+![](/img/cors/story/07-cookie-error.png)
+
+> Access to fetch at 'http://localhost:3000/form' from origin 'http://localhost:8080' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: The value of the 'Access-Control-Allow-Origin' header in the response must not be the wildcard '*' when the request's credentials mode is 'include'.
+
+錯誤訊息其實已經解釋得很清楚了，如果要帶上 cookie 的話，那 `Access-Control-Allow-Origin` 不能是 `*`，一定要明確指定 origin。
+
+為什麼會這樣呢？因為如果沒有這個限制的話，那代表任何網站（任何 origin）都可以發 request 到這個 API，並且帶上使用者的 cookie，這樣就會有安全性的問題產生，大概就跟 CSRF 有異曲同工之妙。
+
+所以因為安全性的關係，強制你如果要帶上 cookie，後端一定要明確指定是哪個 origin 有權限。除此之外，後端還要額外帶上 `Access-Control-Allow-Credentials: true` 這個 header。
+
+於是小明再度請小華改一下後端：
+
+``` js
+const VALID_ORIGIN = 'http://localhost:8080'
+app.post('/form', (req, res) => {
+  res.header('Access-Control-Allow-Origin', VALID_ORIGIN) // 明確指定
+  res.header('Access-Control-Allow-Credentials', true) // 新增這個
+  res.json({
+    success: true
+  })
+})
+
+app.options('/form', (req, res) => {
+  res.header('Access-Control-Allow-Origin', VALID_ORIGIN) // 明確指定
+  res.header('Access-Control-Allow-Credentials', true) // 新增這個
+  res.header('Access-Control-Allow-Headers', 'content-type, X-App-Version')
+  res.end()
+})
+```
+
+改完之後的版本明確指定 `http://localhost:8080` 才有權限存取 CORS Response，也加上了 `Access-Control-Allow-Credentials` 這個 header。
+
+如此一來就大功告成了，在發送 request 的時候可以成功帶上 Cookie，行銷部門那邊的需求也搞定了，耶依。
+
+### Day3 總結
+
+如果你需要在發送 request 的時候帶上 cookie，那必須滿足三個條件：
+
+1. 後端 Response header 有 `Access-Control-Allow-Credentials: true`
+2. 後端 Response header 的 `Access-Control-Allow-Origin` 不能是 `*`，要明確指定
+3. 前端 fetch 加上 `credentials: 'include'`
+
+這三個條件任何一個不滿足的話，都是沒辦法帶上 cookie 的。

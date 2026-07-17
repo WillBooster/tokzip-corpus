@@ -1,209 +1,448 @@
-// Copyright (c) Microsoft. All rights reserved. Licensed under the Apache License, Version 2.0. 
-// See LICENSE.txt in the project root for complete license information.
+import * as ts from "../../_namespaces/ts.js";
+import { jsonToReadableText } from "../helpers.js";
+import {
+    baselineTsserverLogs,
+    closeFilesForSession,
+    openFilesForSession,
+    TestSession,
+} from "../helpers/tsserver.js";
+import {
+    createServerHost,
+    File,
+} from "../helpers/virtualFileSystemWithWatch.js";
 
-///<reference path='typescript.ts' />
+const angularFormsDts: File = {
+    path: "/node_modules/@angular/forms/forms.d.ts",
+    content: "export declare class PatternValidator {}",
+};
+const angularFormsPackageJson: File = {
+    path: "/node_modules/@angular/forms/package.json",
+    content: `{ "name": "@angular/forms", "typings": "./forms.d.ts" }`,
+};
+const angularCoreDts: File = {
+    path: "/node_modules/@angular/core/core.d.ts",
+    content: "",
+};
+const angularCorePackageJson: File = {
+    path: "/node_modules/@angular/core/package.json",
+    content: `{ "name": "@angular/core", "typings": "./core.d.ts" }`,
+};
+const tsconfig: File = {
+    path: "/tsconfig.json",
+    content: `{ "compilerOptions": { "module": "commonjs" } }`,
+};
+const packageJson: File = {
+    path: "/package.json",
+    content: `{ "dependencies": { "@angular/forms": "*", "@angular/core": "*" } }`,
+};
+const indexTs: File = {
+    path: "/index.ts",
+    content: "",
+};
 
-module TypeScript {
-    export class Binder {
-        constructor (public checker: TypeChecker) { }
-        public resolveBaseTypeLinks(typeLinks: TypeLink[], scope: SymbolScope) {
-            var extendsList: Type[] = null;
-            if (typeLinks) {
-                extendsList = new Type[];
-                for (var i = 0, len = typeLinks.length; i < len; i++) {
-                    var typeLink = typeLinks[i];
-                    this.checker.resolvingBases = true;
-                    this.checker.resolveTypeLink(scope, typeLink, true);
-                    this.checker.resolvingBases = false;
-                    if (typeLink.type.isClass()) {
-                        extendsList[i] = typeLink.type.instanceType;
-                    }
-                    else {
-                        extendsList[i] = typeLink.type;
-                    }
-                }
-            }
-            return extendsList;
+describe("unittests:: tsserver:: autoImportProvider", () => {
+    it("Auto import provider program is not created without dependencies listed in package.json", () => {
+        const { session } = setup([
+            angularFormsDts,
+            angularFormsPackageJson,
+            tsconfig,
+            { path: packageJson.path, content: `{ "dependencies": {} }` },
+            indexTs,
+        ]);
+        openFilesForSession([indexTs], session);
+        assert.isUndefined(session.getProjectService().configuredProjects.get(tsconfig.path)!.getLanguageService().getAutoImportProvider());
+        session.host.baselineHost("After getAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "without dependencies listed", session);
+    });
+
+    it("Auto import provider program is not created if dependencies are already in main program", () => {
+        const { session } = setup([
+            angularFormsDts,
+            angularFormsPackageJson,
+            tsconfig,
+            packageJson,
+            { path: indexTs.path, content: "import '@angular/forms';" },
+        ]);
+        openFilesForSession([indexTs], session);
+        assert.isUndefined(session.getProjectService().configuredProjects.get(tsconfig.path)!.getLanguageService().getAutoImportProvider());
+        session.host.baselineHost("After getAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "dependencies are already in main program", session);
+    });
+
+    it("Auto-import program is not created for projects already inside node_modules", () => {
+        // Simulate browsing typings files inside node_modules: no point creating auto import program
+        // for the InferredProject that gets created in there.
+        const { session } = setup([
+            angularFormsDts,
+            { path: angularFormsPackageJson.path, content: `{ "dependencies": { "@angular/core": "*" } }` },
+            { path: "/node_modules/@angular/core/package.json", content: `{ "typings": "./core.d.ts" }` },
+            { path: "/node_modules/@angular/core/core.d.ts", content: `export namespace angular {};` },
+        ]);
+
+        openFilesForSession([angularFormsDts], session);
+        assert.isUndefined(
+            session.getProjectService()
+                .getDefaultProjectForFile(angularFormsDts.path as ts.server.NormalizedPath, /*ensureProject*/ true)!
+                .getLanguageService()
+                .getAutoImportProvider(),
+        );
+        session.host.baselineHost("After getAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "projects already inside node_modules", session);
+    });
+
+    it("Auto-importable file is in inferred project until imported", () => {
+        const { session, updateFile } = setup([angularFormsDts, angularFormsPackageJson, tsconfig, packageJson, indexTs]);
+        openFilesForSession([angularFormsDts], session);
+        updateFile(indexTs.path, "import '@angular/forms'");
+        assert.isUndefined(session.getProjectService().configuredProjects.get(tsconfig.path)!.getLanguageService().getAutoImportProvider());
+        session.host.baselineHost("After getAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "Auto-importable file is in inferred project until imported", session);
+    });
+
+    it("Responds to package.json changes", () => {
+        const { session, host } = setup([
+            angularFormsDts,
+            angularFormsPackageJson,
+            tsconfig,
+            { path: "/package.json", content: "{}" },
+            indexTs,
+        ]);
+
+        openFilesForSession([indexTs], session);
+        assert.isUndefined(session.getProjectService().configuredProjects.get(tsconfig.path)!.getLanguageService().getAutoImportProvider());
+        session.host.baselineHost("After getAutoImportProvider");
+
+        host.writeFile(packageJson.path, packageJson.content);
+        session.host.baselineHost("Before getAutoImportProvider");
+        assert.ok(session.getProjectService().configuredProjects.get(tsconfig.path)!.getLanguageService().getAutoImportProvider());
+        session.host.baselineHost("After getAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "Responds to package_json changes", session);
+    });
+
+    it("Reuses autoImportProvider when program structure is unchanged", () => {
+        const { session, updateFile } = setup([
+            angularFormsDts,
+            angularFormsPackageJson,
+            tsconfig,
+            packageJson,
+            indexTs,
+        ]);
+
+        openFilesForSession([indexTs], session);
+        const autoImportProvider = session.getProjectService().configuredProjects.get(tsconfig.path)!.getLanguageService().getAutoImportProvider();
+        assert.ok(autoImportProvider);
+        session.host.baselineHost("After getAutoImportProvider");
+
+        updateFile(indexTs.path, "console.log(0)");
+        assert.strictEqual(
+            session.getProjectService().configuredProjects.get(tsconfig.path)!.getLanguageService().getAutoImportProvider(),
+            autoImportProvider,
+        );
+        session.host.baselineHost("After getAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "Reuses autoImportProvider when program structure is unchanged", session);
+    });
+
+    it("Closes AutoImportProviderProject when host project closes", () => {
+        const { session } = setup([
+            angularFormsDts,
+            angularFormsPackageJson,
+            tsconfig,
+            packageJson,
+            indexTs,
+        ]);
+
+        openFilesForSession([indexTs], session);
+        const hostProject = session.getProjectService().configuredProjects.get(tsconfig.path)!;
+        hostProject.getPackageJsonAutoImportProvider();
+        const autoImportProviderProject = hostProject.autoImportProviderHost;
+        assert.ok(autoImportProviderProject);
+        session.host.baselineHost("After getPackageJsonAutoImportProvider");
+
+        closeFilesForSession([indexTs], session);
+        openFilesForSession([{ file: "/random/random.ts", content: "export const y = 10;", projectRootPath: "/random" }], session);
+        assert.isTrue(hostProject.isClosed());
+        assert.ok(autoImportProviderProject && autoImportProviderProject.isClosed());
+        assert.isUndefined(hostProject.autoImportProviderHost);
+        baselineTsserverLogs("autoImportProvider", "Closes AutoImportProviderProject when host project closes", session);
+    });
+
+    it("Does not schedule ensureProjectForOpenFiles on AutoImportProviderProject creation", () => {
+        const { session, host } = setup([
+            angularFormsDts,
+            angularFormsPackageJson,
+            tsconfig,
+            indexTs,
+        ]);
+
+        // Create configured project only, ensure !session.getProjectService().pendingEnsureProjectForOpenFiles
+        openFilesForSession([indexTs], session);
+        const hostProject = session.getProjectService().configuredProjects.get(tsconfig.path)!;
+        session.getProjectService().delayEnsureProjectForOpenFiles();
+        host.runQueuedTimeoutCallbacks();
+        assert.isFalse(session.getProjectService().pendingEnsureProjectForOpenFiles);
+
+        // Create auto import provider project, ensure still !session.getProjectService().pendingEnsureProjectForOpenFiles
+        host.writeFile(packageJson.path, packageJson.content);
+        session.host.baselineHost("Before getPackageJsonAutoImportProvider");
+        hostProject.getPackageJsonAutoImportProvider();
+        assert.isFalse(session.getProjectService().pendingEnsureProjectForOpenFiles);
+        session.host.baselineHost("After getPackageJsonAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "Does not schedule ensureProjectForOpenFiles on AutoImportProviderProject creation", session);
+    });
+
+    it("Responds to automatic changes in node_modules", () => {
+        const { session, host } = setup([
+            angularFormsDts,
+            angularFormsPackageJson,
+            angularCoreDts,
+            angularCorePackageJson,
+            tsconfig,
+            packageJson,
+            indexTs,
+        ]);
+
+        openFilesForSession([indexTs], session);
+        const project = session.getProjectService().configuredProjects.get(tsconfig.path)!;
+        const completionsBefore = project.getLanguageService().getCompletionsAtPosition(indexTs.path, 0, { includeCompletionsForModuleExports: true });
+        assert.isTrue(completionsBefore?.entries.some(c => c.name === "PatternValidator"));
+        session.host.baselineHost("After completions");
+
+        // Directory watchers only fire for add/remove, not change.
+        // This is ok since a real `npm install` will always trigger add/remove events.
+        host.deleteFile(angularFormsDts.path);
+        host.writeFile(angularFormsDts.path, "");
+
+        session.host.baselineHost("Before getAutoImportProvider");
+        const autoImportProvider = project.getLanguageService().getAutoImportProvider();
+        session.host.baselineHost("After getAutoImportProvider");
+        const completionsAfter = project.getLanguageService().getCompletionsAtPosition(indexTs.path, 0, { includeCompletionsForModuleExports: true });
+        assert.equal(autoImportProvider!.getSourceFile(angularFormsDts.path)!.getText(), "");
+        assert.isFalse(completionsAfter?.entries.some(c => c.name === "PatternValidator"));
+        session.host.baselineHost("After Completions");
+        baselineTsserverLogs("autoImportProvider", "Responds to automatic changes in node_modules", session);
+    });
+
+    it("Responds to manual changes in node_modules", () => {
+        const { session, updateFile } = setup([
+            angularFormsDts,
+            angularFormsPackageJson,
+            angularCoreDts,
+            angularCorePackageJson,
+            tsconfig,
+            packageJson,
+            indexTs,
+        ]);
+
+        openFilesForSession([indexTs, angularFormsDts], session);
+        const project = session.getProjectService().configuredProjects.get(tsconfig.path)!;
+        const completionsBefore = project.getLanguageService().getCompletionsAtPosition(indexTs.path, 0, { includeCompletionsForModuleExports: true });
+        assert.isTrue(completionsBefore?.entries.some(c => c.name === "PatternValidator"));
+
+        updateFile(angularFormsDts.path, "export class ValidatorPattern {}");
+        const completionsAfter = project.getLanguageService().getCompletionsAtPosition(indexTs.path, 0, { includeCompletionsForModuleExports: true });
+        assert.isFalse(completionsAfter?.entries.some(c => c.name === "PatternValidator"));
+        assert.isTrue(completionsAfter?.entries.some(c => c.name === "ValidatorPattern"));
+        baselineTsserverLogs("autoImportProvider", "Responds to manual changes in node_modules", session);
+    });
+
+    it("Recovers from an unparseable package.json", () => {
+        const { session, host } = setup([
+            angularFormsDts,
+            angularFormsPackageJson,
+            tsconfig,
+            { path: packageJson.path, content: "{" },
+            indexTs,
+        ]);
+
+        openFilesForSession([indexTs], session);
+        assert.isUndefined(session.getProjectService().configuredProjects.get(tsconfig.path)!.getLanguageService().getAutoImportProvider());
+        session.host.baselineHost("After getAutoImportProvider");
+
+        host.writeFile(packageJson.path, packageJson.content);
+        session.host.baselineHost("Before getAutoImportProvider");
+        assert.ok(session.getProjectService().configuredProjects.get(tsconfig.path)!.getLanguageService().getAutoImportProvider());
+        session.host.baselineHost("After getAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "Recovers from an unparseable package_json", session);
+    });
+
+    it("Does not create an auto import provider if there are too many dependencies", () => {
+        const createPackage = (i: number): File[] => [
+            { path: `/node_modules/package${i}/package.json`, content: `{ "name": "package${i}" }` },
+            { path: `/node_modules/package${i}/index.d.ts`, content: `` },
+        ];
+
+        const packages = [];
+        for (let i = 0; i < 11; i++) {
+            packages.push(createPackage(i));
         }
 
-        public resolveBases(scope: SymbolScope, type: Type) {
-            type.extendsList = this.resolveBaseTypeLinks(type.extendsTypeLinks, scope);
+        const dependencies = packages.reduce((hash, p) => ({ ...hash, [JSON.parse(p[0].content).name]: "*" }), {});
+        const packageJson: File = { path: "/package.json", content: jsonToReadableText(dependencies) };
+        const { session } = setup([...ts.flatten(packages), indexTs, tsconfig, packageJson]);
 
-            var i = 0, len = type.extendsList.length;
-            var derivedIsClass = type.isClassInstance();
-            for (; i < len; i++) {
-                var baseIsClass = type.extendsList[i].isClassInstance();
-                if (type.extendsList[i] != this.checker.anyType) {
-                    if (derivedIsClass) {
-                        if (!baseIsClass) {
-                            this.checker.errorReporter.simpleErrorFromSym(type.symbol,
-                                                                     "A export class may only extend other classes, " + type.extendsList[i].symbol.fullName() + " is an interface.");
-                        }
-                    }
-                    else {
-                        if (baseIsClass) {
-                            this.checker.errorReporter.simpleErrorFromSym(type.symbol,
-                                                                     "An interface may only extend other interfaces, " + type.extendsList[i].symbol.fullName() + " is a class.");
-                        }
-                    }
-                }
-            }
+        openFilesForSession([indexTs], session);
+        const project = session.getProjectService().configuredProjects.get(tsconfig.path)!;
+        assert.isUndefined(project.getPackageJsonAutoImportProvider());
+        session.host.baselineHost("After getPackageJsonAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "Does not create an auto import provider if there are too many dependencies", session);
+    });
 
-            type.implementsList = this.resolveBaseTypeLinks(type.implementsTypeLinks, scope);
+    it("Shared source files between AutoImportProvider and main program do not cause duplicate entries in export info map", () => {
+        const files = [
+            // node_modules/memfs - AutoImportProvider only
+            { path: "/node_modules/memfs/package.json", content: jsonToReadableText({ name: "memfs", version: "1.0.0", types: "lib/index.d.ts" }) },
+            { path: "/node_modules/memfs/lib/index.d.ts", content: `/// <reference types="node" />\nexport declare class Volume {}` },
 
-            if (type.implementsList) {
-                for (i = 0, len = type.implementsList.length; i < len; i++) {
-                    var iface = type.implementsList[i];
-                    if (iface.isClassInstance()) {
-                        if (derivedIsClass) {
-                            this.checker.errorReporter.simpleErrorFromSym(type.symbol,
-                                                                     "A class may only implement an interface; " + iface.symbol.fullName() + " is a class.");
-                        }
-                    }
-                }
-            }
+            // node_modules/@types/node - AutoImportProvider and main program
+            { path: "/node_modules/@types/node/package.json", content: jsonToReadableText({ name: "@types/node", version: "1.0.0" }) },
+            { path: "/node_modules/@types/node/index.d.ts", content: `export declare class Stats {}` },
+
+            // root
+            { path: "/package.json", content: `{ "dependencies": { "memfs": "*" }, "devDependencies": { "@types/node": "*" } }` },
+            { path: "/tsconfig.json", content: `{ "compilerOptions": { "types": ["node"] }` },
+            { path: "/index.ts", content: `export {};` },
+        ];
+
+        const { session, triggerCompletions } = setup(files);
+        openFilesForSession([files[files.length - 1]], session);
+        const project = session.getProjectService().configuredProjects.get("/tsconfig.json")!;
+        const autoImportProvider = project.getPackageJsonAutoImportProvider()!;
+        assert.isDefined(autoImportProvider);
+        session.host.baselineHost("After getPackageJsonAutoImportProvider");
+
+        // Trigger completions to ensure export info map is populated
+        triggerCompletions("/index.ts", 0, 0);
+        const exportInfoMap = project.getCachedExportInfoMap();
+        const seenSymbolNames = new Set<string>();
+        exportInfoMap.search("/index.ts" as ts.Path, /*preferCapitalized*/ false, ts.returnTrue, (info, symbolName) => {
+            assert.lengthOf(info, 1);
+            seenSymbolNames.add(symbolName);
+        });
+        assert.equal(seenSymbolNames.size, 2);
+        assert.ok(seenSymbolNames.has("Stats"));
+        assert.ok(seenSymbolNames.has("Volume"));
+        baselineTsserverLogs("autoImportProvider", "Shared source files between AutoImportProvider and main program", session);
+    });
+});
+
+describe("unittests:: tsserver:: autoImportProvider - monorepo", () => {
+    it("Does not create auto import providers upon opening projects for find-all-references", () => {
+        const files = [
+            // node_modules
+            angularFormsDts,
+            angularFormsPackageJson,
+
+            // root
+            { path: tsconfig.path, content: `{ "references": [{ "path": "packages/a" }, { "path": "packages/b" }] }` },
+            { path: packageJson.path, content: `{ "private": true }` },
+
+            // packages/a
+            { path: "/packages/a/package.json", content: packageJson.content },
+            { path: "/packages/a/tsconfig.json", content: `{ "compilerOptions": { "composite": true }, "references": [{ "path": "../b" }] }` },
+            { path: "/packages/a/index.ts", content: "import { B } from '../b';" },
+
+            // packages/b
+            { path: "/packages/b/package.json", content: packageJson.content },
+            { path: "/packages/b/tsconfig.json", content: `{ "compilerOptions": { "composite": true } }` },
+            { path: "/packages/b/index.ts", content: `export class B {}` },
+        ];
+
+        const { session, findAllReferences } = setup(files);
+
+        openFilesForSession([files.find(f => f.path === "/packages/b/index.ts")!], session);
+        findAllReferences("/packages/b/index.ts", 1, "export class B".length - 1);
+
+        // Project for A is created - ensure it doesn't have an autoImportProvider
+        assert.isUndefined(session.getProjectService().configuredProjects.get("/packages/a/tsconfig.json")!.getLanguageService().getAutoImportProvider());
+        session.host.baselineHost("After getAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "Does not create auto import providers upon opening projects for find-all-references", session);
+    });
+
+    it("Does not close when root files are redirects that don't actually exist", () => {
+        const files = [
+            // packages/a
+            { path: "/packages/a/package.json", content: `{ "dependencies": { "b": "*" } }` },
+            { path: "/packages/a/tsconfig.json", content: `{ "compilerOptions": { "composite": true }, "references": [{ "path": "./node_modules/b" }] }` },
+            { path: "/packages/a/index.ts", content: "" },
+
+            // packages/b
+            { path: "/packages/a/node_modules/b/package.json", content: `{ "types": "dist/index.d.ts" }` },
+            { path: "/packages/a/node_modules/b/tsconfig.json", content: `{ "compilerOptions": { "composite": true, "outDir": "dist" } }` },
+            { path: "/packages/a/node_modules/b/index.ts", content: `export class B {}` },
+        ];
+
+        const { session } = setup(files);
+        openFilesForSession([files[2]], session);
+        assert.isDefined(session.getProjectService().configuredProjects.get("/packages/a/tsconfig.json")!.getPackageJsonAutoImportProvider());
+        session.host.baselineHost("After getPackageJsonAutoImportProvider");
+        assert.isDefined(session.getProjectService().configuredProjects.get("/packages/a/tsconfig.json")!.getPackageJsonAutoImportProvider());
+        session.host.baselineHost("After getPackageJsonAutoImportProvider");
+        baselineTsserverLogs("autoImportProvider", "Does not close when root files are redirects that dont actually exist", session);
+    });
+
+    it("Can use the same document registry bucket key as main program", () => {
+        for (const option of ts.sourceFileAffectingCompilerOptions) {
+            assert(
+                !ts.hasProperty(ts.server.AutoImportProviderProject.compilerOptionsOverrides, option.name),
+                `'${option.name}' may cause AutoImportProviderProject not to share source files with main program`,
+            );
         }
+    });
+});
 
-        public resolveSignatureGroup(signatureGroup: SignatureGroup, scope: SymbolScope, instanceType: Type) {
-            var supplyVar = !(signatureGroup.hasImplementation);
-            for (var i = 0, len = signatureGroup.signatures.length; i < len; i++) {
-                var signature = signatureGroup.signatures[i];
-                if (instanceType) {
-                    signature.returnType.type = instanceType;
-                }
-                else {
-                    this.checker.resolveTypeLink(scope, signature.returnType, supplyVar);
-                }
-                var paramLen = signature.parameters.length;
-                for (var j = 0; j < paramLen; j++) {
-                    this.bindSymbol(scope, signature.parameters[j]);
-                }
-                if (signature.hasVariableArgList) {
-                    // check that last parameter has an array type
-                    var lastParam = <ParameterSymbol>signature.parameters[paramLen - 1];
-                    lastParam.argsOffset = paramLen - 1;
-                    if (!lastParam.getType().isArray()) {
-                        this.checker.errorReporter.simpleErrorFromSym(lastParam,
-                                                                 "... parameter must have array type");
-                        lastParam.parameter.typeLink.type = this.checker.makeArrayType(lastParam.parameter.typeLink.type);
-                    }
-                }
-            }
-        }
+function setup(files: File[]) {
+    const host = createServerHost(files);
+    const session = new TestSession(host);
+    session.executeCommandSeq<ts.server.protocol.ConfigureRequest>({
+        command: ts.server.protocol.CommandTypes.Configure,
+        arguments: {
+            preferences: {
+                includePackageJsonAutoImports: "auto",
+                includeCompletionsForModuleExports: true,
+            },
+        },
+    });
+    return {
+        host,
+        session,
+        updateFile,
+        findAllReferences,
+        triggerCompletions,
+    };
 
-        public bindType(scope: SymbolScope, type: Type, instanceType: Type): void {
-            if (instanceType) {
-                this.bindType(scope, instanceType, null);
-            }
-            if (type.hasMembers()) {
-                var members = type.members;
-                var ambientMembers = type.ambientMembers;
-                var typeMembers = type.getAllEnclosedTypes(); // REVIEW: Should only be getting exported types?
-                var ambientTypeMembers = type.getAllAmbientEnclosedTypes(); // REVIEW: Should only be getting exported types?
-                var memberScope = new SymbolTableScope(members, ambientMembers, typeMembers, ambientTypeMembers, type.symbol);
-                var agg = new SymbolAggregateScope(type.symbol);
-                var prevCurrentModDecl = this.checker.currentModDecl;
-                var prevBindStatus = this.checker.inBind;
-                agg.addParentScope(memberScope);
-                agg.addParentScope(scope);
-                if (type.isModuleType()) {
-                    this.checker.currentModDecl = <ModuleDeclaration>type.symbol.declAST;
-                    this.checker.inBind = true;
-                }
-                if (members) {
-                    this.bind(agg, type.members.allMembers); // REVIEW: Should only be getting exported types?
-                }
-                if (typeMembers) {
-                    this.bind(agg, typeMembers.allMembers);
-                }
-                if (ambientMembers) {
-                    this.bind(agg, ambientMembers.allMembers);
-                }
-                if (ambientTypeMembers) {
-                    this.bind(agg, ambientTypeMembers.allMembers);
-                }
-                this.checker.currentModDecl = prevCurrentModDecl;
-                this.checker.inBind = prevBindStatus;
-            }
-            if (type.extendsTypeLinks) {
-                this.resolveBases(scope, type);
-            }
-            if (type.construct) {
-                this.resolveSignatureGroup(type.construct, scope, instanceType);
-            }
-            if (type.call) {
-                this.resolveSignatureGroup(type.call, scope, null);
-            }
-            if (type.index) {
-                this.resolveSignatureGroup(type.index, scope, null);
-            }
-            if (type.elementType) {
-                this.bindType(scope, type.elementType, null);
-            }
-        }
-
-        public bindSymbol(scope: SymbolScope, symbol: Symbol) {
-            if (!symbol.bound) {
-                var prevLocationInfo = this.checker.locationInfo;
-                if ((this.checker.units) && (symbol.unitIndex >= 0) && (symbol.unitIndex < this.checker.units.length)) {
-                    this.checker.locationInfo = this.checker.units[symbol.unitIndex];
-                }
-                switch (symbol.kind()) {
-                    case SymbolKind.Type:
-
-                        if (symbol.flags & SymbolFlags.Bound) {
-                            break;
-                        }
-
-                        var typeSymbol = <TypeSymbol>symbol;
-                        typeSymbol.flags |= SymbolFlags.Bound;
-
-                        // Since type collection happens out of order, a dynamic module referenced by an import statement
-                        // may not yet be in scope when the import symbol is created.  In that case, we need to search
-                        // out the module symbol now
-                        // Note that we'll also want to do this in resolveTypeMembers, in case the symbol is set outside the
-                        // context of a given module  (E.g., an outer import statement)
-                        if (typeSymbol.aliasLink && !typeSymbol.type && typeSymbol.aliasLink.alias.nodeType == NodeType.Name) {
-                            var modPath = (<Identifier>typeSymbol.aliasLink.alias).text;
-                            var modSym = this.checker.findSymbolForDynamicModule(modPath, this.checker.locationInfo.filename, (id) => scope.find(id, false, true));
-                            if (modSym) {
-                                typeSymbol.type = modSym.getType();
-                            }
-                        }
-
-                        if (typeSymbol.type && typeSymbol.type != this.checker.gloModType) {
-                            this.bindType(scope, typeSymbol.type, typeSymbol.instanceType);
-
-                            // bind expansions on the parent type symbol
-                            if (typeSymbol.type.isModuleType()) {
-                                for (var i = 0; i < typeSymbol.expansions.length; i++) {
-                                    this.bindType(scope, typeSymbol.expansions[i], typeSymbol.instanceType);
-                                }
-                            }
-                        }
-                        break;
-                    case SymbolKind.Field:
-                        this.checker.resolveTypeLink(scope, (<FieldSymbol>symbol).field.typeLink,
-                                                false);
-                        break;
-                    case SymbolKind.Parameter:
-                        this.checker.resolveTypeLink(scope,
-                                                (<ParameterSymbol>symbol).parameter.typeLink,
-                                                true);
-                        break;
-                }
-                this.checker.locationInfo = prevLocationInfo;
-            }
-            symbol.bound = true;
-        }
-
-        public bind(scope: SymbolScope, table: IHashTable) {
-            table.map(
-                (key, sym, binder) => {
-                    binder.bindSymbol(scope, sym);
-                },
-                this);
-        }
+    function updateFile(path: string, newText: string) {
+        ts.Debug.assertIsDefined(files.find(f => f.path === path));
+        session.executeCommandSeq<ts.server.protocol.ApplyChangedToOpenFilesRequest>({
+            command: ts.server.protocol.CommandTypes.ApplyChangedToOpenFiles,
+            arguments: {
+                openFiles: [{
+                    fileName: path,
+                    content: newText,
+                }],
+            },
+        });
     }
 
+    function findAllReferences(file: string, line: number, offset: number) {
+        ts.Debug.assertIsDefined(files.find(f => f.path === file));
+        session.executeCommandSeq<ts.server.protocol.ReferencesRequest>({
+            command: ts.server.protocol.CommandTypes.References,
+            arguments: {
+                file,
+                line,
+                offset,
+            },
+        });
+    }
+
+    function triggerCompletions(file: string, line: number, offset: number) {
+        session.executeCommandSeq<ts.server.protocol.CompletionsRequest>({
+            command: ts.server.protocol.CommandTypes.CompletionInfo,
+            arguments: {
+                file,
+                line,
+                offset,
+            },
+        });
+    }
 }

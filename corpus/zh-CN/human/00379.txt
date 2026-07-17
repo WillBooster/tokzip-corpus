@@ -1,15 +1,135 @@
-## 结构体示例程序
+<span class="caption">示例 21-16: 修改 `ThreadPool` 来储存一个传输 `Job` 实例的发送者</span>
 
-[ch05-02-example-structs.md](https://github.com/rust-lang/book/blob/8a6130451b0817ead5c2522ce641dcb0f11a8571/src/ch05-02-example-structs.md)
+在 `ThreadPool::new` 中，新建了一个信道，并接着让线程池在接收端等待。这段代码能够成功编译。
 
-为了理解何时会需要使用结构体，让我们编写一个计算长方形面积的程序。我们会从单独的变量开始，接着重构程序直到使用结构体替代它们为止。
+让我们尝试在线程池创建每个 worker 时将接收端传递给它们。须知我们希望在 worker 所分配的线程中使用接收者，所以将在闭包中引用 `receiver` 参数。示例 21-17 中展示的代码还不能编译：
 
-使用 Cargo 新建一个叫做 *rectangles* 的二进制程序，它获取以像素为单位的长方形的宽度和高度，并计算出长方形的面积。示例 5-8 显示了位于项目的 *src/main.rs* 中的小程序，它刚刚好实现此功能：
+<span class="filename">文件名：src/lib.rs</span>
 
-<span class="filename">文件名：src/main.rs</span>
-
-```rust
-{{#rustdoc_include ../listings/ch05-using-structs-to-structure-related-data/listing-05-08/src/main.rs:all}}
+```rust,ignore,does_not_compile
+{{#rustdoc_include ../listings/ch21-web-server/listing-21-17/src/lib.rs:here}}
 ```
 
-<span class="caption">示例 5-8：通过分别指定长方形的宽和高的变量来计算长方形面积</span>
+<span class="caption">示例 21-17: 将信道的接收端传递给 worker</span>
+
+这是一些简单而直观的修改：将接收端传递进了 `Worker::new`，并接着在闭包中使用它。
+
+如果尝试 check 代码，会得到这个错误：
+
+```console
+{{#include ../listings/ch21-web-server/listing-21-17/output.txt}}
+```
+
+这段代码尝试将 `receiver` 传递给多个 `Worker` 实例。这是不行的，回忆第十六章：Rust 所提供的信道实现是多 **生产者**，单 **消费者** 的。这意味着不能简单的克隆信道的消费端来解决问题。我们也不希望将一个消息向多个消费者发送多次；我们希望有一个消息列表和多个 worker 这样每个消息就只会处理一次。
+
+另外，从信道队列中取出任务涉及到修改 `receiver`，所以这些线程需要一个能安全的共享和修改 `receiver` 的方式，否则可能导致竞争状态（参考第十六章）。
+
+回忆一下第十六章讨论的线程安全智能指针，为了在多个线程间共享所有权并允许线程修改其值，需要使用 `Arc<Mutex<T>>`。`Arc` 使得多个 `Worker` 实例拥有接收端，而 `Mutex` 则确保一次只有一个 `Worker` 能从接收端得到任务。示例 21-18 展示了所需的修改：
+
+<span class="filename">文件名：src/lib.rs</span>
+
+```rust,noplayground
+{{#rustdoc_include ../listings/ch21-web-server/listing-21-18/src/lib.rs:here}}
+```
+
+<span class="caption">示例 21-18: 使用 `Arc` 和 `Mutex` 在 worker 间共享接收者</span>
+
+在 `ThreadPool::new` 中，将接收端放入 `Arc` 和 `Mutex` 中。对于每一个新 `Worker` `Arc` 来增加引用计数，如此这些 `Worker` 实例就可以共享接收者的所有权了。
+
+通过这些修改，代码可以编译了！我们已经快完成了！
+
+#### 实现 `execute` 方法
+
+最后让我们实现 `ThreadPool` 上的 `execute` 方法。同时也要修改 `Job` 结构体：它将不再是结构体，`Job` 将是一个有着 `execute` 接收到的闭包类型的 trait 对象的类型别名。第二十章 [“类型同义词与类型别名”][type-aliases] 部分提到过，类型别名允许将长的类型变短。观察示例 21-19：
+
+<span class="filename">文件名：src/lib.rs</span>
+
+```rust,noplayground
+{{#rustdoc_include ../listings/ch21-web-server/listing-21-19/src/lib.rs:here}}
+```
+
+<span class="caption">示例 21-19: 为存放每一个闭包的 `Box` 创建一个 `Job` 类型别名，接着在信道中发出任务</span>
+
+在使用 `execute` 得到的闭包新建 `Job` 实例之后，将这些任务从信道的发送端发出。这里调用 `send` 上的 `unwrap`，因为发送可能会失败，这可能发生于例如停止了所有线程执行的情况，这意味着接收端停止接收新消息了。不过目前我们无法停止线程执行；只要线程池存在它们就会一直执行。使用 `unwrap` 是因为我们知道失败不可能发生，不过编译器不知道这些。
+
+不过到此事情还没有结束！在 `Worker` 中，传递给 `thread::spawn` 的闭包仍然还只是 **引用** 了信道的接收端。相反我们需要闭包一直循环，向信道的接收端请求任务，并在得到任务时执行它们。如示例 21-20 对 `Worker::new` 做出修改：
+
+<span class="filename">文件名：src/lib.rs</span>
+
+```rust,noplayground
+{{#rustdoc_include ../listings/ch21-web-server/listing-21-20/src/lib.rs:here}}
+```
+
+<span class="caption">示例 21-20: 在 worker 线程中接收并执行任务</span>
+
+这里，首先在 `receiver` 上调用了 `lock` 来获取互斥器，接着 `unwrap` 在出现任何错误时 panic。如果互斥器处于一种叫做 **被污染**（*poisoned*）的状态时获取锁可能会失败，这可能发生于其他线程在持有锁时 panic 了且没有释放锁。在这种情况下，调用 `unwrap` 使其 panic 是正确的行为。请随意将 `unwrap` 改为包含有意义错误信息的 `expect`。
+
+如果锁定了互斥器，接着调用 `recv` 从信道中接收 `Job`。最后的 `unwrap` 也绕过了一些错误，这可能发生于持有信道发送端的线程停止的情况，类似于如果接收端关闭时 `send` 方法如何返回 `Err` 一样。
+
+调用 `recv` 会阻塞当前线程，所以如果还没有任务，其会等待直到有可用的任务。`Mutex<T>` 确保一次只有一个 `Worker` 线程尝试请求任务。
+
+现在线程池处于可以运行的状态了！执行 `cargo run` 并发起一些请求：
+
+```console
+$ cargo run
+   Compiling hello v0.1.0 (file:///projects/hello)
+warning: field `workers` is never read
+ --> src/lib.rs:7:5
+  |
+6 | pub struct ThreadPool {
+  |            ---------- field in this struct
+7 |     workers: Vec<Worker>,
+  |     ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` on by default
+
+warning: fields `id` and `thread` are never read
+  --> src/lib.rs:48:5
+   |
+47 | struct Worker {
+   |        ------ fields in this struct
+48 |     id: usize,
+   |     ^^
+49 |     thread: thread::JoinHandle<()>,
+   |     ^^^^^^
+
+warning: `hello` (lib) generated 2 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.91s
+     Running `target/debug/hello`
+Worker 0 got a job; executing.
+Worker 2 got a job; executing.
+Worker 1 got a job; executing.
+Worker 3 got a job; executing.
+Worker 0 got a job; executing.
+Worker 2 got a job; executing.
+Worker 1 got a job; executing.
+Worker 3 got a job; executing.
+Worker 0 got a job; executing.
+Worker 2 got a job; executing.
+```
+
+成功了！现在我们有了一个可以异步执行连接的线程池！它绝不会创建超过四个线程，所以当服务端收到大量请求时系统也不会负担过重。如果请求 */sleep*，server 也能够通过另外一个线程处理其他请求。
+
+> 注意如果同时在多个浏览器窗口打开 */sleep*，它们可能会彼此间隔地加载 5 秒，因为一些浏览器出于缓存的原因会顺序执行相同请求的多个实例。这些限制并不是由于我们的 web 服务端造成的。
+
+现在正适合停下来想一想：如果示例 21-18、21-19 和 21-20 中，待执行的工作不是一个闭包而是 future，那么这些代码会有哪些不同？哪些类型会变？方法签名会不会变化？哪些部分又会保持不变？
+
+在学习了第十七章和第十八章的 `while let` 循环之后，你可能会好奇为何不能如此编写 worker 线程，如示例 21-21 所示：
+
+<span class="filename">文件名：src/lib.rs</span>
+
+```rust,ignore,not_desired_behavior
+{{#rustdoc_include ../listings/ch21-web-server/listing-21-21/src/lib.rs:here}}
+```
+
+<span class="caption">示例 21-21: 一个使用 `while let` 的 `Worker::new` 替代实现</span>
+
+这段代码可以编译和运行，但是并不会产生所期望的线程行为：一个慢请求仍然会导致其他请求等待执行。其原因有些微妙：`Mutex` 结构体没有公有 `unlock` 方法，因为锁的所有权依赖 `lock` 方法返回的 `LockResult<MutexGuard<T>>` 中 `MutexGuard<T>` 的生命周期。这允许借用检查器在编译时确保绝不会在没有持有锁的情况下访问由 `Mutex` 守护的资源，不过如果没有认真的思考 `MutexGuard<T>` 的生命周期的话，也可能会导致比预期更久的持有锁。
+
+示例 21-20 中的代码使用的 `let job = receiver.lock().unwrap().recv().unwrap();` 之所以可以工作是因为对于 `let` 来说，当 `let` 语句结束时任何表达式中等号右侧使用的临时值都会立即被丢弃。然而 `while let`（`if let` 和 `match`）直到相关的代码块结束都不会丢弃临时值。在示例 21-21 中，`job()` 调用期间锁一直持续，这也意味着其他的 `Worker` 实例无法接收任务。
+
+[type-aliases]: ch20-03-advanced-types.html#类型同义词与类型别名
+[integer-types]: ch03-02-data-types.html#整型
+[fn-traits]: ch13-01-closures.html#将捕获的值移出闭包
+[builder]: https://doc.rust-lang.org/std/thread/struct.Builder.html
+[builder-spawn]: https://doc.rust-lang.org/std/thread/struct.Builder.html#method.spawn

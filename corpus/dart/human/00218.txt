@@ -1,142 +1,128 @@
-// Copyright (c) 2012, the Dart project authors.  Please see the AUTHORS file
+// Copyright (c) 2013, the Dart project authors.  Please see the AUTHORS file
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-import 'dart:async';
+import 'dart:convert';
 
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 import 'package:test/test.dart';
 
-void main() {
-  group('()', () {
-    test('sets body', () {
-      var response = http.Response('Hello, world!', 200);
-      expect(response.body, equals('Hello, world!'));
-    });
+/// A dummy URL for constructing requests that won't be sent.
+Uri get dummyUrl => Uri.http('dart.dev', '');
 
-    test('sets bodyBytes', () {
-      var response = http.Response('Hello, world!', 200);
-      expect(
-          response.bodyBytes,
-          equals(
-              [72, 101, 108, 108, 111, 44, 32, 119, 111, 114, 108, 100, 33]));
-    });
+/// Removes eight spaces of leading indentation from a multiline string.
+///
+/// Note that this is very sensitive to how the literals are styled. They should
+/// be:
+///     '''
+///     Text starts on own line. Lines up with subsequent lines.
+///     Lines are indented exactly 8 characters from the left margin.
+///     Close is on the same line.'''
+///
+/// This does nothing if text is only a single line.
+// TODO(nweiz): Make this auto-detect the indentation level from the first
+// non-whitespace line.
+String cleanUpLiteral(String text) {
+  var lines = text.split('\n');
+  if (lines.length <= 1) return text;
 
-    test('respects the inferred encoding', () {
-      var response = http.Response('föøbãr', 200,
-          headers: {'content-type': 'text/plain; charset=iso-8859-1'});
-      expect(response.bodyBytes, equals([102, 246, 248, 98, 227, 114]));
-    });
-  });
+  for (var j = 0; j < lines.length; j++) {
+    if (lines[j].length > 8) {
+      lines[j] = lines[j].substring(8, lines[j].length);
+    } else {
+      lines[j] = '';
+    }
+  }
 
-  group('.bytes()', () {
-    test('sets body', () {
-      var response = http.Response.bytes([104, 101, 108, 108, 111], 200);
-      expect(response.body, equals('hello'));
-    });
+  return lines.join('\n');
+}
 
-    test('sets bodyBytes', () {
-      var response = http.Response.bytes([104, 101, 108, 108, 111], 200);
-      expect(response.bodyBytes, equals([104, 101, 108, 108, 111]));
-    });
+/// A matcher that matches JSON that parses to a value that matches the inner
+/// matcher.
+Matcher parse(Matcher matcher) => _Parse(matcher);
 
-    test('respects the inferred encoding', () {
-      var response = http.Response.bytes([102, 246, 248, 98, 227, 114], 200,
-          headers: {'content-type': 'text/plain; charset=iso-8859-1'});
-      expect(response.body, equals('föøbãr'));
-    });
-  });
+class _Parse extends Matcher {
+  final Matcher _matcher;
 
-  group('.fromStream()', () {
-    test('sets body', () async {
-      var controller = StreamController<List<int>>(sync: true);
-      var streamResponse =
-          http.StreamedResponse(controller.stream, 200, contentLength: 13);
-      controller
-        ..add([72, 101, 108, 108, 111, 44, 32])
-        ..add([119, 111, 114, 108, 100, 33]);
-      unawaited(controller.close());
-      var response = await http.Response.fromStream(streamResponse);
-      expect(response.body, equals('Hello, world!'));
-    });
+  _Parse(this._matcher);
 
-    test('sets bodyBytes', () async {
-      var controller = StreamController<List<int>>(sync: true);
-      var streamResponse =
-          http.StreamedResponse(controller.stream, 200, contentLength: 5);
-      controller.add([104, 101, 108, 108, 111]);
-      unawaited(controller.close());
-      var response = await http.Response.fromStream(streamResponse);
-      expect(response.bodyBytes, equals([104, 101, 108, 108, 111]));
-    });
-  });
+  @override
+  bool matches(Object? item, Map<dynamic, dynamic> matchState) {
+    if (item is String) {
+      dynamic parsed;
+      try {
+        parsed = json.decode(item);
+      } catch (e) {
+        return false;
+      }
 
-  group('.headersSplitValues', () {
-    test('no headers', () async {
-      var response = http.Response('Hello, world!', 200);
-      expect(response.headersSplitValues, const <String, List<String>>{});
-    });
+      return _matcher.matches(parsed, matchState);
+    }
+    return false;
+  }
 
-    test('one header', () async {
-      var response =
-          http.Response('Hello, world!', 200, headers: {'fruit': 'apple'});
-      expect(response.headersSplitValues, const {
-        'fruit': ['apple']
-      });
-    });
+  @override
+  Description describe(Description description) =>
+      description.add('parses to a value that ').addDescriptionOf(_matcher);
+}
 
-    test('two headers', () async {
-      var response = http.Response('Hello, world!', 200,
-          headers: {'fruit': 'apple,banana'});
-      expect(response.headersSplitValues, const {
-        'fruit': ['apple', 'banana']
-      });
-    });
+/// A matcher that validates the body of a multipart request after finalization.
+///
+/// The string "{{boundary}}" in [pattern] will be replaced by the boundary
+/// string for the request, and LF newlines will be replaced with CRLF.
+/// Indentation will be normalized.
+Matcher bodyMatches(String pattern) => _BodyMatches(pattern);
 
-    test('two headers with lots of spaces', () async {
-      var response = http.Response('Hello, world!', 200,
-          headers: {'fruit': 'apple   \t   ,  \tbanana'});
-      expect(response.headersSplitValues, const {
-        'fruit': ['apple', 'banana']
-      });
-    });
+class _BodyMatches extends Matcher {
+  final String _pattern;
 
-    test('one set-cookie', () async {
-      var response = http.Response('Hello, world!', 200, headers: {
-        'set-cookie': 'id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT'
-      });
-      expect(response.headersSplitValues, const {
-        'set-cookie': ['id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT']
-      });
-    });
+  _BodyMatches(this._pattern);
 
-    test('two set-cookie, with comma in expires', () async {
-      var response = http.Response('Hello, world!', 200, headers: {
-        // ignore: missing_whitespace_between_adjacent_strings
-        'set-cookie': 'id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT,'
-            'sessionId=e8bb43229de9; Domain=foo.example.com'
-      });
-      expect(response.headersSplitValues, const {
-        'set-cookie': [
-          'id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT',
-          'sessionId=e8bb43229de9; Domain=foo.example.com'
-        ]
-      });
-    });
+  @override
+  bool matches(Object? item, Map<dynamic, dynamic> matchState) {
+    if (item is http.MultipartRequest) {
+      return completes.matches(_checks(item), matchState);
+    }
 
-    test('two set-cookie, with lots of commas', () async {
-      var response = http.Response('Hello, world!', 200, headers: {
-        'set-cookie':
-            // ignore: missing_whitespace_between_adjacent_strings
-            'id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/,,HE,=L=LO,'
-                'sessionId=e8bb43229de9; Domain=foo.example.com'
-      });
-      expect(response.headersSplitValues, const {
-        'set-cookie': [
-          'id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/,,HE,=L=LO',
-          'sessionId=e8bb43229de9; Domain=foo.example.com'
-        ]
-      });
-    });
-  });
+    return false;
+  }
+
+  Future<void> _checks(http.MultipartRequest item) async {
+    var bodyBytes = await item.finalize().toBytes();
+    var body = utf8.decode(bodyBytes);
+    var contentType = MediaType.parse(item.headers['content-type']!);
+    var boundary = contentType.parameters['boundary']!;
+    var expected = cleanUpLiteral(_pattern)
+        .replaceAll('\n', '\r\n')
+        .replaceAll('{{boundary}}', boundary);
+
+    expect(body, equals(expected));
+    expect(item.contentLength, equals(bodyBytes.length));
+  }
+
+  @override
+  Description describe(Description description) =>
+      description.add('has a body that matches "$_pattern"');
+}
+
+/// A matcher that matches function or future that throws a
+/// [http.ClientException] with the given [message].
+///
+/// [message] can be a String or a [Matcher].
+Matcher throwsClientException([String? message]) {
+  var exception = isA<http.ClientException>();
+  if (message != null) {
+    exception = exception.having((e) => e.message, 'message', message);
+  }
+  return throwsA(exception);
+}
+
+/// Spawn an isolate in the test runner with an http server.
+///
+/// The server isolate will be killed on teardown.
+Future<Uri> startServer() async {
+  final channel = spawnHybridUri(Uri(path: '/test/stub_server.dart'));
+  final port = await channel.stream.first as int;
+  return Uri.http('localhost:$port', '');
 }

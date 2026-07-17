@@ -1,355 +1,286 @@
-from dataclasses import InitVar
-from typing import Any, ClassVar, Generic, Optional, TypeVar, Union
+import dataclasses
+import json
+import platform
+from typing import ClassVar
 
-from typing_extensions import Self
+import pytest
 
-from pydantic import BaseModel, ConfigDict, Field, RootModel, create_model, field_validator, model_validator, validator
-from pydantic.dataclasses import dataclass
+from pydantic_core import SchemaSerializer, SchemaValidator, core_schema
 
-
-class Model(BaseModel):
-    x: float
-    y: str
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class SelfReferencingModel(BaseModel):
-    submodel: Optional['SelfReferencingModel']
-
-    @property
-    def prop(self) -> None:
-        ...
+on_pypy = platform.python_implementation() == 'PyPy'
+# pypy doesn't seem to maintain order of `__dict__`
+if on_pypy:
+    IsStrictDict = dict
+else:
+    from dirty_equals import IsStrictDict
 
 
-SelfReferencingModel.model_rebuild()
-
-model = Model(x=1, y='y')
-Model(x=1, y='y', z='z')
-# MYPY: error: Unexpected keyword argument "z" for "Model"  [call-arg]
-model.x = 2
-model.model_validate(model)
-
-self_referencing_model = SelfReferencingModel(submodel=SelfReferencingModel(submodel=None))
+@dataclasses.dataclass
+class Foo:
+    a: str
+    b: bytes
 
 
-class KwargsModel(BaseModel, from_attributes=True):
-    x: float
-    y: str
+def test_dataclass():
+    schema = core_schema.dataclass_schema(
+        Foo,
+        core_schema.dataclass_args_schema(
+            'Foo',
+            [
+                core_schema.dataclass_field(name='a', schema=core_schema.str_schema()),
+                core_schema.dataclass_field(name='b', schema=core_schema.bytes_schema()),
+            ],
+        ),
+        ['a', 'b'],
+    )
+    s = SchemaSerializer(schema)
+    assert s.to_python(Foo(a='hello', b=b'more')) == IsStrictDict(a='hello', b=b'more')
+    assert s.to_python(Foo(a='hello', b=b'more'), mode='json') == IsStrictDict(a='hello', b='more')
+    j = s.to_json(Foo(a='hello', b=b'more'))
+
+    if on_pypy:
+        assert json.loads(j) == {'a': 'hello', 'b': 'more'}
+    else:
+        assert j == b'{"a":"hello","b":"more"}'
+
+    assert s.to_python(Foo(a='hello', b=b'more'), exclude={'b'}) == IsStrictDict(a='hello')
+    assert s.to_json(Foo(a='hello', b=b'more'), include={'a'}) == b'{"a":"hello"}'
 
 
-kwargs_model = KwargsModel(x=1, y='y')
-KwargsModel(x=1, y='y', z='z')
-# MYPY: error: Unexpected keyword argument "z" for "KwargsModel"  [call-arg]
-kwargs_model.x = 2
-kwargs_model.model_validate(kwargs_model.__dict__)
+def test_serialization_exclude():
+    schema = core_schema.dataclass_schema(
+        Foo,
+        core_schema.dataclass_args_schema(
+            'Foo',
+            [
+                core_schema.dataclass_field(
+                    name='a', schema=core_schema.str_schema(), serialization_exclude_if=lambda x: x == 'bye'
+                ),
+                core_schema.dataclass_field(name='b', schema=core_schema.bytes_schema(), serialization_exclude=True),
+            ],
+        ),
+        ['a', 'b'],
+    )
+    s = SchemaSerializer(schema)
+    assert s.to_python(Foo(a='hello', b=b'more')) == {'a': 'hello'}
+    assert s.to_python(Foo(a='hello', b=b'more'), mode='json') == {'a': 'hello'}
+    # a = 'bye' excludes it
+    assert s.to_python(Foo(a='bye', b=b'more'), mode='json') == {}
+    j = s.to_json(Foo(a='hello', b=b'more'))
+    if on_pypy:
+        assert json.loads(j) == {'a': 'hello'}
+    else:
+        assert j == b'{"a":"hello"}'
+    j = s.to_json(Foo(a='bye', b=b'more'))
+    if on_pypy:
+        assert json.loads(j) == {}
+    else:
+        assert j == b'{}'
 
 
-class InheritingModel(Model):
-    z: int = 1
+def test_serialization_alias():
+    schema = core_schema.dataclass_schema(
+        Foo,
+        core_schema.dataclass_args_schema(
+            'Foo',
+            [
+                core_schema.dataclass_field(name='a', schema=core_schema.str_schema()),
+                core_schema.dataclass_field(name='b', schema=core_schema.bytes_schema(), serialization_alias='BAR'),
+            ],
+        ),
+        ['a', 'b'],
+    )
+    s = SchemaSerializer(schema)
+    assert s.to_python(Foo(a='hello', b=b'more'), by_alias=True) == IsStrictDict(a='hello', BAR=b'more')
+    assert s.to_python(Foo(a='hello', b=b'more'), mode='json', by_alias=True) == IsStrictDict(a='hello', BAR='more')
+    j = s.to_json(Foo(a='hello', b=b'more'), by_alias=True)
+
+    if on_pypy:
+        assert json.loads(j) == {'a': 'hello', 'BAR': 'more'}
+    else:
+        assert j == b'{"a":"hello","BAR":"more"}'
 
 
-InheritingModel.model_validate(model.__dict__)
+def test_properties():
+    @dataclasses.dataclass
+    class FooProp:
+        a: str
+        b: bytes
+
+        @property
+        def c(self) -> str:
+            return f'{self.a} {self.b.decode()}'
+
+    schema = core_schema.dataclass_schema(
+        Foo,
+        core_schema.dataclass_args_schema(
+            'FooProp',
+            [
+                core_schema.dataclass_field(name='a', schema=core_schema.str_schema()),
+                core_schema.dataclass_field(name='b', schema=core_schema.bytes_schema()),
+            ],
+            computed_fields=[core_schema.computed_field('c', core_schema.str_schema())],
+        ),
+        ['a', 'b'],
+    )
+    s = SchemaSerializer(schema)
+    assert s.to_python(FooProp(a='hello', b=b'more')) == IsStrictDict(a='hello', b=b'more', c='hello more')
+    assert s.to_python(FooProp(a='hello', b=b'more'), mode='json') == IsStrictDict(a='hello', b='more', c='hello more')
+    j = s.to_json(FooProp(a='hello', b=b'more'))
+
+    if on_pypy:
+        assert json.loads(j) == {'a': 'hello', 'b': 'more', 'c': 'hello more'}
+    else:
+        assert j == b'{"a":"hello","b":"more","c":"hello more"}'
+
+    assert s.to_python(FooProp(a='hello', b=b'more'), exclude={'b'}) == IsStrictDict(a='hello', c='hello more')
+    assert s.to_json(FooProp(a='hello', b=b'more'), include={'a'}) == b'{"a":"hello"}'
 
 
-class ForwardReferencingModel(Model):
-    future: 'FutureModel'
+def test_slots_mixed():
+    @dataclasses.dataclass(slots=True)
+    class Model:
+        x: int
+        y: dataclasses.InitVar[str]
+        z: ClassVar[str] = 'z-classvar'
+
+    @dataclasses.dataclass
+    class SubModel(Model):
+        x2: int
+        y2: dataclasses.InitVar[str]
+        z2: ClassVar[str] = 'z2-classvar'
+
+    schema = core_schema.dataclass_schema(
+        SubModel,
+        core_schema.dataclass_args_schema(
+            'SubModel',
+            [
+                core_schema.dataclass_field(name='x', schema=core_schema.int_schema()),
+                core_schema.dataclass_field(name='y', init_only=True, schema=core_schema.str_schema()),
+                core_schema.dataclass_field(name='x2', schema=core_schema.int_schema()),
+                core_schema.dataclass_field(name='y2', init_only=True, schema=core_schema.str_schema()),
+            ],
+        ),
+        ['x', 'x2'],
+        slots=True,
+    )
+    dc = SubModel(x=1, y='a', x2=2, y2='b')
+    assert dataclasses.asdict(dc) == {'x': 1, 'x2': 2}
+
+    s = SchemaSerializer(schema)
+    assert s.to_python(dc) == {'x': 1, 'x2': 2}
+    assert s.to_json(dc) == b'{"x":1,"x2":2}'
 
 
-class FutureModel(Model):
-    pass
-
-
-ForwardReferencingModel.model_rebuild()
-future_model = FutureModel(x=1, y='a')
-forward_model = ForwardReferencingModel(x=1, y='a', future=future_model)
-
-
-class NoMutationModel(BaseModel):
-    x: int
-
-    model_config = ConfigDict(frozen=True)
-
-
-class MutationModel(NoMutationModel):
-    a: int = 1
-
-    model_config = ConfigDict(frozen=False, from_attributes=True)
-
-
-MutationModel(x=1).x = 2
-MutationModel.model_validate(model.__dict__)
-
-
-class KwargsNoMutationModel(BaseModel, frozen=True):
-    x: int
-
-
-class KwargsMutationModel(KwargsNoMutationModel, frozen=False, from_attributes=True):
-    a: int = 1
-
-
-KwargsMutationModel(x=1).x = 2
-KwargsMutationModel.model_validate(model.__dict__)
-
-
-class OverrideModel(Model):
-    x: int
-
-
-OverrideModel(x=1, y='b')
-
-
-class Mixin:
-    def f(self) -> None:
+@pytest.mark.xfail(reason='dataclasses do not serialize extras')
+def test_extra_custom_serializer():
+    @dataclasses.dataclass
+    class Model:
         pass
 
-
-class MultiInheritanceModel(BaseModel, Mixin):
-    pass
-
-
-MultiInheritanceModel().f()
-
-
-class AliasModel(BaseModel):
-    x: str = Field(alias='x_alias')
-    y: str = Field(validation_alias='y_alias')
-    z: str = Field(validation_alias='z_alias', alias='unused')
-
-
-alias_model = AliasModel(x_alias='a', y_alias='a', z_alias='a')
-assert alias_model.x == 'a'
-assert alias_model.y == 'a'
-assert alias_model.z == 'a'
-
-
-class ClassVarModel(BaseModel):
-    x: int
-    y: ClassVar[int] = 1
-
-
-ClassVarModel(x=1)
-
-
-@dataclass(config={'validate_assignment': True})
-class AddProject:
-    name: str
-    slug: Optional[str]
-    description: Optional[str]
-
-
-p = AddProject(name='x', slug='y', description='z')
-
-
-class TypeAliasAsAttribute(BaseModel):
-    __type_alias_attribute__ = Union[str, bytes]
-
-
-class NestedModel(BaseModel):
-    class Model(BaseModel):
-        id: str
-
-    model: Model
-
-
-_ = NestedModel.Model
-
-
-DynamicModel = create_model('DynamicModel', __base__=Model)
-
-dynamic_model = DynamicModel(x=1, y='y')
-dynamic_model.x = 2
-
-
-class FrozenModel(BaseModel):
-    x: int
-
-    model_config = ConfigDict(frozen=True)
-
-
-class NotFrozenModel(FrozenModel):
-    a: int = 1
-
-    model_config = ConfigDict(frozen=False, from_attributes=True)
-
-
-NotFrozenModel(x=1).x = 2
-NotFrozenModel.model_validate(model.__dict__)
-
-
-class KwargsFrozenModel(BaseModel, frozen=True):
-    x: int
-
-
-class KwargsNotFrozenModel(FrozenModel, frozen=False, from_attributes=True):
-    a: int = 1
-
-
-KwargsNotFrozenModel(x=1).x = 2
-KwargsNotFrozenModel.model_validate(model.__dict__)
-
-
-class ModelWithSelfField(BaseModel):
-    self: str
-
-
-def f(name: str) -> str:
-    return name
-
-
-class ModelWithAllowReuseValidator(BaseModel):
-    name: str
-    normalize_name = field_validator('name')(f)
-
-
-model_with_allow_reuse_validator = ModelWithAllowReuseValidator(name='xyz')
-
-
-T = TypeVar('T')
-
-
-class Response(BaseModel, Generic[T]):
-    data: T
-    error: Optional[str]
-
-
-response = Response[Model](data=model, error=None)
-
-
-class ModelWithAnnotatedValidator(BaseModel):
-    name: str
-
-    @field_validator('name')
-    def noop_validator_with_annotations(cls, name: str) -> str:
-        return name
-
-
-def _default_factory_str() -> str:
-    return 'x'
-
-
-def _default_factory_list() -> list[int]:
-    return [1, 2, 3]
-
-
-class FieldDefaultTestingModel(BaseModel):
-    # Required
-    a: int
-    b: int = Field()
-    c: int = Field(...)
-
-    # Default
-    d: int = Field(1)
-
-    # Default factory
-    g: list[int] = Field(default_factory=_default_factory_list)
-    h: str = Field(default_factory=_default_factory_str)
-    i: str = Field(default_factory=lambda: 'test')
-
-
-_TModel = TypeVar('_TModel')
-_TType = TypeVar('_TType')
-
-
-class OrmMixin(Generic[_TModel, _TType]):
-    @classmethod
-    def from_orm(cls, model: _TModel) -> _TType:
-        raise NotImplementedError
-
-    @classmethod
-    def from_orm_optional(cls, model: Optional[_TModel]) -> Optional[_TType]:
-        if model is None:
-            return None
-        return cls.from_orm(model)
-
-
-@dataclass
-class MyDataClass:
-    foo: InitVar[str]
-    bar: str
-
-
-MyDataClass(foo='foo', bar='bar')
-
-
-def get_my_custom_validator(field_name: str) -> Any:
-    @validator(field_name, allow_reuse=True)
-    def my_custom_validator(cls: Any, v: int) -> int:
-        return v
-
-    return my_custom_validator
-
-
-def foo() -> None:
-    class MyModel(BaseModel):
-        number: int
-        custom_validator = get_my_custom_validator('number')  # type: ignore[pydantic-field]
-
-        @model_validator(mode='before')
-        @classmethod
-        def validate_before(cls, values: Any) -> Any:
-            return values
-
-        @model_validator(mode='after')
-        def validate_after(self) -> Self:
-            return self
-
-    MyModel(number=2)
-
-
-class InnerModel(BaseModel):
-    my_var: Union[str, None] = Field(default=None)
-
-
-class OuterModel(InnerModel):
-    pass
-
-
-m = OuterModel()
-if m.my_var is None:
-    # In https://github.com/pydantic/pydantic/issues/7399, this was unreachable
-    print('not unreachable')
-
-
-class Foo(BaseModel):
-    pass
-
-
-class Bar(Foo, RootModel[int]):
-    pass
-
-
-class Model1(BaseModel):
-    model_config = ConfigDict(validate_by_alias=False, validate_by_name=True)
-
-    my_field: str = Field(alias='my_alias')
-
-m1 = Model1(my_field='foo')
-
-class Model2(BaseModel):
-    model_config = ConfigDict(validate_by_alias=True, validate_by_name=False)
-
-    my_field: str = Field(alias='my_alias')
-
-m2 = Model2(my_alias='foo')
-
-class Model3(BaseModel):
-    model_config = ConfigDict(validate_by_alias=True, validate_by_name=True)
-
-    my_field: str = Field(alias='my_alias')
-
-# for this case, we prefer the field name over the alias
-m3 = Model3(my_field='foo')
-
-class Model4(BaseModel):
-    my_field: str = Field(alias='my_alias')
-
-m4 = Model4(my_alias='foo')
-
-class Model5(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
-    my_field: str = Field(alias='my_alias')
-
-m5 = Model5(my_field='foo')
+    schema = core_schema.dataclass_schema(
+        Model,
+        core_schema.dataclass_args_schema(
+            'Model',
+            [],
+            extra_behavior='allow',
+            # extras_schema=core_schema.any_schema(
+            #     serialization=core_schema.plain_serializer_function_ser_schema(
+            #         lambda v: v + ' bam!',
+            #     )
+            # )
+        ),
+        [],
+    )
+    s = SchemaSerializer(schema)
+    v = SchemaValidator(schema)
+
+    m = v.validate_python({'extra': 'extra'})
+
+    assert s.to_python(m) == {'extra': 'extra bam!'}
+
+
+def test_dataclass_initvar_not_required_on_union_ser() -> None:
+    @dataclasses.dataclass
+    class Foo:
+        x: int
+        init_var: dataclasses.InitVar[int] = 1
+
+    @dataclasses.dataclass
+    class Bar:
+        x: int
+
+    schema = core_schema.union_schema(
+        [
+            core_schema.dataclass_schema(
+                Foo,
+                core_schema.dataclass_args_schema(
+                    'Foo',
+                    [
+                        core_schema.dataclass_field(name='x', schema=core_schema.int_schema()),
+                        core_schema.dataclass_field(
+                            name='init_var',
+                            init_only=True,
+                            schema=core_schema.with_default_schema(core_schema.int_schema(), default=1),
+                        ),
+                    ],
+                ),
+                ['x'],
+                post_init=True,
+            ),
+            core_schema.dataclass_schema(
+                Bar,
+                core_schema.dataclass_args_schema(
+                    'Bar', [core_schema.dataclass_field(name='x', schema=core_schema.int_schema())]
+                ),
+                ['x'],
+            ),
+        ]
+    )
+
+    s = SchemaSerializer(schema)
+    assert s.to_python(Foo(x=1), warnings='error') == {'x': 1}
+    assert s.to_python(Foo(x=1, init_var=2), warnings='error') == {'x': 1}
+
+
+@pytest.mark.parametrize(
+    'config,runtime,expected',
+    [
+        (True, True, {'my_alias': 'hello'}),
+        (True, False, {'my_field': 'hello'}),
+        (True, None, {'my_alias': 'hello'}),
+        (False, True, {'my_alias': 'hello'}),
+        (False, False, {'my_field': 'hello'}),
+        (False, None, {'my_field': 'hello'}),
+        (None, True, {'my_alias': 'hello'}),
+        (None, False, {'my_field': 'hello'}),
+        (None, None, {'my_field': 'hello'}),
+    ],
+)
+def test_by_alias_and_name_config_interaction(config, runtime, expected) -> None:
+    """This test reflects the priority that applies for config vs runtime serialization alias configuration.
+
+    If the runtime value (by_alias) is set, that value is used.
+    If the runtime value is unset, the config value (serialize_by_alias) is used.
+    If neither are set, the default, False, is used.
+    """
+
+    @dataclasses.dataclass
+    class Foo:
+        my_field: str
+
+    schema = core_schema.dataclass_schema(
+        Foo,
+        core_schema.dataclass_args_schema(
+            'Foo',
+            [
+                core_schema.dataclass_field(
+                    name='my_field', schema=core_schema.str_schema(), serialization_alias='my_alias'
+                ),
+            ],
+        ),
+        ['my_field'],
+        config=core_schema.CoreConfig(serialize_by_alias=config or False),
+    )
+    s = SchemaSerializer(schema)
+    assert s.to_python(Foo(my_field='hello'), by_alias=runtime) == expected

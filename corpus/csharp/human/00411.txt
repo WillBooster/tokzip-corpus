@@ -1,208 +1,219 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
-using System.IO;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
-#if !NETFRAMEWORK
-using System.Runtime.Loader;
-#endif
+using System.Text;
 
 namespace NUnit.Framework.Internal
 {
     /// <summary>
-    /// AssemblyHelper provides static methods for working
-    /// with assemblies.
+    /// ExceptionHelper provides static methods for working with exceptions
     /// </summary>
-    public static class AssemblyHelper
+    public static class ExceptionHelper
     {
-        private static readonly string UriSchemeFile = Uri.UriSchemeFile;
-        private static readonly string SchemeDelimiter = Uri.SchemeDelimiter;
-
-        #region GetAssemblyPath
-
         /// <summary>
-        /// Gets the path from which an assembly was loaded.
-        /// For builds where this is not possible, returns
-        /// the name of the assembly.
+        /// Rethrows an exception, preserving its stack trace
         /// </summary>
-        /// <param name="assembly">The assembly.</param>
-        /// <returns>The path.</returns>
-        public static string GetAssemblyPath(Assembly assembly)
+        /// <param name="exception">The exception to rethrow</param>
+        [DoesNotReturn]
+        public static void Rethrow(Exception exception)
         {
-#if NETFRAMEWORK
-            // https://learn.microsoft.com/en-us/dotnet/api/system.reflection.assembly.location
-            // .NET Framework only:
-            // If the loaded file was shadow-copied, the location is that of the file after being shadow-copied.
-            // To get the location before the file has been shadow-copied, use the CodeBase property.
-            string? codeBase = assembly.CodeBase;
-
-            if (codeBase is not null && IsFileUri(codeBase))
-                return GetAssemblyPathFromCodeBase(codeBase);
-#endif
-
-            return assembly.Location;
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception).Throw();
         }
 
-        #endregion
-
-        #region GetDirectoryName
-
         /// <summary>
-        /// Gets the path to the directory from which an assembly was loaded.
+        /// Builds up a message, using the Message field of the specified exception
+        /// as well as any InnerExceptions. Optionally excludes exception names,
+        /// creating a more readable message.
         /// </summary>
-        /// <param name="assembly">The assembly.</param>
-        /// <returns>The path.</returns>
-        public static string GetDirectoryName(Assembly assembly)
+        /// <param name="exception">The exception.</param>
+        /// <param name="excludeExceptionNames">Flag indicating whether exception names should be excluded.</param>
+        /// <returns>A combined message string.</returns>
+        public static string BuildMessage(Exception exception, bool excludeExceptionNames = false)
         {
-            return Path.GetDirectoryName(GetAssemblyPath(assembly))!;
-        }
+            Guard.ArgumentNotNull(exception, nameof(exception));
 
-        #endregion
+            StringBuilder sb = new StringBuilder();
+            if (!excludeExceptionNames)
+                sb.AppendFormat("{0} : ", exception.GetType());
+            sb.Append(GetExceptionMessage(exception));
+            AppendExceptionDataContents(exception, sb);
 
-        #region GetAssemblyName
-
-        /// <summary>
-        /// Gets the AssemblyName of an assembly.
-        /// </summary>
-        /// <param name="assembly">The assembly</param>
-        /// <returns>An AssemblyName</returns>
-        public static AssemblyName GetAssemblyName(Assembly assembly)
-        {
-            return assembly.GetName();
-        }
-
-        #endregion
-
-        #region Load
-
-#if !NETFRAMEWORK
-        private sealed class ReflectionAssemblyLoader
-        {
-            private static ReflectionAssemblyLoader? _instance;
-            private static bool _isInitialized;
-
-            private readonly Func<string, Assembly> _loadFromAssemblyPath;
-
-            public Assembly LoadFromAssemblyPath(string assemblyPath) => _loadFromAssemblyPath.Invoke(assemblyPath);
-
-            private ReflectionAssemblyLoader(Func<string, Assembly> loadFromAssemblyPath)
+            foreach (Exception inner in FlattenExceptionHierarchy(exception))
             {
-                _loadFromAssemblyPath = loadFromAssemblyPath;
+                sb.Append(Environment.NewLine);
+                sb.Append("  ----> ");
+                if (!excludeExceptionNames)
+                    sb.AppendFormat("{0} : ", inner.GetType());
+                sb.Append(GetExceptionMessage(inner));
+                AppendExceptionDataContents(inner, sb);
             }
 
-            public static ReflectionAssemblyLoader? TryGet()
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Builds up a message, using the Message field of the specified exception
+        /// as well as any InnerExceptions.
+        /// </summary>
+        /// <param name="exception">The exception.</param>
+        /// <returns>A combined stack trace.</returns>
+        public static string BuildStackTrace(Exception exception)
+        {
+            StringBuilder sb = new StringBuilder(exception.GetStackTraceWithoutThrowing());
+
+            foreach (Exception inner in FlattenExceptionHierarchy(exception))
             {
-                if (_isInitialized)
-                    return _instance;
-                _instance = TryInitialize();
-                _isInitialized = true;
-                return _instance;
+                sb.Append(Environment.NewLine);
+                sb.Append("--");
+                sb.Append(inner.GetType().Name);
+                sb.Append(Environment.NewLine);
+                sb.Append(inner.GetStackTraceWithoutThrowing());
             }
 
-            private static ReflectionAssemblyLoader? TryInitialize()
+            return sb.ToString();
+        }
+
+        private static string GetExceptionMessage(Exception ex)
+        {
+            var message = ex.GetMessageWithoutThrowing();
+
+            if (string.IsNullOrEmpty(message))
             {
-                var assemblyLoadContextType = Type.GetType("System.Runtime.Loader.AssemblyLoadContext", throwOnError: false);
-                if (assemblyLoadContextType is null)
-                    return null;
+                // Special handling for Mono 5.0, which returns an empty message
+                return ex is System.IO.FileNotFoundException fnfEx
+                    ? "Could not load assembly. File not found: " + fnfEx.FileName
+                    : "No message provided";
+            }
 
-                var defaultContext = assemblyLoadContextType.GetRuntimeProperty("Default")!.GetValue(null);
+            return message;
+        }
 
-                var loadFromAssemblyPath = (Func<string, Assembly>)assemblyLoadContextType
-                        .GetRuntimeMethod("LoadFromAssemblyPath", new[] { typeof(string) })!
-                        .CreateDelegate(typeof(Func<string, Assembly>), defaultContext);
+        private static void AppendExceptionDataContents(Exception ex, StringBuilder sb)
+        {
+            var data = ex.GetDataWithoutThrowing();
 
-                assemblyLoadContextType.GetRuntimeEvent("Resolving")!.AddEventHandler(defaultContext,
-                    new Func<AssemblyLoadContext, AssemblyName, Assembly?>((context, assemblyName) =>
+            if (data.IsError(out var message))
+            {
+                sb.AppendLine();
+                sb.Append(message);
+            }
+            else
+            {
+                IDictionary dictionary = data.Value!;
+                if (dictionary.Count != 0)
+                {
+                    sb.AppendLine();
+                    sb.Append("Data:");
+                    foreach (DictionaryEntry kvp in dictionary)
                     {
-                        var dllPath = Path.Combine(AppContext.BaseDirectory, assemblyName.Name + ".dll");
-                        if (File.Exists(dllPath))
-                            return loadFromAssemblyPath.Invoke(dllPath);
-
-                        var exePath = Path.Combine(AppContext.BaseDirectory, assemblyName.Name + ".exe");
-                        if (File.Exists(exePath))
-                            return loadFromAssemblyPath.Invoke(exePath);
-
-                        return null;
-                    }));
-
-                return new ReflectionAssemblyLoader(loadFromAssemblyPath);
+                        sb.AppendLine();
+                        sb.AppendFormat("  {0}: {1}", kvp.Key, kvp.Value?.ToString() ?? "<null>");
+                    }
+                }
             }
+        }
+
+        private static List<Exception> FlattenExceptionHierarchy(Exception exception)
+        {
+            var result = new List<Exception>();
+
+            if (exception is ReflectionTypeLoadException reflectionException)
+            {
+                foreach (var innerException in reflectionException.LoaderExceptions)
+                {
+                    if (innerException is not null)
+                        result.Add(exception);
+                }
+
+                foreach (var innerException in reflectionException.LoaderExceptions)
+                {
+                    if (innerException is not null)
+                        result.AddRange(FlattenExceptionHierarchy(innerException));
+                }
+            }
+            if (exception is AggregateException aggregateException)
+            {
+                result.AddRange(aggregateException.InnerExceptions);
+
+                foreach (var innerException in aggregateException.InnerExceptions)
+                    result.AddRange(FlattenExceptionHierarchy(innerException));
+            }
+            else if (exception.InnerException is not null)
+            {
+                result.Add(exception.InnerException);
+                result.AddRange(FlattenExceptionHierarchy(exception.InnerException));
+            }
+
+            return result;
         }
 
         /// <summary>
-        /// Loads an assembly given a string, which is the AssemblyName
+        /// Executes a parameterless synchronous or async delegate and returns the exception it throws, if any.
         /// </summary>
-        public static Assembly Load(string name)
+        internal static Exception? RecordException(Delegate parameterlessDelegate, string parameterName)
         {
-            var ext = Path.GetExtension(name);
-            if (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase)
-                || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
-            {
-                var fromLoader = ReflectionAssemblyLoader.TryGet()?.LoadFromAssemblyPath(Path.GetFullPath(name));
-                if (fromLoader is not null)
-                    return fromLoader;
+            Guard.ArgumentNotNull(parameterlessDelegate, parameterName);
 
-                name = Path.GetFileNameWithoutExtension(name);
+            Guard.ArgumentValid(
+                parameterlessDelegate.GetType().GetMethod("Invoke")?.GetParameters().Length == 0,
+                $"The actual value must be a parameterless delegate but was {parameterlessDelegate.GetType().Name}.",
+                parameterName);
+
+            Guard.ArgumentNotAsyncVoid(parameterlessDelegate, parameterName);
+
+            using (new TestExecutionContext.IsolatedContext())
+            {
+                if (AsyncToSyncAdapter.IsAsyncOperation(parameterlessDelegate))
+                {
+                    try
+                    {
+                        AsyncToSyncAdapter.Await(parameterlessDelegate.DynamicInvokeWithTransparentExceptions);
+                    }
+                    catch (Exception ex)
+                    {
+                        return ex;
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        parameterlessDelegate.DynamicInvokeWithTransparentExceptions();
+                    }
+                    catch (Exception ex)
+                    {
+                        return ex;
+                    }
+                }
             }
 
-            return Assembly.Load(new AssemblyName { Name = name });
-        }
-#else
-        /// <summary>
-        /// Loads an assembly given a string, which may be the
-        /// path to the assembly or the AssemblyName
-        /// </summary>
-        public static Assembly Load(string nameOrPath)
-        {
-            var ext = Path.GetExtension(nameOrPath);
-
-            // Handle case where this is the path to an assembly
-            if (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
-            {
-                return Assembly.Load(AssemblyName.GetAssemblyName(nameOrPath));
-            }
-
-            // Assume it's the string representation of an AssemblyName
-            return Assembly.Load(nameOrPath);
-        }
-#endif
-
-        #endregion
-
-        #region Helper Methods
-
-        private static bool IsFileUri(string uri)
-        {
-            return uri.StartsWith(UriSchemeFile, StringComparison.OrdinalIgnoreCase);
+            return null;
         }
 
         /// <summary>
-        /// Gets the assembly path from code base.
+        /// Unwraps the exception of type <see cref="TargetInvocationException"/> to its InnerException.
         /// </summary>
-        /// <remarks>Public for testing purposes</remarks>
-        /// <param name="codeBase">The code base.</param>
-        /// <returns></returns>
-        public static string GetAssemblyPathFromCodeBase(string codeBase)
+        /// <param name="exception">The exception to unwrap.</param>
+        /// <returns>The InnerException is available, otherwise the <paramref name="exception"/>.</returns>
+        public static Exception Unwrap(this Exception exception)
         {
-            // Skip over the file:// part
-            int start = UriSchemeFile.Length + SchemeDelimiter.Length;
-
-            if (codeBase[start] == '/') // third slash means a local path
+            if (exception is NUnitException nUnitException &&
+                nUnitException.InnerException is not null)
             {
-                // Handle Windows Drive specifications
-                if (codeBase[start + 2] == ':')
-                    ++start;
-                // else leave the last slash so path is absolute
-            }
-            else // It's either a Windows Drive spec or a share
-            {
-                if (codeBase[start + 1] != ':')
-                    start -= 2; // Back up to include two slashes
+                exception = nUnitException.InnerException;
             }
 
-            return codeBase.Substring(start);
+            while (exception is TargetInvocationException targetInvocationException &&
+                targetInvocationException.InnerException is not null)
+            {
+                exception = targetInvocationException.InnerException;
+            }
+
+            return exception;
         }
-
-        #endregion
     }
 }

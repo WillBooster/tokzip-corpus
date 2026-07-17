@@ -12,127 +12,153 @@
 
 namespace Composer\Test\Command;
 
+use Composer\Composer;
+use Composer\Config;
+use Composer\Factory;
+use Composer\Package\RootPackage;
 use Composer\Test\TestCase;
-use InvalidArgumentException;
+use Composer\Util\Platform;
+use Symfony\Component\Console\Input\ArrayInput;
+use Composer\Repository\RepositoryManager;
+use Composer\Repository\InstalledRepositoryInterface;
+use Composer\Package\Archiver\ArchiveManager;
+use Composer\Command\ArchiveCommand;
+use Composer\EventDispatcher\EventDispatcher;
+use Symfony\Component\Console\Output\OutputInterface;
 
-class UpdateCommandTest extends TestCase
+class ArchiveCommandTest extends TestCase
 {
-    /**
-     * @dataProvider provideUpdates
-     * @param array<mixed> $composerJson
-     * @param array<mixed> $command
-     */
-    public function testUpdate(array $composerJson, array $command, string $expected): void
+    public function testUsesConfigFromComposerObject(): void
     {
-        $this->initTempComposer($composerJson);
+        $input = new ArrayInput([]);
 
-        $appTester = $this->getApplicationTester();
-        $appTester->run(array_merge(['command' => 'update', '--dry-run' => true, '--no-audit' => true], $command));
+        $output = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')
+            ->getMock();
 
-        self::assertStringMatchesFormat(trim($expected), trim($appTester->getDisplay(true)));
+        $ed = $this->getMockBuilder('Composer\EventDispatcher\EventDispatcher')
+            ->disableOriginalConstructor()->getMock();
+
+        $composer = new Composer;
+        $config = new Config;
+        $config->merge(['config' => ['archive-format' => 'zip']]);
+        $composer->setConfig($config);
+
+        $manager = $this->getMockBuilder('Composer\Package\Archiver\ArchiveManager')
+            ->disableOriginalConstructor()->getMock();
+
+        $package = $this->getMockBuilder('Composer\Package\RootPackageInterface')
+            ->getMock();
+
+        $manager->expects($this->once())->method('archive')
+            ->with($package, 'zip', '.', null, false)->willReturn(Platform::getCwd());
+
+        $composer->setArchiveManager($manager);
+        $composer->setEventDispatcher($ed);
+        $composer->setPackage($package);
+
+        $command = $this->getMockBuilder('Composer\Command\ArchiveCommand')
+            ->onlyMethods([
+                'mergeApplicationDefinition',
+                'getSynopsis',
+                'initialize',
+                'tryComposer',
+                'requireComposer',
+            ])->getMock();
+        $command->expects($this->atLeastOnce())->method('tryComposer')
+            ->willReturn($composer);
+        $command->expects($this->atLeastOnce())->method('requireComposer')
+            ->willReturn($composer);
+
+        $command->run($input, $output);
     }
 
-    public static function provideUpdates(): \Generator
+    public function testUsesConfigFromFactoryWhenComposerIsNotDefined(): void
     {
-        $rootDepAndTransitiveDep = [
-            'repositories' => [
-                'packages' => [
-                    'type' => 'package',
-                    'package' => [
-                        ['name' => 'root/req', 'version' => '1.0.0', 'require' => ['dep/pkg' => '^1']],
-                        ['name' => 'dep/pkg', 'version' => '1.0.0'],
-                        ['name' => 'dep/pkg', 'version' => '1.0.1'],
-                        ['name' => 'dep/pkg', 'version' => '1.0.2'],
-                    ],
-                ],
-            ],
-            'require' => [
-                'root/req' => '1.*',
-            ],
-        ];
+        $input = new ArrayInput([]);
 
-        yield 'simple update' => [
-            $rootDepAndTransitiveDep,
-            [],
-            <<<OUTPUT
-Loading composer repositories with package information
-Updating dependencies
-Lock file operations: 2 installs, 0 updates, 0 removals
-  - Locking dep/pkg (1.0.2)
-  - Locking root/req (1.0.0)
-Installing dependencies from lock file (including require-dev)
-Package operations: 2 installs, 0 updates, 0 removals
-  - Installing dep/pkg (1.0.2)
-  - Installing root/req (1.0.0)
-OUTPUT
-        ];
+        $output = $this->getMockBuilder('Symfony\Component\Console\Output\OutputInterface')
+            ->getMock();
+        $config = Factory::createConfig();
 
-        yield 'simple update with very verbose output' => [
-            $rootDepAndTransitiveDep,
-            ['-vv' => true],
-            <<<OUTPUT
-Loading composer repositories with package information
-Pool optimizer completed in %f seconds
-Found %d package versions referenced in your dependency graph. %d (%d%%) were optimized away.
-Updating dependencies
-Dependency resolution completed in %f seconds
-Analyzed %d packages to resolve dependencies
-Analyzed %d rules to resolve dependencies
-Lock file operations: 2 installs, 0 updates, 0 removals
-Installs: dep/pkg:1.0.2, root/req:1.0.0
-  - Locking dep/pkg (1.0.2) from package repo (defining 4 packages)
-  - Locking root/req (1.0.0) from package repo (defining 4 packages)
-Installing dependencies from lock file (including require-dev)
-Package operations: 2 installs, 0 updates, 0 removals
-Installs: dep/pkg:1.0.2, root/req:1.0.0
-  - Installing dep/pkg (1.0.2)
-  - Installing root/req (1.0.0)
-OUTPUT
-        ];
+        $command = $this->getMockBuilder('Composer\Command\ArchiveCommand')
+            ->onlyMethods([
+                'mergeApplicationDefinition',
+                'getSynopsis',
+                'initialize',
+                'tryComposer',
+                'archive',
+            ])->getMock();
+        $command->expects($this->once())->method('tryComposer')
+            ->willReturn(null);
+        $command->expects($this->once())->method('archive')
+            ->with(
+                $this->isInstanceOf('Composer\IO\IOInterface'),
+                $config,
+                null,
+                null,
+                'tar',
+                '.',
+                null,
+                false,
+                null
+            )->willReturn(0);
 
-        yield 'update with temporary constraint + --no-install' => [
-            $rootDepAndTransitiveDep,
-            ['--with' => ['dep/pkg:1.0.0'], '--no-install' => true],
-            <<<OUTPUT
-Loading composer repositories with package information
-Updating dependencies
-Lock file operations: 2 installs, 0 updates, 0 removals
-  - Locking dep/pkg (1.0.0)
-  - Locking root/req (1.0.0)
-OUTPUT
-        ];
-
-        yield 'update with temporary constraint failing resolution' => [
-            $rootDepAndTransitiveDep,
-            ['--with' => ['dep/pkg:^2']],
-            <<<OUTPUT
-Loading composer repositories with package information
-Updating dependencies
-Your requirements could not be resolved to an installable set of packages.
-
-  Problem 1
-    - Root composer.json requires root/req 1.* -> satisfiable by root/req[1.0.0].
-    - root/req 1.0.0 requires dep/pkg ^1 -> found dep/pkg[1.0.0, 1.0.1, 1.0.2] but it conflicts with your temporary update constraint (dep/pkg:^2).
-OUTPUT
-        ];
-
-        yield 'update with temporary constraint failing resolution on root package' => [
-            $rootDepAndTransitiveDep,
-            ['--with' => ['root/req:^2']],
-            <<<OUTPUT
-The temporary constraint "^2" for "root/req" must be a subset of the constraint in your composer.json (1.*)
-Run `composer require root/req` or `composer require root/req:^2` instead to replace the constraint
-OUTPUT
-        ];
+        self::assertEquals(0, $command->run($input, $output));
     }
 
-    public function testInteractiveModeThrowsIfNoPackageEntered(): void
+    public function testUsesConfigFromComposerObjectWithPackageName(): void
     {
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('You must enter minimum one package.');
+        $input = new ArrayInput([
+            'package' => 'foo/bar',
+        ]);
 
-        $appTester = $this->getApplicationTester();
-        $appTester->setInputs(['']);
-        $appTester->run(['command' => 'update', '--interactive' => true]);
+        $output = $this->getMockBuilder(OutputInterface::class)
+            ->getMock();
+
+        $eventDispatcher = $this->getMockBuilder(EventDispatcher::class)
+            ->disableOriginalConstructor()->getMock();
+
+        $composer = new Composer;
+        $config = new Config;
+        $config->merge(['config' => ['archive-format' => 'zip']]);
+        $composer->setConfig($config);
+
+        $manager = $this->getMockBuilder(ArchiveManager::class)
+            ->disableOriginalConstructor()->getMock();
+
+        $package = new RootPackage('foo/bar', '1.0.0', '1.0');
+
+        $installedRepository = $this->getMockBuilder(InstalledRepositoryInterface::class)
+            ->getMock();
+        $installedRepository->expects($this->once())->method('loadPackages')
+            ->willReturn(['packages' => [$package], 'namesFound' => ['foo/bar']]);
+
+        $repositoryManager = $this->getMockBuilder(RepositoryManager::class)
+            ->disableOriginalConstructor()->getMock();
+        $repositoryManager->expects($this->once())->method('getLocalRepository')
+            ->willReturn($installedRepository);
+        $repositoryManager->expects($this->once())->method('getRepositories')
+            ->willReturn([]);
+
+        $manager->expects($this->once())->method('archive')
+            ->with($package, 'zip', '.', null, false)->willReturn(Platform::getCwd());
+
+        $composer->setArchiveManager($manager);
+        $composer->setEventDispatcher($eventDispatcher);
+        $composer->setPackage($package);
+        $composer->setRepositoryManager($repositoryManager);
+
+        $command = $this->getMockBuilder(ArchiveCommand::class)
+            ->onlyMethods([
+                'mergeApplicationDefinition',
+                'getSynopsis',
+                'initialize',
+                'tryComposer',
+                'requireComposer',
+            ])->getMock();
+        $command->expects($this->atLeastOnce())->method('tryComposer')
+            ->willReturn($composer);
+
+        $command->run($input, $output);
     }
 }

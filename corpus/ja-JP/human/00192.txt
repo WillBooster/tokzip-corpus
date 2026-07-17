@@ -1,32 +1,89 @@
-その結果、 Vue は子コンポーネントの発行するイベントとして定義されて _いない_　すべてのイベントリスナを、子のルート要素のネイティブイベントリスナとして追加するようになりました（ただし `inheritAttrs: false` が子のオプションで設定されていない場合）。
+両方のコールバックは依存情報を持つデバッグイベントを受け取ります。このコールバックにはインタラクティブに依存を確認ため `debugger` と言う表現を使う推奨します:
 
-```html
-<my-component
-  v-on:close="handleComponentEvent"
-  v-on:click="handleNativeClickEvent"
-/>
-```
-
-`MyComponent.vue`
-
-```html
-<script>
-  export default {
-    emits: ['close']
+```js
+const plusOne = computed(() => count.value + 1, {
+  onTrack(e) {
+    // count.value を依存関係として追跡する場合にトリガーする
+    debugger
+  },
+  onTrigger(e) {
+    // count.value を変更される場合にトリガーする
+    debugger
   }
-</script>
+})
+
+// plusOne にアクセスされる場合に onTrack がトリガーする
+console.log(plusOne.value)
+
+// count.value を変更される場合に onTrigger がトリガーする
+count.value++
 ```
 
-## 移行の戦略
+`onTrack` と `onTrigger` は開発モードのみに動作します。
 
-- `.native` 修飾子のすべてのインスタンスを削除します。
-- すべてのコンポーネントが、 `emits` オプションでイベントを記録するようにします。
+## `watchEffect`
 
-[移行ビルドのフラグ: `COMPILER_V_ON_NATIVE`](migration-build.html#compat-の設定)
+リアクティブの状態に応じて、作用を *自動的に適用しなおす* ために、`watchEffect` 関数を利用できます。これは依存関係をリアクティブにトラッキングし、変更されるたびに即座に関数を再実行します。
 
-## 参照
+```js
+const count = ref(0)
 
-- [関連する RFC](https://github.com/vuejs/rfcs/blob/master/active-rfcs/0031-attr-fallthrough.md#v-on-listener-fallthrough)
-- [移行ガイド - 新しい Emits のオプション](./emits-option.md)
-- [移行ガイド - `$listeners` の削除](./listeners-removed.md)
-- [移行ガイド - Render 関数 API](./render-function-api.md)
+watchEffect(() => console.log(count.value))
+// -> logs 0
+
+setTimeout(() => {
+  count.value++
+  // -> logs 1
+}, 100)
+```
+
+### 監視の停止
+
+`watchEffect` をコンポーネントの [setup()](composition-api-setup.html) 関数または [ライフサイクルフック](composition-api-lifecycle-hooks.html) の中で呼び出すと、ウォッチャはコンポーネントのライフサイクルにリンクされ、コンポーネントのアンマウント時に自動的に監視が停止します。
+
+その他のケースのため、明示的にウォッチャによる監視を停止するための stop ハンドルが返されます:
+
+```js
+const stop = watchEffect(() => {
+  /* ... */
+})
+
+// 処理後
+stop()
+```
+
+### 副作用の無効化
+
+ウォッチされている関数は、それが無効化された時（つまりは、該当の作用が完了する前に状態が変化した時）にクリーンアップする必要のある非同期の関数を実行することがあります。 watchEffect による関数は、コールバックを無効化するための `onInvalidate` 関数を受け取ることができます。この関数は以下の場合に呼び出されます:
+
+- 該当の作用が再度実行された場合
+- ウォッチャが停止した場合（例: `setup()` またはライフサイクルフックの中で `watchEffect` が使用されているコンポーネントがアンマウントされた時）
+
+```js
+watchEffect(onInvalidate => {
+  const token = performAsyncOperation(id.value)
+  onInvalidate(() => {
+    // ID が変更されたまたはウォッチャが停止した
+    // 以前に pending となった非同期の処理を無効にする
+    token.cancel()
+  })
+})
+```
+
+無効化するコールバックを直接返すのではなく、 `onInvalidate` 関数のコールバックを経由して登録しているのは、非同期のエラー処理では、返り値が非常に重要だからです。データ取得を行う時、作用となる関数が非同期であることは非常に一般的なことです:
+
+```js
+const data = ref(null)
+watchEffect(async onInvalidate => {
+  onInvalidate(() => {
+    /* ... */
+  }) // Promise の解決前にクリーンアップする関数を登録
+  data.value = await fetchData(props.id)
+})
+```
+
+非同期関数は暗黙的に Promise を返却しますが、 Promise が resolve される前にクリーンアップ関数を登録する必要があります。Vue は、 Promise チェーンにおける潜在的なエラーを自動的に処理するため、返却される Promise に依存しています。
+
+### 作用フラッシュのタイミング
+
+Vue のリアクティブシステムは、無効になった変更をバッファリングし、非同期に処理することによって、おなじ "tick" の中での複数の状態の変化に対して、不要な重複の呼び出しを避けることができています。内部的には、コンポーネントの `update` 関数も、監視されている作用の 1 つです。ユーザーによる作用がキューに入っている場合、デフォルトではすべてのコンポーネントの更新の **前に** 呼び出されます:

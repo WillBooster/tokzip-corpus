@@ -10,144 +10,195 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Command;
+namespace Composer\Test\Command;
 
-use Symfony\Component\Console\Input\InputInterface;
-use Composer\Console\Input\InputOption;
-use Symfony\Component\Console\Output\OutputInterface;
-use Composer\Console\Input\InputArgument;
+use Composer\Test\TestCase;
+use Generator;
 
-/**
- * @author Davey Shafik <me@daveyshafik.com>
- */
-class ExecCommand extends BaseCommand
+class FundCommandTest extends TestCase
 {
     /**
-     * @return void
+     * @dataProvider useCaseProvider
+     * @param  array<mixed>  $composerJson
+     * @param  array<mixed>  $command
+     * @param  array<mixed>  $funding
      */
-    protected function configure()
-    {
-        $this
-            ->setName('exec')
-            ->setDescription('Executes a vendored binary/script')
-            ->setDefinition([
-                new InputOption('list', 'l', InputOption::VALUE_NONE),
-                new InputArgument('binary', InputArgument::OPTIONAL, 'The binary to run, e.g. phpunit', null, function () {
-                    return $this->getBinaries(false);
-                }),
-                new InputArgument(
-                    'args',
-                    InputArgument::IS_ARRAY | InputArgument::OPTIONAL,
-                    'Arguments to pass to the binary. Use <info>--</info> to separate from composer arguments'
-                ),
-            ])
-            ->setHelp(
-                <<<EOT
-Executes a vendored binary/script.
+    public function testFundCommand(
+        array $composerJson,
+        array $command,
+        array $funding,
+        string $expected
+    ): void {
+        $this->initTempComposer($composerJson);
 
-Read more at https://getcomposer.org/doc/03-cli.md#exec
-EOT
-            )
-        ;
+        $packages = [
+            'first/pkg' => self::getPackage('first/pkg', '2.3.4'),
+            'stable/pkg' => self::getPackage('stable/pkg', '1.0.0'),
+        ];
+        $devPackages = [
+            'dev/pkg' => self::getPackage('dev/pkg', '2.3.4.5')
+        ];
+
+        if (count($funding) !== 0) {
+            foreach ($funding as $pkg => $fundingInfo) {
+                if (isset($packages[$pkg])) {
+                    $packages[$pkg]->setFunding([$fundingInfo]);
+                }
+                if (isset($devPackages[$pkg])) {
+                    $devPackages[$pkg]->setFunding([$fundingInfo]);
+                }
+            }
+        }
+
+        $this->createInstalledJson($packages, $devPackages);
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run(array_merge(['command' => 'fund'], $command));
+
+        $appTester->assertCommandIsSuccessful();
+        self::assertSame(trim($expected), trim($appTester->getDisplay(true)));
     }
 
-    protected function interact(InputInterface $input, OutputInterface $output): void
+    public static function useCaseProvider(): Generator
     {
-        $binaries = $this->getBinaries(false);
-        if (count($binaries) === 0) {
-            return;
-        }
+        yield 'no funding links present, locally or remotely' => [
+            [
+                'repositories' => [],
+                'require' => [
+                    'first/pkg' => '^2.0',
+                ],
+                'require-dev' => [
+                    'dev/pkg' => '~4.0',
+                ]
+            ],
+            [],
+            [],
+            "No funding links were found in your package dependencies. This doesn't mean they don't need your support!"
+        ];
 
-        if ($input->getArgument('binary') !== null || $input->getOption('list')) {
-            return;
-        }
+        yield 'funding links set locally are used as fallback if not found remotely' => [
+            [
+                'repositories' => [],
+                'require' => [
+                    'first/pkg' => '^2.0',
+                ],
+                'require-dev' => [
+                    'dev/pkg' => '~4.0',
+                ]
+            ],
+            [],
+            [
+                'first/pkg' => [
+                    'type' => 'github',
+                    'url' => 'https://github.com/composer-test-data'
+                ],
+                'dev/pkg' => [
+                    'type' => 'github',
+                    'url' => 'https://github.com/composer-test-data-dev'
+                ]
+            ],
+            "The following packages were found in your dependencies which publish funding information:
 
-        $io = $this->getIO();
-        /** @var int $binary */
-        $binary = $io->select(
-            'Binary to run: ',
-            $binaries,
-            '',
-            1,
-            'Invalid binary name "%s"'
-        );
+dev
+  pkg
+    https://github.com/sponsors/composer-test-data-dev
 
-        $input->setArgument('binary', $binaries[$binary]);
+first
+    https://github.com/sponsors/composer-test-data
+
+Please consider following these links and sponsoring the work of package authors!
+Thank you!"
+        ];
+
+        yield 'funding links set remotely are used as primary if found' => [
+            [
+                'repositories' => [
+                    [
+                        'type' => 'package',
+                        'package' => [
+                            // should not be used as there is a default branch version of this package available
+                            ['name' => 'first/pkg', 'version' => 'dev-foo', 'funding' => [['type' => 'github', 'url' => 'https://github.com/test-should-not-be-used']]],
+                            // should be used as default branch from remote repo takes precedence
+                            ['name' => 'first/pkg', 'version' => 'dev-main', 'default-branch' => true, 'funding' => [['type' => 'custom', 'url' => 'https://example.org']]],
+                            // should be used as default branch from remote repo takes precedence
+                            ['name' => 'dev/pkg', 'version' => 'dev-foo', 'default-branch' => true,  'funding' => [['type' => 'github', 'url' => 'https://github.com/org']]],
+                            // no default branch available so falling back to locally installed data
+                            ['name' => 'stable/pkg', 'version' => '1.0.0', 'funding' => [['type' => 'github', 'url' => 'org2']]],
+                        ],
+                    ]
+                ],
+                'require' => [
+                    'first/pkg' => '^2.0',
+                    'stable/pkg' => '^1.0',
+                ],
+                'require-dev' => [
+                    'dev/pkg' => '~4.0',
+                ]
+            ],
+            [],
+            [
+                'first/pkg' => [
+                    'type' => 'github',
+                    'url' => 'https://github.com/composer-test-data'
+                ],
+                'dev/pkg' => [
+                    'type' => 'github',
+                    'url' => 'https://github.com/composer-test-data-dev'
+                ],
+                'stable/pkg' => [
+                    'type' => 'github',
+                    'url' => 'https://github.com/composer-test-data-stable'
+                ]
+            ],
+            "The following packages were found in your dependencies which publish funding information:
+
+dev
+  pkg
+    https://github.com/sponsors/org
+
+first
+    https://example.org
+
+stable
+    https://github.com/sponsors/composer-test-data-stable
+
+Please consider following these links and sponsoring the work of package authors!
+Thank you!"
+        ];
+
+        yield 'format funding links as JSON' => [
+            [
+                'repositories' => [],
+                'require' => [
+                    'first/pkg' => '^2.0',
+                ],
+                'require-dev' => [
+                    'dev/pkg' => '~4.0',
+                ]
+            ],
+            ['--format' => 'json'],
+            [
+                'first/pkg' => [
+                    'type' => 'github',
+                    'url' => 'https://github.com/composer-test-data'
+                ],
+                'dev/pkg' => [
+                    'type' => 'github',
+                    'url' => 'https://github.com/composer-test-data-dev'
+                ]
+            ],
+            '{
+    "dev": {
+        "https://github.com/sponsors/composer-test-data-dev": [
+            "pkg"
+        ]
+    },
+    "first": {
+        "https://github.com/sponsors/composer-test-data": [
+            "pkg"
+        ]
     }
-
-    protected function execute(InputInterface $input, OutputInterface $output): int
-    {
-        $composer = $this->requireComposer();
-        if ($input->getOption('list') || null === $input->getArgument('binary')) {
-            $bins = $this->getBinaries(true);
-            if ([] === $bins) {
-                $binDir = $composer->getConfig()->get('bin-dir');
-
-                throw new \RuntimeException("No binaries found in composer.json or in bin-dir ($binDir)");
-            }
-
-            $this->getIO()->write(
-                <<<EOT
-<comment>Available binaries:</comment>
-EOT
-            );
-
-            foreach ($bins as $bin) {
-                $this->getIO()->write(
-                    <<<EOT
-<info>- $bin</info>
-EOT
-                );
-            }
-
-            return 0;
-        }
-
-        $binary = $input->getArgument('binary');
-
-        $dispatcher = $composer->getEventDispatcher();
-        $dispatcher->addListener('__exec_command', $binary);
-
-        // If the CWD was modified, we restore it to what it was initially, as it was
-        // most likely modified by the global command, and we want exec to run in the local working directory
-        // not the global one
-        if (getcwd() !== $this->getApplication()->getInitialWorkingDirectory() && $this->getApplication()->getInitialWorkingDirectory() !== false) {
-            try {
-                chdir($this->getApplication()->getInitialWorkingDirectory());
-            } catch (\Exception $e) {
-                throw new \RuntimeException('Could not switch back to working directory "'.$this->getApplication()->getInitialWorkingDirectory().'"', 0, $e);
-            }
-        }
-
-        return $dispatcher->dispatchScript('__exec_command', true, $input->getArgument('args'));
-    }
-
-    /**
-     * @return list<string>
-     */
-    private function getBinaries(bool $forDisplay): array
-    {
-        $composer = $this->requireComposer();
-        $binDir = $composer->getConfig()->get('bin-dir');
-        $bins = glob($binDir . '/*');
-        $localBins = $composer->getPackage()->getBinaries();
-        if ($forDisplay) {
-            $localBins = array_map(static function ($e) {
-                return "$e (local)";
-            }, $localBins);
-        }
-
-        $binaries = [];
-        foreach (array_merge($bins, $localBins) as $bin) {
-            // skip .bat copies
-            if (isset($previousBin) && $bin === $previousBin.'.bat') {
-                continue;
-            }
-
-            $previousBin = $bin;
-            $binaries[] = basename($bin);
-        }
-
-        return $binaries;
+}'
+        ];
     }
 }

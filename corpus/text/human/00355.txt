@@ -1,132 +1,247 @@
-<!--
-Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+Or you can remove them:
 
-SPDX-License-Identifier: curl
--->
-
-# curl client readers
-
-Client readers is a design in the internals of libcurl, not visible in its public API. They were started
-in curl v8.7.0. This document describes the concepts, its high level implementation and the motivations.
-
-## Naming
-
-`libcurl` operates between clients and servers. A *client* is the application using libcurl, like the command line tool `curl` itself. Data to be uploaded to a server is **read** from the client and **sent** to the server, the servers response is **received** by `libcurl` and then **written** to the client.
-
-With this naming established, client readers are concerned with providing data from the application to the server. Applications register callbacks via `CURLOPT_READFUNCTION`, data via `CURLOPT_POSTFIELDS` and other options to be used by `libcurl` when the request is send.
-
-## Invoking
-
-The transfer loop that sends and receives, is using `Curl_client_read()` to get more data to send for a transfer. If no specific reader has been installed yet, the default one that uses `CURLOPT_READFUNCTION` is added. The prototype is
-
-```
-CURLcode Curl_client_read(struct Curl_easy *data, char *buf, size_t blen,
-                          size_t *nread, bool *eos);
-```
-The arguments are the transfer to read for, a buffer to hold the read data, its length, the actual number of bytes placed into the buffer and the `eos` (*end of stream*) flag indicating that no more data is available. The `eos` flag may be set for a read amount, if that amount was the last. That way curl can avoid to read an additional time.
-
-The implementation of `Curl_client_read()` uses a chain of *client reader* instances to get the data. This is similar to the design of *client writers*. The chain of readers allows processing of the data to send.
-
-The definition of a reader is:
-
-```
-struct Curl_crtype {
-  const char *name;        /* writer name. */
-  CURLcode (*do_init)(struct Curl_easy *data, struct Curl_creader *writer);
-  CURLcode (*do_read)(struct Curl_easy *data, struct Curl_creader *reader,
-                      char *buf, size_t blen, size_t *nread, bool *eos);
-  void (*do_close)(struct Curl_easy *data, struct Curl_creader *reader);
-  bool (*needs_rewind)(struct Curl_easy *data, struct Curl_creader *reader);
-  curl_off_t (*total_length)(struct Curl_easy *data,
-                             struct Curl_creader *reader);
-  CURLcode (*resume_from)(struct Curl_easy *data,
-                          struct Curl_creader *reader, curl_off_t offset);
-  CURLcode (*rewind)(struct Curl_easy *data, struct Curl_creader *reader);
-};
-
-struct Curl_creader {
-  const struct Curl_crtype *crt;  /* type implementation */
-  struct Curl_creader *next;  /* Downstream reader. */
-  Curl_creader_phase phase; /* phase at which it operates */
-};
+```ruby
+config.action_dispatch.default_headers.clear
 ```
 
-`Curl_creader` is a reader instance with a `next` pointer to form the chain. It as a type `crt` which provides the implementation. The main callback is `do_read()` which provides the data to the caller. The others are for setup and tear down. `needs_rewind()` is explained further below.
+### `Strict-Transport-Security` Header
 
-## Phases and Ordering
+The HTTP [`Strict-Transport-Security`][] (HSTS) response header makes sure the
+browser automatically upgrades to HTTPS for current and future connections.
 
-Since client readers may transform the data being read through the chain, the order in which they are called is relevant for the outcome. When a reader is created, it gets the `phase` property in which it operates. Reader phases are defined like:
+The header is added to the response when enabling the `force_ssl` option:
 
-```
-typedef enum {
-  CURL_CR_NET,  /* data send to the network (connection filters) */
-  CURL_CR_TRANSFER_ENCODE, /* add transfer-encodings */
-  CURL_CR_PROTOCOL, /* before transfer, but after content decoding */
-  CURL_CR_CONTENT_ENCODE, /* add content-encodings */
-  CURL_CR_CLIENT  /* data read from client */
-} Curl_creader_phase;
+```ruby
+config.force_ssl = true
 ```
 
-If a reader for phase `PROTOCOL` is added to the chain, it is always added *after* any `NET` or `TRANSFER_ENCODE` readers and *before* and `CONTENT_ENCODE` and `CLIENT` readers. If there is already a reader for the same phase, the new reader is added before the existing one(s).
+[`Strict-Transport-Security`]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Strict-Transport-Security
 
-### Example: `chunked` reader
+### `Content-Security-Policy` Header
 
-In `http_chunks.c` a client reader for chunked uploads is implemented. This one operates at phase `CURL_CR_TRANSFER_ENCODE`. Any data coming from the reader "below" has the HTTP/1.1 chunk handling applied and returned to the caller.
+To help protect against XSS and injection attacks, it is recommended to define a
+[`Content-Security-Policy`][] response header for your application. Rails
+provides a DSL that allows you to configure the header.
 
-When this reader sees an `eos` from below, it generates the terminal chunk, adding trailers if provided by the application. When that last chunk is fully returned, it also sets `eos` to the caller.
+Define the security policy in the appropriate initializer:
 
-### Example: `lineconv` reader
+```ruby
+# config/initializers/content_security_policy.rb
+Rails.application.config.content_security_policy do |policy|
+  policy.default_src :self, :https
+  policy.font_src    :self, :https, :data
+  policy.img_src     :self, :https, :data
+  policy.object_src  :none
+  policy.script_src  :self, :https
+  policy.style_src   :self, :https
+  # Specify URI for violation reports
+  policy.report_uri "/csp-violation-report-endpoint"
+end
+```
 
-In `sendf.c` a client reader that does line-end conversions is implemented. It operates at `CURL_CR_CONTENT_ENCODE` and converts any "\n" to "\r\n". This is used for FTP ASCII uploads or when the general `crlf` options has been set.
+The globally configured policy can be overridden on a per-resource basis:
 
-### Example: `null` reader
+```ruby
+class PostsController < ApplicationController
+  content_security_policy do |policy|
+    policy.upgrade_insecure_requests true
+    policy.base_uri "https://www.example.com"
+  end
+end
+```
 
-Implemented in `sendf.c` for phase `CURL_CR_CLIENT`, this reader has the simple job of providing transfer bytes of length 0 to the caller, immediately indicating an `eos`. This reader is installed by HTTP for all GET/HEAD requests and when authentication is being negotiated.
+Or it can be disabled:
 
-### Example: `buf` reader
+```ruby
+class LegacyPagesController < ApplicationController
+  content_security_policy false, only: :index
+end
+```
 
-Implemented in `sendf.c` for phase `CURL_CR_CLIENT`, this reader get a buffer pointer and a length and provides exactly these bytes. This one is used in HTTP for sending `postfields` provided by the application.
+Use lambdas to inject per-request values, such as account subdomains in a
+multi-tenant application:
 
-## Request retries
+```ruby
+class PostsController < ApplicationController
+  content_security_policy do |policy|
+    policy.base_uri :self, -> { "https://#{current_user.domain}.example.com" }
+  end
+end
+```
 
-Sometimes it is necessary to send a request with client data again. Transfer handling can inquire via `Curl_client_read_needs_rewind()` if a rewind (e.g. a reset of the client data) is necessary. This asks all installed readers if they need it and give `FALSE` of none does.
+[`Content-Security-Policy`]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Security-Policy
 
-## Upload Size
+#### Reporting Violations
 
-Many protocols need to know the amount of bytes delivered by the client readers in advance. They may invoke `Curl_creader_total_length(data)` to retrieve that. However, not all reader chains know the exact value beforehand. In that case, the call returns `-1` for "unknown".
+Enable the [`report-uri`][] directive to report violations to the specified URI:
 
-Even if the length of the "raw" data is known, the length that is send may not. Example: with option `--crlf` the uploaded content undergoes line-end conversion. The line converting reader does not know in advance how many newlines it may encounter. Therefore it must return `-1` for any positive raw content length.
+```ruby
+Rails.application.config.content_security_policy do |policy|
+  policy.report_uri "/csp-violation-report-endpoint"
+end
+```
 
-In HTTP, once the correct client readers are installed, the protocol asks the readers for the total length. If that is known, it can set `Content-Length:` accordingly. If not, it may choose to add an HTTP "chunked" reader.
+When migrating legacy content, you might want to report violations without
+enforcing the policy. Set the [`Content-Security-Policy-Report-Only`][]
+response header to only report violations:
 
-In addition, there is `Curl_creader_client_length(data)` which gives the total length as reported by the reader in phase `CURL_CR_CLIENT` without asking other readers that may transform the raw data. This is useful in estimating the size of an upload. The HTTP protocol uses this to determine if `Expect: 100-continue` shall be done.
+```ruby
+Rails.application.config.content_security_policy_report_only = true
+```
 
-## Resuming
+Or override it in a controller:
 
-Uploads can start at a specific offset, if so requested. The "resume from" that offset. This applies to the reader in phase `CURL_CR_CLIENT` that delivers the "raw" content. Resumption can fail if the installed reader does not support it or if the offset is too large.
+```ruby
+class PostsController < ApplicationController
+  content_security_policy_report_only only: :index
+end
+```
 
-The total length reported by the reader changes when resuming. Example: resuming an upload of 100 bytes by 25 reports a total length of 75 afterwards.
+[`Content-Security-Policy-Report-Only`]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Security-Policy-Report-Only
+[`report-uri`]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Security-Policy/report-uri
 
-If `resume_from()` is invoked twice, it is additive. There is currently no way to undo a resume.
+#### Adding a Nonce
 
-## Rewinding
+If you are considering `'unsafe-inline'`, consider using nonces instead. [Nonces
+provide a substantial improvement](https://www.w3.org/TR/CSP3/#security-nonces)
+over `'unsafe-inline'` when implementing a Content Security Policy on top
+of existing code.
 
-When a request is retried, installed client readers are discarded and replaced by new ones. This works only if the new readers upload the same data. For many readers, this is not an issue. The "null" reader always does the same. Also the `buf` reader, initialized with the same buffer, does this.
+```ruby
+# config/initializers/content_security_policy.rb
+Rails.application.config.content_security_policy do |policy|
+  policy.script_src :self, :https
+end
 
-Readers operating on callbacks to the application need to "rewind" the underlying content. For example, when reading from a `FILE*`, the reader needs to `fseek()` to the beginning. The following methods are used:
+Rails.application.config.content_security_policy_nonce_generator = -> request { SecureRandom.base64(16) }
+```
 
-1. `Curl_creader_needs_rewind(data)`: tells if a rewind is necessary, given the current state of the reader chain. If nothing really has been read so far, this returns `FALSE`.
-2. `Curl_creader_will_rewind(data)`: tells if the reader chain rewinds at the start of the next request.
-3. `Curl_creader_set_rewind(data, TRUE)`: marks the reader chain for rewinding at the start of the next request.
-4. `Curl_client_start(data)`: tells the readers that a new request starts and they need to rewind if requested.
+There are a few tradeoffs to consider when configuring the nonce generator.
+Using `SecureRandom.base64(16)` is a good default value, because it will
+generate a new random nonce for each request. However, this method is
+incompatible with [conditional GET caching](caching_with_rails.html#conditional-get-support)
+because new nonces will result in new ETag values for every request. An
+alternative to per-request random nonces would be to use the session id:
 
+```ruby
+Rails.application.config.content_security_policy_nonce_generator = -> request { request.session.id.to_s }
+```
 
-## Summary and Outlook
+This generation method is compatible with ETags, however its security depends on
+the session id being sufficiently random and not being exposed in insecure
+cookies.
 
-By adding the client reader interface, any protocol can control how/if it wants the curl transfer to send bytes for a request. The transfer loop becomes then blissfully ignorant of the specifics.
+By default, nonces will be applied to `script-src` and `style-src` if a nonce
+generator is defined. `config.content_security_policy_nonce_directives` can be
+used to change which directives will use nonces:
 
-The protocols on the other hand no longer have to care to package data most efficiently. At any time, should more data be needed, it can be read from the client. This is used when sending HTTP requests headers to add as much request body data to the initial sending as there is room for.
+```ruby
+Rails.application.config.content_security_policy_nonce_directives = %w(script-src)
+```
 
-Future enhancements based on the client readers:
-* `expect-100` handling: place that into a HTTP specific reader at `CURL_CR_PROTOCOL` and eliminate the checks in the generic transfer parts.
-* `eos forwarding`: transfer should forward an `eos` flag to the connection filters. Filters like HTTP/2 and HTTP/3 can make use of that, terminating streams early. This would also eliminate length checks in stream handling.
+Once nonce generation is configured in an initializer, automatic nonce values
+can be added to script tags by passing `nonce: true` as part of `html_options`:
+
+```html+erb
+<%= javascript_tag nonce: true do -%>
+  alert('Hello, World!');
+<% end -%>
+```
+
+The same works with `javascript_include_tag` and the `stylesheet_link_tag`:
+
+```html+erb
+<%= javascript_include_tag "script", nonce: true %>
+<%= stylesheet_link_tag "style.css", nonce: true %>
+```
+
+Use [`csp_meta_tag`](https://api.rubyonrails.org/classes/ActionView/Helpers/CspHelper.html#method-i-csp_meta_tag)
+helper to create a meta tag "csp-nonce" with the per-session nonce value
+for allowing inline `<script>` tags.
+
+```html+erb
+<head>
+  <%= csp_meta_tag %>
+</head>
+```
+
+This is used by the Rails UJS helper to create dynamically
+loaded inline `<script>` elements.
+
+### `Feature-Policy` Header
+
+NOTE: The `Feature-Policy` header has been renamed to `Permissions-Policy`.
+The `Permissions-Policy` requires a different implementation and isn't
+yet supported by all browsers. To avoid having to rename this
+middleware in the future, we use the new name for the middleware but
+keep the old header name and implementation for now.
+
+To allow or block the use of browser features, you can define a [`Feature-Policy`][]
+response header for your application. Rails provides a DSL that allows you to
+configure the header.
+
+Define the policy in the appropriate initializer:
+
+```ruby
+# config/initializers/permissions_policy.rb
+Rails.application.config.permissions_policy do |policy|
+  policy.camera      :none
+  policy.gyroscope   :none
+  policy.microphone  :none
+  policy.usb         :none
+  policy.fullscreen  :self
+  policy.payment     :self, "https://secure.example.com"
+end
+```
+
+The globally configured policy can be overridden on a per-resource basis:
+
+```ruby
+class PagesController < ApplicationController
+  permissions_policy do |policy|
+    policy.geolocation "https://example.com"
+  end
+end
+```
+
+[`Feature-Policy`]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Feature-Policy
+
+### Cross-Origin Resource Sharing
+
+Browsers restrict cross-origin HTTP requests initiated from scripts. If you
+want to run Rails as an API, and run a frontend app on a separate domain, you
+need to enable [Cross-Origin Resource
+Sharing](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) (CORS).
+
+You can use the [Rack CORS](https://github.com/cyu/rack-cors) middleware for
+handling CORS. If you've generated your application with the `--api` option,
+Rack CORS has probably already been configured and you can skip the following
+steps.
+
+To get started, add the rack-cors gem to your Gemfile:
+
+```ruby
+gem "rack-cors"
+```
+
+Next, add an initializer to configure the middleware:
+
+```ruby
+# config/initializers/cors.rb
+Rails.application.config.middleware.insert_before 0, Rack::Cors do
+  allow do
+    origins 'example.com'
+
+    resource '*',
+      headers: :any,
+      methods: [:get, :post, :put, :patch, :delete, :options, :head]
+  end
+end
+```
+
+Intranet and Admin Security
+---------------------------
+
+Intranet and administration interfaces are popular attack targets, because they allow privileged access. Although this would require several extra-security measures, the opposite is the case in the real world.
+
+In 2007 there was the first tailor-made trojan which stole information from an Intranet, namely the "Monster for employers" website of Monster.com, an online recruitment web application. Tailor-made Trojans are very rare, so far, and the risk is quite low, but it is certainly a possibility and an example of how the security of the client host is important, too. However, the highest threat to Intranet and Admin applications are XSS and CSRF.

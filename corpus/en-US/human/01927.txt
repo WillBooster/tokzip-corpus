@@ -1,100 +1,222 @@
-## Create a task definition
+You can also set `DENO_AUDIT_PERMISSIONS=otel` to emit each access as an
+OpenTelemetry **log record** instead of writing to a file. The records are sent
+to whichever exporter you have configured via
+[`OTEL_DENO`](/runtime/fundamentals/open_telemetry/) and carry these attributes:
 
-A
-[task definition](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definitions.html)
-tells ECS how to run your container: which image, how much CPU and memory, and
-which ports to expose. Save the following as `task-definition.json`,
-substituting your account ID and region:
+- `deno.permission.type`
+- `deno.permission.value`
+- `deno.permission.stack` (if `DENO_TRACE_PERMISSIONS` is also set)
 
-```json title="task-definition.json"
-{
-  "family": "deno-fargate",
-  "networkMode": "awsvpc",
-  "requiresCompatibilities": ["FARGATE"],
-  "cpu": "256",
-  "memory": "512",
-  "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
-  "containerDefinitions": [
-    {
-      "name": "deno-fargate",
-      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/deno-fargate:latest",
-      "essential": true,
-      "portMappings": [
-        {
-          "containerPort": 8000,
-          "protocol": "tcp"
-        }
-      ]
-    }
-  ]
-}
+This is the recommended setup if you already collect OpenTelemetry data — the
+permission audit lands next to your traces and metrics so you can correlate it
+with request handling.
+
+```sh
+OTEL_DENO=true DENO_AUDIT_PERMISSIONS=otel deno run -A main.ts
 ```
 
-The `executionRoleArn` refers to the `ecsTaskExecutionRole`, which lets ECS pull
-images from ECR and write logs to CloudWatch. If you have not used ECS before,
-create it once by following
-[the AWS guide](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html).
+## Configuration file
 
-Register the task definition:
+Deno supports storing permissions in the deno.json/deno.jsonc file. Read more
+under [configuration](/runtime/reference/deno_json/#permissions).
 
-```shell
-aws ecs register-task-definition \
-  --cli-input-json file://task-definition.json \
-  --region $AWS_REGION
+## File system access
+
+By default, executing code can not read or write arbitrary files on the file
+system. This includes listing the contents of directories, checking for the
+existence of a given file, and opening or connecting to Unix sockets.
+
+Access to read files is granted using the `--allow-read` (or `-R`) flag, and
+access to write files is granted using the `--allow-write` (or `-W`) flag. These
+flags can be specified with a list of paths to allow access to specific files or
+directories and any subdirectories in them.
+
+Definition: `--allow-read[=<PATH>...]` or `-R[=<PATH>...]`
+
+PATHs may be separated by comma (`,`) characters. To include a comma character
+in the PATH, it must be doubled. (Example: `this file,, contains a comma.txt`)
+
+```sh
+# Allow all reads from file system
+deno run -R script.ts
+# or 
+deno run --allow-read script.ts
+
+# Allow reads from file foo.txt and bar.txt only
+deno run --allow-read=foo.txt,bar.txt script.ts
+
+# Allow reads from any file in any subdirectory of ./node_modules
+deno run --allow-read=node_modules script.ts
 ```
 
-## Run it as a Fargate service
+Definition: `--deny-read[=<PATH>...]`
 
-Create a cluster to hold the service:
+```sh
+# Allow reading files in /etc but disallow reading /etc/hosts
+deno run --allow-read=/etc --deny-read=/etc/hosts script.ts
 
-```shell
-aws ecs create-cluster --cluster-name deno-cluster --region $AWS_REGION
+# Deny all read access to disk, disabling permission prompts for reads.
+deno run --deny-read script.ts
 ```
 
-Now create a service that keeps one copy of the task running. Fargate needs to
-know which subnets and security group to launch into, and `assignPublicIp` lets
-the task pull the image and be reachable without a NAT gateway. Replace the
-subnet and security group IDs with ones from your VPC, and make sure the
-security group allows inbound traffic on port `8000`:
+Definition: `--allow-write[=<PATH>...]` or `-W[=<PATH>...]`
 
-```shell
-aws ecs create-service \
-  --cluster deno-cluster \
-  --service-name deno-fargate \
-  --task-definition deno-fargate \
-  --desired-count 1 \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[subnet-abc123],securityGroups=[sg-abc123],assignPublicIp=ENABLED}" \
-  --region $AWS_REGION
+```sh
+# Allow all writes to file system
+deno run -W script.ts
+# or 
+deno run --allow-write script.ts
+
+# Allow writes to file foo.txt and bar.txt only
+deno run --allow-write=foo.txt,bar.txt script.ts
 ```
 
-Once the service reaches a steady state, find the task's public IP:
+Definition: `--deny-write[=<PATH>...]`
 
-```shell
-TASK_ARN=$(aws ecs list-tasks --cluster deno-cluster \
-  --service-name deno-fargate --query "taskArns[0]" --output text --region $AWS_REGION)
+```sh
+# Allow reading files in current working directory 
+# but disallow writing to ./secrets directory.
+deno run --allow-write=./ --deny-write=./secrets script.ts
 
-ENI_ID=$(aws ecs describe-tasks --cluster deno-cluster --tasks $TASK_ARN \
-  --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" \
-  --output text --region $AWS_REGION)
-
-aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID \
-  --query "NetworkInterfaces[0].Association.PublicIp" --output text --region $AWS_REGION
+# Deny all write access to disk, disabling permission prompts.
+deno run --deny-write script.ts
 ```
 
-Open `http://<public-ip>:8000` and you should see your Deno app responding from
-Fargate.
+Some APIs in Deno are implemented using file system operations under the hood,
+even though they do not provide direct read/write access to specific files.
+These APIs read and write to disk but do not require any explicit read/write
+permissions. Some examples of these APIs are:
 
-## Production considerations
+- `localStorage`
+- Deno KV
+- `caches`
+- `Blob`
 
-For anything beyond a demo, put the service behind an
-[Application Load Balancer](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-load-balancing.html)
-instead of exposing the task's public IP directly. The load balancer gives you a
-stable DNS name, TLS termination, and health checks, and it lets ECS roll new
-deployments without downtime. You can also raise `desired-count` to run multiple
-tasks and enable
-[service auto scaling](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-auto-scaling.html)
-to adjust capacity based on load.
+Because these APIs are implemented using file system operations, users can use
+them to consume file system resources like storage space, even if they do not
+have direct access to the file system.
 
-🦕 Now you can deploy a Deno app to AWS ECS Fargate by containerizing it,
-pushing the image to Amazon ECR, and running it as a Fargate service.
+During module loading, Deno can load files from disk. This sometimes requires
+explicit permissions, and sometimes is allowed by default:
+
+- All files that are imported from the entrypoint module in a way that they can
+  be statically analyzed are allowed to be read by default. This includes static
+  `import` statements and dynamic `import()` calls where the argument is a
+  string literal that points to a specific file or a directory of files. The
+  full list of files that are in this list can be printed using
+  `deno info <entrypoint>`.
+- Files that are dynamically imported in a way that can not be statically
+  analyzed require runtime read permissions.
+- Files inside of a `node_modules/` directory are allowed to be read by default.
+
+When fetching modules from the network, or when transpiling code from TypeScript
+to JavaScript, Deno uses the file system as a cache. This means that file system
+resources like storage space can be consumed by Deno even if the user has not
+explicitly granted read/write permissions.
+
+### Symbolic links
+
+When reading or writing through a symbolic link, Deno checks permissions based
+on the symlink's location, not the target it points to. This means if you have
+`--allow-read=/app`, you can read through a symlink at `/app/link` even if it
+points to a file outside `/app`.
+
+However, Deno prevents privilege escalation through symlinks. If a symlink
+resolves to a sensitive system path, additional permissions are required:
+
+- **`/proc`, `/dev`, `/sys` (Linux)**: Reading or writing through symlinks that
+  resolve to these paths requires `--allow-all`, as these paths can expose
+  sensitive system information.
+- **`/proc/**/environ`**: Requires `--allow-env` since it exposes environment
+  variables.
+- **`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`**: These safe device
+  files are always accessible without additional permissions.
+
+Creating symlinks with [`Deno.symlink()`](/api/deno/~/Deno.symlink) requires
+both `--allow-read` and `--allow-write` with full access (not path-specific),
+because symlinks can point to arbitrary locations.
+
+> **Note**: Symlinks that already exist on the filesystem can be read through
+> using the permissions for the symlink's location. The full read/write
+> permission requirement only applies to _creating_ new symlinks with
+> [`Deno.symlink()`](/api/deno/~/Deno.symlink).
+
+## Network access
+
+By default, executing code can not make network requests, open network listeners
+or perform DNS resolution. This includes making HTTP requests, opening TCP/UDP
+sockets, and listening for incoming connections on TCP or UDP.
+
+Network access is granted using the `--allow-net` flag. This flag can be
+specified with a list of hosts to allow access to specific network addresses. A
+host can be a hostname or IP address, optionally with a port.
+
+Hostnames do not allow subdomains, unless explicitly listed. To allow any
+subdomain for a hostname, `*` can be used as wildcard for any subdomain.
+
+Definition: `--allow-net[=<HOST>...]` or `-N[=<HOST>...]`
+
+```sh
+# Allow network access
+deno run -N script.ts
+# or
+deno run --allow-net script.ts
+
+# Allow network access to github.com and jsr.io
+deno run --allow-net=github.com,jsr.io script.ts
+
+# Allow all subdomains for example.com
+deno run --allow-net="*.example.com" script.ts
+
+# A hostname at port 80:
+deno run --allow-net=example.com:80 script.ts
+
+# An IPv4 address on port 443
+deno run --allow-net=1.1.1.1:443 script.ts
+
+# An IPv6 address, all ports allowed
+deno run --allow-net=[2606:4700:4700::1111] script.ts
+```
+
+Definition: `--deny-net[=<HOST>...]`
+
+```sh
+# Allow access to network, but deny access 
+# to github.com and jsr.io
+deno run --allow-net --deny-net=github.com,jsr.io script.ts
+
+# Deny all network access, disabling permission prompts.
+deno run --deny-net script.ts
+```
+
+During module loading, Deno can load modules from the network. By default Deno
+allows loading modules from the following locations using both static and
+dynamic imports, without requiring explicit network access:
+
+- `https://deno.land/`
+- `https://jsr.io/`
+- `https://esm.sh/`
+- `https://raw.esm.sh/`
+- `https://cdn.jsdelivr.net/`
+- `https://raw.githubusercontent.com/`
+- `https://gist.githubusercontent.com/`
+
+These locations are trusted "public good" registries that are not expected to
+enable data exfiltration through URL paths. You can add more trusted registries
+using the `--allow-import` flag.
+
+In addition Deno allows importing any NPM package through `npm:` specifiers.
+
+Deno also sends requests to `https://dl.deno.land/` at most once a day to check
+for updates to the Deno CLI. This can be disabled using `DENO_NO_UPDATE_CHECK=1`
+environment var.
+
+## Environment variables
+
+By default, executing code can not read or write environment variables. This
+includes reading environment variables, and setting new values.
+
+Access to environment variables is granted using the `--allow-env` flag. This
+flag can be specified with a list of environment variables to allow access to
+specific environment variables. Starting with Deno v2.1, you can now specify
+suffix wildcards to allow “scoped” access to environmental variables.

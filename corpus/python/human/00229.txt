@@ -1,143 +1,73 @@
-"""https://github.com/pydantic/pydantic/issues/6768"""
+import json
+import pickle
+from datetime import timedelta
 
-from __future__ import annotations
+import pytest
 
-from pathlib import Path
-from typing import Annotated, Any, Generic, TypeVar
-
-from pydantic import BaseModel, TypeAdapter, create_model
-from pydantic.fields import FieldInfo
-
-TYPES_DEFAULTS = {int: 0, str: '', bool: False}  # some dummy basic types with defaults for some fields
-TYPES = [*TYPES_DEFAULTS.keys()]
-# these are set low to minimise test time, they're increased below in the cProfile call
-INNER_DATA_MODEL_COUNT = 5
-OUTER_DATA_MODEL_COUNT = 5
+from pydantic_core import core_schema
+from pydantic_core._pydantic_core import SchemaSerializer
 
 
-def create_data_models() -> list[Any]:
-    # Create varying inner models with different sizes and fields (not actually realistic)
-    models = []
-    for i in range(INNER_DATA_MODEL_COUNT):
-        fields = {}
-        for j in range(i):
-            type_ = TYPES[j % len(TYPES)]
-            type_default = TYPES_DEFAULTS[type_]
-            if j % 4 == 0:
-                type_ = list[type_]
-                type_default = []
-
-            default = ... if j % 2 == 0 else type_default
-            fields[f'f{j}'] = (type_, default)
-        models.append(create_model(f'M1{i}', **fields))
-
-    # Crate varying outer models where some fields use the inner models (not really realistic)
-    models_with_nested = []
-    for i in range(OUTER_DATA_MODEL_COUNT):
-        fields = {}
-        for j in range(i):
-            type_ = models[j % len(models)] if j % 2 == 0 else TYPES[j % len(TYPES)]
-            if j % 4 == 0:
-                type_ = list[type_]
-            fields[f'f{j}'] = (type_, ...)
-        models_with_nested.append(create_model(f'M2{i}', **fields))
-
-    return [*models, *models_with_nested]
+def repr_function(value, _info):
+    return repr(value)
 
 
-def test_fastapi_startup_perf(benchmark: Any):
-    data_models = create_data_models()
-    # API models for reading / writing the different data models
-    T = TypeVar('T')
+def test_basic_schema_serializer():
+    s = SchemaSerializer(core_schema.dict_schema())
+    s = pickle.loads(pickle.dumps(s))
+    assert s.to_python({'a': 1, b'b': 2, 33: 3}) == {'a': 1, b'b': 2, 33: 3}
+    assert s.to_python({'a': 1, b'b': 2, 33: 3, True: 4}, mode='json') == {'a': 1, 'b': 2, '33': 3, 'true': 4}
+    assert s.to_json({'a': 1, b'b': 2, 33: 3, True: 4}) == b'{"a":1,"b":2,"33":3,"true":4}'
 
-    class GetModel(BaseModel, Generic[T]):
-        res: T
-
-    class GetModel2(GetModel[T], Generic[T]):
-        foo: str
-        bar: str
-
-    class GetManyModel(BaseModel, Generic[T]):
-        res: list[T]
-
-    class GetManyModel2(GetManyModel[T], Generic[T]):
-        foo: str
-        bar: str
-
-    class GetManyModel3(BaseModel, Generic[T]):
-        res: dict[str, T]
-
-    class GetManyModel4(BaseModel, Generic[T]):
-        res: dict[str, list[T]]
-
-    class PutModel(BaseModel, Generic[T]):
-        data: T
-
-    class PutModel2(PutModel[T], Generic[T]):
-        foo: str
-        bar: str
-
-    class PutManyModel(BaseModel, Generic[T]):
-        data: list[T]
-
-    class PutManyModel2(PutManyModel[T], Generic[T]):
-        foo: str
-        bar: str
-
-    api_models: list[Any] = [
-        GetModel,
-        GetModel2,
-        GetManyModel,
-        GetManyModel2,
-        GetManyModel3,
-        GetManyModel4,
-        PutModel,
-        PutModel2,
-        PutManyModel,
-        PutManyModel2,
-    ]
-
-    assert len(data_models) == INNER_DATA_MODEL_COUNT + OUTER_DATA_MODEL_COUNT
-
-    def bench():
-        concrete_api_models = []
-        adapters = []
-        for outer_api_model in api_models:
-            for data_model in data_models:
-                concrete_api_model = outer_api_model[
-                    data_model
-                ]  # Would be used eg as request or response body in FastAPI
-                concrete_api_models.append(concrete_api_model)
-
-                # Emulate FastAPI creating its TypeAdapters
-                adapt = TypeAdapter(Annotated[concrete_api_model, FieldInfo(description='foo')])
-                adapters.append(adapt)
-                adapt = TypeAdapter(Annotated[concrete_api_model, FieldInfo(description='bar')])
-                adapters.append(adapt)
-
-        assert len(concrete_api_models) == len(data_models) * len(api_models)
-        assert len(adapters) == len(concrete_api_models) * 2
-
-    benchmark(bench)
+    assert s.to_python({(1, 2): 3}) == {(1, 2): 3}
+    assert s.to_python({(1, 2): 3}, mode='json') == {'1,2': 3}
+    assert s.to_json({(1, 2): 3}) == b'{"1,2":3}'
 
 
-if __name__ == '__main__':
-    # run with `uv run tests/benchmarks/test_fastapi_startup.py`
-    import cProfile
-    import sys
-    import time
-
-    INNER_DATA_MODEL_COUNT = 50
-    OUTER_DATA_MODEL_COUNT = 50
-    print(f'Python version: {sys.version}')
-    if sys.argv[-1] == 'cProfile':
-        cProfile.run(
-            'test_fastapi_startup_perf(lambda f: f())',
-            sort='tottime',
-            filename=Path(__file__).name.strip('.py') + '.cprof',
+@pytest.mark.parametrize(
+    'value,expected_python,expected_json',
+    [(None, 'None', b'"None"'), (1, '1', b'"1"'), ([1, 2, 3], '[1, 2, 3]', b'"[1, 2, 3]"')],
+)
+def test_schema_serializer_capturing_function(value, expected_python, expected_json):
+    # Test a SchemaSerializer that captures a function.
+    s = SchemaSerializer(
+        core_schema.any_schema(
+            serialization=core_schema.plain_serializer_function_ser_schema(repr_function, info_arg=True)
         )
-    else:
-        start = time.perf_counter()
-        test_fastapi_startup_perf(lambda f: f())
-        end = time.perf_counter()
-        print(f'Time taken: {end - start:.2f}s')
+    )
+    s = pickle.loads(pickle.dumps(s))
+    assert s.to_python(value) == expected_python
+    assert s.to_json(value) == expected_json
+    assert s.to_python(value, mode='json') == json.loads(expected_json)
+
+
+def test_schema_serializer_containing_config():
+    s = SchemaSerializer(core_schema.timedelta_schema(), config={'ser_json_timedelta': 'float'})
+    s = pickle.loads(pickle.dumps(s))
+
+    assert s.to_python(timedelta(seconds=4, microseconds=500_000)) == timedelta(seconds=4, microseconds=500_000)
+    assert s.to_python(timedelta(seconds=4, microseconds=500_000), mode='json') == 4.5
+    assert s.to_json(timedelta(seconds=4, microseconds=500_000)) == b'4.5'
+
+
+# Should be defined at the module level for pickling to work:
+class Model:
+    __pydantic_serializer__: SchemaSerializer
+    __pydantic_complete__ = True
+
+
+def test_schema_serializer_not_reused_when_unpickling() -> None:
+    s = SchemaSerializer(
+        core_schema.model_schema(
+            cls=Model,
+            schema=core_schema.model_fields_schema(fields={}, model_name='Model'),
+            config={'title': 'Model'},
+            ref='Model:123',
+        )
+    )
+
+    Model.__pydantic_serializer__ = s
+    assert 'Prebuilt' not in str(Model.__pydantic_serializer__)
+
+    reconstructed = pickle.loads(pickle.dumps(Model.__pydantic_serializer__))
+    assert 'Prebuilt' not in str(reconstructed)

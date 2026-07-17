@@ -1,178 +1,174 @@
-```ts
-   async function insertUser(user: User) {
-     const primaryKey = ["users", user.id] as const;
-     const byEmailKey = ["users_by_email", user.email.toLowerCase()] as const;
-     const res = await kv.atomic()
-       .check({ key: primaryKey, versionstamp: null })
-       .check({ key: byEmailKey, versionstamp: null })
-       .set(primaryKey, user)
-       // store pointer, not full user
-       .set(byEmailKey, user.id)
-       .commit();
-     if (!res.ok) {
-       throw new TypeError("User with ID or email already exists");
-     }
-   }
-   ```
+For now, our handling of the stream consists of calling `unwrap` to terminate
+our program if the stream has any errors; if there aren’t any errors, the
+program prints a message. We’ll add more functionality for the success case in
+the next listing. The reason we might receive errors from the `incoming` method
+when a client connects to the server is that we’re not actually iterating over
+connections. Instead, we’re iterating over _connection attempts_. The
+connection might not be successful for a number of reasons, many of them
+operating system specific. For example, many operating systems have a limit to
+the number of simultaneous open connections they can support; new connection
+attempts beyond that number will produce an error until some of the open
+connections are closed.
 
-   > This function performs the insert using an atomic operation that checks
-   > that no user with the same ID or email already exists. If either of these
-   > constraints is violated, the insert fails and no data is modified.
+Let’s try running this code! Invoke `cargo run` in the terminal and then load
+_127.0.0.1:7878_ in a web browser. The browser should show an error message
+like “Connection reset” because the server isn’t currently sending back any
+data. But when you look at your terminal, you should see several messages that
+were printed when the browser connected to the server!
 
-3. Define a `getUser` function to retrieve a user by their ID:
+```text
+     Running `target/debug/hello`
+Connection established!
+Connection established!
+Connection established!
+```
 
-   ```ts
-   async function getUser(id: string): Promise<User | null> {
-     const res = await kv.get<User>(["users", id]);
-     return res.value;
-   }
-   ```
+Sometimes you’ll see multiple messages printed for one browser request; the
+reason might be that the browser is making a request for the page as well as a
+request for other resources, like the _favicon.ico_ icon that appears in the
+browser tab.
 
-4. Define a `getUserByEmail` function to retrieve a user by their email address
-   using a double lookup (email → user ID → user):
+It could also be that the browser is trying to connect to the server multiple
+times because the server isn’t responding with any data. When `stream` goes out
+of scope and is dropped at the end of the loop, the connection is closed as
+part of the `drop` implementation. Browsers sometimes deal with closed
+connections by retrying, because the problem might be temporary.
 
-   ```ts
-   async function getUserByEmail(email: string): Promise<User | null> {
-     const idRes = await kv.get<string>([
-       "users_by_email",
-       email.toLowerCase(),
-     ]);
-     if (!idRes.value) return null;
-     const res = await kv.get<User>(["users", idRes.value]);
-     return res.value;
-   }
-   ```
+Browsers also sometimes open multiple connections to the server without sending
+any requests so that if they *do* later send requests, those requests can
+happen more quickly. When this occurs, our server will see each connection,
+regardless of whether there are any requests over that connection. Many
+versions of Chrome-based browsers do this, for example; you can disable that
+optimization by using private browsing mode or using a different browser.
 
-   This function queries the store using the secondary key
-   (`["users_by_email", email]`).
+The important factor is that we’ve successfully gotten a handle to a TCP
+connection!
 
-5. Define a `deleteUser` function to delete users by their ID, removing the
-   index entry too:
+Remember to stop the program by pressing <kbd>ctrl</kbd>-<kbd>C</kbd> when
+you’re done running a particular version of the code. Then, restart the program
+by invoking the `cargo run` command after you’ve made each set of code changes
+to make sure you’re running the newest code.
 
-   ```ts
-   async function deleteUser(id: string) {
-     let res = { ok: false } as { ok: boolean };
-     while (!res.ok) {
-       const cur = await kv.get<User>(["users", id]);
-       if (cur.value === null) return;
-       res = await kv.atomic()
-         .check(cur)
-         .delete(["users", id])
-         .delete(["users_by_email", cur.value.email.toLowerCase()])
-         .commit();
-     }
-   }
-   ```
+### Reading the Request
 
-   > This function first retrieves the user by their ID to get the users email
-   > address. This is needed to retrieve the email that is needed to construct
-   > the key for the secondary index for this user address. It then performs an
-   > atomic operation that checks that the user in the database has not changed,
-   > and then deletes both the primary and secondary key pointing to the user
-   > value. If this fails (the user has been modified between query and delete),
-   > the atomic operation aborts. The entire procedure is retried until the
-   > delete succeeds. The check is required to prevent race conditions where
-   > value may have been modified between the retrieve and delete. This race can
-   > occur if an update changes the user's email, because the secondary index
-   > moves in this case. The delete of the secondary index then fails, because
-   > the delete is targeting the old secondary index key.
+Let’s implement the functionality to read the request from the browser! To
+separate the concerns of first getting a connection and then taking some action
+with the connection, we’ll start a new function for processing connections. In
+this new `handle_connection` function, we’ll read data from the TCP stream and
+print it so that we can see the data being sent from the browser. Change the
+code to look like Listing 21-2.
 
-## Non-Unique Indexes (One-to-Many)
+<Listing number="21-2" file-name="src/main.rs" caption="Reading from the `TcpStream` and printing the data">
 
-Non-unique indexes are secondary indexes where a single key can be associated
-with multiple primary keys, allowing you to query for multiple items based on a
-shared attribute. For example, when querying users by their favorite color,
-implement this using a non-unique secondary index. The favorite color is a
-non-unique attribute since multiple users can have the same favorite color.
+```rust,no_run
+{{#rustdoc_include ../listings/ch21-web-server/listing-21-02/src/main.rs}}
+```
 
-To implement a non-unique secondary index for this example, follow these steps:
+</Listing>
 
-1. Define the `User` interface:
+We bring `std::io::BufReader` and `std::io::prelude` into scope to get access
+to traits and types that let us read from and write to the stream. In the `for`
+loop in the `main` function, instead of printing a message that says we made a
+connection, we now call the new `handle_connection` function and pass the
+`stream` to it.
 
-   ```ts
-   interface User {
-     id: string;
-     name: string;
-     favoriteColor: string;
-   }
-   ```
+In the `handle_connection` function, we create a new `BufReader` instance that
+wraps a reference to the `stream`. The `BufReader` adds buffering by managing
+calls to the `std::io::Read` trait methods for us.
 
-2. Define the `insertUser` function (store the primary key as the value in the
-   non‑unique index; note the composite key includes the user ID to avoid
-   collisions):
+We create a variable named `http_request` to collect the lines of the request
+the browser sends to our server. We indicate that we want to collect these
+lines in a vector by adding the `Vec<_>` type annotation.
 
-   ```ts
-   async function insertUser(user: User) {
-     const primaryKey = ["users", user.id] as const;
-     const byColorKey = [
-       "users_by_favorite_color",
-       user.favoriteColor,
-       user.id,
-     ] as const;
-     await kv.atomic()
-       .check({ key: primaryKey, versionstamp: null })
-       .set(primaryKey, user)
-       // store pointer, not full user
-       .set(byColorKey, user.id)
-       .commit();
-   }
-   ```
+`BufReader` implements the `std::io::BufRead` trait, which provides the `lines`
+method. The `lines` method returns an iterator of `Result<String,
+std::io::Error>` by splitting the stream of data whenever it sees a newline
+byte. To get each `String`, we `map` and `unwrap` each `Result`. The `Result`
+might be an error if the data isn’t valid UTF-8 or if there was a problem
+reading from the stream. Again, a production program should handle these errors
+more gracefully, but we’re choosing to stop the program in the error case for
+simplicity.
 
-3. Define a function to retrieve users by their favorite color. This performs a
-   double lookup per result (index → primary):
+The browser signals the end of an HTTP request by sending two newline
+characters in a row, so to get one request from the stream, we take lines until
+we get a line that is the empty string. Once we’ve collected the lines into the
+vector, we’re printing them out using pretty debug formatting so that we can
+take a look at the instructions the web browser is sending to our server.
 
-   ```ts
-   async function getUsersByFavoriteColor(color: string): Promise<User[]> {
-     const iter = kv.list<string>({
-       prefix: ["users_by_favorite_color", color],
-     });
-     const ids: string[] = [];
-     for await (const { value: id } of iter) {
-       ids.push(id);
-     }
-     if (ids.length === 0) return [];
-     const results = await kv.getMany<User>(
-       ids.map((id) => ["users", id] as const),
-     );
-     return results.map((r) => r.value!).filter(Boolean);
-   }
-   ```
+Let’s try this code! Start the program and make a request in a web browser
+again. Note that we’ll still get an error page in the browser, but our
+program’s output in the terminal will now look similar to this:
 
-This example demonstrates the use of a non-unique secondary index,
-`users_by_favorite_color`, which allows querying users based on their favorite
-color. The index stores pointers (user IDs) and requires resolving to the
-primary key to read full values.
+<!-- manual-regeneration
+cd listings/ch21-web-server/listing-21-02
+cargo run
+make a request to 127.0.0.1:7878
+Can't automate because the output depends on making requests
+-->
 
-The primary difference between unique and non‑unique indexes lies in the
-structure and organization of secondary keys. In unique indexes, each secondary
-key is associated with exactly one primary key, ensuring that the indexed
-attribute is unique across all records. In non‑unique indexes, a single
-secondary key can be associated with multiple primary keys, as the indexed
-attribute may be shared among multiple records. To achieve this, non‑unique
-secondary keys are typically structured with an additional unique identifier
-(e.g., primary key) as part of the key, allowing multiple records with the same
-attribute to coexist without conflicts.
+```console
+$ cargo run
+   Compiling hello v0.1.0 (file:///projects/hello)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.42s
+     Running `target/debug/hello`
+Request: [
+    "GET / HTTP/1.1",
+    "Host: 127.0.0.1:7878",
+    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:99.0) Gecko/20100101 Firefox/99.0",
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language: en-US,en;q=0.5",
+    "Accept-Encoding: gzip, deflate, br",
+    "DNT: 1",
+    "Connection: keep-alive",
+    "Upgrade-Insecure-Requests: 1",
+    "Sec-Fetch-Dest: document",
+    "Sec-Fetch-Mode: navigate",
+    "Sec-Fetch-Site: none",
+    "Sec-Fetch-User: ?1",
+    "Cache-Control: max-age=0",
+]
+```
 
-### When duplicating values may be acceptable
+Depending on your browser, you might get slightly different output. Now that
+we’re printing the request data, we can see why we get multiple connections
+from one browser request by looking at the path after `GET` in the first line
+of the request. If the repeated connections are all requesting _/_, we know the
+browser is trying to fetch _/_ repeatedly because it’s not getting a response
+from our program.
 
-While pointer indexes are recommended, duplicating the full value in a secondary
-index can be acceptable when:
+Let’s break down this request data to understand what the browser is asking of
+our program.
 
-- The value is small and reads occur almost exclusively via the secondary index
-- You want to avoid a second read and can tolerate the extra storage
-- You can reliably keep the primary and secondary in sync via atomic
-  transactions
+<!-- Old headings. Do not remove or links may break. -->
 
-If duplicating, ensure inserts/updates/deletes modify both keys in the same
-atomic transaction.
+<a id="a-closer-look-at-an-http-request"></a>
+<a id="looking-closer-at-an-http-request"></a>
 
-### Migration from duplicated-value indexes
+### Looking More Closely at an HTTP Request
 
-To migrate existing duplicated-value indexes to pointer indexes:
+HTTP is a text-based protocol, and a request takes this format:
 
-1. Backfill: scan primary keys and set secondary index values to the primary key
-   (e.g., user ID).
-2. Cutover: update write paths to maintain pointer indexes; keep the old index
-   temporarily for reads.
-3. Cleanup: switch readers to the pointer index, then remove the duplicated
-   index entries.
+```text
+Method Request-URI HTTP-Version CRLF
+headers CRLF
+message-body
+```
+
+The first line is the _request line_ that holds information about what the
+client is requesting. The first part of the request line indicates the method
+being used, such as `GET` or `POST`, which describes how the client is making
+this request. Our client used a `GET` request, which means it is asking for
+information.
+
+The next part of the request line is _/_, which indicates the _uniform resource
+identifier_ _(URI)_ the client is requesting: A URI is almost, but not quite,
+the same as a _uniform resource locator_ _(URL)_. The difference between URIs
+and URLs isn’t important for our purposes in this chapter, but the HTTP spec
+uses the term _URI_, so we can just mentally substitute _URL_ for _URI_ here.
+
+The last part is the HTTP version the client uses, and then the request line
+ends in a CRLF sequence. (_CRLF_ stands for _carriage return_ and _line feed_,
+which are terms from the typewriter days!) The CRLF sequence can also be
+written as `\r\n`, where `\r` is a carriage return and `\n` is a line feed. The
+_CRLF sequence_ separates the request line from the rest of the request data.
+Note that when the CRLF is printed, we see a new line start rather than `\r\n`.

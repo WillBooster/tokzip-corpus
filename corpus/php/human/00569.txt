@@ -1,284 +1,228 @@
 <?php
 
-namespace GuzzleHttp\Handler;
+namespace GuzzleHttp;
 
-use Closure;
-use GuzzleHttp\Promise as P;
-use GuzzleHttp\Promise\Promise;
+use GuzzleHttp\Exception\BadResponseException;
+use GuzzleHttp\Exception\TooManyRedirectsException;
 use GuzzleHttp\Promise\PromiseInterface;
-use GuzzleHttp\Utils;
 use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\UriInterface;
 
 /**
- * Returns an asynchronous response using curl_multi_* functions.
+ * Request redirect middleware.
  *
- * When using the CurlMultiHandler, custom curl options can be specified as an
- * associative array of curl option constants mapping to values in the
- * **curl** key of the provided request options.
+ * Apply this middleware like other middleware using
+ * {@see \GuzzleHttp\Middleware::redirect()}.
  *
  * @final
  */
-class CurlMultiHandler
+class RedirectMiddleware
 {
-    /**
-     * @var CurlFactoryInterface
-     */
-    private $factory;
+    public const HISTORY_HEADER = 'X-Guzzle-Redirect-History';
+
+    public const STATUS_HISTORY_HEADER = 'X-Guzzle-Redirect-Status-History';
 
     /**
-     * @var int
+     * @var array
      */
-    private $selectTimeout;
+    public static $defaultSettings = [
+        'max' => 5,
+        'protocols' => ['http', 'https'],
+        'strict' => false,
+        'referer' => false,
+        'track_redirects' => false,
+    ];
 
     /**
-     * @var int Will be higher than 0 when `curl_multi_exec` is still running.
+     * @var callable(RequestInterface, array): PromiseInterface
      */
-    private $active = 0;
+    private $nextHandler;
 
     /**
-     * @var array Request entry handles, indexed by handle id in `addRequest`.
-     *
-     * @see CurlMultiHandler::addRequest
+     * @param callable(RequestInterface, array): PromiseInterface $nextHandler Next handler to invoke.
      */
-    private $handles = [];
-
-    /**
-     * @var array<int, float> An array of delay times, indexed by handle id in `addRequest`.
-     *
-     * @see CurlMultiHandler::addRequest
-     */
-    private $delays = [];
-
-    /**
-     * @var array<mixed> An associative array of CURLMOPT_* options and corresponding values for curl_multi_setopt()
-     */
-    private $options = [];
-
-    /** @var resource|\CurlMultiHandle */
-    private $_mh;
-
-    /**
-     * This handler accepts the following options:
-     *
-     * - handle_factory: An optional factory  used to create curl handles
-     * - select_timeout: Optional timeout (in seconds) to block before timing
-     *   out while selecting curl handles. Defaults to 1 second.
-     * - options: An associative array of CURLMOPT_* options and
-     *   corresponding values for curl_multi_setopt()
-     */
-    public function __construct(array $options = [])
+    public function __construct(callable $nextHandler)
     {
-        $this->factory = $options['handle_factory'] ?? new CurlFactory(50);
-
-        if (isset($options['select_timeout'])) {
-            $this->selectTimeout = $options['select_timeout'];
-        } elseif ($selectTimeout = Utils::getenv('GUZZLE_CURL_SELECT_TIMEOUT')) {
-            @trigger_error('Since guzzlehttp/guzzle 7.2.0: Using environment variable GUZZLE_CURL_SELECT_TIMEOUT is deprecated. Use option "select_timeout" instead.', \E_USER_DEPRECATED);
-            $this->selectTimeout = (int) $selectTimeout;
-        } else {
-            $this->selectTimeout = 1;
-        }
-
-        $this->options = $options['options'] ?? [];
-
-        // unsetting the property forces the first access to go through
-        // __get().
-        unset($this->_mh);
-    }
-
-    /**
-     * @param string $name
-     *
-     * @return resource|\CurlMultiHandle
-     *
-     * @throws \BadMethodCallException when another field as `_mh` will be gotten
-     * @throws \RuntimeException       when curl can not initialize a multi handle
-     */
-    public function __get($name)
-    {
-        if ($name !== '_mh') {
-            throw new \BadMethodCallException("Can not get other property as '_mh'.");
-        }
-
-        $multiHandle = \curl_multi_init();
-
-        if (false === $multiHandle) {
-            throw new \RuntimeException('Can not initialize curl multi handle.');
-        }
-
-        $this->_mh = $multiHandle;
-
-        foreach ($this->options as $option => $value) {
-            // A warning is raised in case of a wrong option.
-            curl_multi_setopt($this->_mh, $option, $value);
-        }
-
-        return $this->_mh;
-    }
-
-    public function __destruct()
-    {
-        if (isset($this->_mh)) {
-            \curl_multi_close($this->_mh);
-            unset($this->_mh);
-        }
+        $this->nextHandler = $nextHandler;
     }
 
     public function __invoke(RequestInterface $request, array $options): PromiseInterface
     {
-        $easy = $this->factory->create($request, $options);
-        $id = (int) $easy->handle;
+        $fn = $this->nextHandler;
 
-        $promise = new Promise(
-            [$this, 'execute'],
-            function () use ($id) {
-                return $this->cancel($id);
-            }
-        );
+        if (empty($options['allow_redirects'])) {
+            return $fn($request, $options);
+        }
 
-        $this->addRequest(['easy' => $easy, 'deferred' => $promise]);
+        if ($options['allow_redirects'] === true) {
+            $options['allow_redirects'] = self::$defaultSettings;
+        } elseif (!\is_array($options['allow_redirects'])) {
+            throw new \InvalidArgumentException('allow_redirects must be true, false, or array');
+        } else {
+            // Merge the default settings with the provided settings
+            $options['allow_redirects'] += self::$defaultSettings;
+        }
+
+        if (empty($options['allow_redirects']['max'])) {
+            return $fn($request, $options);
+        }
+
+        return $fn($request, $options)
+            ->then(function (ResponseInterface $response) use ($request, $options) {
+                return $this->checkRedirect($request, $options, $response);
+            });
+    }
+
+    /**
+     * @return ResponseInterface|PromiseInterface
+     */
+    public function checkRedirect(RequestInterface $request, array $options, ResponseInterface $response)
+    {
+        if (\strpos((string) $response->getStatusCode(), '3') !== 0
+            || !$response->hasHeader('Location')
+        ) {
+            return $response;
+        }
+
+        $this->guardMax($request, $response, $options);
+        $nextRequest = $this->modifyRequest($request, $options, $response);
+
+        // If authorization is handled by curl, unset it if URI is cross-origin.
+        if (Psr7\UriComparator::isCrossOrigin($request->getUri(), $nextRequest->getUri()) && defined('\CURLOPT_HTTPAUTH')) {
+            unset(
+                $options['curl'][\CURLOPT_HTTPAUTH],
+                $options['curl'][\CURLOPT_USERPWD]
+            );
+        }
+
+        if (isset($options['allow_redirects']['on_redirect'])) {
+            ($options['allow_redirects']['on_redirect'])(
+                $request,
+                $response,
+                $nextRequest->getUri()
+            );
+        }
+
+        $promise = $this($nextRequest, $options);
+
+        // Add headers to be able to track history of redirects.
+        if (!empty($options['allow_redirects']['track_redirects'])) {
+            return $this->withTracking(
+                $promise,
+                (string) $nextRequest->getUri(),
+                $response->getStatusCode()
+            );
+        }
 
         return $promise;
     }
 
     /**
-     * Ticks the curl event loop.
+     * Enable tracking on promise.
      */
-    public function tick(): void
+    private function withTracking(PromiseInterface $promise, string $uri, int $statusCode): PromiseInterface
     {
-        // Add any delayed handles if needed.
-        if ($this->delays) {
-            $currentTime = Utils::currentTime();
-            foreach ($this->delays as $id => $delay) {
-                if ($currentTime >= $delay) {
-                    unset($this->delays[$id]);
-                    \curl_multi_add_handle(
-                        $this->_mh,
-                        $this->handles[$id]['easy']->handle
-                    );
-                }
+        return $promise->then(
+            static function (ResponseInterface $response) use ($uri, $statusCode) {
+                // Note that we are pushing to the front of the list as this
+                // would be an earlier response than what is currently present
+                // in the history header.
+                $historyHeader = $response->getHeader(self::HISTORY_HEADER);
+                $statusHeader = $response->getHeader(self::STATUS_HISTORY_HEADER);
+                \array_unshift($historyHeader, $uri);
+                \array_unshift($statusHeader, (string) $statusCode);
+
+                return $response->withHeader(self::HISTORY_HEADER, $historyHeader)
+                                ->withHeader(self::STATUS_HISTORY_HEADER, $statusHeader);
             }
-        }
-
-        // Run curl_multi_exec in the queue to enable other async tasks to run
-        P\Utils::queue()->add(Closure::fromCallable([$this, 'tickInQueue']));
-
-        // Step through the task queue which may add additional requests.
-        P\Utils::queue()->run();
-
-        if ($this->active && \curl_multi_select($this->_mh, $this->selectTimeout) === -1) {
-            // Perform a usleep if a select returns -1.
-            // See: https://bugs.php.net/bug.php?id=61141
-            \usleep(250);
-        }
-
-        while (\curl_multi_exec($this->_mh, $this->active) === \CURLM_CALL_MULTI_PERFORM) {
-            // Prevent busy looping for slow HTTP requests.
-            \curl_multi_select($this->_mh, $this->selectTimeout);
-        }
-
-        $this->processMessages();
+        );
     }
 
     /**
-     * Runs \curl_multi_exec() inside the event loop, to prevent busy looping
+     * Check for too many redirects.
+     *
+     * @throws TooManyRedirectsException Too many redirects.
      */
-    private function tickInQueue(): void
+    private function guardMax(RequestInterface $request, ResponseInterface $response, array &$options): void
     {
-        if (\curl_multi_exec($this->_mh, $this->active) === \CURLM_CALL_MULTI_PERFORM) {
-            \curl_multi_select($this->_mh, 0);
-            P\Utils::queue()->add(Closure::fromCallable([$this, 'tickInQueue']));
+        $current = $options['__redirect_count']
+            ?? 0;
+        $options['__redirect_count'] = $current + 1;
+        $max = $options['allow_redirects']['max'];
+
+        if ($options['__redirect_count'] > $max) {
+            throw new TooManyRedirectsException("Will not follow more than {$max} redirects", $request, $response);
         }
     }
 
-    /**
-     * Runs until all outstanding connections have completed.
-     */
-    public function execute(): void
+    public function modifyRequest(RequestInterface $request, array $options, ResponseInterface $response): RequestInterface
     {
-        $queue = P\Utils::queue();
+        // Request modifications to apply.
+        $modify = [];
+        $protocols = $options['allow_redirects']['protocols'];
 
-        while ($this->handles || !$queue->isEmpty()) {
-            // If there are no transfers, then sleep for the next delay
-            if (!$this->active && $this->delays) {
-                \usleep($this->timeToNext());
-            }
-            $this->tick();
+        // Use a GET request if this is an entity enclosing request and we are
+        // not forcing RFC compliance, but rather emulating what all browsers
+        // would do.
+        $statusCode = $response->getStatusCode();
+        if ($statusCode == 303
+            || ($statusCode <= 302 && !$options['allow_redirects']['strict'])
+        ) {
+            $safeMethods = ['GET', 'HEAD', 'OPTIONS'];
+            $requestMethod = $request->getMethod();
+
+            $modify['method'] = in_array($requestMethod, $safeMethods) ? $requestMethod : 'GET';
+            $modify['body'] = '';
         }
-    }
 
-    private function addRequest(array $entry): void
-    {
-        $easy = $entry['easy'];
-        $id = (int) $easy->handle;
-        $this->handles[$id] = $entry;
-        if (empty($easy->options['delay'])) {
-            \curl_multi_add_handle($this->_mh, $easy->handle);
+        $uri = self::redirectUri($request, $response, $protocols);
+        if (isset($options['idn_conversion']) && ($options['idn_conversion'] !== false)) {
+            $idnOptions = ($options['idn_conversion'] === true) ? \IDNA_DEFAULT : $options['idn_conversion'];
+            $uri = Utils::idnUriConvert($uri, $idnOptions);
+        }
+
+        $modify['uri'] = $uri;
+        Psr7\Message::rewindBody($request);
+
+        // Add the Referer header if it is told to do so and only
+        // add the header if we are not redirecting from https to http.
+        if ($options['allow_redirects']['referer']
+            && $modify['uri']->getScheme() === $request->getUri()->getScheme()
+        ) {
+            $uri = $request->getUri()->withUserInfo('');
+            $modify['set_headers']['Referer'] = (string) $uri;
         } else {
-            $this->delays[$id] = Utils::currentTime() + ($easy->options['delay'] / 1000);
+            $modify['remove_headers'][] = 'Referer';
         }
+
+        // Remove Authorization and Cookie headers if URI is cross-origin.
+        if (Psr7\UriComparator::isCrossOrigin($request->getUri(), $modify['uri'])) {
+            $modify['remove_headers'][] = 'Authorization';
+            $modify['remove_headers'][] = 'Cookie';
+        }
+
+        return Psr7\Utils::modifyRequest($request, $modify);
     }
 
     /**
-     * Cancels a handle from sending and removes references to it.
-     *
-     * @param int $id Handle ID to cancel and remove.
-     *
-     * @return bool True on success, false on failure.
+     * Set the appropriate URL on the request based on the location header.
      */
-    private function cancel($id): bool
-    {
-        if (!is_int($id)) {
-            trigger_deprecation('guzzlehttp/guzzle', '7.4', 'Not passing an integer to %s::%s() is deprecated and will cause an error in 8.0.', __CLASS__, __FUNCTION__);
+    private static function redirectUri(
+        RequestInterface $request,
+        ResponseInterface $response,
+        array $protocols
+    ): UriInterface {
+        $location = Psr7\UriResolver::resolve(
+            $request->getUri(),
+            new Psr7\Uri($response->getHeaderLine('Location'))
+        );
+
+        // Ensure that the redirect URI is allowed based on the protocols.
+        if (!\in_array($location->getScheme(), $protocols)) {
+            throw new BadResponseException(\sprintf('Redirect URI, %s, does not use one of the allowed redirect protocols: %s', $location, \implode(', ', $protocols)), $request, $response);
         }
 
-        // Cannot cancel if it has been processed.
-        if (!isset($this->handles[$id])) {
-            return false;
-        }
-
-        $handle = $this->handles[$id]['easy']->handle;
-        unset($this->delays[$id], $this->handles[$id]);
-        \curl_multi_remove_handle($this->_mh, $handle);
-        \curl_close($handle);
-
-        return true;
-    }
-
-    private function processMessages(): void
-    {
-        while ($done = \curl_multi_info_read($this->_mh)) {
-            if ($done['msg'] !== \CURLMSG_DONE) {
-                // if it's not done, then it would be premature to remove the handle. ref https://github.com/guzzle/guzzle/pull/2892#issuecomment-945150216
-                continue;
-            }
-            $id = (int) $done['handle'];
-            \curl_multi_remove_handle($this->_mh, $done['handle']);
-
-            if (!isset($this->handles[$id])) {
-                // Probably was cancelled.
-                continue;
-            }
-
-            $entry = $this->handles[$id];
-            unset($this->handles[$id], $this->delays[$id]);
-            $entry['easy']->errno = $done['result'];
-            $entry['deferred']->resolve(
-                CurlFactory::finish($this, $entry['easy'], $this->factory)
-            );
-        }
-    }
-
-    private function timeToNext(): int
-    {
-        $currentTime = Utils::currentTime();
-        $nextTime = \PHP_INT_MAX;
-        foreach ($this->delays as $time) {
-            if ($time < $nextTime) {
-                $nextTime = $time;
-            }
-        }
-
-        return ((int) \max(0, $nextTime - $currentTime)) * 1000000;
+        return $location;
     }
 }

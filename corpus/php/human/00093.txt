@@ -10,108 +10,279 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\DependencyResolver;
+namespace Composer\Test\Installer;
 
-/**
- * @author Nils Adermann <naderman@naderman.de>
- * @phpstan-import-type ReasonData from Rule
- */
-class Rule2Literals extends Rule
+use Composer\Installer\LibraryInstaller;
+use Composer\Repository\InstalledArrayRepository;
+use Composer\Util\Filesystem;
+use Composer\Test\TestCase;
+use Composer\Composer;
+use Composer\Config;
+
+class LibraryInstallerTest extends TestCase
 {
-    /** @var int */
-    protected $literal1;
-    /** @var int */
-    protected $literal2;
+    /**
+     * @var \Composer\Composer
+     */
+    protected $composer;
 
     /**
-     * @param Rule::RULE_* $reason A RULE_* constant
-     * @param mixed $reasonData
-     *
-     * @phpstan-param ReasonData $reasonData
+     * @var \Composer\Config
      */
-    public function __construct(int $literal1, int $literal2, $reason, $reasonData)
-    {
-        parent::__construct($reason, $reasonData);
+    protected $config;
 
-        if ($literal1 < $literal2) {
-            $this->literal1 = $literal1;
-            $this->literal2 = $literal2;
-        } else {
-            $this->literal1 = $literal2;
-            $this->literal2 = $literal1;
-        }
+    /**
+     * @var string
+     */
+    protected $rootDir;
+
+    /**
+     * @var string
+     */
+    protected $vendorDir;
+
+    /**
+     * @var string
+     */
+    protected $binDir;
+
+    /**
+     * @var \Composer\Downloader\DownloadManager&\PHPUnit\Framework\MockObject\MockObject
+     */
+    protected $dm;
+
+    /**
+     * @var \Composer\Repository\InstalledRepositoryInterface&\PHPUnit\Framework\MockObject\MockObject
+     */
+    protected $repository;
+
+    /**
+     * @var \Composer\IO\IOInterface&\PHPUnit\Framework\MockObject\MockObject
+     */
+    protected $io;
+
+    /**
+     * @var \Composer\Util\Filesystem
+     */
+    protected $fs;
+
+    protected function setUp(): void
+    {
+        $this->fs = new Filesystem;
+
+        $this->composer = new Composer();
+        $this->config = new Config(false);
+        $this->composer->setConfig($this->config);
+
+        $this->rootDir = self::getUniqueTmpDirectory();
+        $this->vendorDir = $this->rootDir.DIRECTORY_SEPARATOR.'vendor';
+        self::ensureDirectoryExistsAndClear($this->vendorDir);
+
+        $this->binDir = $this->rootDir.DIRECTORY_SEPARATOR.'bin';
+        self::ensureDirectoryExistsAndClear($this->binDir);
+
+        $this->config->merge([
+            'config' => [
+                'vendor-dir' => $this->vendorDir,
+                'bin-dir' => $this->binDir,
+            ],
+        ]);
+
+        $this->dm = $this->getMockBuilder('Composer\Downloader\DownloadManager')
+            ->disableOriginalConstructor()
+            ->getMock();
+        $this->composer->setDownloadManager($this->dm);
+
+        $this->repository = $this->getMockBuilder('Composer\Repository\InstalledRepositoryInterface')->getMock();
+        $this->io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+    }
+
+    protected function tearDown(): void
+    {
+        parent::tearDown();
+        $this->fs->removeDirectory($this->rootDir);
+    }
+
+    public function testInstallerCreationShouldNotCreateVendorDirectory(): void
+    {
+        $this->fs->removeDirectory($this->vendorDir);
+
+        new LibraryInstaller($this->io, $this->composer);
+        self::assertFileDoesNotExist($this->vendorDir);
+    }
+
+    public function testInstallerCreationShouldNotCreateBinDirectory(): void
+    {
+        $this->fs->removeDirectory($this->binDir);
+
+        new LibraryInstaller($this->io, $this->composer);
+        self::assertFileDoesNotExist($this->binDir);
+    }
+
+    public function testIsInstalled(): void
+    {
+        $library = new LibraryInstaller($this->io, $this->composer);
+        $package = self::getPackage('test/pkg', '1.0.0');
+
+        $repository = new InstalledArrayRepository();
+        self::assertFalse($library->isInstalled($repository, $package));
+
+        // package being in repo is not enough to be installed
+        $repository->addPackage($package);
+        self::assertFalse($library->isInstalled($repository, $package));
+
+        // package being in repo and vendor/pkg/foo dir present means it is seen as installed
+        self::ensureDirectoryExistsAndClear($this->vendorDir.'/'.$package->getPrettyName());
+        self::assertTrue($library->isInstalled($repository, $package));
+
+        $repository->removePackage($package);
+        self::assertFalse($library->isInstalled($repository, $package));
     }
 
     /**
-     * @return list<int>
+     * @depends testInstallerCreationShouldNotCreateVendorDirectory
+     * @depends testInstallerCreationShouldNotCreateBinDirectory
      */
-    public function getLiterals(): array
+    public function testInstall(): void
     {
-        return [$this->literal1, $this->literal2];
+        $library = new LibraryInstaller($this->io, $this->composer);
+        $package = self::getPackage('some/package', '1.0.0');
+
+        $this->dm
+            ->expects($this->once())
+            ->method('install')
+            ->with($package, $this->vendorDir.'/some/package')
+            ->will($this->returnValue(\React\Promise\resolve(null)));
+
+        $this->repository
+            ->expects($this->once())
+            ->method('addPackage')
+            ->with($package);
+
+        $library->install($this->repository, $package);
+        self::assertFileExists($this->vendorDir, 'Vendor dir should be created');
+        self::assertFileExists($this->binDir, 'Bin dir should be created');
     }
 
     /**
-     * @inheritDoc
+     * @depends testInstallerCreationShouldNotCreateVendorDirectory
+     * @depends testInstallerCreationShouldNotCreateBinDirectory
      */
-    public function getHash()
+    public function testUpdate(): void
     {
-        return $this->literal1.','.$this->literal2;
+        $filesystem = $this->getMockBuilder('Composer\Util\Filesystem')
+          ->getMock();
+        $filesystem
+          ->expects($this->once())
+          ->method('rename')
+          ->with($this->vendorDir.'/vendor/package1/oldtarget', $this->vendorDir.'/vendor/package1/newtarget');
+
+        $initial = self::getPackage('vendor/package1', '1.0.0');
+        $target = self::getPackage('vendor/package1', '2.0.0');
+
+        $initial->setTargetDir('oldtarget');
+        $target->setTargetDir('newtarget');
+
+        $this->repository
+            ->expects($this->exactly(3))
+            ->method('hasPackage')
+            ->will($this->onConsecutiveCalls(true, false, false));
+
+        $this->dm
+            ->expects($this->once())
+            ->method('update')
+            ->with($initial, $target, $this->vendorDir.'/vendor/package1/newtarget')
+            ->will($this->returnValue(\React\Promise\resolve(null)));
+
+        $this->repository
+            ->expects($this->once())
+            ->method('removePackage')
+            ->with($initial);
+
+        $this->repository
+            ->expects($this->once())
+            ->method('addPackage')
+            ->with($target);
+
+        $library = new LibraryInstaller($this->io, $this->composer, 'library', $filesystem);
+        $library->update($this->repository, $initial, $target);
+        self::assertFileExists($this->vendorDir, 'Vendor dir should be created');
+        self::assertFileExists($this->binDir, 'Bin dir should be created');
+
+        self::expectException('InvalidArgumentException');
+
+        $library->update($this->repository, $initial, $target);
+    }
+
+    public function testUninstall(): void
+    {
+        $library = new LibraryInstaller($this->io, $this->composer);
+        $package = self::getPackage('vendor/pkg', '1.0.0');
+
+        $this->repository
+            ->expects($this->exactly(2))
+            ->method('hasPackage')
+            ->with($package)
+            ->will($this->onConsecutiveCalls(true, false));
+
+        $this->dm
+            ->expects($this->once())
+            ->method('remove')
+            ->with($package, $this->vendorDir.'/vendor/pkg')
+            ->will($this->returnValue(\React\Promise\resolve(null)));
+
+        $this->repository
+            ->expects($this->once())
+            ->method('removePackage')
+            ->with($package);
+
+        $library->uninstall($this->repository, $package);
+
+        self::expectException('InvalidArgumentException');
+
+        $library->uninstall($this->repository, $package);
+    }
+
+    public function testGetInstallPathWithoutTargetDir(): void
+    {
+        $library = new LibraryInstaller($this->io, $this->composer);
+        $package = self::getPackage('Vendor/Pkg', '1.0.0');
+
+        self::assertEquals($this->vendorDir.'/'.$package->getPrettyName(), $library->getInstallPath($package));
+    }
+
+    public function testGetInstallPathWithTargetDir(): void
+    {
+        $library = new LibraryInstaller($this->io, $this->composer);
+        $package = self::getPackage('Foo/Bar', '1.0.0');
+        $package->setTargetDir('Some/Namespace');
+
+        self::assertEquals($this->vendorDir.'/'.$package->getPrettyName().'/Some/Namespace', $library->getInstallPath($package));
     }
 
     /**
-     * Checks if this rule is equal to another one
-     *
-     * Ignores whether either of the rules is disabled.
-     *
-     * @param  Rule $rule The rule to check against
-     * @return bool Whether the rules are equal
+     * @depends testInstallerCreationShouldNotCreateVendorDirectory
+     * @depends testInstallerCreationShouldNotCreateBinDirectory
      */
-    public function equals(Rule $rule): bool
+    public function testEnsureBinariesInstalled(): void
     {
-        // specialized fast-case
-        if ($rule instanceof self) {
-            if ($this->literal1 !== $rule->literal1) {
-                return false;
-            }
+        $binaryInstallerMock = $this->getMockBuilder('Composer\Installer\BinaryInstaller')
+            ->disableOriginalConstructor()
+            ->getMock();
 
-            if ($this->literal2 !== $rule->literal2) {
-                return false;
-            }
+        $library = new LibraryInstaller($this->io, $this->composer, 'library', null, $binaryInstallerMock);
+        $package = self::getPackage('foo/bar', '1.0.0');
 
-            return true;
-        }
+        $binaryInstallerMock
+            ->expects($this->never())
+            ->method('removeBinaries')
+            ->with($package);
 
-        $literals = $rule->getLiterals();
-        if (2 !== \count($literals)) {
-            return false;
-        }
+        $binaryInstallerMock
+            ->expects($this->once())
+            ->method('installBinaries')
+            ->with($package, $library->getInstallPath($package), false);
 
-        if ($this->literal1 !== $literals[0]) {
-            return false;
-        }
-
-        if ($this->literal2 !== $literals[1]) {
-            return false;
-        }
-
-        return true;
-    }
-
-    /** @return false */
-    public function isAssertion(): bool
-    {
-        return false;
-    }
-
-    /**
-     * Formats a rule as a string of the format (Literal1|Literal2|...)
-     */
-    public function __toString(): string
-    {
-        $result = $this->isDisabled() ? 'disabled(' : '(';
-
-        $result .= $this->literal1 . '|' . $this->literal2 . ')';
-
-        return $result;
+        $library->ensureBinariesPresence($package);
     }
 }

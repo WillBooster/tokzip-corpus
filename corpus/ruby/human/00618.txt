@@ -1,160 +1,441 @@
 # frozen_string_literal: true
 
-require "test_helper"
+require_relative "abstract_unit"
+require_relative "multibyte_test_helpers"
+require "stringio"
+require "fileutils"
+require "tempfile"
+require "tmpdir"
+require "concurrent/atomics"
 
-class ActionCable::Connection::SubscriptionsTest < ActionCable::TestCase
-  class ChatChannelError < Exception; end
+class LoggerTest < ActiveSupport::TestCase
+  include MultibyteTestHelpers
 
-  class Connection < ActionCable::Connection::Base
-    attr_reader :websocket, :exceptions
+  Logger = ActiveSupport::Logger
 
-    rescue_from ChatChannelError, with: :error_handler
+  def setup
+    @message = "A debug message"
+    @integer_message = 12345
+    @output  = StringIO.new
+    @logger  = Logger.new(@output)
+  end
 
-    def initialize(*)
-      super
-      @exceptions = []
+  def test_log_outputs_to
+    assert Logger.logger_outputs_to?(@logger, @output),            "Expected logger_outputs_to? @output to return true but was false"
+    assert Logger.logger_outputs_to?(@logger, @output, STDOUT),    "Expected logger_outputs_to? @output or STDOUT to return true but was false"
+
+    assert_not Logger.logger_outputs_to?(@logger, STDOUT),         "Expected logger_outputs_to? to STDOUT to return false, but was true"
+    assert_not Logger.logger_outputs_to?(@logger, STDOUT, STDERR), "Expected logger_outputs_to? to STDOUT or STDERR to return false, but was true"
+    assert_not Logger.logger_outputs_to?(@logger, "log/production.log")
+  end
+
+  def test_log_outputs_to_with_a_broadcast_logger
+    logger = ActiveSupport::BroadcastLogger.new(Logger.new(STDOUT))
+
+    assert(Logger.logger_outputs_to?(logger, STDOUT))
+    assert_not(Logger.logger_outputs_to?(logger, STDERR))
+
+    logger.broadcast_to(Logger.new(STDERR))
+    assert(Logger.logger_outputs_to?(logger, STDERR))
+  end
+
+  def test_log_outputs_to_with_a_filename
+    t = Tempfile.new ["development", "log"]
+    logger = ActiveSupport::BroadcastLogger.new(Logger.new(t.path))
+
+    assert Logger.logger_outputs_to?(logger, t)
+    assert Logger.logger_outputs_to?(logger, t.path)
+    assert Logger.logger_outputs_to?(logger, File.join(File.dirname(t.path), ".", File.basename(t.path)))
+    assert_not Logger.logger_outputs_to?(logger, "log/production.log")
+    assert_not Logger.logger_outputs_to?(logger, STDOUT)
+  ensure
+    logger.close
+    t.close true
+  end
+
+  def test_write_binary_data_to_existing_file
+    t = Tempfile.new ["development", "log"]
+    t.binmode
+    t.write "hi mom!"
+    t.close
+
+    f = File.open(t.path, "w")
+    f.binmode
+
+    logger = Logger.new f
+    logger.level = Logger::DEBUG
+
+    str = +"\x80"
+    str.force_encoding("ASCII-8BIT")
+
+    assert_nothing_raised do
+      logger.add Logger::DEBUG, str
     end
+  ensure
+    logger.close
+    t.close true
+  end
 
-    def send_async(method, *args)
-      send method, *args
+  def test_write_binary_data_create_file
+    fname = File.join Dir.tmpdir, "lol", "rofl.log"
+    FileUtils.mkdir_p File.dirname(fname)
+    f = File.open(fname, "w")
+    f.binmode
+
+    logger = Logger.new f
+    logger.level = Logger::DEBUG
+
+    str = +"\x80"
+    str.force_encoding("ASCII-8BIT")
+
+    assert_nothing_raised do
+      logger.add Logger::DEBUG, str
     end
+  ensure
+    logger.close
+    File.unlink fname
+  end
 
-    def error_handler(e)
-      @exceptions << e
+  def test_defaults_to_simple_formatter
+    logger = Logger.new(@output)
+    assert_instance_of ActiveSupport::Logger::SimpleFormatter, logger.formatter
+  end
+
+  def test_formatter_can_be_set_via_keyword_arg
+    custom_formatter = ::Logger::Formatter.new
+    logger = Logger.new(@output, formatter: custom_formatter)
+    assert_same custom_formatter, logger.formatter
+  end
+
+  def test_should_log_debugging_message_when_debugging
+    @logger.level = Logger::DEBUG
+    @logger.add(Logger::DEBUG, @message)
+    assert_includes @output.string, @message
+  end
+
+  def test_should_not_log_debug_messages_when_log_level_is_info
+    @logger.level = Logger::INFO
+    @logger.add(Logger::DEBUG, @message)
+    assert_not_includes @output.string, @message
+  end
+
+  def test_should_add_message_passed_as_block_when_using_add
+    @logger.level = Logger::INFO
+    @logger.add(Logger::INFO) { @message }
+    assert_includes @output.string, @message
+  end
+
+  def test_should_add_message_passed_as_block_when_using_shortcut
+    @logger.level = Logger::INFO
+    @logger.info { @message }
+    assert_includes @output.string, @message
+  end
+
+  def test_should_convert_message_to_string
+    @logger.level = Logger::INFO
+    @logger.info @integer_message
+    assert_includes @output.string, @integer_message.to_s
+  end
+
+  def test_should_convert_message_to_string_when_passed_in_block
+    @logger.level = Logger::INFO
+    @logger.info { @integer_message }
+    assert_includes @output.string, @integer_message.to_s
+  end
+
+  def test_should_not_evaluate_block_if_message_wont_be_logged
+    @logger.level = Logger::INFO
+    evaluated = false
+    @logger.add(Logger::DEBUG) { evaluated = true }
+    assert evaluated == false
+  end
+
+  def test_should_not_mutate_message
+    message_copy = @message.dup
+    @logger.info @message
+    assert_equal message_copy, @message
+  end
+
+  def test_should_know_if_its_loglevel_is_below_a_given_level
+    Logger::Severity.constants.each do |level|
+      next if level.to_s == "UNKNOWN"
+      @logger.level = Logger::Severity.const_get(level) - 1
+      assert @logger.public_send("#{level.downcase}?"), "didn't know if it was #{level.downcase}? or below"
     end
   end
 
-  class ChatChannel < ActionCable::Channel::Base
-    attr_reader :room, :lines
-
-    def subscribed
-      @room = Room.new params[:id]
-      @lines = []
-    end
-
-    def speak(data)
-      @lines << data
-    end
-
-    def throw_exception(_data)
-      raise ChatChannelError.new("Uh Oh")
-    end
+  def test_buffer_multibyte
+    @logger.level = Logger::INFO
+    @logger.info(UNICODE_STRING)
+    @logger.info(BYTE_STRING)
+    assert_includes @output.string, UNICODE_STRING
+    byte_string = @output.string.dup
+    byte_string.force_encoding("ASCII-8BIT")
+    assert_includes byte_string, BYTE_STRING
   end
 
-  setup do
-    @server = TestServer.new
-
-    @chat_identifier = ActiveSupport::JSON.encode(id: 1, channel: "ActionCable::Connection::SubscriptionsTest::ChatChannel")
-  end
-
-  test "subscribe command" do
-    run_in_eventmachine do
-      setup_connection
-      channel = subscribe_to_chat_channel
-
-      assert_kind_of ChatChannel, channel
-      assert_equal 1, channel.room.id
+  def test_silencing_everything_but_errors
+    @logger.silence do
+      @logger.debug "NOT THERE"
+      @logger.error "THIS IS HERE"
     end
+
+    assert_not_includes @output.string, "NOT THERE"
+    assert_includes @output.string, "THIS IS HERE"
   end
 
-  test "subscribe command without an identifier" do
-    run_in_eventmachine do
-      setup_connection
+  def test_unsilencing
+    @logger.level = Logger::INFO
 
-      @subscriptions.execute_command "command" => "subscribe"
-      assert_empty @subscriptions.identifiers
+    @logger.debug "NOT THERE"
+
+    @logger.silence Logger::DEBUG do
+      @logger.debug "THIS IS HERE"
     end
+
+    assert_not_includes @output.string, "NOT THERE"
+    assert_includes @output.string, "THIS IS HERE"
   end
 
-  test "subscribe command with Base channel" do
-    run_in_eventmachine do
-      setup_connection
+  def test_logger_silencing_works_for_broadcast
+    another_output  = StringIO.new
+    another_logger  = ActiveSupport::Logger.new(another_output)
 
-      identifier = ActiveSupport::JSON.encode(id: 1, channel: "ActionCable::Channel::Base")
-      @subscriptions.execute_command "command" => "subscribe", "identifier" => identifier
+    logger = ActiveSupport::BroadcastLogger.new(@logger, another_logger)
 
-      assert_empty @subscriptions.identifiers
+    logger.debug "CORRECT DEBUG"
+    logger.silence do |logger|
+      assert_kind_of ActiveSupport::BroadcastLogger, logger
+      logger.debug "FAILURE"
+      logger.error "CORRECT ERROR"
     end
+
+    assert_includes @output.string, "CORRECT DEBUG"
+    assert_includes @output.string, "CORRECT ERROR"
+    assert_not_includes @output.string, "FAILURE"
+
+    assert_includes another_output.string, "CORRECT DEBUG"
+    assert_includes another_output.string, "CORRECT ERROR"
+    assert_not another_output.string.include?("FAILURE")
   end
 
-  test "unsubscribe command" do
-    run_in_eventmachine do
-      setup_connection
-      subscribe_to_chat_channel
+  def test_broadcast_silencing_does_not_break_plain_ruby_logger
+    another_output  = StringIO.new
+    another_logger  = ::Logger.new(another_output)
 
-      channel = subscribe_to_chat_channel
+    logger = ActiveSupport::BroadcastLogger.new(@logger, another_logger)
 
-      assert_called(channel, :unsubscribe_from_channel) do
-        @subscriptions.execute_command "command" => "unsubscribe", "identifier" => @chat_identifier
+    logger.debug "CORRECT DEBUG"
+    logger.silence do |logger|
+      assert_kind_of ActiveSupport::BroadcastLogger, logger
+      logger.debug "FAILURE"
+      logger.error "CORRECT ERROR"
+    end
+
+    assert_includes @output.string, "CORRECT DEBUG"
+    assert_includes @output.string, "CORRECT ERROR"
+    assert_not_includes @output.string, "FAILURE"
+
+    assert_includes another_output.string, "CORRECT DEBUG"
+    assert_includes another_output.string, "CORRECT ERROR"
+    assert_includes another_output.string, "FAILURE"
+    # We can't silence plain ruby Logger cause with thread safety
+    # but at least we don't break it
+  end
+
+  def test_logger_level_per_object_thread_safety
+    logger1 = Logger.new(StringIO.new)
+    logger2 = Logger.new(StringIO.new)
+
+    level = Logger::DEBUG
+    assert_equal level, logger1.level, "Expected level #{level_name(level)}, got #{level_name(logger1.level)}"
+    assert_equal level, logger2.level, "Expected level #{level_name(level)}, got #{level_name(logger2.level)}"
+
+    logger1.level = Logger::ERROR
+    assert_equal level, logger2.level, "Expected level #{level_name(level)}, got #{level_name(logger2.level)}"
+  end
+
+  def test_logger_level_main_thread_safety
+    @logger.level = Logger::INFO
+    assert_level(Logger::INFO)
+
+    latch  = Concurrent::CountDownLatch.new
+    latch2 = Concurrent::CountDownLatch.new
+
+    t = Thread.new do
+      latch.wait
+      assert_level(Logger::INFO)
+      latch2.count_down
+    end
+
+    @logger.silence(Logger::ERROR) do
+      assert_level(Logger::ERROR)
+      latch.count_down
+      latch2.wait
+    end
+
+    t.join
+  end
+
+  def test_logger_level_local_thread_safety
+    @logger.level = Logger::INFO
+    assert_level(Logger::INFO)
+
+    thread_1_latch = Concurrent::CountDownLatch.new
+    thread_2_latch = Concurrent::CountDownLatch.new
+
+    threads = (1..2).collect do |thread_number|
+      Thread.new do
+        # force thread 2 to wait until thread 1 is already in @logger.silence
+        thread_2_latch.wait if thread_number == 2
+
+        @logger.silence(Logger::ERROR) do
+          assert_level(Logger::ERROR)
+          @logger.silence(Logger::DEBUG) do
+            # allow thread 2 to finish but hold thread 1
+            if thread_number == 1
+              thread_2_latch.count_down
+              thread_1_latch.wait
+            end
+            assert_level(Logger::DEBUG)
+          end
+        end
+
+        # allow thread 1 to finish
+        assert_level(Logger::INFO)
+        thread_1_latch.count_down if thread_number == 2
       end
-
-      assert_empty @subscriptions.identifiers
     end
+
+    threads.each(&:join)
+    assert_level(Logger::INFO)
   end
 
-  test "unsubscribe command without an identifier" do
-    run_in_eventmachine do
-      setup_connection
+  def test_logger_level_main_fiber_safety
+    previous_isolation_level = ActiveSupport::IsolatedExecutionState.isolation_level
+    ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
 
-      @subscriptions.execute_command "command" => "unsubscribe"
-      assert_empty @subscriptions.identifiers
+    @logger.level = Logger::INFO
+    assert_level(Logger::INFO)
+
+    fiber = Fiber.new do
+      assert_level(Logger::INFO)
     end
+
+    @logger.silence(Logger::ERROR) do
+      assert_level(Logger::ERROR)
+      fiber.resume
+    end
+  ensure
+    ActiveSupport::IsolatedExecutionState.isolation_level = previous_isolation_level
   end
 
-  test "message command" do
-    run_in_eventmachine do
-      setup_connection
-      channel = subscribe_to_chat_channel
+  def test_logger_level_local_fiber_safety
+    previous_isolation_level = ActiveSupport::IsolatedExecutionState.isolation_level
+    ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
 
-      data = { "content" => "Hello World!", "action" => "speak" }
-      @subscriptions.execute_command "command" => "message", "identifier" => @chat_identifier, "data" => ActiveSupport::JSON.encode(data)
+    @logger.level = Logger::INFO
+    assert_level(Logger::INFO)
 
-      assert_equal [ data ], channel.lines
-    end
-  end
-
-  test "accessing exceptions thrown during command execution" do
-    run_in_eventmachine do
-      setup_connection
-      subscribe_to_chat_channel
-
-      data = { "content" => "Hello World!", "action" => "throw_exception" }
-      @subscriptions.execute_command "command" => "message", "identifier" => @chat_identifier, "data" => ActiveSupport::JSON.encode(data)
-
-      exception = @connection.exceptions.first
-      assert_kind_of ChatChannelError, exception
-    end
-  end
-
-  test "unsubscribe from all" do
-    run_in_eventmachine do
-      setup_connection
-
-      channel1 = subscribe_to_chat_channel
-
-      channel2_id = ActiveSupport::JSON.encode(id: 2, channel: "ActionCable::Connection::SubscriptionsTest::ChatChannel")
-      channel2 = subscribe_to_chat_channel(channel2_id)
-
-      assert_called(channel1, :unsubscribe_from_channel) do
-        assert_called(channel2, :unsubscribe_from_channel) do
-          @subscriptions.unsubscribe_from_all
+    another_fiber = Fiber.new do
+      @logger.silence(Logger::ERROR) do
+        assert_level(Logger::ERROR)
+        @logger.silence(Logger::DEBUG) do
+          assert_level(Logger::DEBUG)
         end
       end
+
+      assert_level(Logger::INFO)
+    end
+
+    Fiber.new do
+      @logger.silence(Logger::ERROR) do
+        assert_level(Logger::ERROR)
+        @logger.silence(Logger::DEBUG) do
+          another_fiber.resume
+          assert_level(Logger::DEBUG)
+        end
+      end
+
+      assert_level(Logger::INFO)
+    end.resume
+
+    assert_level(Logger::INFO)
+  ensure
+    ActiveSupport::IsolatedExecutionState.isolation_level = previous_isolation_level
+  end
+
+  def test_logger_level_thread_safety
+    previous_isolation_level = ActiveSupport::IsolatedExecutionState.isolation_level
+    ActiveSupport::IsolatedExecutionState.isolation_level = :thread
+
+    @logger.level = Logger::INFO
+    assert_level(Logger::INFO)
+
+    enumerator = Enumerator.new do |yielder|
+      @logger.level = Logger::DEBUG
+      yielder.yield @logger.level
+    end
+    assert_equal Logger::DEBUG, enumerator.next
+    assert_level(Logger::DEBUG)
+  ensure
+    ActiveSupport::IsolatedExecutionState.isolation_level = previous_isolation_level
+  end
+
+  def test_temporarily_logging_at_a_noisier_level
+    @logger.level = Logger::INFO
+
+    @logger.debug "NOT THERE"
+
+    @logger.log_at Logger::DEBUG do
+      @logger.debug "THIS IS HERE"
+    end
+
+    @logger.debug "NOT THERE"
+
+    assert_not_includes @output.string, "NOT THERE"
+    assert_includes @output.string, "THIS IS HERE"
+  end
+
+  def test_temporarily_logging_at_a_quieter_level
+    @logger.log_at Logger::ERROR do
+      @logger.debug "NOT THERE"
+      @logger.error "THIS IS HERE"
+    end
+
+    assert_not_includes @output.string, "NOT THERE"
+    assert_includes @output.string, "THIS IS HERE"
+  end
+
+  def test_temporarily_logging_at_a_symbolic_level
+    @logger.log_at :error do
+      @logger.debug "NOT THERE"
+      @logger.error "THIS IS HERE"
+    end
+
+    assert_not_includes @output.string, "NOT THERE"
+    assert_includes @output.string, "THIS IS HERE"
+  end
+
+  def test_log_at_only_impact_receiver
+    logger2 = Logger.new(StringIO.new)
+    assert_equal Logger::DEBUG, logger2.level
+    assert_equal Logger::DEBUG, @logger.level
+
+    @logger.log_at :error do
+      assert_equal Logger::DEBUG, logger2.level
+      assert_equal Logger::ERROR, @logger.level
     end
   end
 
   private
-    def subscribe_to_chat_channel(identifier = @chat_identifier)
-      @subscriptions.execute_command "command" => "subscribe", "identifier" => identifier
-      assert_equal identifier, @subscriptions.identifiers.last
-
-      @subscriptions.send :find, "identifier" => identifier
+    def level_name(level)
+      ::Logger::Severity.constants.find do |severity|
+        Logger.const_get(severity) == level
+      end.to_s
     end
 
-    def setup_connection
-      env = Rack::MockRequest.env_for "/test", "HTTP_HOST" => "localhost", "HTTP_CONNECTION" => "upgrade", "HTTP_UPGRADE" => "websocket"
-      @connection = Connection.new(@server, env)
-
-      @subscriptions = ActionCable::Connection::Subscriptions.new(@connection)
+    def assert_level(level)
+      assert_equal level, @logger.level, "Expected level #{level_name(level)}, got #{level_name(@logger.level)}"
     end
 end

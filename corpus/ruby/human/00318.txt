@@ -1,135 +1,315 @@
 # frozen_string_literal: true
 
-require "pathname"
-require "active_support"
-require "rails/command/helpers/editor"
-require "rails/command/environment_argument"
+require "abstract_unit"
+require "rails/engine"
+require "controller/fake_controllers"
 
-module Rails
-  module Command
-    class CredentialsCommand < Rails::Command::Base # :nodoc:
-      include Helpers::Editor
-      include EnvironmentArgument
+class SecureArticlesController < ArticlesController; end
+class BlockArticlesController < ArticlesController; end
+class QueryArticlesController < ArticlesController; end
 
-      require_relative "credentials_command/diffing"
-      include Diffing
+class SecureBooksController < BooksController; end
+class BlockBooksController < BooksController; end
+class QueryBooksController < BooksController; end
 
-      desc "edit", "Open the decrypted credentials in `$VISUAL` or `$EDITOR` for editing"
-      def edit
-        load_environment_config!
-        load_generators
+module RoutingAssertionsSharedTests
+  def setup
+    root_engine = Class.new(Rails::Engine) do
+      def self.name
+        "root_engine"
+      end
+    end
 
-        if environment_specified?
-          @content_path = "config/credentials/#{environment}.yml.enc" unless config.overridden?(:content_path)
-          @key_path = "config/credentials/#{environment}.key" unless config.overridden?(:key_path)
-        end
+    root_engine.routes.draw do
+      root to: "books#index"
+    end
 
-        ensure_encryption_key_has_been_added
-        ensure_credentials_have_been_added
-        ensure_diffing_driver_is_configured
+    engine = Class.new(Rails::Engine) do
+      def self.name
+        "blog_engine"
+      end
+    end
 
-        change_credentials_in_system_editor
+    engine.routes.draw do
+      resources :books
+
+      scope "secure", constraints: { protocol: "https://" } do
+        resources :books, controller: "secure_books"
       end
 
-      desc "show", "Show the decrypted credentials"
-      def show
-        load_environment_config!
-
-        say credentials.read.presence || missing_credentials_message
+      scope "block", constraints: lambda { |r| r.ssl? } do
+        resources :books, controller: "block_books"
       end
 
-      desc "diff", "Enroll/disenroll in decrypted diffs of credentials using git"
-      option :enroll, type: :boolean, default: false,
-        desc: "Enroll project in credentials file diffing with `git diff`"
-      option :disenroll, type: :boolean, default: false,
-        desc: "Disenroll project from credentials file diffing"
-      def diff(content_path = nil)
-        if @content_path = content_path
-          self.environment = extract_environment_from_path(content_path)
-          load_environment_config!
+      scope "query", constraints: lambda { |r| r.params[:use_query] == "true" } do
+        resources :books, controller: "query_books"
+      end
+    end
 
-          say credentials.read.presence || credentials.content_path.read
-        else
-          disenroll_project_from_credentials_diffing if options[:disenroll]
-          enroll_project_in_credentials_diffing if options[:enroll]
-        end
-      rescue ActiveSupport::MessageEncryptor::InvalidMessage
-        say credentials.content_path.read
+    @routes = ActionDispatch::Routing::RouteSet.new
+    @routes.draw do
+      resources :articles
+
+      scope "secure", constraints: { protocol: "https://" } do
+        resources :articles, controller: "secure_articles"
       end
 
-      private
-        def config
-          Rails.application.config.credentials
+      scope "block", constraints: lambda { |r| r.ssl? } do
+        resources :articles, controller: "block_articles"
+      end
+
+      scope "query", constraints: lambda { |r| r.params[:use_query] == "true" } do
+        resources :articles, controller: "query_articles"
+      end
+
+      mount engine => "/shelf"
+
+      mount root_engine => "/"
+
+      get "/shelf/foo", controller: "query_articles", action: "index"
+    end
+  end
+
+  def test_assert_generates
+    assert_generates("/articles", controller: "articles", action: "index")
+    assert_generates("/articles/1", controller: "articles", action: "show", id: "1")
+  end
+
+  def test_assert_generates_with_defaults
+    assert_generates("/articles/1/edit", { controller: "articles", action: "edit" }, { id: "1" })
+  end
+
+  def test_assert_generates_with_extras
+    assert_generates("/articles", { controller: "articles", action: "index", page: "1" }, {}, { page: "1" })
+  end
+
+  def test_assert_recognizes
+    assert_recognizes({ controller: "articles", action: "index" }, "/articles")
+    assert_recognizes({ controller: "articles", action: "show", id: "1" }, "/articles/1")
+  end
+
+  def test_assert_recognizes_with_extras
+    assert_recognizes({ controller: "articles", action: "index", page: "1" }, "/articles", page: "1")
+  end
+
+  def test_assert_recognizes_with_method
+    assert_recognizes({ controller: "articles", action: "create" }, { path: "/articles", method: :post })
+    assert_recognizes({ controller: "articles", action: "update", id: "1" }, { path: "/articles/1", method: :put })
+  end
+
+  def test_assert_recognizes_with_hash_constraint
+    assert_raise(Minitest::Assertion) do
+      assert_recognizes({ controller: "secure_articles", action: "index" }, "http://test.host/secure/articles")
+    end
+    assert_recognizes({ controller: "secure_articles", action: "index", protocol: "https://" }, "https://test.host/secure/articles")
+  end
+
+  def test_assert_recognizes_with_block_constraint
+    assert_raise(Minitest::Assertion) do
+      assert_recognizes({ controller: "block_articles", action: "index" }, "http://test.host/block/articles")
+    end
+    assert_recognizes({ controller: "block_articles", action: "index" }, "https://test.host/block/articles")
+  end
+
+  def test_assert_recognizes_with_query_constraint
+    assert_raise(Minitest::Assertion) do
+      assert_recognizes({ controller: "query_articles", action: "index", use_query: "false" }, "/query/articles", use_query: "false")
+    end
+    assert_recognizes({ controller: "query_articles", action: "index", use_query: "true" }, "/query/articles", use_query: "true")
+  end
+
+  def test_assert_recognizes_raises_message
+    err = assert_raise(Minitest::Assertion) do
+      assert_recognizes({ controller: "secure_articles", action: "index" }, "http://test.host/secure/articles", {}, "This is a really bad msg")
+    end
+
+    assert_match err.message, "This is a really bad msg"
+  end
+
+  def test_assert_recognizes_with_engine
+    assert_recognizes({ controller: "books", action: "index" }, "/shelf/books")
+    assert_recognizes({ controller: "books", action: "show", id: "1" }, "/shelf/books/1")
+  end
+
+  def test_assert_recognizes_with_engine_at_root
+    assert_recognizes({ controller: "books", action: "index" }, "/")
+  end
+
+  def test_assert_recognizes_with_engine_and_extras
+    assert_recognizes({ controller: "books", action: "index", page: "1" }, "/shelf/books", page: "1")
+  end
+
+  def test_assert_recognizes_with_engine_and_method
+    assert_recognizes({ controller: "books", action: "create" }, { path: "/shelf/books", method: :post })
+    assert_recognizes({ controller: "books", action: "update", id: "1" }, { path: "/shelf/books/1", method: :put })
+  end
+
+  def test_assert_recognizes_with_engine_and_hash_constraint
+    assert_raise(Minitest::Assertion) do
+      assert_recognizes({ controller: "secure_books", action: "index" }, "http://test.host/shelf/secure/books")
+    end
+    assert_recognizes({ controller: "secure_books", action: "index", protocol: "https://" }, "https://test.host/shelf/secure/books")
+  end
+
+  def test_assert_recognizes_with_engine_and_block_constraint
+    assert_raise(Minitest::Assertion) do
+      assert_recognizes({ controller: "block_books", action: "index" }, "http://test.host/shelf/block/books")
+    end
+    assert_recognizes({ controller: "block_books", action: "index" }, "https://test.host/shelf/block/books")
+  end
+
+  def test_assert_recognizes_with_engine_and_query_constraint
+    assert_raise(Minitest::Assertion) do
+      assert_recognizes({ controller: "query_books", action: "index", use_query: "false" }, "/shelf/query/books", use_query: "false")
+    end
+    assert_recognizes({ controller: "query_books", action: "index", use_query: "true" }, "/shelf/query/books", use_query: "true")
+  end
+
+  def test_assert_recognizes_raises_message_with_engine
+    err = assert_raise(Minitest::Assertion) do
+      assert_recognizes({ controller: "secure_books", action: "index" }, "http://test.host/shelf/secure/books", {}, "This is a really bad msg")
+    end
+
+    assert_match err.message, "This is a really bad msg"
+  end
+
+  def test_assert_recognizes_continue_to_recognize_after_it_tried_engines
+    assert_recognizes({ controller: "query_articles", action: "index" }, "/shelf/foo")
+  end
+
+  def test_assert_routing
+    assert_routing("/articles", controller: "articles", action: "index")
+  end
+
+  def test_assert_routing_raises_message
+    err = assert_raise(Minitest::Assertion) do
+      assert_routing("/thisIsNotARoute", { controller: "articles", action: "edit", id: "1" }, { id: "1" }, {}, "This is a really bad msg")
+    end
+
+    assert_match err.message, "This is a really bad msg"
+  end
+
+  def test_assert_routing_with_defaults
+    assert_routing("/articles/1/edit", { controller: "articles", action: "edit", id: "1" }, { id: "1" })
+  end
+
+  def test_assert_routing_with_extras
+    assert_routing("/articles", { controller: "articles", action: "index", page: "1" }, {}, { page: "1" })
+  end
+
+  def test_assert_routing_with_hash_constraint
+    assert_raise(Minitest::Assertion) do
+      assert_routing("http://test.host/secure/articles", controller: "secure_articles", action: "index")
+    end
+    assert_routing("https://test.host/secure/articles", controller: "secure_articles", action: "index", protocol: "https://")
+  end
+
+  def test_assert_routing_with_block_constraint
+    assert_raise(Minitest::Assertion) do
+      assert_routing("http://test.host/block/articles", controller: "block_articles", action: "index")
+    end
+    assert_routing("https://test.host/block/articles", controller: "block_articles", action: "index")
+  end
+
+  def test_with_routing
+    with_routing do |routes|
+      routes.draw do
+        resources :articles, path: "artikel"
+      end
+
+      assert_routing("/artikel", controller: "articles", action: "index")
+      assert_raise(Minitest::Assertion) do
+        assert_routing("/articles", controller: "articles", action: "index")
+      end
+    end
+  end
+
+  module WithRoutingSharedTests
+    extend ActiveSupport::Concern
+
+    def before_setup
+      @routes = ActionDispatch::Routing::RouteSet.new
+      @routes.draw do
+        resources :articles
+      end
+
+      super
+    end
+
+    included do
+      with_routing do |routes|
+        routes.draw do
+          resources :articles, path: "artikel"
+        end
+      end
+    end
+
+    def test_with_routing_for_the_entire_test_file
+      assert_routing("/artikel", controller: "articles", action: "index")
+      assert_raise(Minitest::Assertion) do
+        assert_routing("/articles", controller: "articles", action: "index")
+      end
+    end
+
+    def test_with_routing_for_entire_test_file_can_be_overwritten_for_individual_test
+      with_routing do |routes|
+        routes.draw do
+          resources :articles, path: "articolo"
         end
 
-        def content_path
-          @content_path ||= relative_path(config.content_path)
+        assert_routing("/articolo", controller: "articles", action: "index")
+        assert_raise(Minitest::Assertion) do
+          assert_routing("/artikel", controller: "articles", action: "index")
         end
+      end
 
-        def key_path
-          @key_path ||= relative_path(config.key_path)
-        end
+      assert_routing("/artikel", controller: "articles", action: "index")
+      assert_raise(Minitest::Assertion) do
+        assert_routing("/articolo", controller: "articles", action: "index")
+      end
+    end
+  end
+end
 
-        def credentials
-          @credentials ||= Rails.application.encrypted(content_path, key_path: key_path)
-        end
+class RoutingAssertionsControllerTest < ActionController::TestCase
+  include RoutingAssertionsSharedTests
 
-        def ensure_encryption_key_has_been_added
-          return if credentials.key?
+  class WithRoutingTest < ActionController::TestCase
+    include RoutingAssertionsSharedTests::WithRoutingSharedTests
+  end
+end
 
-          require "rails/generators/rails/encryption_key_file/encryption_key_file_generator"
+class RoutingAssertionsIntegrationTest < ActionDispatch::IntegrationTest
+  include RoutingAssertionsSharedTests
 
-          encryption_key_file_generator = Rails::Generators::EncryptionKeyFileGenerator.new
-          encryption_key_file_generator.add_key_file(key_path)
-          encryption_key_file_generator.ignore_key_file(key_path)
-        end
+  test "https and host settings are set on new session" do
+    https!
+    host! "newhost.com"
 
-        def ensure_credentials_have_been_added
-          require "rails/generators/rails/credentials/credentials_generator"
+    with_routing do |routes|
+      routes.draw {  }
+      assert_predicate integration_session, :https?
+      assert_equal "newhost.com", integration_session.host
+    end
+  end
 
-          Rails::Generators::CredentialsGenerator.new(
-            [content_path, key_path],
-            skip_secret_key_base: environment_specified? && %w[development test].include?(environment),
-            quiet: true
-          ).invoke_all
-        end
+  class WithRoutingTest < ActionDispatch::IntegrationTest
+    include RoutingAssertionsSharedTests::WithRoutingSharedTests
+  end
 
-        def change_credentials_in_system_editor
-          using_system_editor do
-            say "Editing #{content_path}..."
-            credentials.change { |tmp_path| system_editor(tmp_path) }
-            say "File encrypted and saved."
-            warn_if_credentials_are_invalid
-          end
-        rescue ActiveSupport::EncryptedFile::MissingKeyError => error
-          say error.message
-        rescue ActiveSupport::MessageEncryptor::InvalidMessage
-          say "Couldn't decrypt #{content_path}. Perhaps you passed the wrong key?"
-        end
+  class WithRoutingSettingsTest < ActionDispatch::IntegrationTest
+    setup do
+      https!
+      host! "newhost.com"
+    end
 
-        def warn_if_credentials_are_invalid
-          credentials.validate!
-        rescue ActiveSupport::EncryptedConfiguration::InvalidContentError => error
-          say "WARNING: #{error.message}", :red
-          say ""
-          say "Your application will not be able to load '#{content_path}' until the error has been fixed.", :red
-        end
+    with_routing do |routes|
+      routes.draw {  }
+    end
 
-        def missing_credentials_message
-          if !credentials.key?
-            "Missing '#{key_path}' to decrypt credentials. See `#{executable(:help)}`."
-          else
-            "File '#{content_path}' does not exist. Use `#{executable(:edit)}` to change that."
-          end
-        end
-
-        def relative_path(path)
-          Rails.root.join(path).relative_path_from(Rails.root).to_s
-        end
-
-        def extract_environment_from_path(path)
-          available_environments.find { |env| path.end_with?("#{env}.yml.enc") }
-        end
+    test "https and host settings are set on new session" do
+      assert_predicate integration_session, :https?
+      assert_equal "newhost.com", integration_session.host
     end
   end
 end

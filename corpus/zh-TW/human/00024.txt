@@ -1,28 +1,87 @@
----
-title: CTF 中的 EJS 漏洞筆記
-catalog: true
-date: 2023-06-22 14:10:44
-tags: [Security]
-categories: [Security]
-photos: /img/ejs-render-vulnerability-ctf/cover.png
----
+但現實的狀況是，我們不可能只有一個 origin。我們可能有許多的 origin，例如說 `buy.example.com`、`social.example.com`、`note.example.com`，都需要去存取 `api.example.com`，這時候我們就沒辦法寫死 response header 裡的 origin，而是必須動態調整。
 
-原本是想用開發者的角度寫一篇，但最近沒什麼時間，先寫一篇用 CTF 角度來記錄這個問題，以後有時間再補上用開發者角度寫的。
-
-簡單來說，這篇講的是使用以下 pattern 會造成的問題：
+先講一種最糟糕的寫法，就是這樣：
 
 ``` js
-const express = require('express')
-const app = express()
-const port = 3000
-
-app.set('view engine', 'ejs');
-
-app.get('/', (req,res) => {
-    res.render('index', req.query);
-})
-
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`)
+app.use((req, res, next) => {
+  res.headers['Access-Control-Allow-Credentials'] = 'true'
+  res.headers['Access-Control-Allow-Origin'] = req.headers['Origin']
 })
 ```
+
+為了方便起見，所以直接映射 request header 裡面的 origin。這樣做的話，其實就代表任何一個 origin 都能夠通過 CORS 檢查。
+
+這樣做會有什麼問題呢？
+
+問題可大了。
+
+假設我今天做一個釣魚網站，網址是 `http://fake-example.com`，並且試圖讓使用者去點擊這個網站，而釣魚網站裡面寫了一段 script：
+
+``` js
+// 用 api 去拿使用者資料，並且帶上 cookie
+fetch('http://api.example.com/me', {
+  credentials: 'include'
+})
+  .then(res => res.text())
+  .then(res => {
+    // 成功拿到使用者資料，我可以傳送到我自己的 server
+    console.log(res)
+
+    // 把使用者導回真正的網站
+    window.location = 'http://example.com'
+  })
+```
+
+我用 fetch 去打 `http://api.example.com/me` 拿資料，並且帶上 cookie。接著因為 server 不管怎樣都會回覆正確的 header，所以 CORS 檢查就通過了，我就拿到資料了。
+
+因此這個攻擊只要使用者點了釣魚網站並且在 `example.com` 是登入狀態，就會中招。至於影響範圍要看網站的 api，最基本的就是只拿得到使用者資料，比較嚴重一點的可能可以拿到 user token（如果有這個 api）。
+
+這個攻擊有幾件事情要注意：
+
+1. 這不是 XSS，因為我沒有在 `example.com` 執行程式碼，我是在我自己的釣魚網站 `http://fake-example.com` 上執行
+2. 這有點像是 CSRF，但是網站通常對於 GET 的 API 並不會加上 CSRF token 的防護，所以可以過關
+3. 如果有設定 SameSite cookie，攻擊就會失效，因為 cookie 會帶不上去
+
+因此這個攻擊要成立有幾個前提：
+
+1. CORS header 給到不該給的 origin
+2. 網站採用 cookie 進行身份驗證，而且沒有設定 SameSite
+3. 使用者要主動點擊釣魚網站並且是登入狀態
+
+針對第一點，可能沒有人會像我上面那樣子寫，直接用 request header 的 origin。比較有可能的做法是這樣：
+
+``` js
+app.use((req, res, next) => {
+  res.headers['Access-Control-Allow-Credentials'] = 'true'
+  const origin = req.headers['Origin']
+
+  // 偵測是不是 example.com 結尾
+  if (/example\.com$/.test(origin)) {
+    res.headers['Access-Control-Allow-Origin'] = origin
+  }
+})
+```
+
+如此一來，底下的 origin 都可以過關：
+
+1. example.com
+2. buy.example.com
+3. social.example.com
+
+可是這樣寫是有問題的，因為這樣也可以過關：
+
+1. fakeexample.com
+
+像是這類型的漏洞是經由錯誤的 CORS 設置引起，所以稱為 CORS misconfiguration。
+
+而解決方法就是不要用 RegExp 去判斷，而是事先準備好一個清單，有在清單中出現的才通過，否則都是失敗，如此一來就可以保證不會有判斷上的漏洞，然後也記得把 cookie 加上 SameSite 屬性。
+
+``` js
+const allowOrigins = [
+  'example.com',
+  'buy.example.com',
+  'social.example.com'
+]
+app.use((req, res, next) => {
+  res.headers['Access-Control-Allow-Credentials'] = 'true'
+  const origin = req.headers['Origin']

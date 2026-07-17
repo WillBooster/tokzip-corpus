@@ -1,171 +1,311 @@
-require_relative 'test_helper'
+require 'multi_json'
 
-class DelegatorTest < Minitest::Test
-  class Mirror
-    attr_reader :last_call
-    def method_missing(*a, &b)
-      @last_call = [*a.map(&:to_s)]
-      @last_call << b if b
+require 'spec_helper'
+require 'okjson'
+
+RSpec.describe Sinatra::RespondWith do
+  def respond_app(&block)
+    mock_app do
+      set :app_file, __FILE__
+      set :views, root + '/respond_with'
+      register Sinatra::RespondWith
+      class_eval(&block)
     end
   end
 
-  def self.delegates(name)
-    it "delegates #{name}" do
-      m = mirror { send name }
-      assert_equal [name.to_s], m.last_call
-    end
-
-    it "delegates #{name} with arguments" do
-      m = mirror { send name, "foo", "bar" }
-      assert_equal [name.to_s, "foo", "bar"], m.last_call
-    end
-
-    it "delegates #{name} with block" do
-      block = proc { }
-      m = mirror { send(name, &block) }
-      assert_equal [name.to_s, block], m.last_call
-    end
+  def respond_to(*args, &block)
+    respond_app { get('/') { respond_to(*args, &block) } }
   end
 
-  setup do
-    @target_was = Sinatra::Delegator.target
+  def respond_with(*args, &block)
+    respond_app { get('/') { respond_with(*args, &block) } }
   end
 
-  def teardown
-    Sinatra::Delegator.target = @target_was
+  def req(*types)
+    path = types.shift if types.first.is_a?(String) && types.first.start_with?('/')
+    accept = types.map { |t| Sinatra::Base.mime_type(t).to_s }.join ','
+    get (path || '/'), {}, 'HTTP_ACCEPT' => accept
   end
 
-  def delegation_app(&block)
-    mock_app { Sinatra::Delegator.target = self }
-    delegate(&block)
-  end
-
-  def mirror(&block)
-    mirror = Mirror.new
-    Sinatra::Delegator.target = mirror
-    delegate(&block)
-  end
-
-  def delegate(&block)
-    assert Sinatra::Delegator.target != Sinatra::Application
-    Object.new.extend(Sinatra::Delegator).instance_eval(&block) if block
-    Sinatra::Delegator.target
-  end
-
-  def target
-    Sinatra::Delegator.target
-  end
-
-  it 'defaults to Sinatra::Application as target' do
-    assert_equal Sinatra::Application, Sinatra::Delegator.target
-  end
-
-  %w[get put post delete options patch link unlink].each do |verb|
-    it "delegates #{verb} correctly" do
-      delegation_app do
-        send(verb, '/hello') { 'Hello World' }
+  describe "Helpers#respond_to" do
+    it 'allows defining handlers by file extensions' do
+      respond_to do |format|
+        format.html { "html!" }
+        format.json { "json!" }
       end
 
-      request = Rack::MockRequest.new(@app)
-      response = request.request(verb.upcase, '/hello', {})
-      assert response.ok?
-      assert_equal 'Hello World', response.body
+      expect(req(:html).body).to eq("html!")
+      expect(req(:json).body).to eq("json!")
+    end
+
+    it 'respects quality' do
+      respond_to do |format|
+        format.html { "html!" }
+        format.json { "json!" }
+      end
+
+      expect(req("text/html;q=0.7, application/json;q=0.3").body).to eq("html!")
+      expect(req("text/html;q=0.3, application/json;q=0.7").body).to eq("json!")
+    end
+
+    it 'allows using mime types' do
+      respond_to do |format|
+        format.on('text/html') { "html!" }
+        format.json { "json!" }
+      end
+
+      expect(req(:html).body).to eq("html!")
+    end
+
+    it 'allows using wildcards in format matchers' do
+      respond_to do |format|
+        format.on('text/*') { "text!" }
+        format.json { "json!" }
+      end
+
+      expect(req(:html).body).to eq("text!")
+    end
+
+    it 'allows using catch all wildcards in format matchers' do
+      respond_to do |format|
+        format.on('*/*') { "anything!" }
+        format.json { "json!" }
+      end
+
+      expect(req(:html).body).to eq("anything!")
+    end
+
+    it 'prefers concret over generic' do
+      respond_to do |format|
+        format.on('text/*') { "text!" }
+        format.on('*/*') { "anything!" }
+        format.json { "json!" }
+      end
+
+      expect(req(:json).body).to eq("json!")
+      expect(req(:html).body).to eq("text!")
+    end
+
+    it 'does not set up default handlers' do
+      respond_to
+      expect(req).not_to be_ok
+      expect(status).to eq(500)
+      expect(body).to eq("Unknown template engine")
     end
   end
 
-  it "delegates head correctly" do
-    delegation_app do
-      head '/hello' do
-        response['X-Hello'] = 'World!'
-        'remove me'
+  describe "Helpers#respond_with" do
+    describe "matching" do
+      it 'allows defining handlers by file extensions' do
+        respond_with(:ignore) do |format|
+          format.html { "html!" }
+          format.json { "json!" }
+        end
+
+        expect(req(:html).body).to eq("html!")
+        expect(req(:json).body).to eq("json!")
+      end
+
+      it 'respects quality' do
+        respond_with(:ignore) do |format|
+          format.html { "html!" }
+          format.json { "json!" }
+        end
+
+        expect(req("text/html;q=0.7, application/json;q=0.3").body).to eq("html!")
+        expect(req("text/html;q=0.3, application/json;q=0.7").body).to eq("json!")
+      end
+
+      it 'allows using mime types' do
+        respond_with(:ignore) do |format|
+          format.on('text/html') { "html!" }
+          format.json { "json!" }
+        end
+
+        expect(req(:html).body).to eq("html!")
+      end
+
+      it 'allows using wildcards in format matchers' do
+        respond_with(:ignore) do |format|
+          format.on('text/*') { "text!" }
+          format.json { "json!" }
+        end
+
+        expect(req(:html).body).to eq("text!")
+      end
+
+      it 'allows using catch all wildcards in format matchers' do
+        respond_with(:ignore) do |format|
+          format.on('*/*') { "anything!" }
+          format.json { "json!" }
+        end
+
+        expect(req(:html).body).to eq("anything!")
+      end
+
+      it 'prefers concret over generic' do
+        respond_with(:ignore) do |format|
+          format.on('text/*') { "text!" }
+          format.on('*/*') { "anything!" }
+          format.json { "json!" }
+        end
+
+        expect(req(:json).body).to eq("json!")
+        expect(req(:html).body).to eq("text!")
       end
     end
 
-    request = Rack::MockRequest.new(@app)
-    response = request.request('HEAD', '/hello', {})
-    assert response.ok?
-    assert_equal 'World!', response['X-Hello']
-    assert_equal '', response.body
-  end
-
-  it "delegates before with keyword arguments correctly" do
-    delegation_app do
-      set(:foo) do |something|
-        something
+    describe "default behavior" do
+      it 'converts objects to json out of the box' do
+        respond_with 'a' => 'b'
+        expect(OkJson.decode(req(:json).body)).to eq({'a' => 'b'})
       end
-      before(foo: 'bar') do
-        :nothing
+
+      it 'handles multiple routes correctly' do
+        respond_app do
+          get('/') { respond_with 'a' => 'b' }
+          get('/:name') { respond_with 'a' => params[:name] }
+        end
+        expect(OkJson.decode(req('/',  :json).body)).to eq({'a' => 'b'})
+        expect(OkJson.decode(req('/b', :json).body)).to eq({'a' => 'b'})
+        expect(OkJson.decode(req('/c', :json).body)).to eq({'a' => 'c'})
+      end
+
+      it "calls to_EXT if available" do
+        respond_with Struct.new(:to_pdf).new("hello")
+        expect(req(:pdf).body).to eq("hello")
+      end
+
+      it 'results in a 500 if format cannot be produced' do
+        respond_with({})
+        expect(req(:html)).not_to be_ok
+        expect(status).to eq(500)
+        expect(body).to eq("Unknown template engine")
+      end
+    end
+
+    describe 'templates' do
+      it 'looks for templates with name.target.engine' do
+        respond_with :foo, :name => 'World'
+        expect(req(:html)).to be_ok
+        expect(body).to eq("Hello World!")
+      end
+
+      it 'looks for templates with name.engine for specific engines' do
+        respond_with :bar
+        expect(req(:html)).to be_ok
+        expect(body).to eq("guten Tag!")
+      end
+
+      it 'does not use name.engine for engines producing other formats' do
+        respond_with :not_html
+        expect(req(:html)).not_to be_ok
+        expect(status).to eq(500)
+        expect(body).to eq("Unknown template engine")
+      end
+
+      it 'falls back to #json if no template is found' do
+        respond_with :foo, :name => 'World'
+        expect(req(:json)).to be_ok
+        expect(OkJson.decode(body)).to eq({'name' => 'World'})
+      end
+
+      it 'favors templates over #json' do
+        respond_with :bar, :name => 'World'
+        expect(req(:json)).to be_ok
+        expect(body).to eq('json!')
+      end
+
+      it 'falls back to to_EXT if no template is found' do
+        object = {:name => 'World'}
+        def object.to_pdf; "hi" end
+        respond_with :foo, object
+        expect(req(:pdf)).to be_ok
+        expect(body).to eq("hi")
+      end
+
+      unless defined? JRUBY_VERSION
+        it 'uses yajl for json' do
+          respond_with :baz
+          expect(req(:json)).to be_ok
+          expect(body).to eq("\"yajl!\"")
+        end
+      end
+    end
+
+    describe 'customizing' do
+      it 'allows customizing' do
+        respond_with(:foo, :name => 'World') { |f| f.html { 'html!' }}
+        expect(req(:html)).to be_ok
+        expect(body).to eq("html!")
+      end
+
+      it 'falls back to default behavior if none matches' do
+        respond_with(:foo, :name => 'World') { |f| f.json { 'json!' }}
+        expect(req(:html)).to be_ok
+        expect(body).to eq("Hello World!")
+      end
+
+      it 'favors generic rule over default behavior' do
+        respond_with(:foo, :name => 'World') { |f| f.on('*/*') { 'generic!' }}
+        expect(req(:html)).to be_ok
+        expect(body).to eq("generic!")
+      end
+    end
+
+    describe "inherited" do
+      it "registers RespondWith in an inherited app" do
+        app = Sinatra.new do
+          set :app_file, __FILE__
+          set :views, root + '/respond_with'
+          register Sinatra::RespondWith
+
+          get '/a' do
+            respond_with :json
+          end
+        end
+
+        self.app = Sinatra.new(app)
+        expect(req('/a', :json)).not_to be_ok
       end
     end
   end
 
-  it "registers extensions with the delegation target" do
-    app, mixin = mirror, Module.new
-    Sinatra.register mixin
-    assert_equal ["register", mixin.to_s], app.last_call
-  end
-
-  it "registers helpers with the delegation target" do
-    app, mixin = mirror, Module.new
-    Sinatra.helpers mixin
-    assert_equal ["helpers", mixin.to_s], app.last_call
-  end
-
-  it "registers middleware with the delegation target" do
-    app, mixin = mirror, Module.new
-    Sinatra.use mixin
-    assert_equal ["use", mixin.to_s], app.last_call
-  end
-
-  it "should work with method_missing proxies for options" do
-    mixin = Module.new do
-      def respond_to?(method, *)
-        method.to_sym == :options or super
+  describe :respond_to do
+    it 'acts as global provides condition' do
+      respond_app do
+        respond_to :json, :html
+        get('/a') { 'ok' }
+        get('/b') { 'ok' }
       end
 
-      def method_missing(method, *args, &block)
-        return super unless method.to_sym == :options
-        {:some => :option}
+      expect(req('/b', :xml)).not_to be_ok
+      expect(req('/b', :html)).to be_ok
+    end
+
+    it 'still allows provides' do
+      respond_app do
+        respond_to :json, :html
+        get('/a') { 'ok' }
+        get('/b', :provides => :json) { 'ok' }
       end
+
+      expect(req('/b', :html)).not_to be_ok
+      expect(req('/b', :json)).to be_ok
     end
 
-    value = nil
-    mirror do
-      extend mixin
-      value = options
+    it 'plays well with namespaces' do
+      respond_app do
+        register Sinatra::Namespace
+        namespace '/a' do
+          respond_to :json
+          get { 'json' }
+        end
+        get('/b') { 'anything' }
+      end
+
+      expect(req('/a', :html)).not_to be_ok
+      expect(req('/b', :html)).to be_ok
     end
-
-    assert_equal({:some => :option}, value)
   end
-
-  it "delegates crazy method names" do
-    Sinatra::Delegator.delegate "foo:bar:"
-    method = mirror { send "foo:bar:" }.last_call.first
-    assert_equal "foo:bar:", method
-  end
-
-  delegates 'get'
-  delegates 'patch'
-  delegates 'put'
-  delegates 'post'
-  delegates 'delete'
-  delegates 'head'
-  delegates 'options'
-  delegates 'template'
-  delegates 'layout'
-  delegates 'before'
-  delegates 'after'
-  delegates 'error'
-  delegates 'not_found'
-  delegates 'configure'
-  delegates 'set'
-  delegates 'mime_type'
-  delegates 'enable'
-  delegates 'disable'
-  delegates 'use'
-  delegates 'development?'
-  delegates 'test?'
-  delegates 'production?'
-  delegates 'helpers'
-  delegates 'settings'
 end

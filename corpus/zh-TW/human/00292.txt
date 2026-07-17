@@ -1,69 +1,67 @@
-關鍵字：
-
-1. xsleak
-2. lazy loading image
-3. 6 concurrent request limit
-4. socket pool
-5. null origin
-7. null e.source
-
-<!-- more -->
-
-題目敘述：
-
-> Safelist™ is a completely safe list site to hold all your important notes! I mean, look at all the security features we have, we must be safe!
-
-![challenge](/img/sekaictf2022-safelist-and-connection/p1.png)
-
-Source code: https://github.com/project-sekai-ctf/sekaictf-2022/tree/main/web/safelist
-
-這題的功能滿簡單的，你可以新增跟刪除 note，然後因為是 client side 的題目，所以照慣例有個 admin bot，可以提供 URL 讓它去訪問。
-
-這題的特別之處在於它設了一堆 headers，有些我看都沒看過：
-
 ``` js
-app.use((req, res, next) => {
-    res.locals.nonce = crypto.randomBytes(32).toString("hex");
-
-    // Surely this will be enough to protect my website
-    // Clueless
-    res.setHeader("Content-Security-Policy", `
-        default-src 'self';
-        script-src 'nonce-${res.locals.nonce}' 'unsafe-inline';
-        object-src 'none';
-        base-uri 'none';
-        frame-ancestors 'none';
-    `.trim().replace(/\s+/g, " "));
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("X-Frame-Options", "DENY");
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("Referrer-Policy", "no-referrer");
-    res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
-    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-    res.setHeader("Document-Policy", "force-load-at-top");
-
-    if (!req.session.id) {
-        req.session.id = crypto.randomUUID();
-    }
-    if (!users.has(req.session.id)) {
-        users.set(req.session.id, {
-            list: []
-        });
-    }
-
-    req.user = users.get(req.session.id);
-    next();
-});
+fetch('https://httpbin.org/user-agent')
+    .then(() => window.location = 'https://example.com')
 ```
 
-其中 CO 系列的我以前有寫過，但這次真的嘗試才發現有些跟我理解的有點出入，例如說 `Cross-Origin-Opener-Policy` 我本來以為是「有這個設定的頁面在 window.open 的時候，被開啟的視窗不會有 opener」，後來發現應該是雙向的，就是「我從別的頁面去打開一個有設定的頁面，我也沒辦法 access 它」
+當跳轉完成以後，雖然 Network 那邊確實可以看到這個請求，但點進去以後只會看到「Failed to load response data」：
 
-`Document-Policy` 這個也滿酷的，`force-load-at-top` 查了一下應該是禁止 Scroll-to-text-fragment 跟 #abc 這種 anchor。
+![看不到請求](/img/everyone-need-a-http-proxy-to-debug/p1.png)
 
-除此之外呢，note 的內容也會被 `DOMPurify.sanitize()` 過濾，碰到這種題目，基本上就是幾個方向：
+這個問題從 2012 年就有人回報了，好不容易等了十幾年，2023 年底時說這個在 2024 的 roadmap 上，但目前依然沒有任何動靜：[DevTools: XHR (and other resources) content not available after navigation.](https://issues.chromium.org/issues/40254754)。
 
-1. meta 可以用
-2. style 可以用
-3. 針對 window 的 DOM clobbering 可以用（針對 document 的不行）
-4. img 可以用，可以拿來發 request
+總之呢，在這個情境之下，看不到 response 基本上沒辦法 debug，很不方便。
+
+### WebSocket 連線握手失敗找不到原因
+
+雖然我們平常在用 WebSocket 時，只需要一行程式碼就可以建立連接，但背後其實是分了兩步。
+
+第一步會發出一個 HTTP Upgrade 請求，完成以後才切換到 WebSocket 連線。雖然大多數狀況之下第一步都會成功，那如果第一步失敗會怎樣呢？
+
+我們可以請 AI 寫一個很簡單的 demo 出來：
+
+```
+寫一個 nodejs websocket server，然後用一個 nginx 擋在前面
+nginx 的作用是當 url 含有 ?debug 的時候要回傳 500 錯誤
+
+當 websocket 連線後會往 client 自動發送 hello 的 message
+
+最後要包裝成可以用 docker compose 跑起來
+```
+
+等 AI 產完之後用 docker 跑起來，一樣隨便開個網頁建立連接，會發現帶有 debug 的那個連線請求，你只知道失敗了，卻完全不知道原因：
+
+![看不到原因](/img/everyone-need-a-http-proxy-to-debug/p2.png)
+
+這個錯誤訊息甚至跟你隨便連一個沒開的 port 一樣，完全不知道為什麼會失敗，這樣也很難跟後端說問題在哪裡。
+
+以上是兩個我有印象的範例，但實際開發中應該碰過更多更多，基本上都是只靠 DevTools 來看 Network 沒辦法解決的問題，要嘛是看不到，要嘛看到的東西不太對。
+
+## 簡單好用的 HTTP Proxy
+
+既然沒辦法靠 DevTools，那只能依賴更底層的工具了，例如說 HTTP Proxy！有些工具會在你本機起一個 proxy，這樣流量就會都經過它，自然而然就能看到所有的請求了，就不必再受限於 DevTools。
+
+而且另一個好處是有地方可以互相對照，如果 proxy 顯示的跟 DevTools 顯示的不同，就有可能是 DevTools 顯示的東西有問題。
+
+因此，誠心推薦大家找個 HTTP Proxy 來用，我自己用過的有這三個：
+
+1. [Charles](https://www.charlesproxy.com/)
+2. [Burp Suite](https://portswigger.net/burp/communitydownload)
+3. [mitmproxy](https://mitmproxy.org/)
+
+以前我剛接觸 proxy 時用的是 Charles，接觸到資安以後就改成用第二個 Burp Suite 了。它其實是個可以拿來做各種資安相關測試的工具，但我覺得你只拿來做 proxy 也沒問題，非常方便。
+
+第三個 mitmproxy 是開源且免費的，知名度也很高，我偶爾也會用但是用的方式不太一樣，這個晚點再講。
+
+### 把 Burp Suite 當 Proxy App 來用
+
+先到官網下載個免費的社群版：https://portswigger.net/burp/communitydownload
+
+打開之後按下 Next 然後 Start Burp，就會看到主畫面。你會發現它的功能很多，但我們先切到「Proxy」頁籤底下「HTTP history」這一頁就行了：
+
+![Burp 畫面](/img/everyone-need-a-http-proxy-to-debug/p3.png)
+
+然後那顆很顯眼橘色的「Open Browser」點下去，就會開啟它自帶的 Chrome 瀏覽器，可以用這個瀏覽器訪問任何一個網頁，例如說 example.com。
+
+接著切回工具，就會發現 HTTP history 裡面記錄著所有請求的原始內容跟 response：
+
+![請求紀錄](/img/everyone-need-a-http-proxy-to-debug/p4.png)

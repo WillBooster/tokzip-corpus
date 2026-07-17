@@ -1,193 +1,240 @@
+import dataclasses
+import re
 import sys
-from collections.abc import Iterable
-from inspect import Parameter, Signature, signature
-from typing import Annotated, Any, Generic, TypeVar
+import typing
 
 import pytest
-from annotated_types import Gt
-from typing_extensions import get_origin  # noqa: UP035
-from typing_inspection import typing_objects
+import typing_extensions
+from typing_extensions import NamedTuple, TypedDict, TypeForm
 
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, Field, PydanticUserError, TypeAdapter, ValidationError, computed_field, validate_call
+
+self_types: list[TypeForm] = []
+ids: list[str] = []
+if sys.version_info >= (3, 11):
+    self_types.append(typing.Self)
+    ids.append('typing-self')
+    if typing.Self is not typing_extensions.Self:
+        self_types.append(typing_extensions.Self)
+        ids.append('typing-extensions-self')
+else:
+    self_types.append(typing_extensions.Self)
+    ids.append('typing-extensions-self')
+
+pytestmark = pytest.mark.parametrize('Self', self_types, ids=ids)
 
 
-def _equals(a: str | Iterable[str], b: str | Iterable[str]) -> bool:
-    """
-    compare strings with spaces removed
-    """
-    if isinstance(a, str) and isinstance(b, str):
-        return a.replace(' ', '') == b.replace(' ', '')
-    elif isinstance(a, Iterable) and isinstance(b, Iterable):
-        return all(_equals(a_, b_) for a_, b_ in zip(a, b))
-    else:
-        raise TypeError(f'arguments must be both strings or both lists, not {type(a)}, {type(b)}')
+def test_recursive_model(Self):
+    class SelfRef(BaseModel):
+        data: int
+        ref: Self | None = None
+
+    assert SelfRef(data=1, ref={'data': 2}).model_dump() == {'data': 1, 'ref': {'data': 2, 'ref': None}}
 
 
-def test_model_signature():
+def test_recursive_model_invalid(Self):
+    class SelfRef(BaseModel):
+        data: int
+        ref: Self | None = None
+
+    with pytest.raises(
+        ValidationError,
+        match=r'ref\.ref\s+Input should be a valid dictionary or instance of SelfRef \[type=model_type,',
+    ):
+        SelfRef(data=1, ref={'data': 2, 'ref': 3}).model_dump()
+
+
+def test_recursive_model_with_subclass(Self):
+    """Self refs should be valid and should reference the correct class in covariant direction"""
+
+    class SelfRef(BaseModel):
+        x: int
+        ref: Self | None = None
+
+    class SubSelfRef(SelfRef):
+        y: int
+
+    assert SubSelfRef(x=1, ref=SubSelfRef(x=3, y=4), y=2).model_dump() == {
+        'x': 1,
+        'ref': {'x': 3, 'ref': None, 'y': 4},  # SubSelfRef.ref: SubSelfRef
+        'y': 2,
+    }
+    assert SelfRef(x=1, ref=SubSelfRef(x=2, y=3)).model_dump() == {
+        'x': 1,
+        'ref': {'x': 2, 'ref': None},
+    }  # SelfRef.ref: SelfRef
+
+
+def test_recursive_model_with_subclass_invalid(Self):
+    """Self refs are invalid in contravariant direction"""
+
+    class SelfRef(BaseModel):
+        x: int
+        ref: Self | None = None
+
+    class SubSelfRef(SelfRef):
+        y: int
+
+    with pytest.raises(
+        ValidationError,
+        match=r'ref\s+Input should be a valid dictionary or instance of SubSelfRef \[type=model_type,',
+    ):
+        SubSelfRef(x=1, ref=SelfRef(x=2), y=3).model_dump()
+
+
+def test_recursive_model_with_subclass_override(Self):
+    """Self refs should be overridable"""
+
+    class SelfRef(BaseModel):
+        x: int
+        ref: Self | None = None
+
+    class SubSelfRef(SelfRef):
+        y: int
+        ref: SelfRef | Self | None = None
+
+    assert SubSelfRef(x=1, ref=SubSelfRef(x=3, y=4), y=2).model_dump() == {
+        'x': 1,
+        'ref': {'x': 3, 'ref': None, 'y': 4},
+        'y': 2,
+    }
+    assert SubSelfRef(x=1, ref=SelfRef(x=3, y=4), y=2).model_dump() == {
+        'x': 1,
+        'ref': {'x': 3, 'ref': None},
+        'y': 2,
+    }
+
+
+def test_self_type_with_field(Self):
+    class SelfRef(BaseModel):
+        x: int
+        refs: list[Self] = Field(gt=0)
+
+    with pytest.raises(TypeError, match=re.escape("Unable to apply constraint 'gt' to supplied value []")):
+        SelfRef(x=1, refs=[SelfRef(x=2, refs=[])])
+
+
+def test_self_type_json_schema(Self):
+    class SelfRef(BaseModel):
+        x: int
+        refs: list[Self] | None = []
+
+    assert SelfRef.model_json_schema() == {
+        '$defs': {
+            'SelfRef': {
+                'properties': {
+                    'x': {'title': 'X', 'type': 'integer'},
+                    'refs': {
+                        'anyOf': [{'items': {'$ref': '#/$defs/SelfRef'}, 'type': 'array'}, {'type': 'null'}],
+                        'default': [],
+                        'title': 'Refs',
+                    },
+                },
+                'required': ['x'],
+                'title': 'SelfRef',
+                'type': 'object',
+            }
+        },
+        '$ref': '#/$defs/SelfRef',
+    }
+
+
+def test_self_type_in_named_tuple(Self):
+    class SelfRefNamedTuple(NamedTuple):
+        x: int
+        ref: Self | None
+
+    ta = TypeAdapter(SelfRefNamedTuple)
+    assert ta.validate_python({'x': 1, 'ref': {'x': 2, 'ref': None}}) == (1, (2, None))
+
+
+def test_self_type_in_typed_dict(Self):
+    class SelfRefTypedDict(TypedDict):
+        x: int
+        ref: Self | None
+
+    ta = TypeAdapter(SelfRefTypedDict)
+    assert ta.validate_python({'x': 1, 'ref': {'x': 2, 'ref': None}}) == {'x': 1, 'ref': {'x': 2, 'ref': None}}
+
+
+def test_self_type_in_dataclass(Self):
+    @dataclasses.dataclass(frozen=True)
+    class SelfRef:
+        x: int
+        ref: Self | None
+
     class Model(BaseModel):
-        a: float = Field(title='A')
-        b: int = Field(10)
-        c: int = Field(default_factory=lambda: 1)
+        item: SelfRef
 
-    sig = signature(Model)
-    assert sig != signature(BaseModel)
-    assert _equals(map(str, sig.parameters.values()), ('a: float', 'b: int = 10', 'c: int = <factory>'))
-    assert _equals(str(sig), '(*, a: float, b: int = 10, c: int = <factory>) -> None')
-
-
-def test_generic_model_signature():
-    T = TypeVar('T')
-
-    class Model(BaseModel, Generic[T]):
-        a: T
-
-    sig = signature(Model[int])
-    assert sig != signature(BaseModel)
-    assert _equals(map(str, sig.parameters.values()), ('a: int',))
-    assert _equals(str(sig), '(*, a: int) -> None')
+    m = Model.model_validate({'item': {'x': 1, 'ref': {'x': 2, 'ref': None}}})
+    assert m.item.x == 1
+    assert m.item.ref.x == 2
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        m.item.ref.x = 3
 
 
-def test_custom_init_signature():
-    class MyModel(BaseModel):
-        id: int
-        name: str = 'John Doe'
-        f__: str = Field(alias='foo')
+def test_invalid_validate_call(Self):
+    with pytest.raises(PydanticUserError, match='`typing.Self` is invalid in this context'):
 
-        model_config = ConfigDict(extra='allow')
-
-        def __init__(self, id: int = 1, bar=2, *, baz: Any, **data):
-            super().__init__(id=id, **data)
-            self.bar = bar
-            self.baz = baz
-
-    sig = signature(MyModel)
-    assert _equals(
-        map(str, sig.parameters.values()),
-        ('id: int = 1', 'bar=2', 'baz: Any', "name: str = 'John Doe'", 'foo: str', '**data'),
-    )
-
-    assert _equals(str(sig), "(id: int = 1, bar=2, *, baz: Any, name: str = 'John Doe', foo: str, **data) -> None")
-
-
-def test_custom_init_signature_with_no_var_kw():
-    class Model(BaseModel):
-        a: float
-        b: int = 2
-        c: int
-
-        def __init__(self, a: float, b: int):
-            super().__init__(a=a, b=b, c=1)
-
-        model_config = ConfigDict(extra='allow')
-
-    assert _equals(str(signature(Model)), '(a: float, b: int) -> None')
-
-
-def test_invalid_identifiers_signature():
-    model = create_model(
-        'Model',
-        **{'123 invalid identifier!': (int, Field(123, alias='valid_identifier')), '!': (int, Field(0, alias='yeah'))},
-    )
-    assert _equals(str(signature(model)), '(*, valid_identifier: int = 123, yeah: int = 0) -> None')
-    model = create_model('Model', **{'123 invalid identifier!': (int, 123), '!': (int, Field(0, alias='yeah'))})
-    assert _equals(str(signature(model)), '(*, yeah: int = 0, **extra_data: Any) -> None')
-
-
-def test_use_field_name():
-    class Foo(BaseModel):
-        foo: str = Field(alias='this is invalid')
-
-        model_config = ConfigDict(validate_by_name=True)
-
-    assert _equals(str(signature(Foo)), '(*, foo: str) -> None')
-
-
-def test_does_not_use_reserved_word():
-    class Foo(BaseModel):
-        from_: str = Field(alias='from')
-
-        model_config = ConfigDict(validate_by_name=True)
-
-    assert _equals(str(signature(Foo)), '(*, from_: str) -> None')
-
-
-def test_extra_allow_no_conflict():
-    class Model(BaseModel):
-        spam: str
-
-        model_config = ConfigDict(extra='allow')
-
-    assert _equals(str(signature(Model)), '(*, spam: str, **extra_data: Any) -> None')
-
-
-def test_extra_allow_conflict():
-    class Model(BaseModel):
-        extra_data: str
-
-        model_config = ConfigDict(extra='allow')
-
-    assert _equals(str(signature(Model)), '(*, extra_data: str, **extra_data_: Any) -> None')
-
-
-def test_extra_allow_conflict_twice():
-    class Model(BaseModel):
-        extra_data: str
-        extra_data_: str
-
-        model_config = ConfigDict(extra='allow')
-
-    assert _equals(str(signature(Model)), '(*, extra_data: str, extra_data_: str, **extra_data__: Any) -> None')
-
-
-def test_extra_allow_conflict_custom_signature():
-    class Model(BaseModel):
-        extra_data: int
-
-        def __init__(self, extra_data: int = 1, **foobar: Any):
-            super().__init__(extra_data=extra_data, **foobar)
-
-        model_config = ConfigDict(extra='allow')
-
-    assert _equals(str(signature(Model)), '(extra_data: int = 1, **foobar: Any) -> None')
-
-
-def test_signature_is_class_only():
-    class Model(BaseModel):
-        foo: int = 123
-
-        def __call__(self, a: int) -> bool:
+        @validate_call
+        def foo(self: Self):
             pass
 
-    assert _equals(str(signature(Model)), '(*, foo: int = 123) -> None')
-    assert _equals(str(signature(Model())), '(a: int) -> bool')
-    assert not hasattr(Model(), '__signature__')
+
+def test_invalid_validate_call_of_method(Self):
+    with pytest.raises(PydanticUserError, match='`typing.Self` is invalid in this context'):
+
+        class A(BaseModel):
+            @validate_call
+            def foo(self: Self):
+                pass
 
 
-def test_optional_field():
-    class Model(BaseModel):
-        foo: int | None = None
+def test_type_of_self(Self):
+    class A(BaseModel):
+        self_type: type[Self]
 
-    assert signature(Model) == Signature(
-        [Parameter('foo', Parameter.KEYWORD_ONLY, default=None, annotation=int | None)], return_annotation=None
-    )
+        @computed_field
+        def self_types1(self) -> list[type[Self]]:
+            return [type(self), self.self_type]
 
+        # make sure forward refs are supported:
+        @computed_field
+        def self_types2(self) -> list[type['Self']]:
+            return [type(self), self.self_type]
 
-@pytest.mark.skipif(sys.version_info < (3, 12), reason='repr different on older versions')
-def test_annotated_field():
+        @computed_field
+        def self_types3(self) -> 'list[type[Self]]':
+            return [type(self), self.self_type]
 
-    class Model(BaseModel):
-        foo: Annotated[int, Gt(1)] = 1
+        @computed_field
+        def self_types4(self) -> 'list[type[Self]]':
+            return [type(self), self.self_type]
 
-    sig = signature(Model)
-    assert str(sig) == '(*, foo: Annotated[int, Gt(gt=1)] = 1) -> None'
-    # check that the `Annotated` we created is a valid `Annotated`
-    assert typing_objects.is_annotated(get_origin(sig.parameters['foo'].annotation))
+        @computed_field
+        def self_types5(self) -> list['type[Self]']:
+            return [type(self), self.self_type]
 
+    class B(A): ...
 
-@pytest.mark.skipif(sys.version_info < (3, 12), sys.version_info >= (3, 14), reason='repr different on newer versions')
-def test_annotated_optional_field():
+    A(self_type=A)
+    A(self_type=B)
+    B(self_type=B)
 
-    class Model(BaseModel):
-        foo: Annotated[int | None, Gt(1)] = None
+    a = A(self_type=B)
+    for prop in (a.self_types1, a.self_types2, a.self_types3):
+        assert prop == [A, B]
 
-    assert str(signature(Model)) == '(*, foo: Annotated[int | None, Gt(gt=1)] = None) -> None'
+    for invalid_type in (type, int, A, object):
+        with pytest.raises(ValidationError) as exc_info:
+            B(self_type=invalid_type)
+
+        assert exc_info.value.errors(include_url=False) == [
+            {
+                'type': 'is_subclass_of',
+                'loc': ('self_type',),
+                'msg': f'Input should be a subclass of {B.__qualname__}',
+                'input': invalid_type,
+                'ctx': {'class': B.__qualname__},
+            }
+        ]

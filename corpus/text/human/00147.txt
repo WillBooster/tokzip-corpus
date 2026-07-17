@@ -1,630 +1,247 @@
-OkHttp 2.x Change Log
-=====================
+**Solution:** Use [`GsonBuilder.setObjectToNumberStrategy`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/GsonBuilder.html#setObjectToNumberStrategy(com.google.gson.ToNumberStrategy)) to specify what type of number should be returned
 
-## Version 2.7.5
+## <a id="default-lenient"></a> Malformed JSON not rejected
 
-_2016-02-25_
+**Symptom:** Gson parses malformed JSON without throwing any exceptions
 
- *  Fix: Change the certificate pinner to always build full chains. This
-    prevents a potential crash when using certificate pinning with the Google
-    Play Services security provider.
+**Reason:** Due to legacy reasons Gson performs parsing by default in lenient mode
 
+**Solution:** If you are using Gson 2.11.0 or newer, call [`GsonBuilder.setStrictness`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/GsonBuilder.html#setStrictness(com.google.gson.Strictness)),
+[`JsonReader.setStrictness`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/stream/JsonReader.html#setStrictness(com.google.gson.Strictness))
+and [`JsonWriter.setStrictness`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/stream/JsonWriter.html#setStrictness(com.google.gson.Strictness))
+with `Strictness.STRICT` to overwrite the default lenient behavior of `Gson` and make these classes strictly adhere to the JSON specification.
+Otherwise if you are using an older Gson version, see the [`Gson` class documentation](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/Gson.html#default-lenient)
+section "JSON Strictness handling" for alternative solutions.
 
-## Version 2.7.4
+## <a id="unexpected-json-structure"></a> `IllegalStateException`: "Expected ... but was ..."
 
-_2016-02-07_
+**Symptom:** An `IllegalStateException` with a message in the form "Expected ... but was ..." is thrown
 
- *  Fix: Don't crash when finding the trust manager if the Play Services (GMS)
-    security provider is installed.
- *  Fix: The previous release introduced a performance regression on Android,
-    caused by looking up CA certificates. This is now fixed.
+**Reason:**
 
+- The JSON data does not have the correct format
+- Or, Gson has no built-in adapter for a type and tries to deserialize it as JSON object
 
-## Version 2.7.3
+**Solution:** Make sure that your classes correctly model the JSON data. Also during debugging log the JSON data right before calling Gson methods or set a breakpoint to inspect the data and make sure it has the expected format. Read the location information of the exception message, it indicates where exactly in the document the error occurred, including the [JSONPath](https://goessner.net/articles/JsonPath/).
 
-_2016-02-06_
+For example, let's assume you have the following Java class:
 
- *  Fix: Permit the trusted CA root to be pinned by `CertificatePinner`.
+```java
+class WebPage {
+    String languages;
+}
+```
 
+And you want to deserialize the following JSON data:
 
-## Version 2.7.2
+```json
+{
+  "languages": ["English", "French"]
+}
+```
 
-_2016-01-07_
+This will fail with an exception similar to this one: `IllegalStateException: Expected a string but was BEGIN_ARRAY at line 2 column 17 path $.languages`\
+This means Gson expected a JSON string value but found the beginning of a JSON array (`[`). The location information "line 2 column 17" points to the `[` in the JSON data (with some slight inaccuracies), so does the JSONPath `$.languages` in the exception message. It refers to the `languages` member of the root object (`$.`).\
+The solution here is to change in the `WebPage` class the field `String languages` to `List<String> languages`.
 
- *  Fix: Don't eagerly release stream allocations on cache hits. We might still
-    need them to handle redirects.
+If you are sure that the JSON data is correct and the exception message is "Expected BEGIN_OBJECT but was ...", then this might indicate that Gson has no built-in adapter for the type.
+Gson then tries to use reflection and expects that the data is a JSON object (hence the error message "Expected BEGIN_OBJECT ..."). In that case you have to write a custom [`TypeAdapter`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/TypeAdapter.html) for that type. If you already wrote a custom adapter, but it is not used, see [this troubleshooting point](#custom-adapter-not-used).
 
+## <a id="adapter-not-null-safe"></a> `IllegalStateException`: "Expected ... but was NULL"
 
-## Version 2.7.1
+**Symptom:** An `IllegalStateException` with a message in the form "Expected ... but was NULL" is thrown
 
-_2016-01-01_
+**Reason:**
 
- *  Fix: Don't do a health check on newly-created connections. This is
-    unnecessary work that could put the client in an inconsistent state if the
-    health check fails.
+- A built-in adapter does not support JSON null values
+- Or, you have written a custom `TypeAdapter` which does not properly handle JSON null values
 
+**Solution:** If this occurs for a custom adapter you wrote, add code similar to the following at the beginning of its `read` method:
 
-## Version 2.7.0
+```java
+@Override
+public MyClass read(JsonReader in) throws IOException {
+    if (in.peek() == JsonToken.NULL) {
+        in.nextNull();
+        return null;
+    }
 
-_2015-12-13_
+    ...
+}
+```
 
- *  **Rewritten connection management.** Previously OkHttp's connection pool
-    managed both idle and active connections for HTTP/2, but only idle
-    connections for HTTP/1.x. With this update the connection pool manages both
-    idle and active connections for everything. OkHttp now detects and warns on
-    connections that were allocated but never released, and will enforce HTTP/2
-    stream limits. This update also fixes `Call.cancel()` to not do I/O on the
-    calling thread.
- *  Fix: Don't log gzipped data in the logging interceptor.
- *  Fix: Don't resolve DNS addresses when connecting through a SOCKS proxy.
- *  Fix: Drop the synthetic `OkHttp-Selected-Protocol` response header.
- *  Fix: Support 204 and 205 'No Content' replies in the logging interceptor.
- *  New: Add `Call.isExecuted()`.
+Alternatively you can call [`nullSafe()`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/TypeAdapter.html#nullSafe()) on the adapter instance you created.
 
+## <a id="serialize-nulls"></a> Properties missing in JSON
 
-## Version 2.6.0
+**Symptom:** Properties are missing in the JSON output
 
-_2015-11-22_
+**Reason:** Gson by default omits JSON null from the output (or: ProGuard / R8 is not configured correctly and removed unused fields)
 
- *  **New Logging Interceptor.** The `logging-interceptor` subproject offers
-    simple request and response logging. It may be configured to log headers and
-    bodies for debugging. It requires this Maven dependency:
-
-     ```xml
-     <dependency>
-       <groupId>com.squareup.okhttp</groupId>
-       <artifactId>logging-interceptor</artifactId>
-       <version>2.6.0</version>
-     </dependency>
-     ```
-
-    Configure basic logging like this:
-
-    ```java
-    HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor();
-    loggingInterceptor.setLevel(HttpLoggingInterceptor.Level.BASIC);
-    client.networkInterceptors().add(loggingInterceptor);
-    ```
-
-    **Warning:** Avoid `Level.HEADERS` and `Level.BODY` in production because
-    they could leak passwords and other authentication credentials to insecure
-    logs.
-
- *  **WebSocket API now uses `RequestBody` and `ResponseBody` for messages.**
-    This is a backwards-incompatible API change.
-
- *  **The DNS service is now pluggable.** In some situations this may be useful
-    to manually prioritize specific IP addresses.
-
- *  Fix: Don't throw when converting an `HttpUrl` to a `java.net.URI`.
-    Previously URLs with special characters like `|` and `[` would break when
-    subjected to URI’s overly-strict validation.
- *  Fix: Don't re-encode `+` as `%20` in encoded URL query strings. OkHttp
-    prefers `%20` when doing its own encoding, but will retain `+` when that is
-    provided.
- *  Fix: Enforce that callers call `WebSocket.close()` on IO errors. Error
-    handling in WebSockets is significantly improved.
- *  Fix: Don't use SPDY/3 style header concatenation for HTTP/2 request headers.
-    This could have corrupted requests where multiple headers had the same name,
-    as in cookies.
- *  Fix: Reject bad characters in the URL hostname. Previously characters like
-    `\0` would cause a late crash when building the request.
- *  Fix: Allow interceptors to change the request method.
- *  Fix: Don’t use the request's `User-Agent` or `Proxy-Authorization` when
-    connecting to an HTTPS server via an HTTP tunnel. The `Proxy-Authorization`
-    header was being leaked to the origin server.
- *  Fix: Digits may be used in a URL scheme.
- *  Fix: Improve connection timeout recovery.
- *  Fix: Recover from `getsockname` crashes impacting Android releases prior to
-    4.2.2.
- *  Fix: Drop partial support for HTTP/1.0. Previously OkHttp would send
-    `HTTP/1.0` on connections after seeing a response with `HTTP/1.0`. The fixed
-    behavior is consistent with Firefox and Chrome.
- *  Fix: Allow a body in `OPTIONS` requests.
- *  Fix: Don't percent-encode non-ASCII characters in URL fragments.
- *  Fix: Handle null fragments.
- *  Fix: Don’t crash on interceptors that throw `IOException` before a
-    connection is attempted.
- *  New: Support [WebDAV][webdav] HTTP methods.
- *  New: Buffer WebSocket frames for better performance.
- *  New: Drop support for `TLS_DHE_DSS_WITH_AES_128_CBC_SHA`, our only remaining
-    DSS cipher suite. This is consistent with Firefox and Chrome which have also
-    dropped these cipher suite.
-
-## Version 2.5.0
-
-_2015-08-25_
-
- *  **Timeouts now default to 10 seconds.** Previously we defaulted to never
-    timing out, and that was a lousy policy. If establishing a connection,
-    reading the next byte from a connection, or writing the next byte to a
-    connection takes more than 10 seconds to complete, you’ll need to adjust
-    the timeouts manually.
-
- *  **OkHttp now rejects request headers that contain invalid characters.** This
-    includes potential security problems (newline characters) as well as simple
-    non-ASCII characters (including international characters and emoji).
-
- *  **Call canceling is more reliable.**  We had a bug where a socket being
-     connected wasn't being closed when the application used `Call.cancel()`.
-
- *  **Changing a HttpUrl’s scheme now tracks the default port.** We had a bug
-    where changing a URL from `http` to `https` would leave it on port 80.
-
- *  **Okio has been updated to 1.6.0.**
-     ```xml
-     <dependency>
-       <groupId>com.squareup.okio</groupId>
-       <artifactId>okio</artifactId>
-       <version>1.6.0</version>
-     </dependency>
-     ```
-
- *  New: `Cache.initialize()`. Call this on a background thread to eagerly
-    initialize the response cache.
- *  New: Fold `MockWebServerRule` into `MockWebServer`. This makes it easier to
-    write JUnit tests with `MockWebServer`. The `MockWebServer` library now
-    depends on JUnit, though it continues to work with all testing frameworks.
- *  Fix: `FormEncodingBuilder` is now consistent with browsers in which
-    characters it escapes. Previously we weren’t percent-encoding commas,
-    parens, and other characters.
- *  Fix: Relax `FormEncodingBuilder` to support building empty forms.
- *  Fix: Timeouts throw `SocketTimeoutException`, not `InterruptedIOException`.
- *  Fix: Change `MockWebServer` to use the same logic as OkHttp when determining
-    whether an HTTP request permits a body.
- *  Fix: `HttpUrl` now uses the canonical form for IPv6 addresses.
- *  Fix: Use `HttpUrl` internally.
- *  Fix: Recover from Android 4.2.2 EBADF crashes.
- *  Fix: Don't crash with an `IllegalStateException` if an HTTP/2 or SPDY
-    write fails, leaving the connection in an inconsistent state.
- *  Fix: Make sure the default user agent is ASCII.
-
-
-## Version 2.4.0
-
-_2015-05-22_
-
- *  **Forbid response bodies on HTTP 204 and 205 responses.** Webservers that
-    return such malformed responses will now trigger a `ProtocolException` in
-    the client.
-
- *  **WebSocketListener has incompatible changes.** The `onOpen()` method is now
-    called on the reader thread, so implementations must return before further
-    websocket messages will be delivered. The `onFailure()` method now includes
-    an HTTP response if one was returned.
-
-## Version 2.4.0-RC1
-
-_2015-05-16_
-
- *  **New HttpUrl API.** It's like `java.net.URL` but good. Note that
-    `Request.Builder.url()` now throws `IllegalArgumentException` on malformed
-    URLs. (Previous releases would throw a `MalformedURLException` when calling
-    a malformed URL.)
-
- *  **We've improved connect failure recovery.** We now differentiate between
-    setup, connecting, and connected and implement appropriate recovery rules
-    for each. This changes `Address` to no longer use `ConnectionSpec`. (This is
-    an incompatible API change).
-
- *  **`FormEncodingBuilder` now uses `%20` instead of `+` for encoded spaces.**
-    Both are permitted-by-spec, but `%20` requires fewer special cases.
-
- *  **Okio has been updated to 1.4.0.**
-     ```xml
-     <dependency>
-       <groupId>com.squareup.okio</groupId>
-       <artifactId>okio</artifactId>
-       <version>1.4.0</version>
-     </dependency>
-     ```
-
- *  **`Request.Builder` no longer accepts null if a request body is required.**
-    Passing null will now fail for request methods that require a body. Instead
-    use an empty body such as this one:
-
-    ```java
-        RequestBody.create(null, new byte[0]);
-    ```
-
- * **`CertificatePinner` now supports wildcard hostnames.** As always with
-   certificate pinning, you must be very careful to avoid [bricking][brick]
-   your app. You'll need to pin both the top-level domain and the `*.` domain
-   for full coverage.
-
-    ```java
-     client.setCertificatePinner(new CertificatePinner.Builder()
-         .add("publicobject.com",   "sha1/DmxUShsZuNiqPQsX2Oi9uv2sCnw=")
-         .add("*.publicobject.com", "sha1/DmxUShsZuNiqPQsX2Oi9uv2sCnw=")
-         .add("publicobject.com",   "sha1/SXxoaOSEzPC6BgGmxAt/EAcsajw=")
-         .add("*.publicobject.com", "sha1/SXxoaOSEzPC6BgGmxAt/EAcsajw=")
-         .add("publicobject.com",   "sha1/blhOM3W9V/bVQhsWAcLYwPU6n24=")
-         .add("*.publicobject.com", "sha1/blhOM3W9V/bVQhsWAcLYwPU6n24=")
-         .add("publicobject.com",   "sha1/T5x9IXmcrQ7YuQxXnxoCmeeQ84c=")
-         .add("*.publicobject.com", "sha1/T5x9IXmcrQ7YuQxXnxoCmeeQ84c=")
-         .build());
-    ```
-
- *  **Interceptors lists are now deep-copied by `OkHttpClient.clone()`.**
-    Previously clones shared interceptors, which made it difficult to customize
-    the interceptors on a request-by-request basis.
-
- *  New: `Headers.toMultimap()`.
- *  New: `RequestBody.create(MediaType, ByteString)`.
- *  New: `ConnectionSpec.isCompatible(SSLSocket)`.
- *  New: `Dispatcher.getQueuedCallCount()` and
-    `Dispatcher.getRunningCallCount()`. These can be useful in diagnostics.
- *  Fix: OkHttp no longer shares timeouts between pooled connections. This was
-    causing some applications to crash when connections were reused.
- *  Fix: `OkApacheClient` now allows an empty `PUT` and `POST`.
- *  Fix: Websockets no longer rebuffer socket streams.
- *  Fix: Websockets are now better at handling close frames.
- *  Fix: Content type matching is now case insensitive.
- *  Fix: `Vary` headers are not lost with `android.net.http.HttpResponseCache`.
- *  Fix: HTTP/2 wasn't enforcing stream timeouts when writing the underlying
-    connection. Now it is.
- *  Fix: Never return null on `call.proceed()`. This was a bug in call
-    cancelation.
- *  Fix: When a network interceptor mutates a request, that change is now
-    reflected in `Response.networkResponse()`.
- *  Fix: Badly-behaving caches now throw a checked exception instead of a
-    `NullPointerException`.
- *  Fix: Better handling of uncaught exceptions in MockWebServer with HTTP/2.
-
-## Version 2.3.0
-
-_2015-03-16_
-
- *  **HTTP/2 support.** We've done interop testing and haven't seen any
-    problems. HTTP/2 support has been a big effort and we're particularly
-    thankful to Adrian Cole who has helped us to reach this milestone.
-
- *  **RC4 cipher suites are no longer supported by default.** To connect to
-    old, obsolete servers relying on these cipher suites, you must create a
-    custom `ConnectionSpec`.
-
- *  **Beta WebSockets support.**. The `okhttp-ws` subproject offers a new
-    websockets client. Please try it out! When it's ready we intend to include
-    it with the core OkHttp library.
-
- *  **Okio updated to 1.3.0.**
-
-    ```xml
-    <dependency>
-      <groupId>com.squareup.okio</groupId>
-      <artifactId>okio</artifactId>
-      <version>1.3.0</version>
-    </dependency>
-    ```
-
- *  **Fix: improve parallelism of async requests.** OkHttp's Dispatcher had a
-    misconfigured `ExecutorService` that limited the number of worker threads.
-    If you're using `Call.enqueue()` this update should significantly improve
-    request concurrency.
-
- *  **Fix: Lazily initialize the response cache.** This avoids strict mode
-    warnings when initializing OkHttp on Android‘s main thread.
-
- *  **Fix: Disable ALPN on Android 4.4.** That release of the feature was
-    unstable and prone to native crashes in the underlying OpenSSL code.
- *  Fix: Don't send both `If-None-Match` and `If-Modified-Since` cache headers
-    when both are applicable.
- *  Fix: Fail early when a port is out of range.
- *  Fix: Offer `Content-Length` headers for multipart request bodies.
- *  Fix: Throw `UnknownServiceException` if a cleartext connection is attempted
-    when explicitly forbidden.
- *  Fix: Throw a `SSLPeerUnverifiedException` when host verification fails.
- *  Fix: MockWebServer explicitly closes sockets. (On some Android releases,
-    closing the input stream and output stream of a socket is not sufficient.
- *  Fix: Buffer outgoing HTTP/2 frames to limit how many outgoing frames are
-    created.
- *  Fix: Avoid crashing when cache writing fails due to a full disk.
- *  Fix: Improve caching of private responses.
- *  Fix: Update cache-by-default response codes.
- *  Fix: Reused `Request.Builder` instances no longer hold stale URL fields.
- *  New: ConnectionSpec can now be configured to use the SSL socket's default
-    cipher suites. To use, set the cipher suites to `null`.
- *  New: Support `DELETE` with a request body.
- *  New: `Headers.of(Map)` creates headers from a Map.
-
-
-## Version 2.2.0
-
-_2014-12-30_
-
- *  **`RequestBody.contentLength()` now throws `IOException`.**
-    This is a source-incompatible change. If you have code that calls
-    `RequestBody.contentLength()`, your compile will break with this
-    update. The change is binary-compatible, however: code compiled
-    for OkHttp 2.0 and 2.1 will continue to work with this update.
-
- *  **`COMPATIBLE_TLS` no longer supports SSLv3.** In response to the
-    [POODLE](https://googleonlinesecurity.blogspot.ca/2014/10/this-poodle-bites-exploiting-ssl-30.html)
-    vulnerability, OkHttp no longer offers SSLv3 when negotiation an
-    HTTPS connection. If you continue to need to connect to webservers
-    running SSLv3, you must manually configure your own `ConnectionSpec`.
-
- *  **OkHttp now offers interceptors.** Interceptors are a powerful mechanism
-    that can monitor, rewrite, and retry calls. The [interceptors doc][interceptors] is a full
-    introduction to this new API.
-
- *  New: APIs to iterate and selectively clear the response cache.
- *  New: Support for SOCKS proxies.
- *  New: Support for `TLS_FALLBACK_SCSV`.
- *  New: Update HTTP/2 support to `h2-16` and `hpack-10`.
- *  New: APIs to prevent retrying non-idempotent requests.
- *  Fix: Drop NPN support. Going forward we support ALPN only.
- *  Fix: The hostname verifier is now strict. This is consistent with the hostname
-    verifier in modern browsers.
- *  Fix: Improve `CONNECT` handling for misbehaving HTTP proxies.
- *  Fix: Don't retry requests that failed due to timeouts.
- *  Fix: Cache 302s and 308s that include appropriate response headers.
- *  Fix: Improve pooling of connections that use proxy selectors.
- *  Fix: Don't leak connections when using ALPN on the desktop.
- *  Fix: Update Jetty ALPN to `7.1.2.v20141202` (Java 7) and `8.1.2.v20141202` (Java 8).
-    This fixes a bug in resumed TLS sessions where the wrong protocol could be
-    selected.
- *  Fix: Don't crash in SPDY and HTTP/2 when disconnecting before connecting.
- *  Fix: Avoid a reverse DNS-lookup for a numeric proxy address
- *  Fix: Resurrect http/2 frame logging.
- *  Fix: Limit to 20 authorization attempts.
-
-## Version 2.1.0
-
-_2014-11-11_
-
- *  New: Typesafe APIs for interacting with cipher suites and TLS versions.
- *  Fix: Don't crash when mixing authorization challenges with upload retries.
-
-
-## Version 2.1.0-RC1
-
-_2014-11-04_
-
- *  **OkHttp now caches private responses**. We've changed from a shared cache
-    to a private cache, and will now store responses that use an `Authorization`
-    header. This means OkHttp's cache shouldn't be used on middleboxes that sit
-    between user agents and the origin server.
-
- *  **TLS configuration updated.** OkHttp now explicitly enables TLSv1.2,
-    TLSv1.1 and TLSv1.0 where they are supported. It will continue to perform
-    only one fallback, to SSLv3. Applications can now configure this with the
-    `ConnectionSpec` class.
-
-    To disable TLS fallback:
-
-    ```java
-    client.setConnectionSpecs(Arrays.asList(
-        ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT));
-    ```
-
-    To disable cleartext connections, permitting `https` URLs only:
-
-    ```java
-    client.setConnectionSpecs(Arrays.asList(
-        ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS));
-    ```
-
- *  **New cipher suites.** Please confirm that your webservers are reachable
-    with this limited set of cipher suites.
-
-    ```
-                                             Android
-    Name                                     Version
-
-    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256  5.0
-    TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256    5.0
-    TLS_DHE_RSA_WITH_AES_128_GCM_SHA256      5.0
-    TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA     4.0
-    TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA     4.0
-    TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA       4.0
-    TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA       4.0
-    TLS_ECDHE_ECDSA_WITH_RC4_128_SHA         4.0
-    TLS_ECDHE_RSA_WITH_RC4_128_SHA           4.0
-    TLS_DHE_RSA_WITH_AES_128_CBC_SHA         2.3
-    TLS_DHE_DSS_WITH_AES_128_CBC_SHA         2.3
-    TLS_DHE_RSA_WITH_AES_256_CBC_SHA         2.3
-    TLS_RSA_WITH_AES_128_GCM_SHA256          5.0
-    TLS_RSA_WITH_AES_128_CBC_SHA             2.3
-    TLS_RSA_WITH_AES_256_CBC_SHA             2.3
-    SSL_RSA_WITH_3DES_EDE_CBC_SHA            2.3  (Deprecated in 5.0)
-    SSL_RSA_WITH_RC4_128_SHA                 2.3
-    SSL_RSA_WITH_RC4_128_MD5                 2.3  (Deprecated in 5.0)
-    ```
-
- *  **Okio updated to 1.0.1.**
-
-    ```xml
-    <dependency>
-      <groupId>com.squareup.okio</groupId>
-      <artifactId>okio</artifactId>
-      <version>1.0.1</version>
-    </dependency>
-    ```
-
- *  **New APIs to permit easy certificate pinning.** Be warned, certificate
-    pinning is dangerous and could prevent your application from trusting your
-    server!
-
- *  **Cache improvements.** This release fixes some severe cache problems
-    including a bug where the cache could be corrupted upon certain access
-    patterns. We also fixed a bug where the cache was being cleared due to a
-    corrupted journal. We've added APIs to configure a request's `Cache-Control`
-    headers, and to manually clear the cache.
-
- *  **Request cancellation fixes.** This update fixes a bug where synchronous
-    requests couldn't be canceled by tag. This update avoids crashing when
-    `onResponse()` throws an `IOException`. That failure will now be logged
-    instead of notifying the thread's uncaught exception handler. We've added a
-    new API, `Call.isCanceled()` to check if a call has been canceled.
-
- *  New: Update `MultipartBuilder` to support content length.
- *  New: Make it possible to mock `OkHttpClient` and `Call`.
- *  New: Update to h2-14 and hpack-9.
- *  New: OkHttp includes a user-agent by default, like `okhttp/2.1.0-RC1`.
- *  Fix: Handle response code `308 Permanent Redirect`.
- *  Fix: Don't skip the callback if a call is canceled.
- *  Fix: Permit hostnames with underscores.
- *  Fix: Permit overriding the content-type in `OkApacheClient`.
- *  Fix: Use the socket factory for direct connections.
- *  Fix: Honor `OkUrlFactory` APIs that disable redirects.
- *  Fix: Don't crash on concurrent modification of `SPDY` SPDY settings.
-
-## Version 2.0.0
-
-This release commits to a stable 2.0 API. Read the 2.0.0-RC1 changes for advice
-on upgrading from 1.x to 2.x.
-
-_2014-06-21_
-
- *  **API Change**: Use `IOException` in `Callback.onFailure()`. This is
-    a source-incompatible change, and is different from OkHttp 2.0.0-RC2 which
-    used `Throwable`.
- *  Fix: Fixed a caching bug where we weren't storing rewritten request headers
-    like `Accept-Encoding`.
- *  Fix: Fixed bugs in handling the SPDY window size. This was stalling certain
-    large downloads
- *  Update the language level to Java 7. (OkHttp requires Android 2.3+ or Java 7+.)
-
-## Version 2.0.0-RC2
-
-_2014-06-11_
-
-This update fixes problems in 2.0.0-RC1. Read the 2.0.0-RC1 changes for
-advice on upgrading from 1.x to 2.x.
-
- *  Fix: Don't leak connections! There was a regression in 2.0.0-RC1 where
-    connections were neither closed nor pooled.
- *  Fix: Revert builder-style return types from OkHttpClient's timeout methods
-    for binary compatibility with OkHttp 1.x.
- *  Fix: Don't skip client stream 1 on SPDY/3.1. This fixes SPDY connectivity to
-    `https://google.com`, which doesn't follow the SPDY/3.1 spec!
- *  Fix: Always configure NPN headers. This fixes connectivity to
-    `https://facebook.com` when SPDY and HTTP/2 are both disabled. Otherwise an
-    unexpected NPN response is received and OkHttp crashes.
- *  Fix: Write continuation frames when HPACK data is larger than 16383 bytes.
- *  Fix: Don't drop uncaught exceptions thrown in async calls.
- *  Fix: Throw an exception eagerly when a request body is not legal. Previously
-    we ignored the problem at request-building time, only to crash later with a
-    `NullPointerException`.
- *  Fix: Include a backwards-compatible `OkHttp-Response-Source` header with
-    `OkUrlFactory `responses.
- *  Fix: Don't include a default User-Agent header in requests made with the Call
-    API. Requests made with OkUrlFactory will continue to have a default user
-    agent.
- *  New: Guava-like API to create headers:
-
-    ```java
-    Headers headers = Headers.of(name1, value1, name2, value2, ...).
-    ```
-
- *  New: Make the content-type header optional for request bodies.
- *  New: `Response.isSuccessful()` is a convenient API to check response codes.
- *  New: The response body can now be read outside of the callback. Response
-    bodies must always be closed, otherwise they will leak connections!
- *  New: APIs to create multipart request bodies (`MultipartBuilder`) and form
-    encoding bodies (`FormEncodingBuilder`).
-
-## Version 2.0.0-RC1
-
-_2014-05-23_
-
-OkHttp 2 is designed around a new API that is true to HTTP, with classes for
-requests, responses, headers, and calls. It uses modern Java patterns like
-immutability and chained builders. The API now offers asynchronous callbacks
-in addition to synchronous blocking calls.
-
-#### API Changes
-
- *  **New Request and Response types,** each with their own builder. There's also
-    a `RequestBody` class to write the request body to the network and a
-    `ResponseBody` to read the response body from the network. The standalone
-    `Headers` class offers full access to the HTTP headers.
-
- *  **Okio dependency added.** OkHttp now depends on
-    [Okio](https://github.com/square/okio), an I/O library that makes it easier
-    to access, store and process data. Using this library internally makes OkHttp
-    faster while consuming less memory. You can write a `RequestBody` as an Okio
-    `BufferedSink` and a `ResponseBody` as an Okio `BufferedSource`. Standard
-    `InputStream` and `OutputStream` access is also available.
-
- *  **New Call and Callback types** execute requests and receive their
-    responses. Both types of calls can be canceled via the `Call` or the
-    `OkHttpClient`.
-
- *  **URLConnection support has moved to the okhttp-urlconnection module.**
-    If you're upgrading from 1.x, this change will impact you. You will need to
-    add the `okhttp-urlconnection` module to your project and use the
-    `OkUrlFactory` to create new instances of `HttpURLConnection`:
-
-    ```java
-    // OkHttp 1.x:
-    HttpURLConnection connection = client.open(url);
-
-    // OkHttp 2.x:
-    HttpURLConnection connection = new OkUrlFactory(client).open(url);
-    ```
-
- *  **Custom caches are no longer supported.** In OkHttp 1.x it was possible to
-    define your own response cache with the `java.net.ResponseCache` and OkHttp's
-    `OkResponseCache` interfaces. Both of these APIs have been dropped. In
-    OkHttp 2 the built-in disk cache is the only supported response cache.
-
- *  **HttpResponseCache has been renamed to Cache.** Install it with
-    `OkHttpClient.setCache(...)` instead of `OkHttpClient.setResponseCache(...)`.
-
- *  **OkAuthenticator has been replaced with Authenticator.** This new
-    authenticator has access to the full incoming response and can respond with
-    whichever followup request is appropriate. The `Challenge` class is now a
-    top-level class and `Credential` is replaced with a utility class called
-    `Credentials`.
-
- *  **OkHttpClient.getFollowProtocolRedirects() renamed to
-    getFollowSslRedirects()**. We reserve the word _protocol_ for the HTTP
-    version being used (HTTP/1.1, HTTP/2). The old name of this method was
-    misleading; it was always used to configure redirects between `https://` and
-    `http://` schemes.
-
- *  **RouteDatabase is no longer public API.** OkHttp continues to track which
-    routes have failed but this is no exposed in the API.
-
- *  **ResponseSource is gone.** This enum exposed whether a response came from
-    the cache, network, or both. OkHttp 2 offers more detail with raw access to
-    the cache and network responses in the new `Response` class.
-
- *  **TunnelRequest is gone.** It specified how to connect to an HTTP proxy.
-    OkHttp 2 uses the new `Request` class for this.
-
- *  **Dispatcher** is a new class that manages the queue of asynchronous calls. It
-    implements limits on total in-flight calls and in-flight calls per host.
-
-#### Implementation changes
-
- * Support Android `TrafficStats` socket tagging.
- * Drop authentication headers on redirect.
- * Added support for compressed data frames.
- * Process push promise callbacks in order.
- * Update to http/2 draft 12.
- * Update to HPACK draft 07.
- * Add ALPN support. Maven will use ALPN on OpenJDK 8.
- * Update NPN dependency to target `jdk7u60-b13` and `Oracle jdk7u55-b13`.
- * Ensure SPDY variants support zero-length DELETE and POST.
- * Prevent leaking a cache item's InputStreams when metadata read fails.
- * Use a string to identify TLS versions in routes.
- * Add frame logger for HTTP/2.
- * Replacing `httpMinorVersion` with `Protocol`. Expose HTTP/1.0 as a potential protocol.
- * Use `Protocol` to describe framing.
- * Implement write timeouts for HTTP/1.1 streams.
- * Avoid use of SPDY stream ID 1, as that's typically used for UPGRADE.
- * Support OAuth in `Authenticator`.
- * Permit a dangling semicolon in media type parsing.
-
-
-## Version 1.x
-
-[Change log](changelog_1x.md)
-
-
- [brick]: https://noncombatant.org/2015/05/01/about-http-public-key-pinning/
- [interceptors]: https://square.github.io/okhttp/interceptors/
- [webdav]: https://tools.ietf.org/html/rfc4918
+**Solution:** Use [`GsonBuilder.serializeNulls()`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/GsonBuilder.html#serializeNulls())
+
+Note: Gson does not support anonymous and local classes and will serialize them as JSON null, see the [related troubleshooting point](#null-values-for-anonymous-and-local-classes).
+
+## <a id="android-internal-fields"></a> JSON output changes for newer Android versions
+
+**Symptom:** The JSON output differs when running on newer Android versions
+
+**Reason:** You use Gson by accident to access internal fields of Android classes
+
+**Solution:** Write custom Gson [`TypeAdapter`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/TypeAdapter.html) implementations for the affected classes or change the type of your data
+
+**Explanation:**
+
+When no built-in adapter for a type exists and no custom adapter has been registered, Gson falls back to using reflection to access the fields of a class (including `private` ones). Most likely you are experiencing this issue because you (by accident) rely on the reflection-based adapter for Android classes. That should be avoided because you make yourself dependent on the implementation details of these classes which could change at any point.
+
+If you want to prevent using reflection on third-party classes in the future you can write your own [`ReflectionAccessFilter`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/ReflectionAccessFilter.html) or use one of the predefined ones, such as `ReflectionAccessFilter.BLOCK_ALL_PLATFORM`.
+
+## <a id="json-static-fields"></a> JSON output contains values of `static` fields
+
+**Symptom:** The JSON output contains values of `static` fields
+
+**Reason:** You used `GsonBuilder.excludeFieldsWithModifiers` to overwrite the default excluded modifiers
+
+**Solution:** When calling `GsonBuilder.excludeFieldsWithModifiers` you overwrite the default excluded modifiers. Therefore, you have to explicitly exclude `static` fields if desired. This can be done by adding `Modifier.STATIC` as additional argument to the `excludeFieldsWithModifiers` call.
+
+## <a id="no-such-method-error"></a> `NoSuchMethodError` when calling Gson methods
+
+**Symptom:** A `java.lang.NoSuchMethodError` is thrown when trying to call certain Gson methods
+
+**Reason:**
+
+- You have multiple versions of Gson on your classpath
+- Or, the Gson version you compiled against is different from the one on your classpath
+- Or, you are using a code shrinking tool such as ProGuard or R8 which removed methods from Gson
+
+**Solution:** First disable any code shrinking tools such as ProGuard or R8 and check if the issue persists. If not, you have to tweak the configuration of that tool to not modify Gson classes. Otherwise verify that the Gson JAR on your classpath is the same you are compiling against, and that there is only one Gson JAR on your classpath. See [this Stack Overflow question](https://stackoverflow.com/q/227486) to find out where a class is loaded from. For example, for debugging you could include the following code:
+
+```java
+System.out.println(Gson.class.getProtectionDomain().getCodeSource().getLocation());
+```
+
+If that fails with a `NullPointerException` you have to try one of the other ways to find out where a class is loaded from.
+
+## <a id="duplicate-fields"></a> `IllegalArgumentException`: 'Class ... declares multiple JSON fields named '...''
+
+**Symptom:** An exception with the message 'Class ... declares multiple JSON fields named '...'' is thrown
+
+**Reason:**
+
+- The name you have specified with a [`@SerializedName`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/annotations/SerializedName.html) annotation for a field collides with the name of another field
+- Or, the [`FieldNamingStrategy`](https://javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/FieldNamingStrategy.html) you have specified produces conflicting field names
+- Or, a field of your class has the same name as the field of a superclass
+- Or, you are using an obfuscation tool such as ProGuard or R8 and it has renamed the fields; in that case see [this troubleshooting point](#android-app-random-names)
+
+Gson prevents multiple fields with the same name because during deserialization it would be ambiguous for which field the JSON data should be deserialized. For serialization it would cause the same field to appear multiple times in JSON. While the JSON specification permits this, it is likely that the application parsing the JSON data will not handle it correctly.
+
+**Solution:** First identify the fields with conflicting names based on the exception message. Then decide if you want to rename one of them using the [`@SerializedName`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/annotations/SerializedName.html) annotation, or if you want to [exclude](UserGuide.md#excluding-fields-from-serialization-and-deserialization) one of them. When excluding one of the fields you have to apply the exclusion for both serialization and deserialization (even if your application only performs one of these actions) because the duplicate field check cannot differentiate between these actions.
+
+## <a id="java-lang-class-unsupported"></a> `UnsupportedOperationException` when serializing or deserializing `java.lang.Class`
+
+**Symptom:** An `UnsupportedOperationException` is thrown when trying to serialize or deserialize `java.lang.Class`
+
+**Reason:** Gson intentionally does not permit serializing and deserializing `java.lang.Class` for security reasons. Otherwise a malicious user could make your application load an arbitrary class from the classpath and, depending on what your application does with the `Class`, in the worst case perform a remote code execution attack.
+
+**Solution:** First check if you really need to serialize or deserialize a `Class`. Often it is possible to use string aliases and then map them to the known `Class`; you could write a custom [`TypeAdapter`](https://javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/TypeAdapter.html) to do this. If the `Class` values are not known in advance, try to introduce a common base class or interface for all these classes and then verify that the deserialized class is a subclass. For example assuming the base class is called `MyBaseClass`, your custom `TypeAdapter` should load the class like this:
+
+```java
+Class.forName(jsonString, false, getClass().getClassLoader()).asSubclass(MyBaseClass.class)
+```
+
+This will not initialize arbitrary classes, and it will throw a `ClassCastException` if the loaded class is not the same as or a subclass of `MyBaseClass`.
+
+## <a id="custom-adapter-not-used"></a> Custom type adapter is not used
+
+**Symptom:** You have registered a custom `TypeAdapter` (or `JsonSerializer` or `JsonDeserializer`) on a `GsonBuilder`, but Gson is not using your adapter
+
+**Reason:**
+
+- You registered the adapter for the wrong type
+- Or, you are serializing or deserializing a subclass
+- Or, your custom `Gson` instance is not actually used
+
+**Solution:**
+
+- Debug your code and verify that the custom `Gson` instance on which you have registered the adapter is actually used. Possibly parts of your application are using a different `Gson` instance, or you are using a framework such as Spring which is using a different `Gson` instance with default configuration (in that case have a look at the framework-specific configuration options).
+- Verify that you are registering the adapter for the correct type. `GsonBuilder.registerTypeAdapter(...)` takes the adapter as `Object` argument, so you will not see a compilation error when you provide the wrong type.
+  For example when you want to register an adapter for `MyClass`, you should call `registerTypeAdapter(MyClass.class, new MyClassAdapter())`.\
+  Also pay close attention to the package name, there are classes with the same name in different packages, such as `java.util.Date` and `java.sql.Date`.
+- `registerTypeAdapter` only registers an adapter for the specified class, _but not for subclasses_. Use [`registerTypeHierarchyAdapter`](https://javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/GsonBuilder.html#registerTypeHierarchyAdapter(java.lang.Class,java.lang.Object))
+  to also handle subclasses.
+- Be careful with parameterized types for `registerTypeAdapter` because Gson only uses the adapter if there is an exact match for the types.
+  For example if you register an adapter for `List<Number>` it won't be used for `List` (raw type), `List<Integer>` or `ArrayList<Number>`.
+  You can solve this by writing a [`TypeAdapterFactory`](https://javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/TypeAdapterFactory.html) instead, which manually checks if the type matches.
+- If you want to register an adapter for a primitive type such as `boolean`, you might also want to register it for the wrapper type `java.lang.Boolean`, and the other way around.
+- The built-in adapters for `JsonElement` (and subclasses) and for `Object` cannot be overwritten. However, as workaround for a field of those types you can use the [`@JsonAdapter` annotation](https://javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/annotations/JsonAdapter.html) to specify a custom adapter.
+
+## <a id="type-token-raw"></a> `IllegalStateException`: 'TypeToken must be created with a type argument' <br> `RuntimeException`: 'Missing type parameter'
+
+**Symptom:** An `IllegalStateException` with the message 'TypeToken must be created with a type argument' is thrown.\
+For older Gson versions a `RuntimeException` with message 'Missing type parameter' is thrown.
+
+**Reason:**
+
+- You created a `TypeToken` without type argument, for example `new TypeToken() {}` (note the missing `<...>`). You always have to provide the type argument, for example like this: `new TypeToken<List<String>>() {}`. Normally the compiler will also emit a 'raw types' warning when you forget the `<...>`.
+- Or, you are using a code shrinking tool such as ProGuard or R8 (Android app builds normally have this enabled by default) but have not configured it correctly for usage with Gson.
+
+**Solution:** When you are using a code shrinking tool such as ProGuard or R8 you have to adjust your configuration to include the following rules:
+
+```
+# Keep generic signatures; needed for correct type resolution
+-keepattributes Signature
+
+# Keep class TypeToken (respectively its generic signature)
+-keep class com.google.gson.reflect.TypeToken { *; }
+
+# Keep any (anonymous) classes extending TypeToken
+-keep class * extends com.google.gson.reflect.TypeToken
+```
+
+See also the [Android example](examples/android-proguard-example/README.md) for more information.
+
+Note: For newer Gson versions these rules might be applied automatically; make sure you are using the latest Gson version and the latest version of the code shrinking tool.
+
+## <a id="r8-abstract-class"></a> `JsonIOException`: 'Abstract classes can't be instantiated!' (R8)
+
+**Symptom:** A `JsonIOException` with the message 'Abstract classes can't be instantiated!' is thrown; the class mentioned in the exception message is not actually `abstract` in your source code, and you are using the code shrinking tool R8 (Android app builds normally have this configured by default).
+
+Note: If the class which you are trying to deserialize is actually abstract, then this exception is probably unrelated to R8 and you will have to implement a custom [`InstanceCreator`](https://javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/InstanceCreator.html) or [`TypeAdapter`](https://javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/TypeAdapter.html) which creates an instance of a non-abstract subclass of the class. If you already wrote a custom adapter, but it is not used, see [this troubleshooting point](#custom-adapter-not-used).
+
+**Reason:** The code shrinking tool R8 performs optimizations where it removes the no-args constructor from a class and makes the class `abstract`. Due to this Gson cannot create an instance of the class.
+
+**Solution:** Make sure the class has a no-args constructor, then adjust your R8 configuration file to keep the constructor of the class. For example:
+
+```
+# Keep the no-args constructor of the deserialized class
+-keepclassmembers class com.example.MyClass {
+  <init>();
+}
+```
+
+You can also use `<init>(...);` to keep all constructors of that class, but then you might actually rely on `sun.misc.Unsafe` on both JDK and Android to create classes without no-args constructor, see [`GsonBuilder.disableJdkUnsafe()`](https://javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/GsonBuilder.html#disableJdkUnsafe()) for more information.
+
+For Android you can add this rule to the `proguard-rules.pro` file, see also the [Android documentation](https://developer.android.com/build/shrink-code#keep-code). In case the class name in the exception message is obfuscated, see the Android documentation about [retracing](https://developer.android.com/build/shrink-code#retracing).
+
+For Android you can alternatively use the [`@Keep` annotation](https://developer.android.com/studio/write/annotations#keep) on the class or constructor you want to keep. That might be easier than having to maintain a custom R8 configuration.
+
+Note that the latest Gson versions (> 2.10.1) specify a default R8 configuration. If your class is a top-level class or is `static`, has a no-args constructor and its fields are annotated with Gson's [`@SerializedName`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/annotations/SerializedName.html), you might not have to perform any additional R8 configuration.
+
+## <a id="typetoken-type-variable"></a> `IllegalArgumentException`: 'TypeToken type argument must not contain a type variable'
+
+**Symptom:** An exception with the message 'TypeToken type argument must not contain a type variable' is thrown
+
+**Reason:** This exception is thrown when you create an anonymous `TypeToken` subclass which captures a type variable, for example `new TypeToken<List<T>>() {}` (where `T` is a type variable). At compile time such code looks safe and you can use the type `List<T>` without any warnings. However, this code is not actually type-safe because at runtime due to [type erasure](https://dev.java/learn/generics/type-erasure/) only the upper bound of the type variable is available. For the previous example that would be `List<Object>`. When using such a `TypeToken` with any Gson methods performing deserialization this would lead to confusing and difficult to debug `ClassCastException`s. For serialization it can in some cases also lead to undesired results.
+
+Note: Earlier version of Gson unfortunately did not prevent capturing type variables, which caused many users to unwittingly write type-unsafe code.
+
+**Solution:**
+
+- Use [`TypeToken.getParameterized(...)`](https://www.javadoc.io/doc/com.google.code.gson/gson/latest/com.google.gson/com/google/gson/reflect/TypeToken.html#getParameterized(java.lang.reflect.Type,java.lang.reflect.Type...)), for example `TypeToken.getParameterized(List.class, elementType)` where `elementType` is a type you have to provide separately.
+- For Kotlin users: Use [`reified` type parameters](https://kotlinlang.org/docs/inline-functions.html#reified-type-parameters), that means change `<T>` to `<reified T>`, if possible. If you have a chain of functions with type parameters you will probably have to make all of them `reified`.
+- If you don't actually use Gson's `TypeToken` for any Gson method, use a general purpose 'type token' implementation provided by a different library instead, for example Guava's [`com.google.common.reflect.TypeToken`](https://javadoc.io/doc/com.google.guava/guava/latest/com/google/common/reflect/TypeToken.html).
+
+For backward compatibility it is possible to restore Gson's old behavior of allowing `TypeToken` to capture type variables by setting the [system property](https://docs.oracle.com/en/java/javase/11/docs/api/java.base/java/lang/System.html#setProperty(java.lang.String,java.lang.String)) `gson.allowCapturingTypeVariables` to `"true"`, **however**:
+
+- This does not solve any of the type-safety problems mentioned above; in the long term you should prefer one of the other solutions listed above. This system property might be removed in future Gson versions.
+- You should only ever set the property to `"true"`, but never to any other value or manually clear it. Otherwise this might counteract any libraries you are using which might have deliberately set the system property because they rely on its behavior.

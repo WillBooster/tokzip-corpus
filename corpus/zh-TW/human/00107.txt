@@ -1,34 +1,75 @@
----
-title: 從 Intigriti 十月份 XSS 挑戰重新學習 HTML
-catalog: true
-date: 2021-11-14 15:20:49
-tags: [Front-end, Security]
-categories: [Security]
----
+之所以特別講這個，是因為 AI 在嘗試這個方法之前，先在 code 裡面掃過一次，看有沒有長得很像 key 的字串，但發現沒有。做到這步 AI 就知道因為 key 是一個一個加上去的，所以在 code 裡不連續，沒辦法直接掃出來。
 
-## 前言
+再來用 Python 寫了個腳本去解密所有資源，最後就拿到了 JavaScript，還原出遊戲邏輯以及 client 端配置。
 
-之前已經介紹過 Intigriti 的 XSS 挑戰很多次了，這次就不再介紹了，有興趣的可以直接翻我之前的文章。這一篇文章的重點會放在他們[十月份](https://challenge-1021.intigriti.io/)的挑戰，難度不高，我花了大約一兩天的時間解出來以後就放著沒動，會想寫這篇是因為挑戰結束以後，看到許多超乎我想像的解法，因此特地寫一篇文章記錄一下。
+這個案例主要是走純靜態分析，AI 光用靜態分析就找到加解密函式以及設置 key 的地方，再反編譯回推出 key 的內容，把加密過的遊戲資源解開。
 
-<!-- more -->
+### 案例二：另一個 Cocos2d 遊戲
 
-## 關於挑戰
+一樣先拆開先 jadx，發現 dex 有加了個殼，不過這個遊戲也觀察出來是 Cocos2d，所以 dex 先放一旁，先看 `libcocos2djs.so`，從裡面找到一個疑似的 key。
 
-底下先簡單講一下這次的題目要做什麼，核心程式碼是這樣的：
+但因為這個 key 解不了加密的 jsc，所以換別條路，用 Unicorn Engine 去模擬執行這個 so，不過沒進展，跑一跑卡住。
 
-``` js
-window.addEventListener("DOMContentLoaded", function () {
-  e = `)]}'` + new URL(location.href).searchParams.get("xss");
-  c = document.getElementById("body").lastElementChild;
-  if (c.id === "intigriti") {
-    l = c.lastElementChild;
-    i = l.innerHTML.trim();
-    f = i.substr(i.length - 4);
-    e = f + e;
-  }
-  let s = document.createElement("script");
-  s.type = "text/javascript";
-  s.appendChild(document.createTextNode(e));
-  document.body.appendChild(s);
-});
+靜態分析跑不出來，改採動態分析，安裝了 Android 模擬器以及 frida，去 hook 多個參數，`Memory.scanSync` 跟 `fopen` 都失敗了，後來也去找了 `libcocos2djs.so` 導出的函數，發現 `xxtea_decrypt` 是 public 的，就去 hook `xxtea_decrypt`。
+
+把遊戲跑起來之後，就拿到了正確的 key，並且還原出了那些加密後的 jsc 檔案，同樣含有遊戲邏輯與配置。
+
+跑到這邊之後因為遊戲已經還原，就停止了，我想繼續測試他的能力，於是跟他説：「那你試著脫脫看那個殼吧」，結果那個殼的保護滿弱，跑起來之後 frida-dexdump 一下就把 dex 都 dump 出來了。
+
+這個案例靜態分析跑不通改採動態分析加上 hook，並且還順便脫了一個殼(雖然殼滿弱的就是了)。
+
+### 案例三：Unity 遊戲
+
+APK 拆開之後有 libil2cpp、libunity 跟 libxlua 三個 so 檔案，猜測核心邏輯在 Lua 層。之後先用 Il2CppDumper 把 global-metadata 拆開，解出一些 C# 檔案跟 DLL，用 ILSpy 反編譯之後發現都是 class，實作是空的（似乎 IL2CPP 本來就是這樣？）
+
+用 jadx 拆 Java，也都是一些 SDK，沒有遊戲邏輯，於是把心力放在找出 Lua 檔案。
+
+用 UnityPy 掃所有 asset bundle 的 TextAsset，只找到 4 個 lua 腳本，都不是遊戲核心邏輯。從剛剛拿的 C# 程式碼中找到一些字串，發現遊戲有熱更新系統，用裡面翻到的 URL 跟 AES key 與 IV 嘗試去下載，發現都回 404 載不下來。
+
+後來轉向再回去 asset bundle 找，找到一個 bundle 裡面有 3000 個 TextAsset（第一次沒檢查到），從檔名確認是加密的 Lua 腳本。
+
+接著觀察發現這些檔案有許多前 6 個 byte 一樣，猜測是 Lua 5.3 編譯後的 bytecode 開頭，用 XOR 反推回 key 發現解不開。然後又嘗試了幾種不同的加密法，各種 AES 的模式，還是解不開。
+
+再來去反編譯 libil2cpp，看到解密的過程是用 XOR 沒錯，然後密鑰是 6 個 byte 不斷重複。在 C# 裡面跟 global-metadata 用靜態的方式都找不到，到這邊卡關，由我介入。
+
+我就問他說：「你動態分析會不會比較快？」
+
+AI 給了兩個方案，一個 Frida hook，一個 Unicorn 模擬，我選後者，結果 AI 在寫腳本的時候，神來一筆地用別的方法破解了。他說他觀察那些文件，發現有一半前 54 個 bytes 都一樣，而且是 6 個 bytes 不斷重複，`c3 70 43 22 34 a6`。
+
+如果 key 是 6 個 bytes 重複 XOR，那密文重複代表明文也重複，什麼 Lua 文件開頭會有這麼多完全相同的字元？
+
+AI 大膽的猜測：「註解」，Lua 的註解是 `--` 開頭，很多框架的習慣是開頭放 `-----` 一段長長的註解當分隔線。然後他就以這個假設為基礎， XOR 了一下拿到 key，再去解密 Lua 腳本，發現全部解開了，解出來直接是可讀的原始碼。
+
+這個案例的關鍵在於 AI 是懂觀察的，而且會運用許多手段試著去解密，底下是 AI 在解這個案例時的流程，可以看到中間嘗試過許多方法但都走不通，不通就換下一個方法：
+
+```
+XAPK 解包
+  ↓
+Il2CppDumper + ILSpy + JADX  ← 標準流程，沒什麼問題
+  ↓
+UnityPy 掃描 → 只有 4 個工具腳本  ← 以為核心邏輯在服務器
+  ↓
+找 AppConfig → 拿到 CDN 地址和 AES Key
+  ↓
+嘗試下載 → 全部 404  ← 死胡同
+  ↓
+重新檢查 AssetBundle → 找到加密文件！
+  ↓
+觀察密文 → 發現 6 bytes 重複模式
+  ↓
+❌ 錯誤假設：Lua bytecode → 推導出錯誤的密鑰流
+  ↓
+❌ 嘗試 AES-CBC/ECB/OFB/CTR/CFB → 全不匹配
+❌ 嘗試 RC4 → 不匹配
+❌ 嘗試 .NET Random（10K seeds）→ 不匹配
+  ↓
+逆向 libil2cpp.so → 確認是簡單重複 XOR（不是流密碼）
+  ↓
+❌ 嘗試靜態找 ENCRYPT_BYTES → 走不通
+❌ 嘗試 metadata defaultValues → 走不通
+❌ 嘗試 ELF GOT/RELA → 太深
+  ↓
+ 回頭看密文特徵 → 1500 個文件共享 62 bytes 前綴
+  ↓
+💡 假設明文是 '-'(0x2d) 重複 → XOR 得到 key → 解密成功！
 ```

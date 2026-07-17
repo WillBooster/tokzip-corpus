@@ -10,239 +10,159 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Config;
+namespace Composer\Util\Http;
 
-use Composer\Config\JsonConfigSource;
-use Composer\Json\JsonFile;
-use Composer\Test\TestCase;
-use Composer\Util\Filesystem;
+use Composer\Downloader\TransportException;
 
-class JsonConfigSourceTest extends TestCase
+/**
+ * @internal
+ * @author John Stevenson <john-stevenson@blueyonder.co.uk>
+ *
+ * @phpstan-type contextOptions array{http: array{proxy: string, header?: string, request_fulluri?: bool}}
+ */
+class RequestProxy
 {
-    /** @var Filesystem */
-    private $fs;
-    /** @var string */
-    private $workingDir;
+    /** @var ?contextOptions */
+    private $contextOptions;
+    /** @var ?non-empty-string */
+    private $status;
+    /** @var ?non-empty-string */
+    private $url;
+    /** @var ?non-empty-string */
+    private $auth;
 
-    protected static function fixturePath(string $name): string
+    /**
+     * @param ?non-empty-string $url The proxy url, without authorization
+     * @param ?non-empty-string $auth Authorization for curl
+     * @param ?contextOptions $contextOptions
+     * @param ?non-empty-string $status
+     */
+    public function __construct(?string $url, ?string $auth, ?array $contextOptions, ?string $status)
     {
-        return __DIR__.'/Fixtures/'.$name;
+        $this->url = $url;
+        $this->auth = $auth;
+        $this->contextOptions = $contextOptions;
+        $this->status = $status;
     }
 
-    protected function setUp(): void
+    public static function none(): RequestProxy
     {
-        $this->fs = new Filesystem;
-        $this->workingDir = self::getUniqueTmpDirectory();
+        return new self(null, null, null, null);
     }
 
-    protected function tearDown(): void
+    public static function noProxy(): RequestProxy
     {
-        parent::tearDown();
-        if (is_dir($this->workingDir)) {
-            $this->fs->removeDirectory($this->workingDir);
+        return new self(null, null, null, 'excluded by no_proxy');
+    }
+
+    /**
+     * Returns the context options to use for this request, otherwise null
+     *
+     * @return ?contextOptions
+     */
+    public function getContextOptions(): ?array
+    {
+        return $this->contextOptions;
+    }
+
+    /**
+     * Returns an array of curl proxy options
+     *
+     * @param array<string, string|int> $sslOptions
+     * @return array<int, string|int>
+     */
+    public function getCurlOptions(array $sslOptions): array
+    {
+        if ($this->isSecure() && !$this->supportsSecureProxy()) {
+            throw new TransportException('Cannot use an HTTPS proxy. PHP >= 7.3 and cUrl >= 7.52.0 are required.');
         }
-    }
 
-    public function testAddRepository(): void
-    {
-        $config = $this->workingDir.'/composer.json';
-        copy(self::fixturePath('composer-repositories.json'), $config);
-        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
-        $jsonConfigSource->addRepository('example_tld', ['type' => 'git', 'url' => 'example.tld']);
+        // Always set a proxy url, even an empty value, because it tells curl
+        // to ignore proxy environment variables
+        $options = [CURLOPT_PROXY => (string) $this->url];
 
-        self::assertFileEquals(self::fixturePath('config/config-with-exampletld-repository.json'), $config);
-    }
+        // If using a proxy, tell curl to ignore no_proxy environment variables
+        if ($this->url !== null) {
+            $options[CURLOPT_NOPROXY] = '';
+        }
 
-    public function testAddRepositoryWithOptions(): void
-    {
-        $config = $this->workingDir.'/composer.json';
-        copy(self::fixturePath('composer-repositories.json'), $config);
-        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
-        $jsonConfigSource->addRepository('example_tld', [
-            'type' => 'composer',
-            'url' => 'https://example.tld',
-            'options' => [
-                'ssl' => [
-                    'local_cert' => '/home/composer/.ssl/composer.pem',
-                ],
-            ],
-        ]);
+        // Set any authorization
+        if ($this->auth !== null) {
+            $options[CURLOPT_PROXYAUTH] = CURLAUTH_BASIC;
+            $options[CURLOPT_PROXYUSERPWD] = $this->auth;
+        }
 
-        self::assertFileEquals(self::fixturePath('config/config-with-exampletld-repository-and-options.json'), $config);
-    }
+        if ($this->isSecure()) {
+            if (isset($sslOptions['cafile'])) {
+                $options[CURLOPT_PROXY_CAINFO] = $sslOptions['cafile'];
+            }
+            if (isset($sslOptions['capath'])) {
+                $options[CURLOPT_PROXY_CAPATH] = $sslOptions['capath'];
+            }
+        }
 
-    public function testRemoveRepository(): void
-    {
-        $config = $this->workingDir.'/composer.json';
-        copy(self::fixturePath('config/config-with-exampletld-repository.json'), $config);
-        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
-        $jsonConfigSource->removeRepository('example_tld');
-
-        self::assertFileEquals(self::fixturePath('composer-repositories.json'), $config);
-    }
-
-    public function testAddPackagistRepositoryWithFalseValue(): void
-    {
-        $config = $this->workingDir.'/composer.json';
-        copy(self::fixturePath('composer-repositories.json'), $config);
-        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
-        $jsonConfigSource->addRepository('packagist', false);
-
-        self::assertFileEquals(self::fixturePath('config/config-with-packagist-false.json'), $config);
-    }
-
-    public function testRemovePackagist(): void
-    {
-        $config = $this->workingDir.'/composer.json';
-        copy(self::fixturePath('config/config-with-packagist-false.json'), $config);
-        $jsonConfigSource = new JsonConfigSource(new JsonFile($config));
-        $jsonConfigSource->removeRepository('packagist');
-
-        self::assertFileEquals(self::fixturePath('composer-repositories.json'), $config);
+        return $options;
     }
 
     /**
-     * Test addLink()
+     * Returns proxy info associated with this request
      *
-     * @param string $sourceFile     Source file
-     * @param string $type           Type (require, require-dev, provide, suggest, replace, conflict)
-     * @param string $name           Name
-     * @param string $value          Value
-     * @param string $compareAgainst File to compare against after making changes
+     * An empty return value means that the user has not set a proxy.
+     * A non-empty value will either be the sanitized proxy url if a proxy is
+     * required, or a message indicating that a no_proxy value has disabled the
+     * proxy.
      *
-     * @dataProvider provideAddLinkData
+     * @param ?string $format Output format specifier
      */
-    public function testAddLink(string $sourceFile, string $type, string $name, string $value, string $compareAgainst): void
+    public function getStatus(?string $format = null): string
     {
-        $composerJson = $this->workingDir.'/composer.json';
-        copy($sourceFile, $composerJson);
-        $jsonConfigSource = new JsonConfigSource(new JsonFile($composerJson));
+        if ($this->status === null) {
+            return '';
+        }
 
-        $jsonConfigSource->addLink($type, $name, $value);
+        $format = $format ?? '%s';
+        if (strpos($format, '%s') !== false) {
+            return sprintf($format, $this->status);
+        }
 
-        self::assertFileEquals($compareAgainst, $composerJson);
+        throw new \InvalidArgumentException('String format specifier is missing');
     }
 
     /**
-     * Test removeLink()
+     * Returns true if the request url has been excluded by a no_proxy value
      *
-     * @param string $sourceFile     Source file
-     * @param string $type           Type (require, require-dev, provide, suggest, replace, conflict)
-     * @param string $name           Name
-     * @param string $compareAgainst File to compare against after making changes
-     *
-     * @dataProvider provideRemoveLinkData
+     * A false value can also mean that the user has not set a proxy.
      */
-    public function testRemoveLink(string $sourceFile, string $type, string $name, string $compareAgainst): void
+    public function isExcludedByNoProxy(): bool
     {
-        $composerJson = $this->workingDir.'/composer.json';
-        copy($sourceFile, $composerJson);
-        $jsonConfigSource = new JsonConfigSource(new JsonFile($composerJson));
-
-        $jsonConfigSource->removeLink($type, $name);
-
-        self::assertFileEquals($compareAgainst, $composerJson);
+        return $this->status !== null && $this->url === null;
     }
 
     /**
-     * @return string[]
+     * Returns true if this is a secure (HTTPS) proxy
      *
-     * @phpstan-return array{string, string, string, string, string}
+     * A false value means that this is either an HTTP proxy, or that a proxy
+     * is not required for this request, or that the user has not set a proxy.
      */
-    protected static function addLinkDataArguments(string $type, string $name, string $value, string $fixtureBasename, string $before): array
+    public function isSecure(): bool
     {
-        return [
-            $before,
-            $type,
-            $name,
-            $value,
-            self::fixturePath('addLink/'.$fixtureBasename.'.json'),
-        ];
+        return 0 === strpos((string) $this->url, 'https://');
     }
 
     /**
-     * Provide data for testAddLink
-     */
-    public static function provideAddLinkData(): array
-    {
-        $empty = self::fixturePath('composer-empty.json');
-        $oneOfEverything = self::fixturePath('composer-one-of-everything.json');
-        $twoOfEverything = self::fixturePath('composer-two-of-everything.json');
-
-        return [
-            self::addLinkDataArguments('require', 'my-vend/my-lib', '1.*', 'require-from-empty', $empty),
-            self::addLinkDataArguments('require', 'my-vend/my-lib', '1.*', 'require-from-oneOfEverything', $oneOfEverything),
-            self::addLinkDataArguments('require', 'my-vend/my-lib', '1.*', 'require-from-twoOfEverything', $twoOfEverything),
-
-            self::addLinkDataArguments('require-dev', 'my-vend/my-lib-tests', '1.*', 'require-dev-from-empty', $empty),
-            self::addLinkDataArguments('require-dev', 'my-vend/my-lib-tests', '1.*', 'require-dev-from-oneOfEverything', $oneOfEverything),
-            self::addLinkDataArguments('require-dev', 'my-vend/my-lib-tests', '1.*', 'require-dev-from-twoOfEverything', $twoOfEverything),
-
-            self::addLinkDataArguments('provide', 'my-vend/my-lib-interface', '1.*', 'provide-from-empty', $empty),
-            self::addLinkDataArguments('provide', 'my-vend/my-lib-interface', '1.*', 'provide-from-oneOfEverything', $oneOfEverything),
-            self::addLinkDataArguments('provide', 'my-vend/my-lib-interface', '1.*', 'provide-from-twoOfEverything', $twoOfEverything),
-
-            self::addLinkDataArguments('suggest', 'my-vend/my-optional-extension', '1.*', 'suggest-from-empty', $empty),
-            self::addLinkDataArguments('suggest', 'my-vend/my-optional-extension', '1.*', 'suggest-from-oneOfEverything', $oneOfEverything),
-            self::addLinkDataArguments('suggest', 'my-vend/my-optional-extension', '1.*', 'suggest-from-twoOfEverything', $twoOfEverything),
-
-            self::addLinkDataArguments('replace', 'my-vend/other-app', '1.*', 'replace-from-empty', $empty),
-            self::addLinkDataArguments('replace', 'my-vend/other-app', '1.*', 'replace-from-oneOfEverything', $oneOfEverything),
-            self::addLinkDataArguments('replace', 'my-vend/other-app', '1.*', 'replace-from-twoOfEverything', $twoOfEverything),
-
-            self::addLinkDataArguments('conflict', 'my-vend/my-old-app', '1.*', 'conflict-from-empty', $empty),
-            self::addLinkDataArguments('conflict', 'my-vend/my-old-app', '1.*', 'conflict-from-oneOfEverything', $oneOfEverything),
-            self::addLinkDataArguments('conflict', 'my-vend/my-old-app', '1.*', 'conflict-from-twoOfEverything', $twoOfEverything),
-        ];
-    }
-
-    /**
-     * @return string[]
+     * Returns true if an HTTPS proxy can be used.
      *
-     * @phpstan-return array{string, string, string, string}
+     * This depends on PHP7.3+ for CURL_VERSION_HTTPS_PROXY
+     * and curl including the feature (from version 7.52.0)
      */
-    protected static function removeLinkDataArguments(string $type, string $name, string $fixtureBasename, ?string $after = null): array
+    public function supportsSecureProxy(): bool
     {
-        return [
-            self::fixturePath('removeLink/'.$fixtureBasename.'.json'),
-            $type,
-            $name,
-            $after ?: self::fixturePath('removeLink/'.$fixtureBasename.'-after.json'),
-        ];
-    }
+        if (false === ($version = curl_version()) || !defined('CURL_VERSION_HTTPS_PROXY')) {
+            return false;
+        }
 
-    /**
-     * Provide data for testRemoveLink
-     */
-    public static function provideRemoveLinkData(): array
-    {
-        $oneOfEverything = self::fixturePath('composer-one-of-everything.json');
-        $twoOfEverything = self::fixturePath('composer-two-of-everything.json');
+        $features = $version['features'];
 
-        return [
-            self::removeLinkDataArguments('require', 'my-vend/my-lib', 'require-to-empty'),
-            self::removeLinkDataArguments('require', 'my-vend/my-lib', 'require-to-oneOfEverything', $oneOfEverything),
-            self::removeLinkDataArguments('require', 'my-vend/my-lib', 'require-to-twoOfEverything', $twoOfEverything),
-
-            self::removeLinkDataArguments('require-dev', 'my-vend/my-lib-tests', 'require-dev-to-empty'),
-            self::removeLinkDataArguments('require-dev', 'my-vend/my-lib-tests', 'require-dev-to-oneOfEverything', $oneOfEverything),
-            self::removeLinkDataArguments('require-dev', 'my-vend/my-lib-tests', 'require-dev-to-twoOfEverything', $twoOfEverything),
-
-            self::removeLinkDataArguments('provide', 'my-vend/my-lib-interface', 'provide-to-empty'),
-            self::removeLinkDataArguments('provide', 'my-vend/my-lib-interface', 'provide-to-oneOfEverything', $oneOfEverything),
-            self::removeLinkDataArguments('provide', 'my-vend/my-lib-interface', 'provide-to-twoOfEverything', $twoOfEverything),
-
-            self::removeLinkDataArguments('suggest', 'my-vend/my-optional-extension', 'suggest-to-empty'),
-            self::removeLinkDataArguments('suggest', 'my-vend/my-optional-extension', 'suggest-to-oneOfEverything', $oneOfEverything),
-            self::removeLinkDataArguments('suggest', 'my-vend/my-optional-extension', 'suggest-to-twoOfEverything', $twoOfEverything),
-
-            self::removeLinkDataArguments('replace', 'my-vend/other-app', 'replace-to-empty'),
-            self::removeLinkDataArguments('replace', 'my-vend/other-app', 'replace-to-oneOfEverything', $oneOfEverything),
-            self::removeLinkDataArguments('replace', 'my-vend/other-app', 'replace-to-twoOfEverything', $twoOfEverything),
-
-            self::removeLinkDataArguments('conflict', 'my-vend/my-old-app', 'conflict-to-empty'),
-            self::removeLinkDataArguments('conflict', 'my-vend/my-old-app', 'conflict-to-oneOfEverything', $oneOfEverything),
-            self::removeLinkDataArguments('conflict', 'my-vend/my-old-app', 'conflict-to-twoOfEverything', $twoOfEverything),
-        ];
+        return (bool) ($features & CURL_VERSION_HTTPS_PROXY);
     }
 }

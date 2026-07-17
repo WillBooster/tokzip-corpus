@@ -1,39 +1,56 @@
 # frozen_string_literal: true
 
-RSpec.describe Rack::Protection::PathTraversal do
-  it_behaves_like 'any rack application'
+module Sinatra
+  PARAMS_CONFIG = {}
 
-  context 'escaping' do
-    before do
-      mock_app { |e| [200, { 'content-type' => 'text/plain' }, [e['PATH_INFO']]] }
+  if ARGV.any?
+    require 'optparse'
+    parser = OptionParser.new do |op|
+      op.on('-p port',   'set the port (default is 4567)')               { |val| PARAMS_CONFIG[:port] = Integer(val) }
+      op.on('-s server', 'specify rack server/handler')                  { |val| PARAMS_CONFIG[:server] = val }
+      op.on('-q',        'turn on quiet mode (default is off)')          {       PARAMS_CONFIG[:quiet] = true }
+      op.on('-x',        'turn on the mutex lock (default is off)')      {       PARAMS_CONFIG[:lock] = true }
+      op.on('-e env',    'set the environment (default is development)') do |val|
+        ENV['RACK_ENV'] = val
+        PARAMS_CONFIG[:environment] = val.to_sym
+      end
+      op.on('-o addr', "set the host (default is (env == 'development' ? 'localhost' : '0.0.0.0'))") do |val|
+        PARAMS_CONFIG[:bind] = val
+      end
     end
-
-    %w[/foo/bar /foo/bar/ / /.f /a.x].each do |path|
-      it("does not touch #{path.inspect}") { expect(get(path).body).to eq(path) }
+    begin
+      parser.parse!(ARGV.dup)
+    rescue StandardError => e
+      PARAMS_CONFIG[:optparse_error] = e
     end
+  end
 
-    { # yes, this is ugly, feel free to change that
-      '/..' => '/', '/a/../b' => '/b', '/a/../b/' => '/b/', '/a/.' => '/a/',
-      '/%2e.' => '/', '/a/%2E%2e/b' => '/b', '/a%2f%2E%2e%2Fb/' => '/b/',
-      '//' => '/', '/%2fetc%2Fpasswd' => '/etc/passwd'
-    }.each do |a, b|
-      it("replaces #{a.inspect} with #{b.inspect}") { expect(get(a).body).to eq(b) }
-    end
+  require 'sinatra/base'
 
-    it 'should be able to deal with PATH_INFO = nil (fcgi?)' do
-      app = Rack::Protection::PathTraversal.new(proc { 42 })
-      expect(app.call({})).to eq(42)
+  class Application < Base
+    # we assume that the first file that requires 'sinatra' is the
+    # app_file. all other path related options are calculated based
+    # on this path by default.
+    set :app_file, caller_files.first || $0
+
+    set :run, proc { File.expand_path($0) == File.expand_path(app_file) }
+
+    if run? && ARGV.any?
+      error = PARAMS_CONFIG.delete(:optparse_error)
+      raise error if error
+
+      PARAMS_CONFIG.each { |k, v| set k, v }
     end
   end
 
-  context "PATH_INFO's encoding" do
-    before do
-      @app = Rack::Protection::PathTraversal.new(proc { |e| [200, { 'content-type' => 'text/plain' }, [e['PATH_INFO'].encoding.to_s]] })
-    end
+  remove_const(:PARAMS_CONFIG)
+  at_exit { Application.run! if $!.nil? && Application.run? }
+end
 
-    it 'should remain unchanged as ASCII-8BIT' do
-      body = @app.call({ 'PATH_INFO' => '/'.encode('ASCII-8BIT') })[2][0]
-      expect(body).to eq('ASCII-8BIT')
-    end
-  end
+# include would include the module in Object
+# extend only extends the `main` object
+extend Sinatra::Delegator
+
+class Rack::Builder
+  include Sinatra::Delegator
 end

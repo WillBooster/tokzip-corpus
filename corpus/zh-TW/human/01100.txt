@@ -1,244 +1,135 @@
+``` js
 /**
-   * Fires non-authenticated Ajax actions for logged-out users.
-   *
-   * The dynamic portion of the hook name, `$action`, refers
-   * to the name of the Ajax action callback being fired.
-   *
-   * @since 2.8.0
-   */
-  do_action( "wp_ajax_nopriv_{$action}" );
-}
-
-?>
-```
-
-Amelia registered two hooks in `ameliabooking.php`:
-
-``` php
-/** Isolate API calls */
-add_action('wp_ajax_wpamelia_api', array('AmeliaBooking\Plugin', 'wpAmeliaApiCall'));
-add_action('wp_ajax_nopriv_wpamelia_api', array('AmeliaBooking\Plugin', 'wpAmeliaApiCall'));
-```
-
-The difference between `wp_ajax_wpamelia_api` and `wp_ajax_nopriv_wpamelia_api` is that the former requires authenticated user to perform the action, while the latter requires none.
-
-As you can see, many plugins choose to handle both actions in the same place, to deal with the permission check itself.
-
-In `wpAmeliaApiCall`, a few routes have been registered:
-
-``` php
-/**
- * API Call
+ * Injects rewrite rules into the Next.js config provided by the user to tunnel
+ * requests from the `tunnelPath` to Sentry.
  *
- * @throws \InvalidArgumentException
+ * See https://nextjs.org/docs/api-reference/next.config.js/rewrites.
  */
-public static function wpAmeliaApiCall()
-{
-    try {
-        /** @var Container $container */
-        $container = require AMELIA_PATH . '/src/Infrastructure/ContainerConfig/container.php';
+function setUpTunnelRewriteRules(userNextConfig: NextConfigObject, tunnelPath: string): void {
+  const originalRewrites = userNextConfig.rewrites;
 
-        $app = new App($container);
+  // This function doesn't take any arguments at the time of writing but we future-proof
+  // here in case Next.js ever decides to pass some
+  userNextConfig.rewrites = async (...args: unknown[]) => {
+    const injectedRewrite = {
+      // Matched rewrite routes will look like the following: `[tunnelPath]?o=[orgid]&p=[projectid]`
+      // Nextjs will automatically convert `source` into a regex for us
+      source: `${tunnelPath}(/?)`,
+      has: [
+        {
+          type: 'query',
+          key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
+          value: '(?<orgid>.*)',
+        },
+        {
+          type: 'query',
+          key: 'p', // short for projectId - we keep it short so matching is harder for ad-blockers
+          value: '(?<projectid>.*)',
+        },
+      ],
+      destination: 'https://o:orgid.ingest.sentry.io/api/:projectid/envelope/?hsts=0',
+    };
 
-        // Initialize all API routes
-        Routes::routes($app);
-
-        $app->run();
-
-        exit();
-    } catch (Exception $e) {
-        echo 'ERROR: ' . $e->getMessage();
+    if (typeof originalRewrites !== 'function') {
+      return [injectedRewrite];
     }
+
+    // @ts-expect-error Expected 0 arguments but got 1 - this is from the future-proofing mentioned above, so we don't care about it
+    const originalRewritesResult = await originalRewrites(...args);
+
+    if (Array.isArray(originalRewritesResult)) {
+      return [injectedRewrite, ...originalRewritesResult];
+    } else {
+      return {
+        ...originalRewritesResult,
+        beforeFiles: [injectedRewrite, ...(originalRewritesResult.beforeFiles || [])],
+      };
+    }
+  };
 }
 ```
 
-There are a few files in `src/Infrastructure/Routes` folder for handling routing. For example, `src/Infrastructure/Routes/User/User.php` is responsible for the routing of `/users`:
+The crucial part is this section:
 
-``` php
-/**
- * Class User
- *
- * @package AmeliaBooking\Infrastructure\Routes\User
- */
-class User
-{
-    /**
-     * @param App $app
-     */
-    public static function routes(App $app)
+``` js
+const injectedRewrite = {
+  // Matched rewrite routes will look like the following: `[tunnelPath]?o=[orgid]&p=[projectid]`
+  // Nextjs will automatically convert `source` into a regex for us
+  source: `${tunnelPath}(/?)`,
+  has: [
     {
-        $app->get('/users/wp-users', GetWPUsersController::class);
-        $app->post('/users/authenticate', LoginCabinetController::class);
-        $app->post('/users/logout', LogoutCabinetController::class);
-
-        // Customers
-        $app->get('/users/customers/{id:[0-9]+}', GetCustomerController::class);
-        $app->get('/users/customers', GetCustomersController::class);
-        $app->post('/users/customers', AddCustomerController::class);
-        $app->post('/users/customers/{id:[0-9]+}', UpdateCustomerController::class);
-        $app->post('/users/customers/delete/{id:[0-9]+}', DeleteUserController::class);
-        $app->get('/users/customers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
-        $app->post('/users/customers/reauthorize', ReauthorizeController::class);
-
-        // Providers
-        $app->get('/users/providers/{id:[0-9]+}', GetProviderController::class);
-        $app->get('/users/providers', GetProvidersController::class);
-        $app->post('/users/providers', AddProviderController::class);
-        $app->post('/users/providers/{id:[0-9]+}', UpdateProviderController::class);
-        $app->post('/users/providers/status/{id:[0-9]+}', UpdateProviderStatusController::class);
-        $app->post('/users/providers/delete/{id:[0-9]+}', DeleteUserController::class);
-        $app->get('/users/providers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
-
-        // Current User
-        $app->get('/users/current', GetCurrentUserController::class);
-    }
-}
-```
-
-Usually, the routing is related to the URL path directly, but Amelia is a bit different because it's a WordPress plugin.
-
-In Amelia, it's based on the query string, instead of the path of URL(`src/Infrastructure/ContainerConfig/request.php`):
-
-``` php
-<?php
-
-use Slim\Http\Request;
-use Slim\Http\Uri;
-
-$entries['request'] = function (AmeliaBooking\Infrastructure\Common\Container $c) {
-
-    $curUri = Uri::createFromEnvironment($c->get('environment'));
-    // Note: AMELIA_ACTION_SLUG = "action=wpamelia_api&call="
-    $newRoute = str_replace(
-        ['XDEBUG_SESSION_START=PHPSTORM&' . AMELIA_ACTION_SLUG, AMELIA_ACTION_SLUG],
-        '',
-        $curUri->getQuery()
-    );
-
-    $newPath = strpos($newRoute, '&') ? substr(
-        $newRoute,
-        0,
-        strpos($newRoute, '&')
-    ) : $newRoute;
-
-    $newQuery = strpos($newRoute, '&') ? substr(
-        $newRoute,
-        strpos($newRoute, '&') + 1
-    ) : '';
-
-   $request = Request::createFromEnvironment($c->get('environment'))
-       ->withUri(
-           $curUri
-               ->withPath($newPath)
-               ->withQuery($newQuery)
-       );
-
-    if (method_exists($request, 'getParam') && $request->getParam('showAmeliaErrors')) {
-        ini_set('display_errors', 1);
-        ini_set('display_startup_errors', 1);
-        error_reporting(E_ALL);
-    }
-
-    return $request;
+      type: 'query',
+      key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
+      value: '(?<orgid>.*)',
+    },
+    {
+      type: 'query',
+      key: 'p', // short for projectId - we keep it short so matching is harder for ad-blockers
+      value: '(?<projectid>.*)',
+    },
+  ],
+  destination: 'https://o:orgid.ingest.sentry.io/api/:projectid/envelope/?hsts=0',
 };
 ```
 
-For example, when the request URL is `/wordpress/wp-admin/admin-ajax.php?action=wpamelia_api&call=/users/wp-users`, query string is `action=wpamelia_api&call=/users/wp-users`. After AMELIA_ACTION_SLUG has been replaced with empty string, the remaining part is `/users/wp-users`, that's how the system handles routes.
+It determines the final URL to redirect to based on the `o` and `p` query string parameters.
 
-Let's check `GetWPUsersController::class`, the corresponding controller for `/users/wp-users`:
+The problem here is that both of these parameters use the `.*` regular expression, which matches any character. In other words, for the following URL:
 
-``` php
-<?php
-
-namespace AmeliaBooking\Application\Controller\User;
-
-use AmeliaBooking\Application\Commands\User\GetWPUsersCommand;
-use AmeliaBooking\Application\Controller\Controller;
-use Slim\Http\Request;
-
-/**
- * Class GetWPUsersController
- *
- * @package AmeliaBooking\Application\Controller\User
- */
-class GetWPUsersController extends Controller
-{
-    /**
-     * Instantiates the Get WP Users command to hand it over to the Command Handler
-     *
-     * @param Request $request
-     * @param         $args
-     *
-     * @return GetWPUsersCommand
-     * @throws \RuntimeException
-     */
-    protected function instantiateCommand(Request $request, $args)
-    {
-        $command = new GetWPUsersCommand($args);
-        $command->setField('id', (int)$request->getQueryParam('id'));
-        $command->setField('role', $request->getQueryParam('role'));
-        $requestBody = $request->getParsedBody();
-        $this->setCommandFields($command, $requestBody);
-
-        return $command;
-    }
-}
+```
+https://huli.tw/tunnel?o=abc&p=def
 ```
 
-We can see a classic design pattern here: Command Pattern, every action is a command. The command will be processed by its parent class `AmeliaBooking\Application\Controller\Controller`:
+It will proxy to:
 
-``` php
-/**
- * @param Request  $request
- * @param Response $response
- * @param          $args
- *
- * @return Response
- * @throws \InvalidArgumentException
- * @throws \RuntimeException
- */
-public function __invoke(Request $request, Response $response, $args)
+```
+https://oabc.ingest.sentry.io/api/def/envelope/?hsts=0
+```
+
+It looks fine, but what if it's like this?
+
+```
+https://huli.tw/tunnel?o=example.com%23&p=def
+```
+
+`%23` is the URL-encoded result of `#`. It will be proxied to:
+
+```
+https://oexample.com#.ingest.sentry.io/api/def/envelope/?hsts=0
+```
+
+We use `#` to include the original hostname as part of the hash and successfully change the destination of the proxy. However, the leading `o` is a bit annoying. Let's get rid of it by adding `@` at the beginning:
+
+```
+https://huli.tw/tunnel?o=@example.com%23&p=def
+```
+
+It becomes:
+
+```
+https://o@example.com#.ingest.sentry.io/api/def/envelope/?hsts=0
+```
+
+In this way, an attacker can use the `o` parameter to change the destination of the proxy and redirect the request anywhere. As mentioned earlier, this rewrite feature directly returns the response. So when a user visits `https://huli.tw/tunnel?o=@example.com%23&p=def`, they will see the response of `example.com`.
+
+In other words, if an attacker redirects the request to their own website, they can output `<script>alert(document.cookie)</script>`, turning it into an XSS vulnerability.
+
+If the attacker redirects the request to other internal web pages like `https://localhost:3001`, it becomes an SSRF vulnerability (but the target must support HTTPS).
+
+As for the fix, it's simple. Just add some restrictions to the regex. Finally, Sentry adjusted it to [only allow digits](https://github.com/getsentry/sentry-javascript/pull/9416/files):
+
+``` js
 {
-    /** @var Command $command */
-    $command = $this->instantiateCommand($request, $args);
+  type: 'query',
+  key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
+  value: '(?<orgid>\\d*)',
+},
+```
 
-    if (!wp_verify_nonce($command->getField('ameliaNonce'), 'ajax-nonce') &&
-        (
-            $command instanceof DeleteUserCommand ||
-            $command instanceof DeletePackageCommand ||
-            $command instanceof DeleteCategoryCommand ||
-            $command instanceof DeleteServiceCommand ||
-            $command instanceof DeleteExtraCommand ||
-            $command instanceof DeleteLocationCommand ||
-            $command instanceof DeleteEventCommand ||
-            $command instanceof DeletePaymentCommand ||
-            $command instanceof DeleteCouponCommand ||
-            $command instanceof DeleteCustomFieldCommand ||
-            $command instanceof DeleteAppointmentCommand ||
-            $command instanceof DeleteBookingCommand ||
-            $command instanceof DeleteEventBookingCommand ||
-            $command instanceof DeletePackageCustomerCommand ||
-            $command instanceof DeleteNotificationCommand
-        )
-    ) {
-        return $response->withStatus(self::STATUS_INTERNAL_SERVER_ERROR);
-    }
+This issue has been fixed in version 7.77.0 and later.
 
-    /** @var CommandResult $commandResult */
-    $commandResult = $this->commandBus->handle($command);
+## Conclusion
 
-    if ($commandResult->getUrl() !== null) {
-        $this->emitSuccessEvent($this->eventBus, $commandResult);
+This vulnerability is really simple and easy to reproduce. Just find the fix commit and take a look at the code to understand how to exploit it.
 
-        /** @var Response $response */
-        $response = $response->withHeader('Location', $commandResult->getUrl());
-        $response = $response->withStatus(self::STATUS_REDIRECT);
-
-        return $response;
-    }
-
-    if ($commandResult->hasAttachment() === false) {
-        $responseBody = [
-            'message' => $commandResult->getMessage(),
-            'data'    => $commandResult->getData()
-        ];
+In summary, when doing URL rewriting, you really need to be cautious, as it's easy to encounter issues (especially when you're not just rewriting the path but the entire URL).

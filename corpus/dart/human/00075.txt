@@ -4,152 +4,341 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
-import 'package:path/path.dart' as p;
-import 'package:test/test.dart';
+import 'package:dio/io.dart';
+import 'package:http2/http2.dart';
+import 'package:meta/meta.dart';
 
-import '../../util.dart';
+part 'client_setting.dart';
 
-void uploadTests(
-  Dio Function(String baseUrl) create,
-) {
-  late Dio dio;
+part 'connection_manager.dart';
 
-  setUp(() {
-    dio = create(httpbunBaseUrl);
-  });
+part 'connection_manager_imp.dart';
 
-  test('Uint8List should not be transformed', () async {
-    final bytes = Uint8List.fromList(List.generate(10, (index) => index));
-    final transformer = dio.transformer = _TestTransformer();
-    final r = await dio.put(
-      '/put',
-      data: bytes,
-    );
-    expect(transformer.requestTransformed, isFalse);
-    expect(r.statusCode, 200);
-  });
+/// The signature of [Http2Adapter.onNotSupported].
+typedef H2NotSupportedCallback = Future<ResponseBody> Function(
+  RequestOptions options,
+  Stream<Uint8List>? requestStream,
+  Future<void>? cancelFuture,
+  DioH2NotSupportedException exception,
+);
 
-  test('List<int> should be transformed', () async {
-    final ints = List.generate(10, (index) => index);
-    final transformer = dio.transformer = _TestTransformer();
-    final r = await dio.put(
-      '/put',
-      data: ints,
-    );
-    expect(transformer.requestTransformed, isTrue);
-    expect(r.data['data'], ints.toString());
-  });
+/// A Dio HttpAdapter which implements Http/2.0.
+class Http2Adapter implements HttpClientAdapter {
+  Http2Adapter(
+    ConnectionManager? connectionManager, {
+    HttpClientAdapter? fallbackAdapter,
+    this.onNotSupported,
+  })  : connectionManager = connectionManager ?? ConnectionManager(),
+        fallbackAdapter = fallbackAdapter ?? IOHttpClientAdapter();
 
-  test('stream', () async {
-    const str = 'hello 😌';
-    final bytes = utf8.encode(str).toList();
-    final stream = Stream.fromIterable(bytes.map((e) => [e]));
-    final r = await dio.put(
-      '/put',
-      data: stream,
-      options: Options(
-        contentType: Headers.textPlainContentType,
-        headers: {
-          Headers.contentLengthHeader: bytes.length, // set content-length
-        },
-      ),
-    );
-    expect(r.data['data'], str);
-  });
+  /// {@macro dio_http2_adapter.ConnectionManager}
+  ConnectionManager connectionManager;
 
-  test(
-    'file stream',
-    () async {
-      final tmp = Directory.systemTemp.createTempSync('dio_test_');
-      addTearDown(() => tmp.deleteSync(recursive: true));
+  /// {@macro dio.HttpClientAdapter}
+  HttpClientAdapter fallbackAdapter;
 
-      final f = File(p.join(tmp.path, 'flutter.png'));
-      f.createSync();
-      f.writeAsBytesSync(base64Decode(_flutterLogPngBase64));
-
-      final contentLength = f.lengthSync();
-      final r = await dio.put(
-        '/put',
-        data: f.openRead(),
-        options: Options(
-          contentType: 'image/png',
-          headers: {
-            Headers.contentLengthHeader: contentLength,
-          },
-        ),
-      );
-      expect(r.data['headers']['Content-Length'], contentLength.toString());
-
-      final img = base64Encode(f.readAsBytesSync());
-      expect(r.data['data'], img);
-    },
-    testOn: 'vm',
-  );
-
-  test(
-    'file stream<Uint8List>',
-    () async {
-      final tmp = Directory.systemTemp.createTempSync('dio_test_');
-      addTearDown(() => tmp.deleteSync(recursive: true));
-
-      final f = File(p.join(tmp.path, 'flutter.png'));
-      f.createSync();
-      f.writeAsBytesSync(base64Decode(_flutterLogPngBase64));
-
-      final contentLength = f.lengthSync();
-      final r = await dio.put(
-        '/put',
-        data: f.readAsBytes().asStream(),
-        options: Options(
-          contentType: 'image/png',
-          headers: {
-            Headers.contentLengthHeader: contentLength,
-          },
-        ),
-      );
-      expect(r.data['headers']['Content-Length'], contentLength.toString());
-
-      final img = base64Encode(f.readAsBytesSync());
-      expect(r.data['data'], img);
-    },
-    testOn: 'vm',
-  );
-
-  test('send progress', () async {
-    final data = ['aaaa', 'hello 😌', 'dio is a dart http client'];
-    final stream = Stream.fromIterable(data.map((e) => e.codeUnits));
-    final expanded = data.expand((element) => element.codeUnits);
-    bool fullFilled = false;
-    final _ = await dio.put(
-      '/put',
-      data: stream,
-      onSendProgress: (a, b) {
-        expect(b, expanded.length);
-        expect(a <= b, isTrue);
-        if (a == b) {
-          fullFilled = true;
-        }
-      },
-      options: Options(
-        contentType: Headers.textPlainContentType,
-        headers: {
-          Headers.contentLengthHeader: expanded.length, // set content-length
-        },
-      ),
-    );
-    expect(fullFilled, isTrue);
-  });
-}
-
-class _TestTransformer extends BackgroundTransformer {
-  bool requestTransformed = false;
+  /// Handles [DioH2NotSupportedException] and returns a [ResponseBody].
+  H2NotSupportedCallback? onNotSupported;
 
   @override
-  Future<String> transformRequest(RequestOptions options) async {
-    requestTransformed = true;
-    return super.transformRequest(options);
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) {
+    // Recursive fetching.
+    final redirects = <RedirectRecord>[];
+    return _fetch(options, requestStream, cancelFuture, redirects);
+  }
+
+  Future<ResponseBody> _fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+    List<RedirectRecord> redirects,
+  ) async {
+    late final ClientTransportConnection transport;
+    try {
+      transport = await connectionManager.getConnection(options);
+    } on DioH2NotSupportedException catch (e) {
+      // Fallback to use the callback
+      // or to another adapter (typically IOHttpClientAdapter)
+      // since the request can have a better handle by it.
+      if (onNotSupported != null) {
+        return onNotSupported!(options, requestStream, cancelFuture, e);
+      }
+      return fallbackAdapter.fetch(options, requestStream, cancelFuture);
+    } on SocketException catch (e) {
+      if (e.message.contains('timed out')) {
+        final Duration effectiveTimeout;
+        if (options.connectTimeout != null &&
+            options.connectTimeout! > Duration.zero) {
+          effectiveTimeout = options.connectTimeout!;
+        } else {
+          effectiveTimeout = Duration.zero;
+        }
+        throw DioException.connectionTimeout(
+          requestOptions: options,
+          timeout: effectiveTimeout,
+          error: e,
+        );
+      }
+      throw DioException.connectionError(
+        requestOptions: options,
+        reason: e.message,
+        error: e,
+      );
+    }
+
+    final uri = options.uri;
+    String path = uri.path;
+    const excludeMethods = ['PUT', 'POST', 'PATCH'];
+
+    if (path.isEmpty || !path.startsWith('/')) {
+      path = '/$path';
+    }
+    if (uri.query.trim().isNotEmpty) {
+      path += '?${uri.query}';
+    }
+    final headers = [
+      Header.ascii(':method', options.method),
+      Header.ascii(':path', path),
+      Header.ascii(':scheme', uri.scheme),
+      Header.ascii(':authority', uri.host),
+    ];
+
+    // Add custom headers
+    headers.addAll(
+      options.headers.entries.map(
+        (entry) {
+          final String v;
+          if (entry.value is Iterable) {
+            v = entry.value.join(', ');
+          } else {
+            v = '${entry.value}';
+          }
+          return Header.ascii(entry.key.toLowerCase(), v);
+        },
+      ).toList(),
+    );
+
+    // Creates a new outgoing stream.
+    final stream = transport.makeRequest(headers);
+    final streamWR = WeakReference<ClientTransportStream>(stream);
+
+    final hasRequestData = requestStream != null;
+    if (hasRequestData && cancelFuture != null) {
+      cancelFuture.whenComplete(() {
+        streamWR.target?.outgoingMessages.close();
+      });
+    }
+
+    List<Uint8List>? list;
+    if (!excludeMethods.contains(options.method) && hasRequestData) {
+      list = await requestStream.toList();
+      requestStream = Stream.fromIterable(list);
+    }
+
+    if (hasRequestData) {
+      Future<dynamic> requestStreamFuture = requestStream!.listen((data) {
+        stream.outgoingMessages.add(DataStreamMessage(data));
+      }).asFuture();
+      final sendTimeout = options.sendTimeout ?? Duration.zero;
+      if (sendTimeout > Duration.zero) {
+        requestStreamFuture = requestStreamFuture.timeout(
+          sendTimeout,
+          onTimeout: () {
+            stream.outgoingMessages.close().catchError((_) {});
+            throw DioException.sendTimeout(
+              timeout: sendTimeout,
+              requestOptions: options,
+            );
+          },
+        );
+      }
+      await requestStreamFuture;
+    }
+    await stream.outgoingMessages.close();
+
+    final responseSink = StreamController<Uint8List>();
+    final responseHeaders = Headers();
+    final responseCompleter = Completer();
+    late StreamSubscription responseSubscription;
+    bool needRedirect = false;
+    bool needResponse = false;
+
+    final receiveTimeout = options.receiveTimeout ?? Duration.zero;
+
+    late int statusCode;
+    responseSubscription = stream.incomingMessages.listen(
+      (StreamMessage message) async {
+        if (message is HeadersStreamMessage) {
+          for (final header in message.headers) {
+            final name = utf8.decode(header.name);
+            final value = utf8.decode(header.value);
+            responseHeaders.add(name, value);
+          }
+
+          final status = responseHeaders.value(':status');
+          if (status != null) {
+            statusCode = int.parse(status);
+            responseHeaders.removeAll(':status');
+            needRedirect = _needRedirect(options, statusCode);
+            needResponse =
+                !needRedirect && options.validateStatus(statusCode) ||
+                    options.receiveDataWhenStatusError;
+            responseCompleter.complete();
+          }
+        } else if (message is DataStreamMessage) {
+          if (needResponse) {
+            responseSink.add(
+              message.bytes is Uint8List
+                  ? message.bytes as Uint8List
+                  : Uint8List.fromList(message.bytes),
+            );
+          } else {
+            responseSubscription.cancel().whenComplete(() {
+              responseSink.close();
+            });
+          }
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        // If connection is being forcefully terminated, remove the connection.
+        if (error is TransportConnectionException) {
+          connectionManager.removeConnection(transport);
+        }
+        if (!responseCompleter.isCompleted) {
+          responseCompleter.completeError(error, stackTrace);
+        } else {
+          responseSink.addError(error, stackTrace);
+        }
+        responseSubscription.cancel();
+        responseSink.close();
+      },
+      onDone: () {
+        responseSubscription.cancel();
+        responseSink.close();
+      },
+      cancelOnError: true,
+    );
+
+    Future<dynamic> responseFuture = responseCompleter.future;
+    if (receiveTimeout > Duration.zero) {
+      responseFuture = responseFuture.timeout(
+        receiveTimeout,
+        onTimeout: () {
+          responseSubscription
+              .cancel()
+              .catchError((_) {})
+              .whenComplete(() => responseSink.close().catchError((_) {}));
+          throw DioException.receiveTimeout(
+            timeout: receiveTimeout,
+            requestOptions: options,
+          );
+        },
+      );
+    }
+    await responseFuture;
+
+    // Handle redirection.
+    if (needRedirect) {
+      if (responseHeaders['location'] == null) {
+        // Redirect without location is illegal.
+        throw DioException.connectionError(
+          requestOptions: options,
+          reason: 'Received redirect without location header.',
+        );
+      }
+      final url = responseHeaders.value('location');
+      // An empty `location` header is considered a self redirect.
+      final uri = Uri.parse(url ?? '');
+      redirects.add(
+        RedirectRecord(
+          statusCode,
+          options.method,
+          uri,
+        ),
+      );
+      final String path = resolveRedirectUri(options.uri, uri);
+      return _fetch(
+        options.copyWith(
+          path: path,
+          maxRedirects: --options.maxRedirects,
+        ),
+        list != null ? Stream.fromIterable(list) : null,
+        cancelFuture,
+        redirects,
+      );
+    }
+    return ResponseBody(
+      responseSink.stream,
+      statusCode,
+      headers: responseHeaders.map,
+      redirects: redirects,
+      isRedirect: redirects.isNotEmpty,
+      onClose: () {
+        responseSubscription.cancel();
+        responseSink.close();
+        streamWR.target?.outgoingMessages.close();
+      },
+    );
+  }
+
+  bool _needRedirect(RequestOptions options, int status) {
+    const statusCodes = [301, 302, 303, 307, 308];
+    return options.followRedirects &&
+        options.maxRedirects > 0 &&
+        statusCodes.contains(status);
+  }
+
+  @visibleForTesting
+  static String resolveRedirectUri(Uri currentUri, Uri redirectUri) {
+    if (redirectUri.hasScheme) {
+      /// This is a full URL which has to be redirected to as is.
+      return redirectUri.toString();
+    }
+
+    /// This is relative with or without leading slash and is
+    /// resolved against the URL of the original request.
+    return currentUri.resolveUri(redirectUri).toString();
+  }
+
+  @override
+  void close({bool force = false}) {
+    connectionManager.close(force: force);
   }
 }
 
-const _flutterLogPngBase64 =
-    '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';
+/// The exception when a connected socket for the [uri]
+/// does not support HTTP/2.
+class DioH2NotSupportedException extends SocketException {
+  const DioH2NotSupportedException(
+    this.uri,
+    this.selectedProtocol,
+  ) : super('h2 protocol not supported');
+
+  final Uri uri;
+  final String? selectedProtocol;
+
+  @override
+  String toString() {
+    final sb = StringBuffer();
+    sb.write('DioH2NotSupportedException');
+    if (message.isNotEmpty) {
+      sb.write(': $message');
+      if (osError != null) {
+        sb.write(' ($osError)');
+      }
+    } else if (osError != null) {
+      sb.write(': $osError');
+    }
+    if (address != null) {
+      sb.write(', address = ${address!.host}');
+    }
+    if (port != null) {
+      sb.write(', port = $port');
+    }
+    return sb.toString();
+  }
+}

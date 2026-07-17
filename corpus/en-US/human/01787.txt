@@ -1,87 +1,49 @@
-We'll run this with:
+### Icons
 
-```tsx
-deno run --allow-net main.ts
+The Web Notifications spec types `icon` as a URL string. The desktop runtime can
+only resolve `data:` URLs synchronously, so an inline `data:image/png;base64,…`
+icon is rendered. Other URL schemes (`https:`, `file:`) are accepted and
+round-trip through the `icon` property, but the OS notification is shown without
+an icon. To use a file on disk, read it and encode it as a `data:` URL:
+
+```ts
+import { encodeBase64 } from "jsr:@std/encoding/base64";
+
+const bytes = await Deno.readFile("./icons/alert.png");
+const dataUrl = "data:image/png;base64," + encodeBase64(bytes);
+new Notification("Heads up", { icon: dataUrl });
 ```
 
-If we then go to [http://localhost:3000/ry](http://localhost:3000/ry) in
-Postman, we'll get the Github response:
+## Events
 
-![uncached-redis-body.png](./images/how-to/redis/uncached-redis-body.png)
+A `Notification` is an `EventTarget`. Listen with `addEventListener` or the
+`on<event>` properties:
 
-Let's cache this response using Redis.
+```ts
+const n = new Notification("Download finished");
 
-## Checking the cache
-
-Once we have our response from the Github API, we can cache this within Redis
-using `client.set`, with our username as the key and the user object as the
-value:
-
-```tsx
-await client.set(username, JSON.stringify(user));
+n.onshow = () => console.log("shown");
+n.onclick = () => openDownloadsFolder();
+n.onclose = () => console.log("dismissed");
+n.onerror = () => console.warn("the OS rejected the notification");
 ```
 
-Next time we request the same username, we can use `client.get` to get the
-cached user:
+| Event   | When it fires                                         |
+| ------- | ----------------------------------------------------- |
+| `show`  | The OS displayed the notification.                    |
+| `click` | The user clicked the notification body.               |
+| `close` | The user dismissed it, or it expired.                 |
+| `error` | The OS could not display it (e.g. permission denied). |
 
-```tsx
-const cached_user = await client.get(username);
+## Dismissing
+
+Call `close()` to dismiss a notification programmatically:
+
+```ts
+const n = new Notification("Connecting…");
+// later, once connected:
+n.close();
 ```
 
-This returns null if the key doesn't exist. So we can use it in some flow
-control. When we get the username, we'll initially check whether we already have
-that user in the cache. If we do we'll serve the cached result. If not, we'll
-call the Github API to get the user, cache it, the serve the API result. In both
-cases, we'll add a custom header to show which version we're serving:
-
-```tsx
-const server = new Server({
-  handler: async (req) => {
-    const { pathname } = new URL(req.url);
-    // strip the leading slash
-    const username = pathname.substring(1);
-    const cached_user = await client.get(username);
-    if (cached_user) {
-      return new Response(cached_user, {
-        headers: {
-          "content-type": "application/json",
-          "is-cached": "true",
-        },
-      });
-    } else {
-      const resp = await fetch(`https://api.github.com/users/${username}`);
-      const user = await resp.json();
-      await client.set(username, JSON.stringify(user));
-      return new Response(JSON.stringify(user), {
-        headers: {
-          "content-type": "application/json",
-          "is-cached": "false",
-        },
-      });
-    }
-  },
-
-  port: 3000,
-});
-
-server.listenAndServe();
-```
-
-Running this first time gives us the same response as above, and we'll see the
-`is-cached` header set to `false`:
-
-![uncached-redis-header.png](./images/how-to/redis/uncached-redis-header.png)
-
-But call with the same username again, and we get the cached result. The body is
-identical:
-
-![cached-redis-body.png](./images/how-to/redis/cached-redis-body.png)
-
-But the header shows we have the cache:
-
-![cached-redis-header.png](./images/how-to/redis/cached-redis-header.png)
-
-We can also see that the response was ~200ms quicker!
-
-You can check out the Redis documentation [here](https://redis.io/docs/) and the
-Redis node package [here](https://github.com/redis/node-redis).
+Notifications are otherwise fire-and-forget. The OS owns them once shown, and
+`close()` is a best-effort request.

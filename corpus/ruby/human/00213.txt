@@ -1,108 +1,201 @@
 # frozen_string_literal: true
 
-require_relative "abstract_unit"
-require "active_support/encrypted_configuration"
+require "cases/helper"
 
-class EncryptedConfigurationTest < ActiveSupport::TestCase
+class AttributesDirtyTest < ActiveModel::TestCase
+  class DirtyModel
+    include ActiveModel::Model
+    include ActiveModel::Attributes
+    include ActiveModel::Dirty
+    attribute :name, :string
+    attribute :color, :string
+    attribute :size, :integer
+
+    def save
+      changes_applied
+    end
+  end
+
   setup do
-    @tmpdir = Dir.mktmpdir("config-")
-    @credentials_config_path = File.join(@tmpdir, "credentials.yml.enc")
-
-    @credentials_key_path = File.join(@tmpdir, "master.key")
-    File.write(@credentials_key_path, ActiveSupport::EncryptedConfiguration.generate_key)
-
-    @credentials = ActiveSupport::EncryptedConfiguration.new(
-      config_path: @credentials_config_path, key_path: @credentials_key_path,
-      env_key: "RAILS_MASTER_KEY", raise_if_missing_key: true
-    )
+    @model = DirtyModel.new
   end
 
-  teardown do
-    FileUtils.rm_rf @tmpdir
+  test "setting attribute will result in change" do
+    assert_not_predicate @model, :changed?
+    assert_not_predicate @model, :name_changed?
+    @model.name = "Ringo"
+    assert_predicate @model, :changed?
+    assert_predicate @model, :name_changed?
   end
 
-  test "reading configuration by env key" do
-    FileUtils.rm_rf @credentials_key_path
-
-    begin
-      ENV["RAILS_MASTER_KEY"] = ActiveSupport::EncryptedConfiguration.generate_key
-      @credentials.write({ something: { good: true, bad: false } }.to_yaml)
-
-      assert @credentials[:something][:good]
-      assert_not @credentials.dig(:something, :bad)
-      assert_nil @credentials.fetch(:nothing, nil)
-    ensure
-      ENV["RAILS_MASTER_KEY"] = nil
-    end
+  test "list of changed attribute keys" do
+    assert_equal [], @model.changed
+    @model.name = "Paul"
+    assert_equal ["name"], @model.changed
   end
 
-  test "reading configuration by key file" do
-    @credentials.write({ something: { good: true, bad: false, nested: { foo: "bar" } } }.to_yaml)
-
-    assert @credentials.something[:good]
-    assert_not @credentials.something[:bad]
-    assert @credentials.something.good
-    assert_not @credentials.something.bad
-    assert_equal "bar", @credentials.dig(:something, :nested, :foo)
-    assert_equal "bar", @credentials.something.nested.foo
-    assert_equal [:something], @credentials.keys
-    assert_equal [:good, :bad, :nested], @credentials.something.keys
-    assert_equal ({ good: true, bad: false, nested: { foo: "bar" } }), @credentials.something
+  test "changes to attribute values" do
+    assert_not @model.changes["name"]
+    @model.name = "John"
+    assert_equal [nil, "John"], @model.changes["name"]
   end
 
-  test "reading comment-only configuration" do
-    @credentials.write("# comment")
-
-    assert_equal({}, @credentials.config)
+  test "checking if an attribute has changed to a particular value" do
+    @model.name = "Ringo"
+    assert @model.name_changed?(from: nil, to: "Ringo")
+    assert_not @model.name_changed?(from: "Pete", to: "Ringo")
+    assert @model.name_changed?(to: "Ringo")
+    assert_not @model.name_changed?(to: "Pete")
+    assert @model.name_changed?(from: nil)
+    assert_not @model.name_changed?(from: "Pete")
   end
 
-  test "writing with element assignment and reading with element reference" do
-    @credentials[:foo] = 42
-    assert_equal 42, @credentials[:foo]
+  test "changes accessible through both strings and symbols" do
+    @model.name = "David"
+    assert_not_nil @model.changes[:name]
+    assert_not_nil @model.changes["name"]
   end
 
-  test "writing with dynamic accessor and reading with element reference" do
-    @credentials.foo = 42
-    assert_equal 42, @credentials[:foo]
+  test "be consistent with symbols arguments after the changes are applied" do
+    @model.name = "David"
+    assert @model.attribute_changed?(:name)
+    @model.save
+    @model.name = "Rafael"
+    assert @model.attribute_changed?(:name)
   end
 
-  test "change configuration by key file" do
-    @credentials.write({ something: { good: true } }.to_yaml)
-    @credentials.change do |config_file|
-      config = YAML.load(config_file.read)
-      config_file.write config.merge(new: "things").to_yaml
-    end
-
-    assert @credentials.something[:good]
-    assert_equal "things", @credentials[:new]
+  test "attribute mutation" do
+    @model.name = "Yam"
+    @model.save
+    assert_not_predicate @model, :name_changed?
+    @model.name.replace("Hadad")
+    assert_predicate @model, :name_changed?
   end
 
-  test "raises helpful error when loading invalid content" do
-    @credentials.write("key: value\nbad")
-
-    assert_raise(ActiveSupport::EncryptedConfiguration::InvalidContentError) do
-      @credentials.config
-    end
+  test "resetting attribute" do
+    @model.name = "Bob"
+    @model.restore_name!
+    assert_nil @model.name
+    assert_not_predicate @model, :name_changed?
   end
 
-  test "raises helpful error when validating invalid content" do
-    @credentials.write("key: value\nbad")
-
-    assert_raise(ActiveSupport::EncryptedConfiguration::InvalidContentError) do
-      @credentials.validate!
-    end
+  test "setting color to same value should not result in change being recorded" do
+    @model.color = "red"
+    assert_predicate @model, :color_changed?
+    @model.save
+    assert_not_predicate @model, :color_changed?
+    assert_not_predicate @model, :changed?
+    @model.color = "red"
+    assert_not_predicate @model, :color_changed?
+    assert_not_predicate @model, :changed?
   end
 
-  test "raises key error when accessing config via bang method" do
-    assert_raise(KeyError) { @credentials.something! }
+  test "saving should reset model's changed status" do
+    @model.name = "Alf"
+    assert_predicate @model, :changed?
+    @model.save
+    assert_not_predicate @model, :changed?
+    assert_not_predicate @model, :name_changed?
   end
 
-  test "inspect does not show unencrypted attributes" do
-    secret = "something secret"
-    @credentials.write({ secret: secret }.to_yaml)
-    @credentials.config
+  test "saving should preserve previous changes" do
+    @model.name = "Jericho Cane"
+    @model.save
+    assert_equal [nil, "Jericho Cane"], @model.previous_changes["name"]
+  end
 
-    assert_no_match(/#{secret}/, @credentials.inspect)
-    assert_match(/\A#<ActiveSupport::EncryptedConfiguration:0x[0-9a-f]+>\z/, @credentials.inspect)
+  test "setting new attributes should not affect previous changes" do
+    @model.name = "Jericho Cane"
+    @model.save
+    @model.name = "DudeFella ManGuy"
+    assert_equal [nil, "Jericho Cane"], @model.name_previous_change
+  end
+
+  test "saving should preserve model's previous changed status" do
+    @model.name = "Jericho Cane"
+    @model.save
+    assert_predicate @model, :name_previously_changed?
+  end
+
+  test "previous value is preserved when changed after save" do
+    assert_equal({}, @model.changed_attributes)
+    @model.name = "Paul"
+    assert_equal({ "name" => nil }, @model.changed_attributes)
+
+    @model.save
+
+    @model.name = "John"
+    assert_equal({ "name" => "Paul" }, @model.changed_attributes)
+  end
+
+  test "changing the same attribute multiple times retains the correct original value" do
+    @model.name = "Otto"
+    @model.save
+    @model.name = "DudeFella ManGuy"
+    @model.name = "Mr. Manfredgensonton"
+    assert_equal ["Otto", "Mr. Manfredgensonton"], @model.name_change
+    assert_equal "Otto", @model.name_was
+  end
+
+  test "using attribute_will_change! with a symbol" do
+    @model.size = 1
+    assert_predicate @model, :size_changed?
+  end
+
+  test "clear_changes_information should reset all changes" do
+    @model.name = "Dmitry"
+    @model.name_changed?
+    @model.save
+    @model.name = "Bob"
+
+    assert_equal [nil, "Dmitry"], @model.previous_changes["name"]
+    assert_equal "Dmitry", @model.changed_attributes["name"]
+
+    @model.clear_changes_information
+
+    assert_equal ActiveSupport::HashWithIndifferentAccess.new, @model.previous_changes
+    assert_equal ActiveSupport::HashWithIndifferentAccess.new, @model.changed_attributes
+  end
+
+  test "restore_attributes should restore all previous data" do
+    @model.name = "Dmitry"
+    @model.color = "Red"
+    @model.save
+    @model.name = "Bob"
+    @model.color = "White"
+
+    @model.restore_attributes
+
+    assert_not_predicate @model, :changed?
+    assert_equal "Dmitry", @model.name
+    assert_equal "Red", @model.color
+  end
+
+  test "restore_attributes can restore only some attributes" do
+    @model.name = "Dmitry"
+    @model.color = "Red"
+    @model.save
+    @model.name = "Bob"
+    @model.color = "White"
+
+    @model.restore_attributes(["name"])
+
+    assert_predicate @model, :changed?
+    assert_equal "Dmitry", @model.name
+    assert_equal "White", @model.color
+  end
+
+  test "changing the attribute reports a change only when the cast value changes" do
+    @model.size = "2.3"
+    @model.save
+    @model.size = "2.1"
+
+    assert_equal false, @model.changed?
+
+    @model.size = "5.1"
+
+    assert_equal true, @model.changed?
+    assert_equal true, @model.size_changed?
+    assert_equal({ "size" => [2, 5] }, @model.changes)
   end
 end

@@ -1,96 +1,128 @@
-import utils from '../../../lib/utils';
+import GithubAPI from "./GithubAPI.js";
+import api from './api.js';
+import Handlebars from "handlebars";
+import fs from "fs/promises";
+import {colorize} from "./helpers/colorize.js";
+import {getReleaseInfo} from "./contributors.js";
+import path from "path";
+import {fileURLToPath} from "url";
 
-const {merge} = utils;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-describe('utils::merge', function () {
-  it('should be immutable', function () {
-    const a = {};
-    const b = {foo: 123};
-    const c = {bar: 456};
+const NOTIFY_PR_TEMPLATE = path.resolve(__dirname, '../templates/pr_published.hbs');
 
-    merge(a, b, c);
+const normalizeTag = (tag) => tag ? 'v' + tag.replace(/^v/, '') : '';
 
-    expect(typeof a.foo).toEqual('undefined');
-    expect(typeof a.bar).toEqual('undefined');
-    expect(typeof b.bar).toEqual('undefined');
-    expect(typeof c.foo).toEqual('undefined');
-  });
+const GITHUB_BOT_LOGIN = 'github-actions[bot]';
 
-  it('should merge properties', function () {
-    const a = {foo: 123};
-    const b = {bar: 456};
-    const c = {foo: 789};
-    const d = merge(a, b, c);
+const skipCollaboratorPRs = true;
 
-    expect(d.foo).toEqual(789);
-    expect(d.bar).toEqual(456);
-  });
+class RepoBot {
+  constructor(options) {
+    const {
+      owner, repo,
+      templates
+    } = options || {};
 
-  it('should merge recursively', function () {
-    const a = {foo: {bar: 123}};
-    const b = {foo: {baz: 456}, bar: {qux: 789}};
+    this.templates = Object.assign({
+      published: NOTIFY_PR_TEMPLATE
+    }, templates);
 
-    expect(merge(a, b)).toEqual({
-      foo: {
-        bar: 123,
-        baz: 456
-      },
-      bar: {
-        qux: 789
+    this.github = api || new GithubAPI(owner, repo);
+
+    this.owner = this.github.owner;
+    this.repo = this.github.repo;
+  }
+
+  async addComment(targetId, message) {
+    return this.github.createComment(targetId, message);
+  }
+
+  async notifyPRPublished(id, tag) {
+    let pr;
+
+    try {
+      pr = await this.github.getPR(id);
+    } catch (err) {
+      if(err.response?.status === 404) {
+        throw new Error(`PR #${id} not found (404)`);
+      }
+
+      throw err;
+    }
+
+    tag = normalizeTag(tag);
+
+    const {merged, labels, user: {login, type}} = pr;
+
+    const isBot = type === 'Bot';
+
+    if (!merged) {
+      return false
+    }
+
+    await this.github.appendLabels(id, [tag]);
+
+    if (isBot || labels.find(({name}) => name === 'automated pr') || (skipCollaboratorPRs && await this.github.isCollaborator(login))) {
+      return false;
+    }
+
+    const comments = await this.github.getComments(id, {desc: true});
+
+    const comment = comments.find(
+      ({body, user}) => user.login === GITHUB_BOT_LOGIN && body.indexOf('published in') >= 0
+    )
+
+    if (comment) {
+      console.log(colorize()`Release comment [${comment.html_url}] already exists in #${pr.id}`);
+      return false;
+    }
+
+    const author = await this.github.getUser(login);
+
+    author.isBot = isBot;
+
+    const message = await this.constructor.renderTemplate(this.templates.published, {
+      id,
+      author,
+      release: {
+        tag,
+        url: `https://github.com/${this.owner}/${this.repo}/releases/tag/${tag}`
       }
     });
-  });
 
-  it('should remove all references from nested objects', function () {
-    const a = {foo: {bar: 123}};
-    const b = {};
-    const d = merge(a, b);
+    return await this.addComment(id, message);
+  }
 
-    expect(d).toEqual({
-      foo: {
-        bar: 123
+  async notifyPublishedPRs(tag) {
+    tag = normalizeTag(tag);
+
+    const release = await getReleaseInfo(tag);
+
+    if (!release) {
+      throw Error(colorize()`Can't get release info for ${tag}`);
+    }
+
+    const {merges} = release;
+
+    console.log(colorize()`Found ${merges.length} PRs in ${tag}:`);
+
+    let i = 0;
+
+    for (const pr of merges) {
+      try {
+        console.log(colorize()`${i++}) Notify PR #${pr.id}`)
+        const result = await this.notifyPRPublished(pr.id, tag);
+        console.log('✔️', result ? 'Label, comment' : 'Label');
+      } catch (err) {
+        console.warn(colorize('green', 'red')`❌ Failed notify PR ${pr.id}: ${err.message}`);
       }
-    });
+    }
+  }
 
-    expect(d.foo).not.toBe(a.foo);
-  });
+  static async renderTemplate(template, data) {
+    return Handlebars.compile(String(await fs.readFile(template)))(data);
+  }
+}
 
-  it('handles null and undefined arguments', function () {
-    expect(merge(undefined, undefined)).toEqual({});
-    expect(merge(undefined, {foo: 123})).toEqual({foo: 123});
-    expect(merge({foo: 123}, undefined)).toEqual({foo: 123});
-
-    expect(merge(null, null)).toEqual({});
-    expect(merge(null, {foo: 123})).toEqual({foo: 123});
-    expect(merge({foo: 123}, null)).toEqual({foo: 123});
-  });
-
-  it('should replace properties with null', function () {
-    expect(merge({}, {a: null})).toEqual({a: null});
-    expect(merge({a: null}, {})).toEqual({a: null});
-  });
-
-  it('should replace properties with arrays', function () {
-    expect(merge({}, {a: [1, 2, 3]})).toEqual({a: [1, 2, 3]});
-    expect(merge({a: 2}, {a: [1, 2, 3]})).toEqual({a: [1, 2, 3]});
-    expect(merge({a: {b: 2}}, {a: [1, 2, 3]})).toEqual({a: [1, 2, 3]});
-  });
-
-  it('should replace properties with cloned arrays', function () {
-    const a = [1, 2, 3];
-    const d = merge({}, {a: a});
-
-    expect(d).toEqual({a: [1, 2, 3]});
-    expect(d.a).not.toBe(a);
-  });
-
-  it('should support caseless option', ()=> {
-    const a = {x: 1};
-    const b = {X: 2};
-    const merged = merge.call({caseless: true}, a, b);
-
-    expect(merged).toEqual({
-      x: 2
-    });
-  });
-});
+export default RepoBot;

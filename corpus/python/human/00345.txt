@@ -1,249 +1,193 @@
-import copy
-import functools
-import pickle
 import sys
-import unittest
-from datetime import datetime, timedelta, timezone, tzinfo
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from collections.abc import Iterable
+from inspect import Parameter, Signature, signature
+from typing import Annotated, Any, Generic, TypeVar
 
-from pydantic_core import SchemaValidator, TzInfo, core_schema
+import pytest
+from annotated_types import Gt
+from typing_extensions import get_origin  # noqa: UP035
+from typing_inspection import typing_objects
+
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 
-class _ALWAYS_EQ:
+def _equals(a: str | Iterable[str], b: str | Iterable[str]) -> bool:
     """
-    Object that is equal to anything.
+    compare strings with spaces removed
     """
-
-    def __eq__(self, other):
-        return True
-
-    def __ne__(self, other):
-        return False
-
-
-ALWAYS_EQ = _ALWAYS_EQ()
+    if isinstance(a, str) and isinstance(b, str):
+        return a.replace(' ', '') == b.replace(' ', '')
+    elif isinstance(a, Iterable) and isinstance(b, Iterable):
+        return all(_equals(a_, b_) for a_, b_ in zip(a, b))
+    else:
+        raise TypeError(f'arguments must be both strings or both lists, not {type(a)}, {type(b)}')
 
 
-@functools.total_ordering
-class _LARGEST:
-    """
-    Object that is greater than anything (except itself).
-    """
+def test_model_signature():
+    class Model(BaseModel):
+        a: float = Field(title='A')
+        b: int = Field(10)
+        c: int = Field(default_factory=lambda: 1)
 
-    def __eq__(self, other):
-        return isinstance(other, _LARGEST)
-
-    def __lt__(self, other):
-        return False
-
-
-LARGEST = _LARGEST()
+    sig = signature(Model)
+    assert sig != signature(BaseModel)
+    assert _equals(map(str, sig.parameters.values()), ('a: float', 'b: int = 10', 'c: int = <factory>'))
+    assert _equals(str(sig), '(*, a: float, b: int = 10, c: int = <factory>) -> None')
 
 
-@functools.total_ordering
-class _SMALLEST:
-    """
-    Object that is less than anything (except itself).
-    """
+def test_generic_model_signature():
+    T = TypeVar('T')
 
-    def __eq__(self, other):
-        return isinstance(other, _SMALLEST)
+    class Model(BaseModel, Generic[T]):
+        a: T
 
-    def __gt__(self, other):
-        return False
-
-
-SMALLEST = _SMALLEST()
+    sig = signature(Model[int])
+    assert sig != signature(BaseModel)
+    assert _equals(map(str, sig.parameters.values()), ('a: int',))
+    assert _equals(str(sig), '(*, a: int) -> None')
 
 
-pickle_choices = [(pickle, pickle, proto) for proto in range(pickle.HIGHEST_PROTOCOL + 1)]
+def test_custom_init_signature():
+    class MyModel(BaseModel):
+        id: int
+        name: str = 'John Doe'
+        f__: str = Field(alias='foo')
 
-HOUR = timedelta(hours=1).total_seconds()
-ZERO = timedelta(0).total_seconds()
+        model_config = ConfigDict(extra='allow')
 
+        def __init__(self, id: int = 1, bar=2, *, baz: Any, **data):
+            super().__init__(id=id, **data)
+            self.bar = bar
+            self.baz = baz
 
-def first_sunday_on_or_after(dt):
-    days_to_go = 6 - dt.weekday()
-    if days_to_go:
-        dt += timedelta(days_to_go)
-    return dt
-
-
-DSTSTART = datetime(1, 4, 1, 2)
-DSTEND = datetime(1, 10, 25, 1)
-
-
-class TestTzInfo(unittest.TestCase):
-    """Adapted from CPython `timezone` tests
-
-    Original tests are located here https://github.com/python/cpython/blob/a0bb4a39d1ca10e4a75f50a9fbe90cc9db28d29e/Lib/test/datetimetester.py#L256
-    """
-
-    def setUp(self):
-        self.ACDT = TzInfo(timedelta(hours=9.5).total_seconds())
-        self.EST = TzInfo(-timedelta(hours=5).total_seconds())
-        self.UTC = TzInfo(timedelta(0).total_seconds())
-        self.DT = datetime(2010, 1, 1)
-
-    def test_str(self):
-        for tz in [self.ACDT, self.EST]:
-            self.assertEqual(str(tz), tz.tzname(None))
-
-    def test_constructor(self):
-        for subminute in [timedelta(microseconds=1), timedelta(seconds=1)]:
-            tz = TzInfo(subminute.total_seconds())
-            self.assertNotEqual(tz.utcoffset(None) % timedelta(minutes=1), 0)
-        # invalid offsets
-        for invalid in [timedelta(1, 1), timedelta(1)]:
-            self.assertRaises(ValueError, TzInfo, invalid.total_seconds())
-            self.assertRaises(ValueError, TzInfo, -invalid.total_seconds())
-
-        with self.assertRaises(TypeError):
-            TzInfo(None)
-        with self.assertRaises(TypeError):
-            TzInfo(timedelta(seconds=42))
-        with self.assertRaises(TypeError):
-            TzInfo(ZERO, None)
-        with self.assertRaises(TypeError):
-            TzInfo(ZERO, 42)
-        with self.assertRaises(TypeError):
-            TzInfo(ZERO, 'ABC', 'extra')
-
-    def test_inheritance(self):
-        self.assertIsInstance(self.EST, tzinfo)
-
-    def test_utcoffset(self):
-        dummy = self.DT
-        for h in [0, 1.5, 12]:
-            offset = h * HOUR
-            self.assertEqual(timedelta(seconds=offset), TzInfo(offset).utcoffset(dummy))
-            self.assertEqual(timedelta(seconds=-offset), TzInfo(-offset).utcoffset(dummy))
-
-        self.assertEqual(self.EST.utcoffset(''), timedelta(hours=-5))
-        self.assertEqual(self.EST.utcoffset(5), timedelta(hours=-5))
-
-    def test_dst(self):
-        self.EST.dst('') is None
-        self.EST.dst(5) is None
-
-    def test_tzname(self):
-        self.assertEqual('-05:00', TzInfo(-5 * HOUR).tzname(None))
-        self.assertEqual('+09:30', TzInfo(9.5 * HOUR).tzname(None))
-        self.assertEqual('-00:01', TzInfo(timedelta(minutes=-1).total_seconds()).tzname(None))
-        # Sub-minute offsets:
-        self.assertEqual('+01:06:40', TzInfo(timedelta(0, 4000).total_seconds()).tzname(None))
-        self.assertEqual('-01:06:40', TzInfo(-timedelta(0, 4000).total_seconds()).tzname(None))
-        self.assertEqual('+01:06:40', TzInfo(timedelta(0, 4000, 1).total_seconds()).tzname(None))
-        self.assertEqual('-01:06:40', TzInfo(-timedelta(0, 4000, 1).total_seconds()).tzname(None))
-
-        self.assertEqual(self.EST.tzname(''), '-05:00')
-        self.assertEqual(self.EST.tzname(5), '-05:00')
-
-    def test_fromutc(self):
-        for tz in [self.EST, self.ACDT]:
-            utctime = self.DT.replace(tzinfo=tz)
-            local = tz.fromutc(utctime)
-            self.assertEqual(local - utctime, tz.utcoffset(local))
-            self.assertEqual(local, self.DT.replace(tzinfo=timezone.utc))
-
-    def test_comparison(self):
-        self.assertNotEqual(TzInfo(ZERO), TzInfo(HOUR))
-        self.assertEqual(TzInfo(HOUR), TzInfo(HOUR))
-        self.assertFalse(TzInfo(ZERO) < TzInfo(ZERO))
-        self.assertIn(TzInfo(ZERO), {TzInfo(ZERO)})
-        self.assertTrue(TzInfo(ZERO) is not None)
-        self.assertFalse(TzInfo(ZERO) is None)
-
-        tz = TzInfo(ZERO)
-        self.assertTrue(tz == ALWAYS_EQ)
-        self.assertFalse(tz != ALWAYS_EQ)
-        self.assertTrue(tz < LARGEST)
-        self.assertFalse(tz > LARGEST)
-        self.assertTrue(tz <= LARGEST)
-        self.assertFalse(tz >= LARGEST)
-        self.assertFalse(tz < SMALLEST)
-        self.assertTrue(tz > SMALLEST)
-        self.assertFalse(tz <= SMALLEST)
-        self.assertTrue(tz >= SMALLEST)
-
-        # offset based comparison tests for tzinfo derived classes like datetime.timezone.
-        utcdatetime = self.DT.replace(tzinfo=timezone.utc)
-        self.assertTrue(tz == utcdatetime.tzinfo)
-        estdatetime = self.DT.replace(tzinfo=timezone(-timedelta(hours=5)))
-        self.assertTrue(self.EST == estdatetime.tzinfo)
-        self.assertTrue(tz > estdatetime.tzinfo)
-
-        if sys.platform == 'linux':
-            try:
-                europe_london = ZoneInfo('Europe/London')
-            except ZoneInfoNotFoundError:
-                # tz data not available
-                pass
-            else:
-                self.assertFalse(tz == europe_london)
-                with self.assertRaises(TypeError):
-                    tz > europe_london
-
-    def test_copy(self):
-        for tz in self.ACDT, self.EST:
-            tz_copy = copy.copy(tz)
-            self.assertEqual(tz_copy, tz)
-
-    def test_deepcopy(self):
-        for tz in self.ACDT, self.EST:
-            tz_copy = copy.deepcopy(tz)
-            self.assertEqual(tz_copy, tz)
-
-    def test_offset_boundaries(self):
-        # Test timedeltas close to the boundaries
-        time_deltas = [timedelta(hours=23, minutes=59), timedelta(hours=23, minutes=59, seconds=59)]
-        time_deltas.extend([-delta for delta in time_deltas])
-
-        for delta in time_deltas:
-            with self.subTest(test_type='good', delta=delta):
-                print(delta.total_seconds())
-                TzInfo(delta.total_seconds())
-
-        # Test timedeltas on and outside the boundaries
-        bad_time_deltas = [timedelta(hours=24), timedelta(hours=24, microseconds=1)]
-        bad_time_deltas.extend([-delta for delta in bad_time_deltas])
-
-        for delta in bad_time_deltas:
-            with self.subTest(test_type='bad', delta=delta):
-                with self.assertRaises(ValueError):
-                    TzInfo(delta.total_seconds())
-
-    def test_no_args_constructor(self):
-        # Test that TzInfo can be constructed without arguments
-        tz = TzInfo()
-        self.assertEqual(tz.utcoffset(None), timedelta(0))
-        self.assertEqual(str(tz), 'UTC')
-
-    def test_pickle(self):
-        # Test that TzInfo can be pickled and unpickled
-        for tz in self.ACDT, self.EST, self.UTC:
-            for pickler, unpickler, proto in pickle_choices:
-                with self.subTest(tz=tz, proto=proto):
-                    pickled = pickler.dumps(tz, proto)
-                    unpickled = unpickler.loads(pickled)
-                    self.assertEqual(tz, unpickled)
-                    self.assertEqual(tz.utcoffset(None), unpickled.utcoffset(None))
-
-
-def test_tzinfo_could_be_reused():
-    class Model:
-        value: datetime
-
-    v = SchemaValidator(
-        core_schema.model_schema(
-            Model, core_schema.model_fields_schema({'value': core_schema.model_field(core_schema.datetime_schema())})
-        )
+    sig = signature(MyModel)
+    assert _equals(
+        map(str, sig.parameters.values()),
+        ('id: int = 1', 'bar=2', 'baz: Any', "name: str = 'John Doe'", 'foo: str', '**data'),
     )
 
-    m = v.validate_python({'value': '2015-10-21T15:28:00.000000+01:00'})
+    assert _equals(str(sig), "(id: int = 1, bar=2, *, baz: Any, name: str = 'John Doe', foo: str, **data) -> None")
 
-    target = datetime(1955, 11, 12, 14, 38, tzinfo=m.value.tzinfo)
-    assert target == datetime(1955, 11, 12, 14, 38, tzinfo=timezone(timedelta(hours=1)))
 
-    now = datetime.now(tz=m.value.tzinfo)
-    assert isinstance(now, datetime)
+def test_custom_init_signature_with_no_var_kw():
+    class Model(BaseModel):
+        a: float
+        b: int = 2
+        c: int
+
+        def __init__(self, a: float, b: int):
+            super().__init__(a=a, b=b, c=1)
+
+        model_config = ConfigDict(extra='allow')
+
+    assert _equals(str(signature(Model)), '(a: float, b: int) -> None')
+
+
+def test_invalid_identifiers_signature():
+    model = create_model(
+        'Model',
+        **{'123 invalid identifier!': (int, Field(123, alias='valid_identifier')), '!': (int, Field(0, alias='yeah'))},
+    )
+    assert _equals(str(signature(model)), '(*, valid_identifier: int = 123, yeah: int = 0) -> None')
+    model = create_model('Model', **{'123 invalid identifier!': (int, 123), '!': (int, Field(0, alias='yeah'))})
+    assert _equals(str(signature(model)), '(*, yeah: int = 0, **extra_data: Any) -> None')
+
+
+def test_use_field_name():
+    class Foo(BaseModel):
+        foo: str = Field(alias='this is invalid')
+
+        model_config = ConfigDict(validate_by_name=True)
+
+    assert _equals(str(signature(Foo)), '(*, foo: str) -> None')
+
+
+def test_does_not_use_reserved_word():
+    class Foo(BaseModel):
+        from_: str = Field(alias='from')
+
+        model_config = ConfigDict(validate_by_name=True)
+
+    assert _equals(str(signature(Foo)), '(*, from_: str) -> None')
+
+
+def test_extra_allow_no_conflict():
+    class Model(BaseModel):
+        spam: str
+
+        model_config = ConfigDict(extra='allow')
+
+    assert _equals(str(signature(Model)), '(*, spam: str, **extra_data: Any) -> None')
+
+
+def test_extra_allow_conflict():
+    class Model(BaseModel):
+        extra_data: str
+
+        model_config = ConfigDict(extra='allow')
+
+    assert _equals(str(signature(Model)), '(*, extra_data: str, **extra_data_: Any) -> None')
+
+
+def test_extra_allow_conflict_twice():
+    class Model(BaseModel):
+        extra_data: str
+        extra_data_: str
+
+        model_config = ConfigDict(extra='allow')
+
+    assert _equals(str(signature(Model)), '(*, extra_data: str, extra_data_: str, **extra_data__: Any) -> None')
+
+
+def test_extra_allow_conflict_custom_signature():
+    class Model(BaseModel):
+        extra_data: int
+
+        def __init__(self, extra_data: int = 1, **foobar: Any):
+            super().__init__(extra_data=extra_data, **foobar)
+
+        model_config = ConfigDict(extra='allow')
+
+    assert _equals(str(signature(Model)), '(extra_data: int = 1, **foobar: Any) -> None')
+
+
+def test_signature_is_class_only():
+    class Model(BaseModel):
+        foo: int = 123
+
+        def __call__(self, a: int) -> bool:
+            pass
+
+    assert _equals(str(signature(Model)), '(*, foo: int = 123) -> None')
+    assert _equals(str(signature(Model())), '(a: int) -> bool')
+    assert not hasattr(Model(), '__signature__')
+
+
+def test_optional_field():
+    class Model(BaseModel):
+        foo: int | None = None
+
+    assert signature(Model) == Signature(
+        [Parameter('foo', Parameter.KEYWORD_ONLY, default=None, annotation=int | None)], return_annotation=None
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason='repr different on older versions')
+def test_annotated_field():
+
+    class Model(BaseModel):
+        foo: Annotated[int, Gt(1)] = 1
+
+    sig = signature(Model)
+    assert str(sig) == '(*, foo: Annotated[int, Gt(gt=1)] = 1) -> None'
+    # check that the `Annotated` we created is a valid `Annotated`
+    assert typing_objects.is_annotated(get_origin(sig.parameters['foo'].annotation))
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), sys.version_info >= (3, 14), reason='repr different on newer versions')
+def test_annotated_optional_field():
+
+    class Model(BaseModel):
+        foo: Annotated[int | None, Gt(1)] = None
+
+    assert str(signature(Model)) == '(*, foo: Annotated[int | None, Gt(gt=1)] = None) -> None'

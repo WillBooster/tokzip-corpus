@@ -1,430 +1,94 @@
-import * as Harness from "../../_namespaces/Harness.js";
-import * as ts from "../../_namespaces/ts.js";
+import { dedent } from "../../_namespaces/Utils.js";
+import * as vfs from "../../_namespaces/vfs.js";
 import { jsonToReadableText } from "../helpers.js";
+import { verifyTsc } from "../helpers/tsc.js";
 import {
-    baselineTsserverLogs,
-    openFilesForSession,
-    TestSession,
-    verifyGetErrRequest,
-} from "../helpers/tsserver.js";
-import {
-    createServerHost,
-    File,
-    libFile,
-} from "../helpers/virtualFileSystemWithWatch.js";
+    appendText,
+    loadProjectFromFiles,
+    replaceText,
+} from "../helpers/vfs.js";
 
-describe("unittests:: tsserver:: plugins:: loading", () => {
-    const testProtocolCommand = "testProtocolCommand";
-    const testProtocolCommandRequest = "testProtocolCommandRequest";
-    const testProtocolCommandResponse = "testProtocolCommandResponse";
-
-    function createHostWithPlugin(files: readonly File[], globalPlugins?: readonly string[]) {
-        const host = createServerHost(files);
-        host.require = (_initialPath, moduleName) => {
-            session.logger.log(`Loading plugin: ${moduleName}`);
-            return {
-                module: () => ({
-                    create(info: ts.server.PluginCreateInfo) {
-                        info.session?.addProtocolHandler(testProtocolCommand, request => {
-                            session.logger.log(`addProtocolHandler: ${jsonToReadableText(request)}`);
-                            // Assume this one needs program
-                            info.languageService.getProgram();
-                            return {
-                                response: testProtocolCommandResponse,
-                            };
-                        });
-                        return Harness.LanguageService.makeDefaultProxy(info);
-                    },
-                }),
-                error: undefined,
-            };
-        };
-        const session = new TestSession({ host, globalPlugins });
-        return { host, session };
+describe("unittests:: tsbuild:: outFile:: on amd modules with --out", () => {
+    function outFileFs(prepend?: boolean) {
+        return loadProjectFromFiles({
+            "/src/app/file3.ts": dedent`
+                export const z = 30;
+                import { x } from "file1";
+            `,
+            "/src/app/file4.ts": `const myVar = 30;`,
+            "/src/app/tsconfig.json": jsonToReadableText({
+                compilerOptions: {
+                    target: "es5",
+                    module: "amd",
+                    composite: true,
+                    strict: false,
+                    sourceMap: true,
+                    declarationMap: true,
+                    outFile: "module.js",
+                },
+                exclude: ["module.d.ts"],
+                references: [
+                    { path: "../lib", prepend },
+                ],
+            }),
+            "/src/lib/file0.ts": `const myGlob = 20;`,
+            "/src/lib/file1.ts": `export const x = 10;`,
+            "/src/lib/file2.ts": `export const y = 20;`,
+            "/src/lib/global.ts": `const globalConst = 10;`,
+            "/src/lib/tsconfig.json": jsonToReadableText({
+                compilerOptions: {
+                    target: "es5",
+                    module: "amd",
+                    composite: true,
+                    sourceMap: true,
+                    declarationMap: true,
+                    strict: false,
+                    outFile: "module.js",
+                },
+                exclude: ["module.d.ts"],
+            }),
+        });
     }
 
-    it("With local plugins", () => {
-        const expectedToLoad = [
-            "@myscoped/plugin",
-            "@myscoped/plugin/subpath",
-            "@myscoped/plugin/sub/path",
-            "unscopedPlugin",
-            "unscopedPlugin/subpath",
-            "unscopedPlugin/sub/path",
-        ];
-        const notToLoad = [
-            "../myPlugin",
-            "@myscoped/plugin/../malicious",
-            "myPlugin/../malicious",
-            "myPlugin/subpath/../../malicious",
-        ];
-        const aTs: File = { path: "/a.ts", content: `class c { prop = "hello"; foo() { return this.prop; } }` };
-        const tsconfig: File = {
-            path: "/tsconfig.json",
-            content: jsonToReadableText({
-                compilerOptions: {
-                    plugins: [
-                        ...[...expectedToLoad, ...notToLoad].map(name => ({ name })),
-                        { transform: "some-transform" },
-                    ],
-                },
-            }),
-        };
-        const { session } = createHostWithPlugin([aTs, tsconfig, libFile]);
-        openFilesForSession([aTs], session);
-        baselineTsserverLogs("plugins", "With local plugins", session);
+    verifyTsc({
+        scenario: "amdModulesWithOut",
+        subScenario: "modules and globals mixed in amd",
+        fs: outFileFs,
+        commandLineArgs: ["--b", "/src/app", "--verbose"],
+        baselineSourceMap: true,
+        edits: [{
+            caption: "incremental-declaration-doesnt-change",
+            edit: fs => appendText(fs, "/src/lib/file1.ts", "console.log(x);"),
+        }],
     });
 
-    it("With global plugins", () => {
-        const expectedToLoad = [
-            "@myscoped/plugin",
-            "@myscoped/plugin/subpath",
-            "@myscoped/plugin/sub/path",
-            "unscopedPlugin",
-            "unscopedPlugin/subpath",
-            "unscopedPlugin/sub/path",
-        ];
-        const notToLoad = [
-            "../myPlugin",
-            "@myscoped/plugin/../malicious",
-            "myPlugin/../malicious",
-            "myPlugin/subpath/../../malicious",
-        ];
-        const aTs: File = { path: "/a.ts", content: `class c { prop = "hello"; foo() { return this.prop; } }` };
-        const tsconfig: File = {
-            path: "/tsconfig.json",
-            content: "{}",
-        };
-        const { session } = createHostWithPlugin([aTs, tsconfig, libFile], [...expectedToLoad, ...notToLoad]);
-        openFilesForSession([aTs], session);
-        baselineTsserverLogs("plugins", "With global plugins", session);
+    verifyTsc({
+        scenario: "amdModulesWithOut",
+        subScenario: "prepend reports deprecation error",
+        fs: () => outFileFs(/*prepend*/ true),
+        commandLineArgs: ["--b", "/src/app", "--verbose"],
+        baselineSourceMap: true,
+        edits: [{
+            caption: "incremental-declaration-doesnt-change",
+            edit: fs => appendText(fs, "/src/lib/file1.ts", "console.log(x);"),
+        }],
     });
 
-    it("With session and custom protocol message", () => {
-        const pluginName = "some-plugin";
-        const aTs: File = { path: "/a.ts", content: `class c { prop = "hello"; foo() { return this.prop; } }` };
-        const tsconfig: File = {
-            path: "/tsconfig.json",
-            content: jsonToReadableText({
-                compilerOptions: {
-                    plugins: [
-                        { name: pluginName },
-                    ],
-                },
-            }),
-        };
+    describe("when the module resolution finds original source file", () => {
+        function modifyFs(fs: vfs.FileSystem) {
+            // Make lib to output to parent dir
+            replaceText(fs, "/src/lib/tsconfig.json", `"outFile": "module.js"`, `"outFile": "../module.js", "rootDir": "../"`);
+            // Change reference to file1 module to resolve to lib/file1
+            replaceText(fs, "/src/app/file3.ts", "file1", "lib/file1");
+        }
 
-        const { session } = createHostWithPlugin([aTs, tsconfig, libFile]);
-
-        openFilesForSession([aTs], session);
-
-        session.executeCommandSeq({
-            command: testProtocolCommand,
-            arguments: testProtocolCommandRequest,
+        verifyTsc({
+            scenario: "amdModulesWithOut",
+            subScenario: "when the module resolution finds original source file",
+            fs: outFileFs,
+            commandLineArgs: ["-b", "/src/app", "--verbose"],
+            modifyFs,
+            baselineSourceMap: true,
         });
-
-        baselineTsserverLogs("plugins", "With session and custom protocol message", session);
-    });
-
-    it("when plugins use LS to get program and update is pending", () => {
-        const pluginName = "some-plugin";
-        const aTs: File = {
-            path: "/user/username/projects/project/a.ts",
-            content: `/// <reference path="./b.ts"/>`,
-        };
-        const tsconfig: File = {
-            path: "/user/username/projects/project/tsconfig.json",
-            content: jsonToReadableText({
-                compilerOptions: {
-                    plugins: [
-                        { name: pluginName },
-                    ],
-                },
-            }),
-        };
-
-        const { session, host } = createHostWithPlugin([aTs, tsconfig, libFile]);
-
-        openFilesForSession([aTs], session);
-        // Write the missing file (referenced by 'a.ts') to schedule an update.
-        host.writeFile("/user/username/projects/project/b.ts", "const y = 10;");
-
-        // This should update the language service with a new program.
-        session.executeCommandSeq({
-            command: testProtocolCommand,
-            arguments: testProtocolCommandRequest,
-        });
-
-        // This results in a program update.
-        host.runQueuedTimeoutCallbacks();
-
-        baselineTsserverLogs("plugins", "when plugins use LS to get program and update is pending", session);
-    });
-
-    it("gets external files with config file reload", () => {
-        const aTs: File = { path: `/user/username/projects/myproject/a.ts`, content: `export const x = 10;` };
-        const tsconfig: File = {
-            path: `/user/username/projects/myproject/tsconfig.json`,
-            content: jsonToReadableText({
-                compilerOptions: {
-                    plugins: [{ name: "some-plugin" }],
-                },
-            }),
-        };
-
-        const externalFiles: ts.MapLike<string[]> = {
-            "some-plugin": ["someFile.txt"],
-            "some-other-plugin": ["someOtherFile.txt"],
-        };
-
-        const host = createServerHost([aTs, tsconfig, libFile]);
-        host.require = (_initialPath, moduleName) => {
-            session.logger.log(`Require:: ${moduleName}`);
-            return {
-                module: (): ts.server.PluginModule => {
-                    session.logger.log(`PluginFactory Invoke`);
-                    return {
-                        create: Harness.LanguageService.makeDefaultProxy,
-                        getExternalFiles: () => externalFiles[moduleName],
-                    };
-                },
-                error: undefined,
-            };
-        };
-        const session = new TestSession(host);
-        openFilesForSession([aTs], session);
-        session.logger.log(`ExternalFiles:: ${jsonToReadableText(session.getProjectService().configuredProjects.get(tsconfig.path)!.getExternalFiles())}`);
-
-        host.writeFile(
-            tsconfig.path,
-            jsonToReadableText({
-                compilerOptions: {
-                    plugins: [{ name: "some-other-plugin" }],
-                },
-            }),
-        );
-        host.runQueuedTimeoutCallbacks();
-        session.logger.log(`ExternalFiles:: ${jsonToReadableText(session.getProjectService().configuredProjects.get(tsconfig.path)!.getExternalFiles())}`);
-
-        baselineTsserverLogs("plugins", "gets external files with config file reload", session);
-    });
-});
-
-describe("unittests:: tsserver:: plugins:: overriding getSupportedCodeFixes", () => {
-    it("getSupportedCodeFixes can be proxied", () => {
-        const aTs: File = {
-            path: "/a.ts",
-            content: `class c { prop = "hello"; foo() { const x = 0; } }`,
-        };
-        const bTs: File = {
-            path: "/b.ts",
-            content: aTs.content,
-        };
-        const cTs: File = {
-            path: "/c.ts",
-            content: aTs.content,
-        };
-        const config: File = {
-            path: "/tsconfig.json",
-            content: jsonToReadableText({
-                compilerOptions: { plugins: [{ name: "myplugin" }] },
-            }),
-        };
-        const host = createServerHost([aTs, bTs, cTs, config, libFile]);
-        host.require = () => {
-            return {
-                module: () => ({
-                    create(info: ts.server.PluginCreateInfo) {
-                        const proxy = Harness.LanguageService.makeDefaultProxy(info);
-                        proxy.getSupportedCodeFixes = fileName => {
-                            switch (fileName) {
-                                case "/a.ts":
-                                    return ["a"];
-                                case "/b.ts":
-                                    return ["b"];
-                                default:
-                                    // Make this stable list of single item so we dont have to update the baseline for every additional error
-                                    return info.languageService.getSupportedCodeFixes(fileName);
-                            }
-                        };
-                        return proxy;
-                    },
-                }),
-                error: undefined,
-            };
-        };
-        const session = new TestSession(host);
-        openFilesForSession([aTs, bTs, cTs], session);
-        // Without arguments
-        session.executeCommandSeq<ts.server.protocol.GetSupportedCodeFixesRequest>({
-            command: ts.server.protocol.CommandTypes.GetSupportedCodeFixes,
-        });
-        session.executeCommandSeq<ts.server.protocol.GetSupportedCodeFixesRequest>({
-            command: ts.server.protocol.CommandTypes.GetSupportedCodeFixes,
-            arguments: { file: aTs.path },
-        });
-        session.executeCommandSeq<ts.server.protocol.GetSupportedCodeFixesRequest>({
-            command: ts.server.protocol.CommandTypes.GetSupportedCodeFixes,
-            arguments: { file: bTs.path },
-        });
-        session.executeCommandSeq<ts.server.protocol.GetSupportedCodeFixesRequest>({
-            command: ts.server.protocol.CommandTypes.GetSupportedCodeFixes,
-            arguments: { file: cTs.path },
-        });
-        session.executeCommandSeq<ts.server.protocol.GetSupportedCodeFixesRequest>({
-            command: ts.server.protocol.CommandTypes.GetSupportedCodeFixes,
-            arguments: { projectFileName: config.path },
-        });
-
-        baselineTsserverLogs("plugins", "getSupportedCodeFixes can be proxied", session);
-    });
-});
-
-describe("unittests:: tsserver:: plugins:: supportedExtensions::", () => {
-    function createGetExternalFiles(getSession: () => TestSession) {
-        const externalFiles = new Map<ts.server.Project, string[]>();
-        return (project: ts.server.Project, updateLevel: ts.ProgramUpdateLevel) => {
-            if (project.projectKind !== ts.server.ProjectKind.Configured) return [];
-            if (updateLevel === ts.ProgramUpdateLevel.Update) {
-                const existing = externalFiles.get(project);
-                if (existing) {
-                    getSession().logger.log(`getExternalFiles:: Returning cached .vue files`);
-                    return existing;
-                }
-            }
-            getSession().logger.log(`getExternalFiles:: Getting new list of .vue files`);
-            const configFile = project.getProjectName();
-            const config = ts.readJsonConfigFile(configFile, project.readFile.bind(project));
-            const parseHost: ts.ParseConfigHost = {
-                useCaseSensitiveFileNames: project.useCaseSensitiveFileNames(),
-                fileExists: project.fileExists.bind(project),
-                readFile: project.readFile.bind(project),
-                readDirectory: (...args) => {
-                    args[1] = [".vue"];
-                    return project.readDirectory(...args);
-                },
-            };
-            const parsed = ts.parseJsonSourceFileConfigFileContent(config, parseHost, project.getCurrentDirectory());
-            externalFiles.set(project, parsed.fileNames);
-            return parsed.fileNames;
-        };
-    }
-
-    it("new files with non ts extensions and wildcard matching", () => {
-        const aTs: File = {
-            path: "/user/username/projects/myproject/a.ts",
-            content: `export const a = 10;`,
-        };
-        const dTs: File = {
-            path: "/user/username/projects/myproject/d.ts",
-            content: `export const d = 10;`,
-        };
-        const bVue: File = {
-            path: "/user/username/projects/myproject/b.vue",
-            content: "bVue file",
-        };
-        const config: File = {
-            path: "/user/username/projects/myproject/tsconfig.json",
-            content: jsonToReadableText({
-                compilerOptions: { composite: true },
-                include: ["*.ts", "*.vue"],
-            }),
-        };
-        const host = createServerHost([aTs, dTs, bVue, config, libFile]);
-        host.require = () => {
-            return {
-                module: () => ({
-                    create(info: ts.server.PluginCreateInfo) {
-                        const proxy = Harness.LanguageService.makeDefaultProxy(info);
-                        const originalScriptKind = info.languageServiceHost.getScriptKind!.bind(info.languageServiceHost);
-                        info.languageServiceHost.getScriptKind = fileName =>
-                            ts.fileExtensionIs(fileName, ".vue") ?
-                                ts.ScriptKind.TS :
-                                originalScriptKind(fileName);
-                        const originalGetScriptSnapshot = info.languageServiceHost.getScriptSnapshot.bind(info.languageServiceHost);
-                        info.languageServiceHost.getScriptSnapshot = fileName =>
-                            ts.fileExtensionIs(fileName, ".vue") ?
-                                ts.ScriptSnapshot.fromString(`export const y = "${info.languageServiceHost.readFile(fileName)}";`) :
-                                originalGetScriptSnapshot(fileName);
-                        return proxy;
-                    },
-                    getExternalFiles: createGetExternalFiles(() => session),
-                }),
-                error: undefined,
-            };
-        };
-        const session = new TestSession({ host, globalPlugins: ["myplugin"] });
-        openFilesForSession([aTs], session);
-
-        host.writeFile("/user/username/projects/myproject/c.vue", "cVue file");
-        host.runQueuedTimeoutCallbacks();
-
-        host.appendFile(dTs.path, "export const x = 10;");
-        host.runQueuedTimeoutCallbacks();
-
-        baselineTsserverLogs("plugins", "new files with non ts extensions with wildcard matching", session);
-    });
-
-    it("when scriptKind changes for the external file", () => {
-        const aTs: File = {
-            path: "/user/username/projects/myproject/a.ts",
-            content: `export const a = 10;`,
-        };
-        const bVue: File = {
-            path: "/user/username/projects/myproject/b.vue",
-            content: "bVueFile",
-        };
-        const config: File = {
-            path: "/user/username/projects/myproject/tsconfig.json",
-            content: jsonToReadableText({
-                compilerOptions: { composite: true },
-                include: ["*.ts", "*.vue"],
-            }),
-        };
-        const host = createServerHost([aTs, bVue, config, libFile]);
-        let currentVueScriptKind = ts.ScriptKind.TS;
-        host.require = () => {
-            return {
-                module: () => ({
-                    create(info: ts.server.PluginCreateInfo) {
-                        const proxy = Harness.LanguageService.makeDefaultProxy(info);
-                        const originalScriptKind = info.languageServiceHost.getScriptKind!.bind(info.languageServiceHost);
-                        info.languageServiceHost.getScriptKind = fileName =>
-                            fileName === bVue.path ?
-                                currentVueScriptKind :
-                                originalScriptKind(fileName);
-                        const originalGetScriptSnapshot = info.languageServiceHost.getScriptSnapshot.bind(info.languageServiceHost);
-                        info.languageServiceHost.getScriptSnapshot = fileName =>
-                            fileName === bVue.path ?
-                                ts.ScriptSnapshot.fromString(`import { y } from "${bVue.content}";`) : // Change the text so that imports change and we need to reconstruct program
-                                originalGetScriptSnapshot(fileName);
-                        return proxy;
-                    },
-                    getExternalFiles: createGetExternalFiles(() => session),
-                }),
-                error: undefined,
-            };
-        };
-        const session = new TestSession({ host, globalPlugins: ["myplugin"] });
-        openFilesForSession([bVue], session);
-
-        session.executeCommandSeq<ts.server.protocol.UpdateOpenRequest>({
-            command: ts.server.protocol.CommandTypes.UpdateOpen,
-            arguments: {
-                changedFiles: [{
-                    fileName: bVue.path,
-                    textChanges: [{
-                        start: { line: 1, offset: bVue.content.length + 1 },
-                        end: { line: 1, offset: bVue.content.length + 1 },
-                        newText: "Updated",
-                    }],
-                }],
-            },
-        });
-        bVue.content += "Updated";
-        currentVueScriptKind = ts.ScriptKind.JS;
-
-        verifyGetErrRequest({ session, files: [bVue] });
-        baselineTsserverLogs("plugins", "when scriptKind changes for the external file", session);
     });
 });

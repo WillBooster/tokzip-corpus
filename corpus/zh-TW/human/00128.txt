@@ -1,43 +1,67 @@
-## 先從 timestamp 開始談起
+而使用的方式也非常簡單：
 
-要談時間，我比較喜歡從 timestamp 開始談起，或講得更精確一點是 Unix timestamp。
+``` js
+navigator.sendBeacon("/log", payload);
+```
 
-什麼是 timestamp 呢？你打開 devtool 的 console 然後輸入：`console.log(new Date().getTime())`，出來的東西就是我們所謂的 timestamp。
+就會發送一個 POST 的請求到 `/log` 去。
 
-而這個 timestamp 指的是：「從 UTC+0 時區的 1970 年 1 月 1 號 0 時 0 分 0 秒開始，總共過了多少毫秒」，而我寫這篇文章的時候得出來的值是 1608905630674。
+雖然簡單易用，但需要注意的一點是，送出的 payload 是有大小限制的，而且這個限制不是單一請求的限制。
 
-ECMAScript 的 spec 是這樣寫的：
+## navigator.sendBeacon 的 payload 限制
 
->  20.4.1.1 Time Values and Time Range
-> 
-> Time measurement in ECMAScript is analogous to time measurement in POSIX, in particular sharing definition in terms of the proleptic Gregorian calendar, an epoch of midnight at the beginning of 01 January, 1970 UTC, and an accounting of every day as comprising exactly 86,400 seconds (each of which is 1000 milliseconds long).
+`sendBeacon` 的 payload 上限是 64 KiB，等同於 65536 個 bytes，如果 payload 都是由英文字組成的話，因為每一個是一個 byte，就是 65536 個字。
 
-在 Unix 系統中的時間就是這樣表示的，而許多程式語言得到的 timestamp 也都是類似的表示方法，但有些可能只能精確到「秒」，有些可以精確到「毫秒」，如果你發現程式碼中有些地方需要除以 1000 或是乘以 1000，就很有可能是在做秒跟毫秒的轉換。
+如果超過這個大小，你會發現請求送不出去，永遠處於 pending 狀態：
 
-上面我們有提到「UTC +0」這東西，這其實就是 +0 時區的意思。
+``` html
+<script>
+  navigator.sendBeacon("/log", 'A'.repeat(65536 + 1));
+</script>
+```
 
-舉例來說，臺灣的時區是 +8，或如果要講得更標準一點，就是 GMT +8 或是 UTC +8，這兩者的區別可以參考：[到底是 GMT+8 還是 UTC+8 ?](https://pansci.asia/archives/84978)，現在的標準基本上都是 UTC 了，所以這篇文章接下來都只會用 UTC。
+![永遠 pending ](/img/navigator-sendbeacon-64kib-and-source-code/p1.png)
 
-## 儲存時間的標準格式
+而且這個限制其實並不是限制單一請求，而是背後有個 queue，這個 queue 只要超過 65536 bytes 就不接受新的東西了。
 
-有了一些基本概念之後，可以來談該如何儲存時間。其中一種儲存方式就是存上面所說的 timestamp，但缺點是無法用肉眼直接看出時間是什麼，一定要經過轉換。
+舉例來說，當我們連續送出 8 個 10000 字的請求時：
 
-而另外一種儲存時間的標準叫做 [ISO 8601](https://www.iso.org/iso-8601-date-and-time-format.html)，在許多地方你都可以發現它的蹤影。
+``` html
+<script>
+  for(let i=1; i<=8; i++) {
+    navigator.sendBeacon("https://httpstat.us/200?log"+i, 'A'.repeat(10000));
+  }
+</script>
+```
 
-例如說 [OpenAPI](https://swagger.io/docs/specification/data-models/data-types/) 裡面有定義了一個格式叫做 `date-time`，它的敘述是這樣寫的：
+你會發現最後兩個一直處於 pending 狀態，送不出去：
 
-> the date-time notation as defined by RFC 3339, section 5.6, for example, 2017-07-21T17:32:28Z
+![超過 queue 的範圍就會一直 pending](/img/navigator-sendbeacon-64kib-and-source-code/p2.png)
 
-如果你直接去看 [RFC 3339](https://tools.ietf.org/html/rfc3339) 的話，開頭的摘要就已經寫明了：
+這是因為前六次 `sendBeacon` 已經把 queue 填到 60000 了，因此最後兩次都塞不下，所以無法接受新的請求，就會永遠處於 pending，就會 queue 空了也不會主動再塞進去。
 
-> This document defines a date and time format for use in Internet protocols that is a profile of the ISO 8601 standard for representation of dates and times using the Gregorian calendar.
+不過嚴格來講這其實也不是 `sendBeacon` 的問題，而是 fetch 加上 keepalive 會有的限制。事實上，`navigator.sendBeacon` 的底層就是 fetch 加上 keepalive。
 
-那這到底是個什麼樣的格式呢？其實就是像 `2020-12-26T12:38:00Z` 這種格式，用字串表現一個帶有時區的時間。
+## navigator.sendBeacon 的規格與 Sentry 的小故事
 
-更詳細的規則可以看 [RFC](https://tools.ietf.org/html/rfc3339#section-5.6)：
+在規格的段落 [3.2 Processing Model](https://w3c.github.io/beacon/#sec-processing-model) 的第六步中，就有提到剛剛講的 queue：
 
-![](/img/date-time/rfc3339.png)
+![spec 中的 queue](/img/navigator-sendbeacon-64kib-and-source-code/p3.png)
 
-RFC 的規則會定義的比較完整，但總而言之就是我上面說的那種形式，然後最後面如果是 Z 就代表 UTC +0，如果要其他時區可以這樣寫：`2020-12-26T12:38:00+08:00`，代表 +8 時區的 12 月 26 號 12 點 38 分 0 秒。
+如果判斷塞不進去 queue 的話，`sendBeacon` 會回傳 false。
 
-在 JavaScript 裡面則是基於一個 ISO 8601 的延伸格式，在 ECMAScript spec 中的 20.4.1.15 Date Time String Format 有提到 ：
+其實這就是 payload 碰到問題時的解法，在呼叫 `sendBeacon` 之後判斷回傳值是否為 false，是的話就進行處理，看是要 fallback 成一般的 fetch，還是自己再做個重試的機制。
+
+而第七步則是 `sendBeacon` 主要做的事情，新建一個 keepalive 的請求然後送出：
+
+![keepalive 的段落](/img/navigator-sendbeacon-64kib-and-source-code/p4.png)
+
+而 fetch + keepalive 的 payload 限制就是 64 KiB，這是有寫在 [spec](https://fetch.spec.whatwg.org/#http-network-or-cache-fetch) 裡的：
+
+![fetch 的 spec](/img/navigator-sendbeacon-64kib-and-source-code/fetch-spec.png)
+
+專門做 error tracking 的服務 Sentry 以前其實就碰過這問題，在 2018 年時有人發現 Sentry 在 fetch 時會預設打開 keepalive，導致有些超過 65536 bytes 的請求送不出去，因此把這個 flag 給拿掉了：
+
+![Sentry 的 issue](/img/navigator-sendbeacon-64kib-and-source-code/p5.png)
+
+來源：[When fetch is used keepalive is the default, and Chrome only allows a POST body <= 65536 bytes in that scenario #1464](https://github.com/getsentry/sentry-javascript/issues/1464)，拿掉的 PR：[ref: Remove keepalive:true as a default and document payload size #1496](https://github.com/getsentry/sentry-javascript/pull/1496)

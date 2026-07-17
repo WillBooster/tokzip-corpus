@@ -1,230 +1,41 @@
-因此無論密碼是否加密，攻擊者都可以拿到明文，只是如果有加密的話，攻擊者取得密碼的成本較高（需要先找到在哪邊加密的，然後把那段改掉）。
+那時候搜到了幾個相關的 issue，但還是想自己查個清楚，就跑去找了 redux-form 的原始碼，研究了幾個小時終於找到出問題的地方。
 
-（話說 HTTPS 要被中間人攻擊的前提也很難滿足就是了，一樣要使用者主動信任惡意憑證，或是 server 端的憑證被入侵）
+在 redux-form [執行 validation](https://github.com/erikras/redux-form/blob/5c13be079476cb0d0430ca88fd3e1abbd09e674a/src/selectors/isValid.js#L37) 的時候，會先檢查 fields 是不是有被註冊過，如果沒被註冊的話，就直接回傳`true`，不會進行任何驗證，我自己加了幾個 console.log 之後，發現問題就是出在這邊，field 沒有被註冊到。
 
-### 攻擊者可以在網路層監聽 request 並使用漏洞取得明文
+接著就來找一下是在哪邊註冊的，發現在`componentWillMount`的時候，會 dispatch 一個 action 來註冊所有的表單欄位（`REGISTER_FIELD`）。
 
-這個狀況跟上一個的不同之處在於這個只能讀，不能寫。若是有辦法解密 request 的封包，就能夠看到明文。
+然後在`componentWillUnmount`的時候，redux-form 會 dispatch 一個 action 叫做`DESTROY`（[相關程式碼](https://github.com/erikras/redux-form/blob/5c13be079476cb0d0430ca88fd3e1abbd09e674a/src/createReduxForm.js#L556)），把所有註冊的 field 給清掉。
 
-所以如果有把密碼先加密，攻擊者就無法取得密碼的明文。
+到目前為止，一切看似都很合理。我在離開 B 頁面的時候，觸發`FormBlock`的`componentWillUnmount`，取消註冊所有的 field，在進入 A 頁面時，觸發`FormBlock`的`componentWillMount`，把所有的 field 重新註冊回來。
 
-這邊需要注意的是儘管無法取得明文，攻擊者依然可以透過重送請求來登入你的帳號（先假設沒有其他機制），所以你帳號還是被盜了，只是攻擊者不知道你的密碼明文。
+可是如果你打開 redux-devtool，會發現順序跟你想像中不太一樣：
 
-這有差嗎？有！
+![form](https://user-images.githubusercontent.com/2755720/49351561-fea9f280-f6ee-11e8-834a-89bd7937b17f.png)
 
-假設他知道了你的密碼明文，就可以拿你的這組帳號密碼去各個服務都試試看，若是你其他網站也用同一組帳號密碼，就會跟著淪陷（俗稱的撞庫攻擊）。
+咦？怎麼會先註冊再刪除？而且因為刪除了，所以驗證就失效了，不會執行任何驗證的邏輯。
 
-因此在這個狀況底下，加密密碼的安全性顯然是更高的。
+再仔細找了一下相關的資料，看到這篇 [Browser back button not working with react-router@4.0.0-beta.7 and react@16-alpha.4](https://github.com/facebook/react/issues/9214#issuecomment-287763538) Issue 以及 Redux 以及 React 的開發者 gaearon 在下面的回答：
 
-此時你可能會想問的問題是：「那在什麼狀況下攻擊者能夠取得 HTTPS 的明文？真的有可能嗎？」
+> In React 15, if A is replaced by B, we unmount A, and then create and mount B:
+  
+> 1. A.componentWillUnmount
+> 2. B.constructor
+> 3. B.componentWillMount
+> 4. B.componentDidMount
+  
+> In Fiber, we create B first, and only later unmount A and mount B:
+  
+> 1. B.constructor
+> 2. B.componentWillMount
+> 3. A.componentWillUnmount
+> 4. B.componentDidMount
 
-這邊有一份美國衛生及公共服務部 HHS 所做的簡報：[SSL/TLS Vulnerabilities](https://www.hhs.gov/sites/default/files/securing-ssl-tls-in-healthcare-tlpwhite.pdf)，裡面有記錄一些 SSL/TLS 曾經有過的漏洞，所以取得 HTTPS 的明文確實是有可能的。
+在 React 16 以後，由於這樣子的順序改變，導致了上面 redux-form 的 lifecycle 執行順序跟預期中不符，也間接導致了我開頭所說的那個 Bug。
 
-不過光是知道「有可能」是不夠的，應該問的是「機率高嗎？」，在討論風險的時候，通常也會根據風險的高低以及嚴重程度來決定該怎麼處理這個風險。
+到了這邊，問題產生的原因一路從 redux-form 本身追到了 React，又更細節的追到了 Fiber，看來，沒辦法再繼續逃避 Fiber 了。
 
-答案是「機率很低」，簡報裡的漏洞最近的已經是 2017 年的事情了，而且是使用一些舊的、有問題的加密演算法，除此之外還需要符合不少其他條件，才能執行攻擊，所以我認為機率確實是很低的。
+先一併奉上跟 redux-form 以及執行順序相關的其他參考資料，再讓我們好好看看 Fiber。
 
-以 2016 年發表的 [DROWN(Decrypting RSA with Obsolete and Weakened eNcryption)](https://drownattack.com/) 來說，Server 要支援 SSLv2，而攻擊者要能抓到加密過的 TLS connection，符合這些條件以後，進行一大堆運算後就可以解開 900 個 connection 中的 1 個，而運算成本在當時是 440 美金，約 13k 台幣。
-
-總之呢，針對這個狀況，我們可以說：
-
-> 假設攻擊者可以取得 HTTPS 的明文，那確實自己在應用層加密會更安全，但要符合這個假設的成本很高，發生機率很低
-
-### 攻擊者直接針對 HTTPS server 進行攻擊
-
-這個分類我指的是在 2014 年發生過的 [Heartbleed](https://devco.re/blog/2014/04/11/openssl-heartbleed-how-to-hack-how-to-protect/) 漏洞，攻擊者可以藉由 OpenSSL 的漏洞讀取到 server 的記憶體。
-
-這個狀況跟上一個滿像的，如果有在 client 端先加密過密碼，那攻擊者在 server 上讀到的就是加密過後的，不知道密碼明文是什麼。
-
-所以結論跟上個一樣，就是加密密碼會更安全。
-
-## 中場總結
-
-剛剛我們討論了幾種「HTTPS 變得不安全」的狀況，從以往發生過的案例可以得知「HTTPS 變得不安全」是有可能的。若是攻擊者能夠讀到 HTTPS 傳輸的明文，那在應用層將密碼加密，就能防止攻擊者取得密碼的明文，因此會比沒有加密來得更安全。
-
-如果要講得更詳細，可以從兩個維度去切入，一個是嚴重性（severity），另一個是可能性（possibility）。
-
-以嚴重性來說，不管有沒有加密密碼，只要攻擊者有辦法拿到 request 的內容，你的帳號就已經淪陷了，而有沒有加密唯一的差別只有攻擊者是否能取得明文密碼，有的話就可以執行撞庫攻擊，拿密碼去試更多其他的網站。
-
-而可能性就是「HTTPS 的明文被拿到」這件事的可能性，從過往的經歷以及研究來看，雖然是有可能的，但在 2023 年的今天，機率是很低的。
-
-因此我們現階段的結論應該是：
-
-攻擊者若是可以繞過 HTTPS 拿到明文的 request，那在應用層將密碼加密，確實會比較安全，但要注意的是要達成這個前提非常困難，發生的機率極低。
-
-## 假設 HTTPS 是安全的
-
-接下來我們討論第二種狀況，那就是假設 HTTPS 是安全的，沒有任何人可以從中間看到明文的內容，這應該也是留言區中大多數人假設的前提。
-
-在這種狀況下，會有哪些風險呢？
-
-有一個現實生活中會發生，而且也確實發生過的風險，那就是 logging。
-
-身為前端工程師，在前端加裝一些 error tracking 的服務是很合理的事情，若是我們直接實作一個「只要伺服器回傳 5xx，就把 request 記錄起來」的機制，如果好巧不巧哪天登入的 API 出現這個狀況，你就可以在 log 裡面看到使用者的明文密碼。
-
-而且不只前端，後端也可能有類似的機制，碰到一些問題就把 request 整個寫到 log 檔去，方便以後查看以及 debug，一不小心密碼就可能被寫進去。
-
-在這種狀況下，在 client 端先把密碼加密顯然是有好處的，那就是在這些錯誤處理的 log 中，被記錄下來的密碼會是密文，除非你有密鑰，否則你是不會知道使用者的密碼的。
-
-我在網路上找到一篇跟我論點一樣的文章：[The case for client-side hashing: logging passwords by mistake](https://www.sjoerdlangkemper.nl/2020/02/12/the-case-for-client-side-hashing-logging-passwords-by-mistake/)，裡面有附上很多參考連結，都是以前各大公司不小心把密碼的明文記錄下來的案例。
-
-然後有個小地方稍微講一下，上面這篇做的是「在 client 端 hash」，跟我這篇一開始設定的「在 client 端做非對稱式加密」有點不同，hash 會更安全一點，確保在 server 真的沒人知道你的密碼明文是什麼。
-
-總之呢，在 client 端先把密碼加密或是 hash，可以避免在日誌中不小心出現使用者的密碼明文，這個顯然是個額外的優點。
-
-## 加密還是 hash？
-
-文章開頭我有提到 hash 的狀況有些複雜，所以我先把情境設定在「對密碼做非對稱式加密」再傳輸，因為對上面我舉的那些例子而言，這兩種情境的差異不大。
-
-舉例來說，HTTPS 被拿到明文內容，無論你對密碼做了非對稱式加密還是雜湊，在攻擊者無法取得伺服器端密鑰的前提之下，都是拿不到明文密碼的。
-
-那為什麼 hash 的狀況有些複雜呢？
-
-假設我們在前端先把密碼 hash 過後再傳到後端，那後端是要直接存進去資料庫嗎？如果直接存進去資料庫，哪天資料庫的內容曝光，攻擊者就拿到這些 hash 過的密碼了。
-
-通常在有加鹽以及雜湊演算法夠強的前提之下，被拿到 hash 的密碼還是能保證一定的安全性，可是在這種情況下，反而變得很不安全。
-
-因為前端傳給後端的內容已經是 hash 過的了，所以攻擊者可以直接拿 hash 過的密碼進行登入，根本不用知道明文是什麼。雖然保護了明文，但失去了原本雜湊的安全性。
-
-因此如果要做 client side hashing，server side 收到後也要再做一次。如此一來，就算資料庫被偷走，攻擊者也沒辦法利用資料庫中的 hash 直接登入。
-
-有些人可能跟我一樣好奇：「做兩次 hash 不會更不安全嗎？」，我們可以看一下 Google 在 [Modern password security for system designers](https://cloud.google.com/static/solutions/modern-password-security-for-system-designers.pdf) 裡面怎麼說：
-
-> Have the client computer hash the password using a cryptographically secure algorithm and a unique salt provided by the server. When the password is received by the server, hash it again with a different salt that is unknown to the client. Be sure to store both salts securely. If you are using a modern and secure hashing algorithm, repeated hashing does not reduce entropy.
-
-看起來是還好，問題不大。
-
-（感謝 HowardCsie 的留言補充，並不是所有的 hash 演算法都不會有問題，可參考：[Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) 與 [Security Issue: Combining Bcrypt With Other Hash Functions](https://blog.ircmaxell.com/2015/03/security-issue-combining-bcrypt-with.html) 這兩篇文章）
-
-總之呢，看起來最安全的但也更複雜的解法就是 client side 先 hash 一次，然後丟到 server 的時候再 hash 一次存進資料庫，如此一來就可以保證：
-
-1. HTTPS 因為各種原因失效時，攻擊者無法取得明文密碼
-2. 在 Server 端，沒有任何人知道使用者的明文密碼
-3. 明文密碼不會因為人為失誤被記錄到 log 中
-
-那如果真的比較好用，為什麼沒人在用？
-
-## 現實生活中，到底有誰在前端做 hash 或是加密？
-
-當我一開始碰到這個問題，講出「怎麼沒人在用」的時候，其實只是「我自己沒碰過有人這樣用」，但實際上我並不知道那些知名網站的登入是怎麼做的。
-
-因此呢，我就直接去看了幾個知名網站的登入機制，我們一起來看一下結果，為了方便觀看，我把跟帳號密碼無關的內容都拿掉了。
-
-我在測試的時候，基本上都是用 test 或是 test@test.com 搭配簡單的密碼如 1234 在測試，然後觀察 request 的內容。
-
-先來看一下 FAANG 吧！
-
-### FAANG
-
-#### Facebook
-
-API 網址：`https://zh-tw.facebook.com/login`
-
-請求內容：
-
-```
-email=test@test.com
-encpass=#PWD_BROWSER:5:1673256089:AbJQAJUvZZNvh2dZbeDqdu9dp7HWwyHOl3+0sCGjiHMMjvYdxJokpdHE/O+E5LIbnakRmDWQfV40ZaB31MaNXFYo1b+RI+LHh6MAdDPa4PJ+BesDp4u8B4F4diVQ+q7idbEhT5wTNaU=
-```
-
-沒想到 Facebook 就是有實作前端加密的網站！後面那段 Base64 並不是直接把密碼 Base64，而是把加密過的密碼做 Base64，解出來是這樣：`\x01²P\x00\x95/e\x93o\x87gYmàêvï]§±ÖÃ!Î\x97\x7F´°!£\x88s\f\x8Eö\x1DÄ\x9A$¥ÑÄüï\x84ä²\x1B\x9D©\x11\x985\x90}^4e wÔÆ\x8D\\V(Õ¿\x91#âÇ\x87£\x00t3Úàò~\x05ë\x03§\x8B¼\x07\x81xv%Pú®âu±!O\x9C\x135¥`
-
-#### Amazon
-
-API 網址：`https://www.amazon.com/ap/signin`
-請求內容：`email=test@test.com&password=1234`
-
-#### Apple
-
-API 網址：`https://idmsa.apple.com/appleauth/auth/signin`
-請求內容：`{"accountName":"test@test.com","password":"1234"}`
-
-#### Netflix
-
-API 網址：`https://www.netflix.com/tw/login`
-請求內容：`userLoginId=test@test.com&password=1234`
-
-
-#### Google
-
-API 網址：`https://accounts.google.com/v3/signin/_/AccountsSignInUi/data/batchexecute`
-
-請求內容：
-```
-f.req=[[["14hajb","[1,1,null,[1,null,null,null,[\"1234\",null,true]]]]
-```
-
-看來 FAANG 裡面，只有 Facebook 是有實作的。
-
-接著我突然好奇起其他常用服務的登入有沒有做，底下貼結果。
-
-#### GitHub
-
-API 網址：`https://github.com/session`
-請求內容：`login=test@test.com&password=1234`
-
-#### Microsoft
-
-API 網址：`https://login.live.com/ppsecure/post.srf`
-請求內容：`login=test@test.com&passwd=1234`
-
-#### IBM cloud
-
-API 網址：`https://cloud.ibm.com/login/doLogin`
-請求內容：`{"username":"test@test.com","password":"1234"}`
-
-看來有實作的是少數，那資安廠商呢？資安廠商自己有做嗎？
-
-### 資安廠商
-
-#### Kaspersky
-
-API 網址：`https://eu.uis.kaspersky.com/v3/logon/proceed`
-請求內容：`{"login":"test@test.com","password":"12345678"}`
-
-#### 趨勢
-
-API 網址：`https://sso1.trendmicro.com/api/usersigninauth`
-請求內容：`{"email":"test@test.com","password":"12345678"}`
-
-#### Tenable
-
-API 網址：`https://cloud.tenable.com/session`
-請求內容：`{"username":"test","password":"1234"}`
-
-#### Proton 
-
-這個應該不算資安廠商，但突然很好奇強調隱私的 Proton 是怎麼做的，一看發現好像很複雜。
-
-在登入的時候會先把 username 送過去，拿到一些看起來是 key 的東西。
-
-API 網址：`https://account.proton.me/api/auth/info`
-
-```
-{"Username":"test@test.com"}
-```
-
-```
-{
-  "Code":1000,
-  "Modulus":"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nu9K5yr97L9VV2ijOSI62tJcewUiRhQa8qJa24baNpGyw0lf3JLiF4fxUHqTErwF9UdoxE0z4Kb147naphylBFddyKsjhzHNcxk2rBw9haiPxD69BrVYm0n+LVlPqmjXFF7btr1H7oqHGX4b4Dy9omL/KaZz/Dco2NEhw0UBhEZbTAs6Ch01ur9XLbSOI7yb6MRsqCehfy82gDTdbPtXvqQsQjg5XoC2Ib2qTYFaU/24mq/gOaMbVuAGX0hBYzr5NpN9ol2XCdHOLg28Xe90+kisg39VV04axy7Ndvh489dC1CxjcWSSpXd6cPJyOn/HH9aPeTZeucBllRGbPgwR6/w==\n-----BEGIN PGP SIGNATURE-----\nVersion: ProtonMail\nComment: https://protonmail.com\n\nwl4EARYIABAFAlwB1j0JEDUFhcTpUY8mAAD1GwEAoC91QCSfXPEuWM13NZvy\nvL9NQIABuSrVOvgJwMhUTnUBAPb4zbIdTYFOQNrPLvonJt2mmRNy4lGcW7uN\n5yHzJ18J\n=Oykn\n-----END PGP SIGNATURE-----\n",
-  "ServerEphemeral":"DY6eRYM1bqYZZ5jzZFdWv88tKYP2PnS0y4A+f7/eqMXj8wB2VefV2kfIDrZ5AorWfDzBq4wMtNG2k5dzbT2qWppzpvltrSl2Nm4i8eWIRVxXWHl/46dGuPXFHUcXBNMP3XEQvft0YEbHOPO9Es0RZRaObV5XPFyx6kzOJxXc1tIt4PfbhODMfsAoy/yxt6eLN3HUiORCBOvzsH2sfG99Gx1YSAe3GL6g/K+bdg59eglueXRESoB0/VFRsvQevi9nVXx/JZNTG0U4BBUOlMjpYYMgEP6eQgZZ/09ZPYD3a2tW65mSnNt6lSDfwiKj02UuDqymTvj7mYm44T0SuAocwg==",
-  "Version":4,
-  "Salt":"dI7OcD+K4rGPBA==",
-  "SRPSession":"3fa6224285409b6af07c811971e05341"
-}
-```
-
-接著輸入密碼登入時，會送出如下的 request，看起來也很複雜：
-
-```
-{
-  "ClientProof":"I9Nfd0Nd3OzODf2nt9zLxFHWogEwfRje8zjoeZnblyLfyzz23uXTjJ4qgRFomjIEEtZrlM1jTQa4wRIMGIIV7E6pMqq8c6wcc2tegP4Xt76S0EbnVtE1F9i0Wj46aCPUM0Mha3Zmgi9LKerrGlaftr2FBedjPFT9rPrbLqRQcFNMD33tn69gD/p28q4RAr3/7d/tz7TYhytD5oxCAUwrkqiZOi0kg//2mUJ9YNT2nWcgqUERoaU51NbNMcaPnMteEe1PlIJdiQbvNa5K07u8rk7itpBrGW2FP26bREp0UMTzNYM5HcDDkmp4dp9GoBjFJL9n0THUdt/oRRJ/Enj5WQ==",
-  "ClientEphemeral":"D013N7FXYHylqMeWa6ctJIv3J4uF1hqodyYfw6O+Sj7MZOIB+wksfgk/nkXCmRxQhuSYwqwMJIpyFD3MEolOZAHMU2n6HQlxe9A4KbrE4gk3UiGwfgcZDmFejTmMMxfWhf4zO2Z1fBbohreqwwN0mz3AqqsfE5dsDh3LEfkiJB449YGZfHeUHyIzS1jTmnx/8l6uVSKwJDCJelVFYKMXrxVt0ltcGRoYD92MUj82kR0am+BN4+djHyYYXuwuIYArnTW4kDP3T2yCIAMVgZnFaUCc2gfynt40mQP4q87jmMELOl8TDIDo5iKyH4gJc/470qIuIyj4ffVLiZ7t8S+kcw==",
-  "SRPSession":"3fa6224285409b6af07c811971e05341",
-  "Username":"test@test.com",
-  "Payload":{
-    "qcA_CRYU6gSyHWdn":"c6UZSKPo4Sfm/3+DvQN72TTxyj+/TplKT9edDiUI5wMfGUsoJs9FGerOtkoW8T49r7KOvqHkzS2+M2v8ra7J9l5kSf5jgC9ZvgZ8Ja5Xgg02nxgAABydOirGLoL4htFsYVtwLrNg8NeSEanLwYLCVaSqkjANRJks0eaKpUOd8xRhCFtUH/GCbyg27oZfzDsqKXemKprOUsOh42NTqzEmruAkxs2x8mUsLy/vXptVAdaiJLrsSRqD0YBGjvOp4W2/0g6V2zfedJpJEzVwtSi1vXTC5bwxmEJlYdV9AiQECogAAJFxLQi7JjtmgFe4tNcv97JD0B8giZ6XS35swjz0vz0mOjVBUwmiDa8n54Y5kBaAoZe5pijdp2S4SOcRAknDIcD1nf0v7oSMOE9WtH/sa+XI1D2s5lFKo/iInf7r5R9src2hHFoy0b2XT0oCfLPwFX87yjaKbf7bbkjByx/3dOgzEliAkS6nHK+fmeDDVM4EoZqVSKZHLg3QTcg4DKaICyDsotALr2UqI/ARzkX4yhAXz5xHFaxl6hWAKLJPJcgk6il6oX0s0PCBNSY0Fi3vbQvXD4WalUx+LBNto6CUqeAIzVuAh8sCubzufoSORypE5WqfnuJzAlZ9sMEjaQycuRi497aV3jmjgx53UwO0OiZGxDTEMFBcov4P0g1blZ4vxmULhZU0RfdP31udLr6GTCAB90CM6Vk9w9CsYM+hmo3+JpEAtIVgLVVqcPikTbV+yaOJ1RknxBf3g06kTl0LQ+zBV6pG2rFVi8G4XT9L4FsIgxTNsl/ryzs8vJU7K+HvyE1Lp2pAXrfcju7TAIqK/FOXvp1c8Ay9O6d4fmd/PZalnRDv5mQ6Gmd6JSNzNh6i6AibBuF13w3OBaulY3FGNU/cH/AXLBIqjSzf/OySwkKkC9HBurSs3D0zqcH9BwUpmPEL8jbc8yPE+hPAim+tDo1BXCQNClxgGLaI6FXkuCiQ4AHiKsq0xs5b3WAFzcvBv1rc003RWxRegH/2teIooKU9w1kDPQRaK8/rIYe8u+BlBeZq4OwCXxx56JHfmTxtJwBi95KqsWzLGtY3ILcb+/XkzSRmE2TWbkW1IXzRsl8F6NSJj7JnHA3UrQf4hxuwbaYxpKJrcHuHc8e1wxqXrUSKooCOUxwSBgxvLLT37eaByNTxpfWomxIsH671wuydnmMedWyNIqyaMtxBORuiWUiG4jbMC2BjrVptXJ7VWigf3Vy5OQlMOyTx8tLWi1qZODYyywMBAvHYQlFfSqmIrm4y4dmK/srJE/+daEnNS+kWF48Jm/rQORO5AUwqWL+Lefg9pchcL1BnHOANcviO8pAkxLo8TiK7VLKI5/xUsZQoQSlhRt27zMF+sIv+exY375HApiY+a1VQ6OqE4Nvba7O8ETLoLFg4a8Aj+W8erXFHW5F0vVIRphAve9orM4QYnAmOigFAiLb0Pxx124wUjFR9s5oP98hAtNL/t+uGAXrb0oxiCfyHb9wa2Qb0x6o9FpuBIc5ZXId+cEXEvOdqhnUQ7ZuOi/fX81hlqgUaiD/A6P+zjAcREXdktd+hrhSXwCIKSBkp/mNymnalQKJkLaNVT+W2sOWqXxTSTIytCQx36xABcj1BXRApntob6Qvche8QJLTjzr9bDpn+Mo59N9PSU51DPIj5Avre6ChTHEQvjz9s1IM2XroBX/KFBnPj33aYQZyov4uxrVXxic+fiY+fLMF8x1ut/eNWeQU6fn+rU5PEGQ9bbAsjVBZYA5H93ROhO5lnSxoEk5PHkgQ9WpxueckPjJIUGAs+O8QMRFicccfKjhNIc32rXTqbVqLyoz62riDn8Y18MUBoeI8ORyqZOKEEBFsi5dwqoq8t82NFdx5LFjsLdk4RmMXZ2uygNLk8gH2Yyfu3iOQS2bKtNCW42Xmo66Xu5kt8NwAneYQK0mTn6HUv94K10J4hY+Q="
-  }
-}
-```
+1. [Re-mounting a Field component erases the field-level validation function](https://github.com/erikras/redux-form/issues/3566)
+2. [Ordering of componentWillMount/Unmount in React 16](https://github.com/facebook/react/issues/12233)
+3. [Asynchronous ComponentWillUnmount in React 16](https://github.com/facebook/react/issues/11106)

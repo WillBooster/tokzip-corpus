@@ -1,227 +1,97 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
-#if !NETFRAMEWORK
-#pragma warning disable format // Temporary until release of https://github.com/dotnet/roslyn/issues/62612
-#endif
-
-#if NETFRAMEWORK
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Reflection;
-using System.Security;
-using System.Security.Permissions;
-using System.Security.Policy;
-using NUnit.Framework.Internal;
+using System.IO;
 
-namespace NUnit.Framework.Tests.Assertions
+namespace NUnit.Framework.Internal
 {
-    [TestFixture]
-    [Platform(Exclude = "Mono,MonoTouch", Reason = "Mono does not implement Code Access Security")]
-    public class LowTrustFixture
-    {
-        private TestSandBox _sandBox;
-
-        [OneTimeSetUp]
-        public void CreateSandBox()
-        {
-            _sandBox = new TestSandBox();
-        }
-
-        [OneTimeTearDown]
-        public void DisposeSandBox()
-        {
-            _sandBox.Dispose();
-        }
-
-        [Test]
-        public void AssertEqualityInLowTrustSandBox()
-        {
-            Assert.That(
-                () => _sandBox.Run(() => Assert.That(1, Is.EqualTo(1))),
-                Throws.Exception.InstanceOf<MemberAccessException>());
-        }
-
-        [Test]
-        public void AssertEqualityWithToleranceInLowTrustSandBox()
-        {
-            Assert.That(
-                () => _sandBox.Run(() => Assert.That(10.5, Is.EqualTo(10.5))),
-                Throws.Exception.InstanceOf<MemberAccessException>());
-        }
-
-        [Test]
-        public void AssertThrowsInLowTrustSandBox()
-        {
-            Assert.That(
-                () => _sandBox.Run(() => Assert.Throws<SecurityException>(() => new SecurityPermission(SecurityPermissionFlag.Infrastructure).Demand())),
-                Throws.Exception.InstanceOf<MemberAccessException>());
-        }
-    }
-
     /// <summary>
-    /// A facade for an <see cref="AppDomain"/> with partial trust privileges.
+    /// InternalTrace provides facilities for tracing the execution
+    /// of the NUnit framework. Tests and classes under test may make use
+    /// of Console writes, System.Diagnostics.Trace or various loggers and
+    /// NUnit itself traps and processes each of them. For that reason, a
+    /// separate internal trace is needed.
+    ///
+    /// Note:
+    /// InternalTrace uses a global lock to allow multiple threads to write
+    /// trace messages. This can easily make it a bottleneck so it must be
+    /// used sparingly. Keep the trace Level as low as possible and only
+    /// insert InternalTrace writes where they are needed.
+    /// TODO: add some buffering and a separate writer thread as an option.
+    /// TODO: figure out a way to turn on trace in specific classes only.
     /// </summary>
-    public sealed class TestSandBox : IDisposable
+    public static class InternalTrace
     {
-        private readonly AppDomain _appDomain;
-
-        #region Constructor(s)
-
-        /// <summary>
-        /// Creates a low trust <see cref="TestSandBox"/> instance.
-        /// </summary>
-        /// <param name="fullTrustAssemblies">Strong named assemblies that will have full trust in the sandbox.</param>
-        public TestSandBox(params Assembly[] fullTrustAssemblies)
-            : this(null, fullTrustAssemblies)
-        {
-        }
+        private static InternalTraceLevel _traceLevel;
+        private static InternalTraceWriter? _traceWriter;
 
         /// <summary>
-        /// Creates a partial trust <see cref="TestSandBox"/> instance with a given set of permissions.
+        /// Gets a flag indicating whether the InternalTrace is initialized
         /// </summary>
-        /// <param name="permissions">Optional <see cref="TestSandBox"/> permission set. By default a minimal trust
-        /// permission set is used.</param>
-        /// <param name="fullTrustAssemblies">Strong named assemblies that will have full trust in the sandbox.</param>
-        public TestSandBox(PermissionSet? permissions, params Assembly[] fullTrustAssemblies)
+        public static bool Initialized => _traceWriter is not null;
+
+        /// <summary>
+        /// Initialize the internal trace facility using the name of the log
+        /// to be written to and the trace level.
+        /// </summary>
+        /// <param name="logName">The log name</param>
+        /// <param name="level">The trace level</param>
+        public static void Initialize(string logName, InternalTraceLevel level)
         {
-            var setup = new AppDomainSetup { ApplicationBase = AppDomain.CurrentDomain.BaseDirectory };
-
-            var strongNames = new HashSet<StrongName>();
-
-            // Grant full trust to NUnit.Framework assembly to enable use of NUnit assertions in sandboxed test code.
-            strongNames.Add(GetStrongName(typeof(TestAttribute).Assembly));
-            if (fullTrustAssemblies is not null)
+            if (_traceWriter is null)
             {
-                foreach (var assembly in fullTrustAssemblies)
+                _traceLevel = level;
+
+                if (_traceLevel > InternalTraceLevel.Off)
                 {
-                    strongNames.Add(GetStrongName(assembly));
+                    _traceWriter = new InternalTraceWriter(logName);
+                    _traceWriter.WriteLine("InternalTrace: Initializing to level {0}", _traceLevel);
                 }
             }
-
-            _appDomain = AppDomain.CreateDomain(
-                "TestSandBox" + DateTime.Now.Ticks, null!, setup,
-                permissions ?? GetLowTrustPermissionSet(),
-                strongNames.ToArray());
-        }
-
-        #endregion
-
-        #region Finalizer and Dispose methods
-
-        /// <summary>
-        /// The <see cref="TestSandBox"/> finalizer.
-        /// </summary>
-        ~TestSandBox()
-        {
-            Dispose(false);
-        }
-
-        /// <summary>
-        /// Unloads the <see cref="AppDomain"/>.
-        /// </summary>
-        public void Dispose()
-        {
-            Dispose(true);
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Unloads the <see cref="AppDomain"/>.
-        /// </summary>
-        /// <param name="disposing">Indicates whether this method is called from <see cref="Dispose()"/>.</param>
-        private void Dispose(bool disposing)
-        {
-            AppDomain.Unload(_appDomain);
-        }
-
-        #endregion
-
-        #region PermissionSet factory methods
-        public static PermissionSet GetLowTrustPermissionSet()
-        {
-            var permissions = new PermissionSet(PermissionState.None);
-#pragma warning disable SA1025 // Code should not contain multiple whitespace in a row
-            permissions.AddPermission(new SecurityPermission(
-                SecurityPermissionFlag.Execution |                  // Required to execute test code
-                SecurityPermissionFlag.SerializationFormatter));    // Required to support cross-appdomain test result formatting by NUnit TestContext
-            permissions.AddPermission(new ReflectionPermission(
-                ReflectionPermissionFlag.MemberAccess));            // Required to instantiate classes that contain test code and to get cross-appdomain communication to work.
-#pragma warning restore SA1025 // Code should not contain multiple whitespace in a row
-            return permissions;
-        }
-
-        #endregion
-
-        #region Run methods
-
-        public void Run(Action action)
-        {
-            Run(action.Method);
-        }
-        public object? Run(MethodInfo method, params object[] parameters)
-        {
-            if (method is null)
-                throw new ArgumentNullException(nameof(method));
-            if (_appDomain is null)
-                throw new ObjectDisposedException(null);
-
-            var methodRunnerType = typeof(MethodRunner);
-            var methodRunnerProxy = (MethodRunner?)_appDomain.CreateInstanceAndUnwrap(
-                methodRunnerType.Assembly.FullName!, methodRunnerType.FullName!);
-            Assert.That(methodRunnerProxy, Is.Not.Null);
-
-            try
+            else
             {
-                return methodRunnerProxy.Run(method, parameters);
-            }
-            catch (Exception e)
-            {
-                throw e.Unwrap();
+                _traceWriter.WriteLine($"InternalTrace: Ignoring attempted re-initialization from level {_traceLevel} to level {level}");
             }
         }
 
-        #endregion
-
-        #region Private methods
-
-        private static StrongName GetStrongName(Assembly assembly)
+        /// <summary>
+        /// Initialize the internal trace using a provided TextWriter and level
+        /// </summary>
+        /// <param name="writer">A TextWriter</param>
+        /// <param name="level">The InternalTraceLevel</param>
+        public static void Initialize(TextWriter writer, InternalTraceLevel level)
         {
-            AssemblyName assemblyName = assembly.GetName();
-
-            byte[]? publicKey = assembly.GetName().GetPublicKey();
-            if (publicKey is null || publicKey.Length == 0)
+            if (_traceWriter is null)
             {
-                throw new InvalidOperationException("Assembly is not strongly named");
-            }
+                _traceLevel = level;
 
-            return new StrongName(new StrongNamePublicKeyBlob(publicKey), assemblyName.Name, assemblyName.Version);
-        }
-
-        #endregion
-
-        #region Inner classes
-
-        [Serializable]
-        internal class MethodRunner : MarshalByRefObject
-        {
-            public object? Run(MethodInfo method, params object[] parameters)
-            {
-                var instance = method.IsStatic
-                    ? null
-                    : Activator.CreateInstance(method.ReflectedType!);
-                try
+                if (_traceLevel > InternalTraceLevel.Off)
                 {
-                    return method.Invoke(instance, parameters);
-                }
-                catch (TargetInvocationException e)
-                {
-                    throw e.Unwrap();
+                    _traceWriter = new InternalTraceWriter(writer);
+                    _traceWriter.WriteLine($"InternalTrace: Initializing to level {_traceLevel}");
                 }
             }
+            else
+            {
+                _traceWriter.WriteLine($"InternalTrace: Ignoring attempted re-initialization from level {_traceLevel} to level {level}");
+            }
         }
 
-        #endregion
+        /// <summary>
+        /// Get a named Logger
+        /// </summary>
+        /// <returns></returns>
+        public static Logger GetLogger(string name)
+        {
+            return new Logger(name, _traceLevel, _traceWriter);
+        }
+
+        /// <summary>
+        /// Get a logger named for a particular Type.
+        /// </summary>
+        public static Logger GetLogger(Type type)
+        {
+            return GetLogger(type.FullName());
+        }
     }
 }
-#endif

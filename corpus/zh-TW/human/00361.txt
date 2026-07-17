@@ -1,12 +1,264 @@
----
-title: JavaScript 中的同步與非同步（上）：先成為 callback 大師吧！
-date: 2019-10-04 22:07
-catalog: true
-tags: [JavaScript,Front-end]
-categories:
-  - JavaScript
----
+如果你有用過 React 的 styled-components 或類似的東西，應該寫過像這樣的程式碼：
 
-## 前言
+``` js
+const Box = styled.div`
+  background: red;
+`
+```
 
-如果要舉出一個在 JavaScript 裡面很重要也很常用，但新手常常搞混的概念，那「非同步（Asynchronous）」當仁不讓，絕對是第一名。跟其他那些 [this](https://blog.huli.tw/2019/02/23/javascript-what-is-this/)、[closure](https://blog.huli.tw/2018/12/08/javascript-closure/)、[prototype](https://blog.huli.tw/2017/08/27/the-javascripts-prototype-chain/) 或是 [hoisting](https://blog.huli.tw/2018/11/10/javascript-hoisting-and-tdz/) 比起來，非同步在實際開發的時候用到的頻率高太多了，而且是初學者常常會踩坑的地方。
+為什麼這樣就可以產生出一個 component 呢？這是因為反引號除了可以用來當作 template string 以外，也可以拿來當作函式呼叫，這我在 [ Intigriti’s 0521 XSS 挑戰解法：限定字元組合程式碼](https://blog.huli.tw/2021/06/07/xss-challenge-by-intigriti-writeup-may/)裡面有提到過。
+
+所以可以這樣寫：
+
+``` js
+alert`1`
+```
+
+那如果現在連反引號都不能用呢？有沒有其他方法？
+
+有一個我第一次看到的時候讚嘆了許久的方法：
+
+``` js
+onerror=alert;throw 1
+```
+
+它把 `window.onerror` 改寫成 `alert`，再拋出一個錯誤，而這個錯誤因為沒有被 catch 到，就會被 `window.onerror` 接住，最後被丟到 alert 裡面執行。
+
+除了 alert 以外，改寫一下就可以執行任意程式碼：
+
+``` js
+onerror=eval;
+throw "=alert\x281\x29"
+```
+
+第一行跟剛剛一樣，只是這次把 `onerror` 變成了 `eval`，但第二行是在做什麼呢？先講一下那個 `\x28` 跟 `\x29`，分別是 `()` 的編碼。
+
+但為什麼前面多一個 `=`？
+
+這是因為把錯誤拋出去的時候，如果是 Chrome，它最後會產生的字串是：`Uncaught {err_message}`，像是 `throw 1`，就會產生出 `Uncaught 1`，但這樣並不是一段 JavaScript 程式碼，丟到 `eval` 會直接噴出錯誤。
+
+所以我們把 `"=alert\x281\x29"` 丟出去，就會變成 `Uncaught=alert\x281\x29`，整句變成了一個 expression，`Uncaught` 被當作是沒有宣告的全域變數，它的值是 `alert(1)` 的回傳值，如此一來，整段 error message 就變成合法的 JavaScript 程式碼了！利用這樣的方式丟給 eval，就可以正常執行。
+
+其實還有一些更驚人的手法，但篇幅有限而且有些我也還在努力看懂，所以就先在此打住，以下圖做個總結：
+
+
+![](/img/learn-frontend-from-security-pov/p2-explosion.jpg)
+
+### 字數限制
+
+除了上面那些屬性以及字元的限制以外，還有另一種限制叫做字數限制。
+
+舉例來說，如果有個網站的暱稱有 XSS 漏洞，可是只能輸入最多 25 個字，這種情況下只跳出一個 alert 是沒有殺傷力的，你有辦法執行任意程式碼嗎？
+
+最短的 XSS payload `<svg/onload=>` 的這個骨架就有 13 個字了，因此我們只剩下 12 個字可以來執行程式碼，這時候就需要用到一個技巧，那就是「利用現有資訊」，像是這樣：
+
+``` js
+// 13 + 18 = 31 字
+<svg/onload=eval(`'`+location)>
+```
+
+這短短的程式碼隱藏了不少細節，首先呢，如果你想拿到網址，你會怎麼做？`location.href` 嗎？更短的做法是把 `location` 轉成字串，你一樣能拿到網址。但網址本身不是合法的程式碼，所以我們要在前面加上一個單引號，接著再利用網址列上的 `#`，例如說這樣：`https://example.com#';alert(1)`，跟單引號拼起來就會變成：
+
+``` js
+'https://example.com#';alert(1)
+```
+
+這就是一段合法的 JavaScript 程式碼了，因為它變成一個字串後面接指令！
+
+除了 `location` 以外，`document.URL` 也可以拿到網址，但這字數明顯比 `locaton` 多，可是你知道嗎，`document` 可以省略，變成這樣：
+
+``` js
+// 13 + 13 = 26 字
+<svg/onload=eval(`'`+URL)>
+```
+
+為什麼不需要寫 `document`？這是因為有個隱藏的規格，在 event handler 裡面的 inline 程式碼，預設就會有 document 這個 scope：
+
+![](/img/learn-frontend-from-security-pov/p3-spec.jpg)
+
+用 debugger 看也很明顯，所以儘管我們只輸入 URL，也會因為 scope 跟 with 的關係找到 document.URL
+
+![](/img/learn-frontend-from-security-pov/p4-debugger.jpg)
+
+只差一個字就可以壓在 25 個字以內了，還有其他招式嗎？有，請先看一下底下的程式碼，你預期的輸出是什麼？
+
+``` js
+name = 123
+console.log(typeof name === 'number')
+```
+
+應該是 true 對吧？123 是數字，十分合理啊！但如果你真的在瀏覽器上面執行，會發現輸出居然是 false，因為 `typeof name` 是 string！
+
+這是因為 name 是一個特別的屬性，它代表了這個視窗的名稱，或簡單一點也可以想成是這個分頁的名稱，換句話說，同一個分頁儘管內容不同，依然會共享同一個名稱！
+
+假設我要攻擊的網站是 example.com，我的網站是 huli.tw，我可以在我的網站底下這樣寫：
+
+``` html
+<script>
+  name = 'alert(1)'
+  window.location = 'http://example.com'
+</script>
+```
+
+設置完 name 以後跳轉過去目標網站，接著在目標網站輸入這組 payload：
+
+``` js
+// 13 + 10 = 23 字
+<svg/onload=eval(name)>
+```
+
+因為 name 會共享的關係，就可以成功執行我想要的程式碼，這次只要 23 個字，成功壓在 25 個字以內。
+
+有一個網站叫做 [Tiny XSS Payloades](https://tinyxss.terjanq.me/)，專門收集這些很短的 payload，裡面有更多千奇百怪的 payload，有需要的話可以參考看看，我所知道的 payload 也都是從這個網站來的。
+
+## XS leaks
+
+上面講完了一些限制的繞過以後，我們來看看另一個主題，叫做 Cross-Site Leaks（簡寫為 XS Leaks），這個攻擊其實就是網頁上的一種 side-channel attack，有關於 side-channel attack，我之前在 [CORS 完全手冊（五）：跨來源的安全性問題](https://blog.huli.tw/2021/02/19/cors-guide-5/)裡面有提到過，用很知名的 Spectre 來舉例。
+
+什麼是 side-channel attack 呢？就是你透過一些方法「間接」得知了資訊，例如說假設你面前有一個燈泡，但你的眼睛完全看不見，連光源都感受不到，你要怎麼知道這個燈泡現在是亮的還是不亮的？
+
+有一種方式是透過「溫度」，因為燈泡如果亮著會發光，可能會產生熱能（先假設這前提為真然後忽略一些 edge case，舉例用途而已），因此你摸燈泡的時候就感覺得到熱度，這就是透過溫度間接得知了燈泡亮不亮這個資訊。
+
+把這個概念用在網頁上的話也是類似的，透過一些方法間接得知網頁上的資訊，我們來看兩個例子。
+
+### 搜尋與下載
+
+假設現在有一個具有搜尋與下載功能的網站，可以在 query string 直接帶入想要搜尋的字串，例如說 `https://example.com/download?q=example`，如果資料庫裡面沒有符合的資料，就會出現一個「查無使用者」的畫面：
+
+![](/img/learn-frontend-from-security-pov/p5-search1.png)
+
+反之，如果有資料的話，就會直接跳出原生的檔案下載視窗，讓你直接下載相對應的檔案：
+
+![](/img/learn-frontend-from-security-pov/p6-search2.png)
+
+身為一個攻擊者，我們知道這個資訊以後可以做些什麼呢？
+
+假設我有一個自己的網站，網址是 `https://huli.tw`，接著我在我的網站上面把剛剛的範例網站用 iframe 嵌入：
+
+``` js
+const iframe = document.createElement('iframe')
+iframe.src = "https://example.com/download?q=user01"
+document.body.appendChild(iframe)
+```
+
+這時候關鍵的來了，如果 `user01` 這筆資料不存在於資料庫裡面，當我試著存取 `iframe.contentWindow.origin` 的時候就會出錯，這是因為 `huli.tw` 跟 `example.com` 不是同源的網站，所以被瀏覽器的 Same-Origin Policy 擋了下來。
+
+但是呢！如果 `user01` 這筆資料存在於資料庫裡面，不是就會直接跳出下載畫面嗎？這時候如果我去存取 `iframe.contentWindow.origin`，就不會出錯，因為我會拿到 `null` 這個結果。
+
+所以我們可以根據存取 `iframe.contentWindow.origin` 的結果，得知某個關鍵字是否存在於資料庫裡面：
+
+``` js
+const iframe = document.createElement('iframe')
+iframe.src = "https://example.com/download?q=user01"
+document.body.appendChild(iframe)
+
+// 先假設一秒後會載入完畢，可以做到更精確但先跳過
+setTimeout(() => {
+    try {
+        iframe.contentWindow.origin
+        console.log('使用者存在')
+    } catch(err) {
+        console.log('使用者不存在')
+    }
+}, 1000)
+```
+
+這就是 XS leaks，我們明明在 A 網站，卻可以利用一些技巧去得知 B 網站的資訊。
+
+完整的攻擊實作會把上面的攻擊腳本延伸，例如說先測 `a` 再測 `b` 之類的，假設測到 `b` 是存在的，那就重複剛剛的流程去測 `ba`, `bb`...，如此一來就可以洩漏出至少一組的使用者帳號。接著只要把這個網頁的連結傳給有權限存取到 `https://example.com/download` 頁面而且處於登入狀態下的人，點開以後攻擊就會啟動。
+
+雖然說聽起來前置步驟有點多，但它確實是個可行的攻擊手法。
+
+### id 的奧妙
+
+假設現在有個標榜隱私度極高的社群網站，你沒有辦法看到你好友的好友有誰，看不到共同好友，所以你也不知道誰跟誰是朋友，只知道自己有哪些朋友。
+
+你跟 user id 是 123 的 David 是好朋友，所以當你點進他的個人頁面：`http://example.com/users/123` 時，會看到一個按鈕「傳送訊息」，按鈕的 id 是 message：
+
+![](/img/learn-frontend-from-security-pov/p7-id1.png)
+
+而你跟 user id 是 210 的 Peter 並不是好友，所以點進他的頁面以後，會看到另一個按鈕叫做「加入好友」，id 是 add：
+
+![](/img/learn-frontend-from-security-pov/p8-id2.png)
+
+這聽起來都沒什麼問題，十分合理的實作，網頁上的元素有 id 再合理不過了。不過，其實這樣也會有 XS leaks 的風險。
+
+瀏覽器有一個貼心的功能不知道大家有沒有注意過，當網址後面加上 `#id` 的時候，瀏覽器會自動跳到有這個 id 的段落然後把元素 focus（如果可以被 focus 的話），文章的錨點（anchor）功能就是靠這個，才能跳到特定的段落去。
+
+因此當我連到 `http://example.com/users/123#message` 時，如果我跟 id 為 123 的人是好友，那頁面上就會出現傳送訊息的按鈕，瀏覽器就會跳到按鈕那邊並且把按鈕 focus。那如果我跟 123 不是好友呢？那就不會有任何事情發生。所以我們可以透過這個差異，來知道 id 123 的人是不是當前使用者的好友。
+
+做法跟剛剛的搜尋下載很像，都是要先把目標網頁嵌入 iframe 之中，如果有這個 id 存在，那 iframe 就會 focus，而原本的 body 就會 blur：
+
+``` js
+window.onblur = () => {
+  console.log('是好友')
+}
+
+const iframe = document.createElement('iframe')
+iframe.src = 'https://example.com/users/123#message'
+document.body.appendChild(iframe)
+```
+
+接著把這個網頁傳給你想知道他好友狀況的人，他一打開網頁之後，你就能知道他跟 123 是不是好朋友。如果這個網站的 id 是流水號，你就可以遍歷每一個 id，得知他的好友清單裡面有誰。
+
+以上就是兩個 XS leaks 的範例，都是透過一些瀏覽器或是 JS 的特性來達成的攻擊，如果你對這些有興趣，可以參考：[XS-Leaks Wiki](https://xsleaks.dev/)，裡面有更多更有趣的案例（我所知道的這些也是從這個網站來的）
+
+如果想看 XS leaks 的實際案例，這邊有很多：[Mass XS-Search using Cache Attack](https://terjanq.github.io/Bug-Bounty/Google/cache-attack-06jd2d2mz2r0/index.html)，而最近的這一個也很有趣：[Abusing Slack’s file-sharing functionality to de-anonymise fellow workspace members](https://jub0bs.com/posts/2021-10-12-xsleak-stack/)
+
+
+## 其他你可能不知道的功能
+
+最後一個段落裡面想跟大家分享一些「你可能不知道」的功能，或更精確一點來說，是「我知道以後很驚訝」的功能，我原本沒有想到原來可以這樣做。
+
+### 讀取不同 path 的 cookie
+
+在設定 Cookie 的時候有許多參數可以設置，其中一個叫做 path，例如說我設定 cookie 的 path 是 `/siteA`，那當我在 `/siteB` 的時候，就沒辦法讀取到 `/siteA` 的 cookie，因為 path 不一樣，所以沒辦法拿到。
+
+但其實不一定，如果你的網站沒有阻擋 iframe 嵌入，而且 cookie 又沒有設置 HttpOnly，就可以利用 iframe 來讀取不同 path 的 cookie：
+
+``` js
+// 假設我們在 https://example.com/siteA
+const iframe = document.createElement('iframe')
+iframe.src = 'https://example.com/siteB'
+iframe.onload = () => 
+  alert(iframe.contentWindow.document.cookie)
+}
+document.body.appendChild(iframe)
+```
+
+這是因為 `https://example.com/siteA` 跟 `https://example.com/siteB` 雖然 path 不同，但是是同源的，因此可以直接透過 iframe 來存取同源的其他網頁的 document，就可以利用這個特性拿到 `document.cookie`
+
+如果沒有支援 iframe，那其實 `window.open` 也可以達到一樣的效果：
+
+``` js
+const win = window.open('//example.com/siteB')
+setTimeout(() => {
+  alert(win.document.cookie)
+}, 1000)
+```
+
+不過要注意的是 `window.open` 預設會被擋住，要使用者主動允許才能開啟，或者是要使用者做操作以後執行（例如說把上面那段放在 button onclick 裡面）。
+
+而我後來發現其實 [RFC 6265](https://datatracker.ietf.org/doc/html/rfc6265#section-8.5) 的 section 8.5: Weak Confidentiality 就有提到了（奇怪，以前讀的時候怎麼沒注意到）：
+
+> Cookies do not always provide isolation by path. Although the network-level protocol does not send cookies stored for one path to another, some user agents expose cookies via non-HTTP APIs, such as HTML's document.cookie API.  Because some of these user agents (e.g., web browsers) do not isolate resources received from different paths, a resource retrieved from one path might be able to access cookies stored for another path.
+
+### 讀取 PDF 內容
+
+假設你的網站上嵌入了一個 same origin 的 pdf 檔案，像這樣：
+
+``` html
+<embed src="/test.pdf">
+```
+
+這時候你該怎麼用 JS 去讀取這個 pdf 裡面的內容？想必答案一定就是 fetch 或是 xhr 了：
+
+``` js
+fetch("/test.pdf")
+  .then(res => res.blob())
+  .then(res => {
+      console.log('pdf', res)
+  })
+```
+
+那如果 fetch 沒辦法用呢？舉例來說，server 在後端擋住來自 fetch 的請求（利用 [Fetch Metadata](https://web.dev/fetch-metadata/)），這時候該怎麼辦呢？有沒有什麼方法可以讀到 PDF 的內容？

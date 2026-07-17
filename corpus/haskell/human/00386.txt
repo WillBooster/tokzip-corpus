@@ -1,45 +1,60 @@
 {-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE OverloadedStrings #-}
 
-module Stack.Types.Platform
-  ( PlatformVariant (..)
-  , HasPlatform (..)
-  , platformVariantSuffix
-  , platformOnlyRelDir
+module Stack.Types.ProjectAndConfigMonoid
+  ( ProjectAndConfigMonoid (..)
+  , parseProjectAndConfigMonoid
   ) where
 
-import           Distribution.System ( Platform )
-import           Distribution.Text ( display )
-import           Lens.Micro ( _1, _2 )
-import           Path ( parseRelDir )
+import           Data.Aeson.Types ( Value )
+import           Data.Aeson.WarningParser
+                   ( WithJSONWarnings, (...:), (..:?), (..!=), jsonSubWarnings
+                   , jsonSubWarningsT, jsonSubWarningsTT, withObjectWarnings
+                   )
+import qualified Data.Set as Set
+import qualified Data.Yaml as Yaml
 import           Stack.Prelude
+import           Stack.Types.ConfigMonoid
+                   ( ConfigMonoid, parseConfigMonoidObject )
+import           Stack.Types.Project ( Project (..) )
 
--- | A variant of the platform, used to differentiate Docker builds from host
-data PlatformVariant
-  = PlatformVariantNone
-  | PlatformVariant String
+data ProjectAndConfigMonoid
+  = ProjectAndConfigMonoid !Project !ConfigMonoid
 
--- | Class for environment values which have a Platform
-class HasPlatform env where
-  platformL :: Lens' env Platform
-  platformVariantL :: Lens' env PlatformVariant
+parseProjectAndConfigMonoid ::
+     Path Abs Dir
+  -> Value
+  -> Yaml.Parser (WithJSONWarnings (IO ProjectAndConfigMonoid))
+parseProjectAndConfigMonoid rootDir =
+  withObjectWarnings "ProjectAndConfigMonoid" $ \o -> do
+    packages <- o ..:? "packages" ..!= [RelFilePath "."]
+    deps <- jsonSubWarningsTT (o ..:? "extra-deps") ..!= []
+    flags' <- o ..:? "flags" ..!= mempty
+    let flagsByPkg = unCabalStringMap <$> unCabalStringMap
+                (flags' :: Map (CabalString PackageName) (Map (CabalString FlagName) Bool))
 
-instance HasPlatform (Platform, PlatformVariant) where
-  platformL = _1
-  platformVariantL = _2
-
--- | Render a platform variant to a String suffix.
-platformVariantSuffix :: PlatformVariant -> String
-platformVariantSuffix PlatformVariantNone = ""
-platformVariantSuffix (PlatformVariant v) = "-" ++ v
-
--- | Relative directory for the platform identifier
-platformOnlyRelDir ::
-     (MonadReader env m, HasPlatform env, MonadThrow m)
-  => m (Path Rel Dir)
-platformOnlyRelDir = do
-  platform <- view platformL
-  platformVariant <- view platformVariantL
-  parseRelDir
-    (  Distribution.Text.display platform
-    ++ platformVariantSuffix platformVariant
-    )
+    resolver' <- jsonSubWarnings $ o ...: ["snapshot", "resolver"]
+    compiler <- o ..:? "compiler"
+    userMsg <- o ..:? "user-message"
+    config <- parseConfigMonoidObject rootDir o
+    extraPackageDBs <- o ..:? "extra-package-dbs" ..!= []
+    curator <- jsonSubWarningsT (o ..:? "curator")
+    drops <- o ..:? "drop-packages" ..!= mempty
+    let dropPackages = Set.map unCabalString drops
+    pure $ do
+      deps' <- mapM (resolvePaths (Just rootDir)) deps
+      let extraDeps =
+            concatMap toList (deps' :: [NonEmpty RawPackageLocation])
+      resolver <- resolvePaths (Just rootDir) resolver'
+      let project = Project
+            { userMsg
+            , resolver
+            , compiler -- FIXME make sure resolver' isn't SLCompiler
+            , extraPackageDBs
+            , packages
+            , extraDeps
+            , flagsByPkg
+            , curator
+            , dropPackages
+            }
+      pure $ ProjectAndConfigMonoid project config

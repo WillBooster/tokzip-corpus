@@ -1,4 +1,4 @@
-<?php declare(strict_types=1);
+<?php
 
 /*
  * This file is part of Composer.
@@ -10,256 +10,570 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\DependencyResolver;
-
-use Composer\Package\BasePackage;
-use Composer\Package\Version\VersionParser;
-use Composer\Semver\CompilingMatcher;
-use Composer\Semver\Constraint\ConstraintInterface;
-use Composer\Semver\Constraint\Constraint;
+namespace Composer\Autoload;
 
 /**
- * A package pool contains all packages for dependency resolution
+ * ClassLoader implements a PSR-0, PSR-4 and classmap class loader.
  *
- * @author Nils Adermann <naderman@naderman.de>
+ *     $loader = new \Composer\Autoload\ClassLoader();
+ *
+ *     // register classes with namespaces
+ *     $loader->add('Symfony\Component', __DIR__.'/component');
+ *     $loader->add('Symfony',           __DIR__.'/framework');
+ *
+ *     // activate the autoloader
+ *     $loader->register();
+ *
+ *     // to enable searching the include path (eg. for PEAR packages)
+ *     $loader->setUseIncludePath(true);
+ *
+ * In this example, if you try to use a class in the Symfony\Component
+ * namespace or one of its children (Symfony\Component\Console for instance),
+ * the autoloader will first look for the class under the component/
+ * directory, and it will then fallback to the framework/ directory if not
+ * found before giving up.
+ *
+ * This class is loosely based on the Symfony UniversalClassLoader.
+ *
+ * @author Fabien Potencier <fabien@symfony.com>
  * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @see    https://www.php-fig.org/psr/psr-0/
+ * @see    https://www.php-fig.org/psr/psr-4/
  */
-class Pool implements \Countable
+class ClassLoader
 {
-    /** @var BasePackage[] */
-    protected $packages = [];
-    /** @var array<string, BasePackage[]> */
-    protected $packageByName = [];
-    /** @var VersionParser */
-    protected $versionParser;
-    /** @var array<string, array<string, BasePackage[]>> */
-    protected $providerCache = [];
-    /** @var BasePackage[] */
-    protected $unacceptableFixedOrLockedPackages;
-    /** @var array<string, array<string, string>> Map of package name => normalized version => pretty version */
-    protected $removedVersions = [];
-    /** @var array<string, array<string, string>> Map of package object hash => removed normalized versions => removed pretty version */
-    protected $removedVersionsByPackage = [];
+    /** @var \Closure(string):void */
+    private static $includeFile;
 
+    /** @var string|null */
+    private $vendorDir;
+
+    // PSR-4
     /**
-     * @param BasePackage[] $packages
-     * @param BasePackage[] $unacceptableFixedOrLockedPackages
-     * @param array<string, array<string, string>> $removedVersions
-     * @param array<string, array<string, string>> $removedVersionsByPackage
+     * @var array<string, array<string, int>>
      */
-    public function __construct(array $packages = [], array $unacceptableFixedOrLockedPackages = [], array $removedVersions = [], array $removedVersionsByPackage = [])
-    {
-        $this->versionParser = new VersionParser;
-        $this->setPackages($packages);
-        $this->unacceptableFixedOrLockedPackages = $unacceptableFixedOrLockedPackages;
-        $this->removedVersions = $removedVersions;
-        $this->removedVersionsByPackage = $removedVersionsByPackage;
-    }
-
+    private $prefixLengthsPsr4 = array();
     /**
-     * @return array<string, string>
+     * @var array<string, list<string>>
      */
-    public function getRemovedVersions(string $name, ConstraintInterface $constraint): array
-    {
-        if (!isset($this->removedVersions[$name])) {
-            return [];
-        }
-
-        $result = [];
-        foreach ($this->removedVersions[$name] as $version => $prettyVersion) {
-            if ($constraint->matches(new Constraint('==', $version))) {
-                $result[$version] = $prettyVersion;
-            }
-        }
-
-        return $result;
-    }
-
+    private $prefixDirsPsr4 = array();
     /**
-     * @return array<string, string>
+     * @var list<string>
      */
-    public function getRemovedVersionsByPackage(string $objectHash): array
-    {
-        if (!isset($this->removedVersionsByPackage[$objectHash])) {
-            return [];
-        }
+    private $fallbackDirsPsr4 = array();
 
-        return $this->removedVersionsByPackage[$objectHash];
-    }
-
+    // PSR-0
     /**
-     * @param BasePackage[] $packages
-     */
-    private function setPackages(array $packages): void
-    {
-        $id = 1;
-
-        foreach ($packages as $package) {
-            $this->packages[] = $package;
-
-            $package->id = $id++;
-
-            foreach ($package->getNames() as $provided) {
-                $this->packageByName[$provided][] = $package;
-            }
-        }
-    }
-
-    /**
-     * @return BasePackage[]
-     */
-    public function getPackages(): array
-    {
-        return $this->packages;
-    }
-
-    /**
-     * Retrieves the package object for a given package id.
-     */
-    public function packageById(int $id): BasePackage
-    {
-        return $this->packages[$id - 1];
-    }
-
-    /**
-     * Returns how many packages have been loaded into the pool
-     */
-    public function count(): int
-    {
-        return \count($this->packages);
-    }
-
-    /**
-     * Searches all packages providing the given package name and match the constraint
+     * List of PSR-0 prefixes
      *
-     * @param string $name The package name to be searched for
-     * @param ?ConstraintInterface $constraint A constraint that all returned
-     *                                         packages must match or null to return all
-     * @return BasePackage[] A set of packages
+     * Structured as array('F (first letter)' => array('Foo\Bar (full prefix)' => array('path', 'path2')))
+     *
+     * @var array<string, array<string, list<string>>>
      */
-    public function whatProvides(string $name, ?ConstraintInterface $constraint = null): array
-    {
-        $key = (string) $constraint;
-        if (isset($this->providerCache[$name][$key])) {
-            return $this->providerCache[$name][$key];
-        }
+    private $prefixesPsr0 = array();
+    /**
+     * @var list<string>
+     */
+    private $fallbackDirsPsr0 = array();
 
-        return $this->providerCache[$name][$key] = $this->computeWhatProvides($name, $constraint);
+    /** @var bool */
+    private $useIncludePath = false;
+
+    /**
+     * @var array<string, string>
+     */
+    private $classMap = array();
+
+    /** @var bool */
+    private $classMapAuthoritative = false;
+
+    /**
+     * @var array<string, bool>
+     */
+    private $missingClasses = array();
+
+    /** @var string|null */
+    private $apcuPrefix;
+
+    /**
+     * @var array<string, self>
+     */
+    private static $registeredLoaders = array();
+
+    /**
+     * @param string|null $vendorDir
+     */
+    public function __construct($vendorDir = null)
+    {
+        $this->vendorDir = $vendorDir;
+        self::initializeIncludeClosure();
     }
 
     /**
-     * @param  string               $name       The package name to be searched for
-     * @param  ?ConstraintInterface $constraint A constraint that all returned
-     *                                          packages must match or null to return all
-     * @return BasePackage[]
+     * @return array<string, list<string>>
      */
-    private function computeWhatProvides(string $name, ?ConstraintInterface $constraint = null): array
+    public function getPrefixes()
     {
-        if (!isset($this->packageByName[$name])) {
-            return [];
+        if (!empty($this->prefixesPsr0)) {
+            return call_user_func_array('array_merge', array_values($this->prefixesPsr0));
         }
 
-        $matches = [];
-
-        foreach ($this->packageByName[$name] as $candidate) {
-            if ($this->match($candidate, $name, $constraint)) {
-                $matches[] = $candidate;
-            }
-        }
-
-        return $matches;
-    }
-
-    public function literalToPackage(int $literal): BasePackage
-    {
-        $packageId = abs($literal);
-
-        return $this->packageById($packageId);
+        return array();
     }
 
     /**
-     * @param array<int, BasePackage> $installedMap
+     * @return array<string, list<string>>
      */
-    public function literalToPrettyString(int $literal, array $installedMap): string
+    public function getPrefixesPsr4()
     {
-        $package = $this->literalToPackage($literal);
+        return $this->prefixDirsPsr4;
+    }
 
-        if (isset($installedMap[$package->id])) {
-            $prefix = ($literal > 0 ? 'keep' : 'remove');
+    /**
+     * @return list<string>
+     */
+    public function getFallbackDirs()
+    {
+        return $this->fallbackDirsPsr0;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function getFallbackDirsPsr4()
+    {
+        return $this->fallbackDirsPsr4;
+    }
+
+    /**
+     * @return array<string, string> Array of classname => path
+     */
+    public function getClassMap()
+    {
+        return $this->classMap;
+    }
+
+    /**
+     * @param array<string, string> $classMap Class to filename map
+     *
+     * @return void
+     */
+    public function addClassMap(array $classMap)
+    {
+        if ($this->classMap) {
+            $this->classMap = array_merge($this->classMap, $classMap);
         } else {
-            $prefix = ($literal > 0 ? 'install' : 'don\'t install');
+            $this->classMap = $classMap;
         }
-
-        return $prefix.' '.$package->getPrettyString();
     }
 
     /**
-     * Checks if the package matches the given constraint directly or through
-     * provided or replaced packages
+     * Registers a set of PSR-0 directories for a given prefix, either
+     * appending or prepending to the ones previously set for this prefix.
      *
-     * @param  string              $name       Name of the package to be matched
+     * @param string              $prefix  The prefix
+     * @param list<string>|string $paths   The PSR-0 root directories
+     * @param bool                $prepend Whether to prepend the directories
+     *
+     * @return void
      */
-    public function match(BasePackage $candidate, string $name, ?ConstraintInterface $constraint = null): bool
+    public function add($prefix, $paths, $prepend = false)
     {
-        $candidateName = $candidate->getName();
-        $candidateVersion = $candidate->getVersion();
+        $paths = (array) $paths;
+        if (!$prefix) {
+            if ($prepend) {
+                $this->fallbackDirsPsr0 = array_merge(
+                    $paths,
+                    $this->fallbackDirsPsr0
+                );
+            } else {
+                $this->fallbackDirsPsr0 = array_merge(
+                    $this->fallbackDirsPsr0,
+                    $paths
+                );
+            }
 
-        if ($candidateName === $name) {
-            return $constraint === null || CompilingMatcher::match($constraint, Constraint::OP_EQ, $candidateVersion);
+            return;
         }
 
-        $provides = $candidate->getProvides();
-        $replaces = $candidate->getReplaces();
+        $first = $prefix[0];
+        if (!isset($this->prefixesPsr0[$first][$prefix])) {
+            $this->prefixesPsr0[$first][$prefix] = $paths;
 
-        // aliases create multiple replaces/provides for one target so they can not use the shortcut below
-        if (isset($replaces[0]) || isset($provides[0])) {
-            foreach ($provides as $link) {
-                if ($link->getTarget() === $name && ($constraint === null || $constraint->matches($link->getConstraint()))) {
-                    return true;
-                }
+            return;
+        }
+        if ($prepend) {
+            $this->prefixesPsr0[$first][$prefix] = array_merge(
+                $paths,
+                $this->prefixesPsr0[$first][$prefix]
+            );
+        } else {
+            $this->prefixesPsr0[$first][$prefix] = array_merge(
+                $this->prefixesPsr0[$first][$prefix],
+                $paths
+            );
+        }
+    }
+
+    /**
+     * Registers a set of PSR-4 directories for a given namespace, either
+     * appending or prepending to the ones previously set for this namespace.
+     *
+     * @param string              $prefix  The prefix/namespace, with trailing '\\'
+     * @param list<string>|string $paths   The PSR-4 base directories
+     * @param bool                $prepend Whether to prepend the directories
+     *
+     * @throws \InvalidArgumentException
+     *
+     * @return void
+     */
+    public function addPsr4($prefix, $paths, $prepend = false)
+    {
+        $paths = (array) $paths;
+        if (!$prefix) {
+            // Register directories for the root namespace.
+            if ($prepend) {
+                $this->fallbackDirsPsr4 = array_merge(
+                    $paths,
+                    $this->fallbackDirsPsr4
+                );
+            } else {
+                $this->fallbackDirsPsr4 = array_merge(
+                    $this->fallbackDirsPsr4,
+                    $paths
+                );
             }
-
-            foreach ($replaces as $link) {
-                if ($link->getTarget() === $name && ($constraint === null || $constraint->matches($link->getConstraint()))) {
-                    return true;
-                }
+        } elseif (!isset($this->prefixDirsPsr4[$prefix])) {
+            // Register directories for a new namespace.
+            $length = strlen($prefix);
+            if ('\\' !== $prefix[$length - 1]) {
+                throw new \InvalidArgumentException("A non-empty PSR-4 prefix must end with a namespace separator.");
             }
+            $this->prefixLengthsPsr4[$prefix[0]][$prefix] = $length;
+            $this->prefixDirsPsr4[$prefix] = $paths;
+        } elseif ($prepend) {
+            // Prepend directories for an already registered namespace.
+            $this->prefixDirsPsr4[$prefix] = array_merge(
+                $paths,
+                $this->prefixDirsPsr4[$prefix]
+            );
+        } else {
+            // Append directories for an already registered namespace.
+            $this->prefixDirsPsr4[$prefix] = array_merge(
+                $this->prefixDirsPsr4[$prefix],
+                $paths
+            );
+        }
+    }
 
+    /**
+     * Registers a set of PSR-0 directories for a given prefix,
+     * replacing any others previously set for this prefix.
+     *
+     * @param string              $prefix The prefix
+     * @param list<string>|string $paths  The PSR-0 base directories
+     *
+     * @return void
+     */
+    public function set($prefix, $paths)
+    {
+        if (!$prefix) {
+            $this->fallbackDirsPsr0 = (array) $paths;
+        } else {
+            $this->prefixesPsr0[$prefix[0]][$prefix] = (array) $paths;
+        }
+    }
+
+    /**
+     * Registers a set of PSR-4 directories for a given namespace,
+     * replacing any others previously set for this namespace.
+     *
+     * @param string              $prefix The prefix/namespace, with trailing '\\'
+     * @param list<string>|string $paths  The PSR-4 base directories
+     *
+     * @throws \InvalidArgumentException
+     *
+     * @return void
+     */
+    public function setPsr4($prefix, $paths)
+    {
+        if (!$prefix) {
+            $this->fallbackDirsPsr4 = (array) $paths;
+        } else {
+            $length = strlen($prefix);
+            if ('\\' !== $prefix[$length - 1]) {
+                throw new \InvalidArgumentException("A non-empty PSR-4 prefix must end with a namespace separator.");
+            }
+            $this->prefixLengthsPsr4[$prefix[0]][$prefix] = $length;
+            $this->prefixDirsPsr4[$prefix] = (array) $paths;
+        }
+    }
+
+    /**
+     * Turns on searching the include path for class files.
+     *
+     * @param bool $useIncludePath
+     *
+     * @return void
+     */
+    public function setUseIncludePath($useIncludePath)
+    {
+        $this->useIncludePath = $useIncludePath;
+    }
+
+    /**
+     * Can be used to check if the autoloader uses the include path to check
+     * for classes.
+     *
+     * @return bool
+     */
+    public function getUseIncludePath()
+    {
+        return $this->useIncludePath;
+    }
+
+    /**
+     * Turns off searching the prefix and fallback directories for classes
+     * that have not been registered with the class map.
+     *
+     * @param bool $classMapAuthoritative
+     *
+     * @return void
+     */
+    public function setClassMapAuthoritative($classMapAuthoritative)
+    {
+        $this->classMapAuthoritative = $classMapAuthoritative;
+    }
+
+    /**
+     * Should class lookup fail if not found in the current class map?
+     *
+     * @return bool
+     */
+    public function isClassMapAuthoritative()
+    {
+        return $this->classMapAuthoritative;
+    }
+
+    /**
+     * APCu prefix to use to cache found/not-found classes, if the extension is enabled.
+     *
+     * @param string|null $apcuPrefix
+     *
+     * @return void
+     */
+    public function setApcuPrefix($apcuPrefix)
+    {
+        $this->apcuPrefix = function_exists('apcu_fetch') && filter_var(ini_get('apc.enabled'), FILTER_VALIDATE_BOOLEAN) ? $apcuPrefix : null;
+    }
+
+    /**
+     * The APCu prefix in use, or null if APCu caching is not enabled.
+     *
+     * @return string|null
+     */
+    public function getApcuPrefix()
+    {
+        return $this->apcuPrefix;
+    }
+
+    /**
+     * Registers this instance as an autoloader.
+     *
+     * @param bool $prepend Whether to prepend the autoloader or not
+     *
+     * @return void
+     */
+    public function register($prepend = false)
+    {
+        spl_autoload_register(array($this, 'loadClass'), true, $prepend);
+
+        if (null === $this->vendorDir) {
+            return;
+        }
+
+        if ($prepend) {
+            self::$registeredLoaders = array($this->vendorDir => $this) + self::$registeredLoaders;
+        } else {
+            unset(self::$registeredLoaders[$this->vendorDir]);
+            self::$registeredLoaders[$this->vendorDir] = $this;
+        }
+    }
+
+    /**
+     * Unregisters this instance as an autoloader.
+     *
+     * @return void
+     */
+    public function unregister()
+    {
+        spl_autoload_unregister(array($this, 'loadClass'));
+
+        if (null !== $this->vendorDir) {
+            unset(self::$registeredLoaders[$this->vendorDir]);
+        }
+    }
+
+    /**
+     * Loads the given class or interface.
+     *
+     * @param  string    $class The name of the class
+     * @return true|null True if loaded, null otherwise
+     */
+    public function loadClass($class)
+    {
+        if ($file = $this->findFile($class)) {
+            $includeFile = self::$includeFile;
+            $includeFile($file);
+
+            return true;
+        }
+
+        return null;
+    }
+
+    /**
+     * Finds the path to the file where the class is defined.
+     *
+     * @param string $class The name of the class
+     *
+     * @return string|false The path if found, false otherwise
+     */
+    public function findFile($class)
+    {
+        // class map lookup
+        if (isset($this->classMap[$class])) {
+            return $this->classMap[$class];
+        }
+        if ($this->classMapAuthoritative || isset($this->missingClasses[$class])) {
             return false;
         }
-
-        if (isset($provides[$name]) && ($constraint === null || $constraint->matches($provides[$name]->getConstraint()))) {
-            return true;
+        if (null !== $this->apcuPrefix) {
+            $file = apcu_fetch($this->apcuPrefix.$class, $hit);
+            if ($hit) {
+                return $file;
+            }
         }
 
-        if (isset($replaces[$name]) && ($constraint === null || $constraint->matches($replaces[$name]->getConstraint()))) {
-            return true;
+        $file = $this->findFileWithExtension($class, '.php');
+
+        // Search for Hack files if we are running on HHVM
+        if (false === $file && defined('HHVM_VERSION')) {
+            $file = $this->findFileWithExtension($class, '.hh');
+        }
+
+        if (null !== $this->apcuPrefix) {
+            apcu_add($this->apcuPrefix.$class, $file);
+        }
+
+        if (false === $file) {
+            // Remember that this class does not exist.
+            $this->missingClasses[$class] = true;
+        }
+
+        return $file;
+    }
+
+    /**
+     * Returns the currently registered loaders keyed by their corresponding vendor directories.
+     *
+     * @return array<string, self>
+     */
+    public static function getRegisteredLoaders()
+    {
+        return self::$registeredLoaders;
+    }
+
+    /**
+     * @param  string       $class
+     * @param  string       $ext
+     * @return string|false
+     */
+    private function findFileWithExtension($class, $ext)
+    {
+        // PSR-4 lookup
+        $logicalPathPsr4 = strtr($class, '\\', DIRECTORY_SEPARATOR) . $ext;
+
+        $first = $class[0];
+        if (isset($this->prefixLengthsPsr4[$first])) {
+            $subPath = $class;
+            while (false !== $lastPos = strrpos($subPath, '\\')) {
+                $subPath = substr($subPath, 0, $lastPos);
+                $search = $subPath . '\\';
+                if (isset($this->prefixDirsPsr4[$search])) {
+                    $pathEnd = DIRECTORY_SEPARATOR . substr($logicalPathPsr4, $lastPos + 1);
+                    foreach ($this->prefixDirsPsr4[$search] as $dir) {
+                        if (file_exists($file = $dir . $pathEnd)) {
+                            return $file;
+                        }
+                    }
+                }
+            }
+        }
+
+        // PSR-4 fallback dirs
+        foreach ($this->fallbackDirsPsr4 as $dir) {
+            if (file_exists($file = $dir . DIRECTORY_SEPARATOR . $logicalPathPsr4)) {
+                return $file;
+            }
+        }
+
+        // PSR-0 lookup
+        if (false !== $pos = strrpos($class, '\\')) {
+            // namespaced class name
+            $logicalPathPsr0 = substr($logicalPathPsr4, 0, $pos + 1)
+                . strtr(substr($logicalPathPsr4, $pos + 1), '_', DIRECTORY_SEPARATOR);
+        } else {
+            // PEAR-like class name
+            $logicalPathPsr0 = strtr($class, '_', DIRECTORY_SEPARATOR) . $ext;
+        }
+
+        if (isset($this->prefixesPsr0[$first])) {
+            foreach ($this->prefixesPsr0[$first] as $prefix => $dirs) {
+                if (0 === strpos($class, $prefix)) {
+                    foreach ($dirs as $dir) {
+                        if (file_exists($file = $dir . DIRECTORY_SEPARATOR . $logicalPathPsr0)) {
+                            return $file;
+                        }
+                    }
+                }
+            }
+        }
+
+        // PSR-0 fallback dirs
+        foreach ($this->fallbackDirsPsr0 as $dir) {
+            if (file_exists($file = $dir . DIRECTORY_SEPARATOR . $logicalPathPsr0)) {
+                return $file;
+            }
+        }
+
+        // PSR-0 include paths.
+        if ($this->useIncludePath && $file = stream_resolve_include_path($logicalPathPsr0)) {
+            return $file;
         }
 
         return false;
     }
 
-    public function isUnacceptableFixedOrLockedPackage(BasePackage $package): bool
-    {
-        return \in_array($package, $this->unacceptableFixedOrLockedPackages, true);
-    }
-
     /**
-     * @return BasePackage[]
+     * @return void
      */
-    public function getUnacceptableFixedOrLockedPackages(): array
+    private static function initializeIncludeClosure()
     {
-        return $this->unacceptableFixedOrLockedPackages;
-    }
-
-    public function __toString(): string
-    {
-        $str = "Pool:\n";
-
-        foreach ($this->packages as $package) {
-            $str .= '- '.str_pad((string) $package->id, 6, ' ', STR_PAD_LEFT).': '.$package->getName()."\n";
+        if (self::$includeFile !== null) {
+            return;
         }
 
-        return $str;
+        /**
+         * Scope isolated include.
+         *
+         * Prevents access to $this/self from included files.
+         *
+         * @param  string $file
+         * @return void
+         */
+        self::$includeFile = \Closure::bind(static function($file) {
+            include $file;
+        }, null, null);
     }
 }

@@ -1,24 +1,66 @@
----
-title: 一堆來不及做的 web 與 XSS 題目
-date: 2023-12-03 13:40:00
-catalog: true
-tags: [Security]
-categories: [Security]
-photos: /img/xss-and-web-challenges/cover.png
----
+if hashlib.sha256((SECRET_KEY + user_string).encode('raw_unicode_escape')).hexdigest() != signature_string:
+        print("nope")
+        return None
 
-因為最近有點忙的關係，這兩三個月比較少打 CTF 了，但還是會在推特上看到一些有趣的題目。雖然沒時間打，但筆記還是要記的，沒記的話下次看到鐵定還是做不出來。
+    user = serialize_user(user_string)
+    return user
+```
 
-這篇主要記一些網頁前端相關的題目，由於自己可能沒有實際下去解題，所以內容都是參考別人的筆記之後再記錄一些心得。
+會從 cookie 去判斷你是哪一個 user，序列化跟反序列化的程式碼如下：
 
-關鍵字列表：
+``` py
+def serialize_user(user_string):
+    user = dict()
+    for kv in user_string.split(','):
+        k = kv.split('=')[0]
+        v = kv.split('=')[1]
+        user[k] = v
+    return user
 
-1. copy paste XSS
-2. connection pool
-3. content type UTF16
-4. multipart/mixed
-5. Chrome DevTools Protocol
-6. new headless mode default download
-7. Scroll to Text Fragment (STTF)
-8. webVTT cue xsleak
-9. flask/werkzeug cookie parsing quirks
+def deserialize_user(user):
+    values = []
+    for k in ["username", "locale"]:
+        values.append(f'{k}={user.__dict__[k]}')
+    return ','.join(values)
+```
+
+而產生 cookie 的程式碼長這樣：
+
+``` py
+def generate_cookie(user):
+    user_string = deserialize_user(user)
+    signature_string = hashlib.sha256(
+        (SECRET_KEY + user_string).encode('raw_unicode_escape')).hexdigest()
+    cookie = base64.b64encode(
+        (f'{user_string}|{signature_string}').encode('raw_unicode_escape')).decode()
+    return cookie
+```
+
+目標是想辦法偽造成 admin 登入，就可以拿到 flag。
+
+正常的狀況下，假設我們的 user 叫做 abc 好了，locale 是 en，產生出來的 user_string 就會是：`username=abc,locale=en`。
+
+從 `serialize_user` 中可以看出前面的屬性會被後面蓋掉，所以如果我們的 user_string 是 `username=a,locale=en,username=admin`，還原回 user 時身份就會變成 admin。
+
+在產生 cookie 時，後面有特別加上一個簽名（`sha256(secret + user_string)`）來驗證資料完整性。
+
+所以在我們不知道 key 的狀況下，照理來說我們沒有辦法偽造 user_string，因為完整性的檢查過不了。
+
+但是呢，這題用的這種驗證方式可以用一種叫做長度擴充攻擊（Length extension attack）的方式來打。
+
+簡單來說呢，如果今天有一個操作是：`M1 = hash(secret + data)`，你只要知道 secret+data 的「長度」就好，不需要知道內容是什麼，以及產生出來的結果 M1，那你就可以在 `secret+data` 後面拼接任意字串，並且知道合法的 `hash(secret + data + padding + 任意 data)`
+
+舉例來說，你今天知道 `"{secret}username=a"` 在 md5 過後會變成 `781e5e245d69b566979b86e28d23f2c7`，在不知道 secret 為何的狀況之下，你還是能知道 `"{secret}username=a{padding},username=admin"` 的 md5 是多少。
+
+上面的 `{padding}`，這跟 hash 演算法的原理有關。
+
+總之呢，透過這個攻擊方式，我們可以在不知道 secret 的狀況下把已知的字串延長並且產生出合法的 hash 值，就能繞過這題的檢查。
+
+至於詳細的原理跟攻擊方式，先留幾篇參考文章，未來有機會再回來補這個坑：
+
+
+2. [長度擴充攻擊 | Length Extension Attack (LEA)](https://maojui.me/Crypto/LEA/)
+3. [Hash Length Extension Attacks](https://www.whitehatsec.com/blog/hash-length-extension-attacks/)
+4. [Understanding the length extension attack](https://crypto.stackexchange.com/questions/3978/understanding-the-length-extension-attack)
+6. [哈希长度拓展攻击(Hash Length Extension Attacks)](https://xz.aliyun.com/t/2563)
+7. [Length extension attack](https://ucgjhe.github.io/post/length_extension_attack/)

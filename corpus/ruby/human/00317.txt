@@ -1,69 +1,73 @@
 # frozen_string_literal: true
 
-require "test_helper"
-require "minitest/mock"
-require "stubs/test_server"
+require "abstract_unit"
 
-class ActionCable::Connection::StreamTest < ActionCable::TestCase
-  class Connection < ActionCable::Connection::Base
-    attr_reader :connected, :websocket, :errors
-
-    def initialize(*)
-      super
-      @errors = []
-    end
-
-    def connect
-      @connected = true
-    end
-
-    def disconnect
-      @connected = false
-    end
-
-    def send_async(method, *args)
-      send method, *args
-    end
-
-    def on_error(message)
-      @errors << message
+class TestResponseTest < ActiveSupport::TestCase
+  def assert_response_code_range(range, predicate)
+    response = ActionDispatch::TestResponse.new
+    (0..599).each do |status|
+      response.status = status
+      assert_equal range.include?(status), response.send(predicate),
+                   "ActionDispatch::TestResponse.new(#{status}).#{predicate}"
     end
   end
 
-  setup do
-    @server = TestServer.new
-    @server.config.allowed_request_origins = %w( http://rubyonrails.com )
+  test "helpers" do
+    assert_response_code_range 200..299, :successful?
+    assert_response_code_range [404],    :not_found?
+    assert_response_code_range 300..399, :redirection?
+    assert_response_code_range 500..599, :server_error?
+    assert_response_code_range 400..499, :client_error?
   end
 
-  [ EOFError, Errno::ECONNRESET ].each do |closed_exception|
-    test "closes socket on #{closed_exception}" do
-      run_in_eventmachine do
-        rack_hijack_io = File.open(File::NULL, "w")
-        connection = open_connection(rack_hijack_io)
+  test "response parsing" do
+    response = ActionDispatch::TestResponse.create(200, {}, "")
+    assert_equal response.body, response.parsed_body
 
-        # Internal hax = :(
-        client = connection.websocket.send(:websocket)
-        rack_hijack_io.stub(:write_nonblock, proc { raise(closed_exception, "foo") }) do
-          assert_called(client, :client_gone) do
-            client.write("boo")
-          end
-        end
-        assert_equal [], connection.errors
-      end
-    end
+    response = ActionDispatch::TestResponse.create(200, { "Content-Type" => "application/json" }, '{ "foo": "fighters" }')
+    assert_kind_of ActiveSupport::HashWithIndifferentAccess, response.parsed_body
+    assert_equal({ "foo" => "fighters" }, response.parsed_body)
+
+    response = ActionDispatch::TestResponse.create(200, { "Content-Type" => "text/html" }, <<~HTML)
+      <html>
+        <head></head>
+        <body>
+          <div>Content</div>
+        </body>
+      </html>
+    HTML
+    assert_kind_of(Nokogiri::XML::Document, response.parsed_body)
+    assert_equal("Content", response.parsed_body.at_xpath("/html/body/div").text)
   end
 
-  private
-    def open_connection(io)
-      env = Rack::MockRequest.env_for "/test",
-        "HTTP_CONNECTION" => "upgrade", "HTTP_UPGRADE" => "websocket",
-        "HTTP_HOST" => "localhost", "HTTP_ORIGIN" => "http://rubyonrails.com"
-      env["rack.hijack"] = -> { env["rack.hijack_io"] = io }
+  test "JSON response Hash pattern matching" do
+    response = ActionDispatch::TestResponse.create(200, { "Content-Type" => "application/json" }, '{ "foo": "fighters" }')
 
-      Connection.new(@server, env).tap do |connection|
-        connection.process
-        connection.send :handle_open
-        assert connection.connected
-      end
-    end
+    assert_pattern { response.parsed_body => { foo: /fighter/ } }
+  end
+
+  test "JSON response Array pattern matching" do
+    response = ActionDispatch::TestResponse.create(200, { "Content-Type" => "application/json" }, '[{ "foo": "fighters" }, { "nir": "vana" }]')
+    assert_pattern { response.parsed_body => [{ foo: /fighter/ }, { nir: /vana/ }] }
+  end
+
+  test "HTML response pattern matching" do
+    response = ActionDispatch::TestResponse.create(200, { "Content-Type" => "text/html" }, <<~HTML)
+      <html>
+        <head></head>
+        <body>
+          <main><h1>Some main content</h1></main>
+        </body>
+      </html>
+    HTML
+    html = response.parsed_body
+
+    html.at("main") => {name:, content:}
+    assert_equal "main", name
+    assert_equal "Some main content", content
+
+    assert_pattern { html.at("main") => { content: "Some main content" } }
+    assert_pattern { html.at("main") => { content: /content/ } }
+    assert_pattern { html.at("main") => { children: [{ name: "h1", content: /content/ }] } }
+  end
 end

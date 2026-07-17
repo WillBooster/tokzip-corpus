@@ -10,259 +10,149 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test;
+namespace Composer\Plugin;
 
-use Composer\Pcre\Preg;
-use Composer\Util\Filesystem;
-use Composer\Util\Platform;
-use Symfony\Component\Finder\Finder;
-use Symfony\Component\Process\Process;
+use Composer\EventDispatcher\Event;
+use Composer\Util\HttpDownloader;
 
 /**
- * @group slow
+ * The pre file download event.
+ *
+ * @author Nils Adermann <naderman@naderman.de>
  */
-class AllFunctionalTest extends TestCase
+class PreFileDownloadEvent extends Event
 {
-    /** @var string|false */
-    protected $oldcwd;
-    /** @var ?string */
-    protected $testDir;
+    /**
+     * @var HttpDownloader
+     */
+    private $httpDownloader;
+
+    /**
+     * @var non-empty-string
+     */
+    private $processedUrl;
+
+    /**
+     * @var string|null
+     */
+    private $customCacheKey;
+
     /**
      * @var string
      */
-    private static $pharPath;
+    private $type;
 
-    public function setUp(): void
+    /**
+     * @var mixed
+     */
+    private $context;
+
+    /**
+     * @var mixed[]
+     */
+    private $transportOptions = [];
+
+    /**
+     * Constructor.
+     *
+     * @param string           $name           The event name
+     * @param mixed            $context
+     * @param non-empty-string $processedUrl
+     */
+    public function __construct(string $name, HttpDownloader $httpDownloader, string $processedUrl, string $type, $context = null)
     {
-        $this->oldcwd = Platform::getCwd();
-
-        chdir(__DIR__.'/Fixtures/functional');
+        parent::__construct($name);
+        $this->httpDownloader = $httpDownloader;
+        $this->processedUrl = $processedUrl;
+        $this->type = $type;
+        $this->context = $context;
     }
 
-    protected function tearDown(): void
+    public function getHttpDownloader(): HttpDownloader
     {
-        parent::tearDown();
-        if ($this->oldcwd) {
-            chdir($this->oldcwd);
-        }
-
-        if ($this->testDir) {
-            $fs = new Filesystem;
-            $fs->removeDirectory($this->testDir);
-            $this->testDir = null;
-        }
-    }
-
-    public static function setUpBeforeClass(): void
-    {
-        self::$pharPath = self::getUniqueTmpDirectory() . '/composer.phar';
-    }
-
-    public static function tearDownAfterClass(): void
-    {
-        $fs = new Filesystem;
-        $fs->removeDirectory(dirname(self::$pharPath));
-    }
-
-    public function testBuildPhar(): void
-    {
-        if (defined('HHVM_VERSION')) {
-            $this->markTestSkipped('Building the phar does not work on HHVM.');
-        }
-
-        $target = dirname(self::$pharPath);
-        $fs = new Filesystem();
-        chdir($target);
-
-        $it = new \RecursiveDirectoryIterator(__DIR__.'/../../../', \RecursiveDirectoryIterator::SKIP_DOTS);
-        $ri = new \RecursiveIteratorIterator($it, \RecursiveIteratorIterator::SELF_FIRST);
-
-        foreach ($ri as $file) {
-            $targetPath = $target . DIRECTORY_SEPARATOR . $ri->getSubPathName();
-            if ($file->isDir()) {
-                $fs->ensureDirectoryExists($targetPath);
-            } else {
-                copy($file->getPathname(), $targetPath);
-            }
-        }
-
-        $proc = new Process([PHP_BINARY, '-dphar.readonly=0', './bin/compile'], $target);
-        $exitcode = $proc->run();
-
-        if ($exitcode !== 0 || trim($proc->getOutput())) {
-            $this->fail($proc->getOutput());
-        }
-
-        self::assertFileExists(self::$pharPath);
-        copy(self::$pharPath, __DIR__.'/../../composer-test.phar');
+        return $this->httpDownloader;
     }
 
     /**
-     * @dataProvider getTestFiles
-     * @depends testBuildPhar
+     * Retrieves the processed URL that will be downloaded.
+     *
+     * @return non-empty-string
      */
-    public function testIntegration(string $testFile): void
+    public function getProcessedUrl(): string
     {
-        $testData = $this->parseTestFile($testFile);
-        $this->testDir = self::getUniqueTmpDirectory();
-
-        // if a dir is present with the name of the .test file (without .test), we
-        // copy all its contents in the $testDir to be used to run the test with
-        $testFileSetupDir = substr($testFile, 0, -5);
-        if (is_dir($testFileSetupDir)) {
-            $fs = new Filesystem();
-            $fs->copy($testFileSetupDir, $this->testDir);
-        }
-
-        $env = [
-            'COMPOSER_HOME' => $this->testDir.'home',
-            'COMPOSER_CACHE_DIR' => $this->testDir.'cache',
-        ];
-
-        $proc = Process::fromShellCommandline(escapeshellcmd(PHP_BINARY).' '.escapeshellarg(self::$pharPath).' --no-ansi '.$testData['RUN'], $this->testDir, $env, null, 300);
-        $output = '';
-
-        $exitCode = $proc->run(static function ($type, $buffer) use (&$output): void {
-            $output .= $buffer;
-        });
-
-        if (isset($testData['EXPECT'])) {
-            $output = trim($this->cleanOutput($output));
-            $expected = $testData['EXPECT'];
-
-            $line = 1;
-            for ($i = 0, $j = 0; $i < strlen($expected);) {
-                if ($expected[$i] === "\n") {
-                    $line++;
-                }
-                if ($expected[$i] === '%') {
-                    Preg::isMatchStrictGroups('{%(.+?)%}', substr($expected, $i), $match);
-                    $regex = $match[1];
-
-                    if (Preg::isMatch('{'.$regex.'}', substr($output, $j), $match)) {
-                        $i += strlen($regex) + 2;
-                        $j += strlen((string) $match[0]);
-                        continue;
-                    } else {
-                        $this->fail(
-                            'Failed to match pattern '.$regex.' at line '.$line.' / abs offset '.$i.': '
-                            .substr($output, $j, min(strpos($output, "\n", $j) - $j, 100)).PHP_EOL.PHP_EOL.
-                            'Output:'.PHP_EOL.$output
-                        );
-                    }
-                }
-                if ($expected[$i] !== $output[$j]) {
-                    $this->fail(
-                        'Output does not match expectation at line '.$line.' / abs offset '.$i.': '.PHP_EOL
-                        .'-'.substr($expected, $i, min(strpos($expected, "\n", $i) - $i, 100)).PHP_EOL
-                        .'+'.substr($output, $j, min(strpos($output, "\n", $j) - $j, 100)).PHP_EOL.PHP_EOL
-                        .'Output:'.PHP_EOL.$output
-                    );
-                }
-                $i++;
-                $j++;
-            }
-        }
-        if (isset($testData['EXPECT-REGEX'])) {
-            self::assertMatchesRegularExpression($testData['EXPECT-REGEX'], $this->cleanOutput($output));
-        }
-        if (isset($testData['EXPECT-REGEXES'])) {
-            $cleanOutput = $this->cleanOutput($output);
-            foreach (explode("\n", $testData['EXPECT-REGEXES']) as $regex) {
-                self::assertMatchesRegularExpression($regex, $cleanOutput, 'Output: '.$output);
-            }
-        }
-        if (isset($testData['EXPECT-EXIT-CODE'])) {
-            self::assertSame($testData['EXPECT-EXIT-CODE'], $exitCode);
-        }
+        return $this->processedUrl;
     }
 
     /**
-     * @return array<string, array<string>>
+     * Sets the processed URL that will be downloaded.
+     *
+     * @param non-empty-string $processedUrl New processed URL
      */
-    public static function getTestFiles(): array
+    public function setProcessedUrl(string $processedUrl): void
     {
-        $tests = [];
-        foreach (Finder::create()->in(__DIR__.'/Fixtures/functional')->name('*.test')->files() as $file) {
-            $tests[$file->getFilename()] = [(string) $file];
-        }
-
-        return $tests;
+        $this->processedUrl = $processedUrl;
     }
 
     /**
-     * @return array{RUN: string, EXPECT?: string, EXPECT-EXIT-CODE?: int, EXPECT-REGEX?: string, EXPECT-REGEXES?: string, TEST?: string}
+     * Retrieves a custom package cache key for this download.
      */
-    private function parseTestFile(string $file): array
+    public function getCustomCacheKey(): ?string
     {
-        $tokens = Preg::split('#(?:^|\n*)--([A-Z-]+)--\n#', file_get_contents($file), -1, PREG_SPLIT_DELIM_CAPTURE);
-        $data = [];
-        $section = null;
-
-        foreach ($tokens as $token) {
-            if ('' === $token && null === $section) {
-                continue;
-            }
-
-            // Handle section headers.
-            if (null === $section) {
-                $section = $token;
-                continue;
-            }
-
-            $sectionData = $token;
-
-            // Allow sections to validate, or modify their section data.
-            switch ($section) {
-                case 'EXPECT-EXIT-CODE':
-                    $sectionData = (int) $sectionData;
-                    break;
-
-                case 'RUN':
-                case 'EXPECT':
-                case 'EXPECT-REGEX':
-                case 'EXPECT-REGEXES':
-                    $sectionData = trim($sectionData);
-                    break;
-
-                case 'TEST':
-                    break;
-
-                default:
-                    throw new \RuntimeException(sprintf(
-                        'Unknown section "%s". Allowed sections: "RUN", "EXPECT", "EXPECT-EXIT-CODE", "EXPECT-REGEX", "EXPECT-REGEXES". '
-                       .'Section headers must be written as "--HEADER_NAME--".',
-                        $section
-                    ));
-            }
-
-            $data[$section] = $sectionData;
-            $section = $sectionData = null;
-        }
-
-        // validate data
-        if (!isset($data['RUN'])) {
-            throw new \RuntimeException('The test file must have a section named "RUN".');
-        }
-        if (!isset($data['EXPECT']) && !isset($data['EXPECT-REGEX']) && !isset($data['EXPECT-REGEXES'])) {
-            throw new \RuntimeException('The test file must have a section named "EXPECT", "EXPECT-REGEX", or "EXPECT-REGEXES".');
-        }
-
-        return $data; // @phpstan-ignore return.type
+        return $this->customCacheKey;
     }
 
-    private function cleanOutput(string $output): string
+    /**
+     * Sets a custom package cache key for this download.
+     *
+     * @param string|null $customCacheKey New cache key
+     */
+    public function setCustomCacheKey(?string $customCacheKey): void
     {
-        $processed = '';
+        $this->customCacheKey = $customCacheKey;
+    }
 
-        for ($i = 0; $i < strlen($output); $i++) {
-            if ($output[$i] === "\x08") {
-                $processed = substr($processed, 0, -1);
-            } elseif ($output[$i] !== "\r") {
-                $processed .= $output[$i];
-            }
-        }
+    /**
+     * Returns the type of this download (package, metadata).
+     */
+    public function getType(): string
+    {
+        return $this->type;
+    }
 
-        return $processed;
+    /**
+     * Returns the context of this download, if any.
+     *
+     * If this download is of type package, the package object is returned.
+     * If the type is metadata, an array{repository: RepositoryInterface} is returned.
+     *
+     * @return mixed
+     */
+    public function getContext()
+    {
+        return $this->context;
+    }
+
+    /**
+     * Returns transport options for the download.
+     *
+     * Only available for events with type metadata, for packages set the transport options on the package itself.
+     *
+     * @return mixed[]
+     */
+    public function getTransportOptions(): array
+    {
+        return $this->transportOptions;
+    }
+
+    /**
+     * Sets transport options for the download.
+     *
+     * Only available for events with type metadata, for packages set the transport options on the package itself.
+     *
+     * @param mixed[] $options
+     */
+    public function setTransportOptions(array $options): void
+    {
+        $this->transportOptions = $options;
     }
 }

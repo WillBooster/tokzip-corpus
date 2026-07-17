@@ -1,104 +1,125 @@
-﻿namespace AutoMapper;
+using AutoMapper.Internal.Mappers;
+namespace AutoMapper.Configuration;
+
 [EditorBrowsable(EditorBrowsableState.Never)]
-public sealed class ConstructorMap
+public readonly record struct ConfigurationValidator(IGlobalConfigurationExpression Expression)
 {
-    private bool? _canResolve;
-    private readonly List<ConstructorParameterMap> _ctorParams = new();
-    public ConstructorInfo Ctor { get; private set; }
-    public IReadOnlyCollection<ConstructorParameterMap> CtorParams => _ctorParams;
-    public void Reset(ConstructorInfo ctor)
+    private void Validate(ValidationContext context)
     {
-        Ctor = ctor;
-        _ctorParams.Clear();
-        _canResolve = null;
-    }
-    public bool CanResolve
-    {
-        get => _canResolve ??= ParametersCanResolve();
-        set => _canResolve = value;
-    }
-    bool ParametersCanResolve()
-    {
-        foreach (var param in _ctorParams)
+        foreach (var validator in Expression.Validators)
         {
-            if (!param.IsMapped)
+            validator(context);
+        }
+    }
+    public void AssertConfigurationExpressionIsValid(IGlobalConfiguration config, IEnumerable<TypeMap> typeMaps)
+    {
+        var duplicateTypeMapConfigs = Expression.Profiles.Append((Profile)Expression)
+            .SelectMany(p => p.TypeMapConfigs, (profile, typeMap) => (profile, typeMap))
+            .GroupBy(x => x.typeMap.Types)
+            .Where(g => g.Count() > 1)
+            .Select(g => (TypePair : g.Key, ProfileNames : g.Select(tmc => tmc.profile.ProfileName).ToArray()))
+            .Select(g => new DuplicateTypeMapConfigurationException.TypeMapConfigErrors(g.TypePair, g.ProfileNames))
+            .ToArray();
+        if (duplicateTypeMapConfigs.Any())
+        {
+            throw new DuplicateTypeMapConfigurationException(duplicateTypeMapConfigs);
+        }
+        AssertConfigurationIsValid(config, typeMaps);
+    }
+    public void AssertConfigurationIsValid(IGlobalConfiguration config, IEnumerable<TypeMap> typeMaps)
+    {
+        var maps = typeMaps as TypeMap[] ?? typeMaps.ToArray();
+        var badTypeMaps =
+            (from typeMap in maps
+                where typeMap.ShouldCheckForValid
+                let unmappedPropertyNames = typeMap.GetUnmappedPropertyNames()
+                let canConstruct = typeMap.PassesCtorValidation
+                where unmappedPropertyNames.Length > 0 || !canConstruct
+                select new AutoMapperConfigurationException.TypeMapConfigErrors(typeMap, unmappedPropertyNames, canConstruct)
+                ).ToArray();
+
+        if (badTypeMaps.Any())
+        {
+            throw new AutoMapperConfigurationException(badTypeMaps);
+        }
+        var typeMapsChecked = new HashSet<TypeMap>();
+        var configExceptions = new List<Exception>();
+        foreach (var typeMap in maps)
+        {
+            try
             {
-                return false;
+                DryRunTypeMap(config, typeMapsChecked, typeMap.Types, typeMap, null);
+            }
+            catch (Exception e)
+            {
+                configExceptions.Add(e);
             }
         }
-        return true;
-    }
-    public ConstructorParameterMap this[string name]
-    {
-        get
+        if (configExceptions.Count > 1)
         {
-            foreach (var param in _ctorParams)
+            throw new AggregateException(configExceptions);
+        }
+        if (configExceptions.Count > 0)
+        {
+            throw configExceptions[0];
+        }
+    }
+    private void DryRunTypeMap(IGlobalConfiguration config, HashSet<TypeMap> typeMapsChecked, TypePair types, TypeMap typeMap, MemberMap memberMap)
+    {
+        if(typeMap == null)
+        {
+            if (types.ContainsGenericParameters)
             {
-                if (param.DestinationName.Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
-                    return param;
-                }
+                return;
             }
-            return null;
+            typeMap = config.ResolveTypeMap(types.SourceType, types.DestinationType);
         }
-    }
-    public void AddParameter(ParameterInfo parameter, IEnumerable<MemberInfo> sourceMembers, TypeMap typeMap) => _ctorParams.Add(new(typeMap, parameter, sourceMembers.ToArray()));
-    public bool ApplyMap(TypeMap typeMap, IncludedMember includedMember = null)
-    {
-        var constructorMap = typeMap.ConstructorMap;
-        if(constructorMap == null)
+        if (typeMap != null)
         {
-            return false;
-        }
-        bool applied = false;
-        foreach(var parameterMap in _ctorParams)
-        {
-            var inheritedParameterMap = constructorMap[parameterMap.DestinationName];
-            if(inheritedParameterMap is not { IsMapped: true, DestinationType: var type } || type != parameterMap.DestinationType || !parameterMap.ApplyMap(inheritedParameterMap, includedMember))
+            if (typeMapsChecked.Contains(typeMap))
             {
-                continue;
+                return;
             }
-            applied = true;
-            _canResolve = null;
-        }
-        return applied;
-    }
-}
-[EditorBrowsable(EditorBrowsableState.Never)]
-public class ConstructorParameterMap : MemberMap
-{
-    public ConstructorParameterMap(TypeMap typeMap, ParameterInfo parameter, MemberInfo[] sourceMembers) : base(typeMap)
-    {
-        Parameter = parameter;
-        if (sourceMembers.Length > 0)
-        {
-            MapByConvention(sourceMembers);
+            typeMapsChecked.Add(typeMap);
+            var context = new ValidationContext(types, memberMap, typeMap);
+            Validate(context);
+            if(!typeMap.ShouldCheckForValid)
+            {
+                return;
+            }
+            CheckPropertyMaps(config, typeMapsChecked, typeMap);
         }
         else
         {
-            SourceMembers = Array.Empty<MemberInfo>();
+            var mapperToUse = config.FindMapper(types);
+            if (mapperToUse == null)
+            {
+                throw new AutoMapperConfigurationException(memberMap.TypeMap.Types) { MemberMap = memberMap };
+            }
+            var context = new ValidationContext(types, memberMap, ObjectMapper: mapperToUse);
+            Validate(context);
+            if (mapperToUse.GetAssociatedTypes(types) is TypePair newTypes && newTypes != types)
+            {
+                DryRunTypeMap(config, typeMapsChecked, newTypes, null, memberMap);
+            }
         }
     }
-    public ParameterInfo Parameter { get; }
-    public override Type DestinationType => Parameter.ParameterType;
-    public override IncludedMember IncludedMember { get; protected set; }
-    public override MemberInfo[] SourceMembers { get; set; }
-    public override string DestinationName => Parameter.Name;
-    public Expression DefaultValue(IGlobalConfiguration configuration) => Parameter.IsOptional ? Parameter.GetDefaultValue(configuration) : configuration.Default(DestinationType);
-    public override string ToString() => $"{Parameter.Member}, parameter {DestinationName}";
-    public bool ApplyMap(ConstructorParameterMap inheritedParameterMap, IncludedMember includedMember)
+    private void CheckPropertyMaps(IGlobalConfiguration config, HashSet<TypeMap> typeMapsChecked, TypeMap typeMap)
     {
-        if(includedMember != null && IsMapped)
+        foreach (var memberMap in typeMap.MemberMaps)
         {
-            return false;
+            if(memberMap.Ignored || (memberMap is PropertyMap && typeMap.ConstructorParameterMatches(memberMap.DestinationName)))
+            {
+                continue;
+            }
+            var sourceType = memberMap.SourceType;
+            // when we don't know what the source type is, bail
+            if (sourceType.IsGenericParameter || sourceType == typeof(object))
+            {
+                continue;
+            }
+            DryRunTypeMap(config, typeMapsChecked, new(sourceType, memberMap.DestinationType), null, memberMap);
         }
-        ExplicitExpansion ??= inheritedParameterMap.ExplicitExpansion;
-        if(ApplyInheritedMap(inheritedParameterMap))
-        {
-            IncludedMember = includedMember?.Chain(inheritedParameterMap.IncludedMember);
-            return true;
-        }
-        return false;
     }
-    public override bool? ExplicitExpansion { get; set; }
 }
+public readonly record struct ValidationContext(TypePair Types, MemberMap MemberMap, TypeMap TypeMap = null, IObjectMapper ObjectMapper = null);

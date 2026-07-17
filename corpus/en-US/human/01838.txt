@@ -1,65 +1,63 @@
-[View source here.](https://github.com/denoland/examples/tree/main/with-planetscale)
+In both modes the Deno runtime and the rendering backend (CEF, WebView, …) stay
+alive across changes. There is no full restart, no webview teardown, no
+reconnect.
 
-We'll use the Planetscale serverless driver, `@planetscale/database`, to work
-with Deno. First we want to create `main.ts` and import the connect method from
-this package:
+## Framework HMR
 
-```tsx
-import { connect } from "npm:@planetscale/database@^1.4";
+When framework detection identifies your project (see
+[Frameworks](/runtime/desktop/frameworks/)), `--hmr` runs the framework's own
+dev server instead of its production server. The webview connects to that dev
+server directly: fast refresh, state preservation, and error overlays all work
+the same as in a browser tab.
+
+```sh
+deno desktop --hmr .       # in a Next.js / Astro / Fresh / … project
 ```
 
-## Configuring our connection
+The dev server's exact behavior comes from the framework. If `next dev`
+preserves component state across edits in a browser, it preserves it in your
+desktop app too. If `astro dev` shows an in-page error overlay on a syntax
+error, you see the same overlay.
 
-The connection requires three credentials: host, username, and password. These
-are database-specific, so we first need to create a database in Planetscale. You
-can do that by following the initial instructions
-[here](https://planetscale.com/docs/tutorials/planetscale-quick-start-guide).
-Don't worry about adding the schema—we can do that through
-`@planetscale/database`.
+You do not need to run the framework's dev script separately;
+`deno desktop --hmr` starts it as part of the desktop runtime.
 
-Once you have created the database, head to Overview, click "Connect", and
-choose "Connect with `@planetscale/database`" to get the host and username. Then
-click through to Passwords to create a new password for your database. Once you
-have all three you can plug them in directly, or better, store them as
-environment variables:
+## Plain-app HMR
 
-```bash
-export HOST=<host>
-export USERNAME=<username>
-export PASSWORD=<password>
+For projects without a detected framework, `--hmr` watches your source files and
+uses V8's `Debugger.setScriptSource` to hot-swap modules into the running
+isolate.
+
+```ts title="main.ts"
+Deno.serve((req) => {
+  return new Response("hello world");
+});
 ```
 
-Then call them using `Deno.env`:
-
-```tsx
-const config = {
-  host: Deno.env.get("HOST"),
-  username: Deno.env.get("USERNAME"),
-  password: Deno.env.get("PASSWORD"),
-};
-
-const conn = connect(config);
+```sh
+deno desktop --hmr main.ts
 ```
 
-This will also work on Deno Deploy if you set the environment variables in the
-dashboard. Run with:
+Edit `main.ts` (change the response body, add a route) and the change applies on
+save. The runtime does not restart, the webview does not reload, the listening
+socket stays bound.
 
-```shell
-deno run --allow-net --allow-env main.ts
-```
+### What persists across reloads
 
-The `conn` object is now an open connection to our Planetscale database.
+`Debugger.setScriptSource` replaces the **code** of a function with new code.
+Live values stay the same:
 
-## Creating and populating our database table
+- Module-level state (top-level `let`, top-level `Map`, etc.) is preserved.
+- Open file handles, network connections, child processes: all preserved.
+- The HTTP listener is preserved.
+- Timers and intervals keep firing on their original schedule unless you
+  `clearTimeout` / `clearInterval` them.
 
-Now that you have the connection running, you can `conn.execute()` with SQL
-commands to create tables and insert the initial data:
+### What changes on the next call
 
-```tsx
-await conn.execute(
-  "CREATE TABLE dinosaurs (id int NOT NULL AUTO_INCREMENT PRIMARY KEY, name varchar(255) NOT NULL, description varchar(255) NOT NULL);",
-);
-await conn.execute(
-  "INSERT INTO `dinosaurs` (id, name, description) VALUES (1, 'Aardonyx', 'An early stage in the evolution of sauropods.'), (2, 'Abelisaurus', 'Abels lizard has been reconstructed from a single skull.'), (3, 'Deno', 'The fastest dinosaur that ever lived.')",
-);
-```
+The replaced functions execute their new bodies the next time they are called.
+So:
+
+- A request handler change takes effect on the next request.
+- A timer callback change takes effect on the next firing.
+- An event listener change takes effect on the next event.

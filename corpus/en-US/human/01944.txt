@@ -1,13 +1,60 @@
----
-last_modified: 2026-05-20
-title: "Handle OS signals"
-description: "Tutorial on handling operating system signals in Deno. Learn how to capture SIGINT and SIGBREAK events, manage signal listeners, and implement graceful shutdown handlers in your applications."
-url: /examples/os_signals_tutorial/
-oldUrl:
-  - /runtime/manual/examples/os_signals/
-  - /runtime/tutorials/os_signals/
----
+## Why the behavior is changing
 
-> ⚠️ Windows supports listening for `SIGINT`, `SIGBREAK`, `SIGTERM`, `SIGQUIT`,
-> `SIGHUP`, and `SIGWINCH` (all except `SIGINT`/`SIGBREAK` go through libuv's
-> Windows signal emulation).
+Because the signal aborted on success, code that watches `request.signal` could
+not tell the difference between "the client disconnected" and "the response was
+delivered normally". This breaks a number of common libraries, most visibly
+Node-style HTTP proxies such as
+[`http-proxy`](https://www.npmjs.com/package/http-proxy) and
+[`http-proxy-middleware`](https://www.npmjs.com/package/http-proxy-middleware)
+(used by Vite, among others), which treat the upstream abort as a genuine
+failure and surface a spurious error.
+
+See issues [#28850](https://github.com/denoland/deno/issues/28850) and
+[#29111](https://github.com/denoland/deno/issues/29111) for background.
+
+## The new behavior
+
+With `--unstable-no-legacy-abort` enabled, `request.signal` aborts **only** when
+the client actually cancels the request or the connection is lost before the
+response has been fully sent. A successful response no longer triggers an abort.
+
+```ts
+Deno.serve((req) => {
+  req.signal.addEventListener("abort", () => {
+    // With --unstable-no-legacy-abort this only runs on a real client
+    // disconnect, not on every successful response.
+    console.log("client went away");
+  });
+
+  return new Response("hello");
+});
+```
+
+## Detecting when a request has been fully delivered
+
+If you relied on the legacy abort to know that a response had been fully sent,
+use the `completed` promise on the second argument to the handler
+([`ServeHandlerInfo`](/api/deno/~/Deno.ServeHandlerInfo)) instead. It is the
+intended, mode-independent way to observe delivery:
+
+```ts
+Deno.serve((req, info) => {
+  info.completed
+    .then(() => {
+      // The response, including a streaming body, was sent successfully.
+      console.log("response fully delivered");
+    })
+    .catch((err) => {
+      // Delivery failed partway through (client disconnected, write error, ...).
+      console.error("response was not sent successfully:", err);
+    });
+
+  return new Response(someStream);
+});
+```
+
+`info.completed`:
+
+- **resolves** once the response (including any streaming body) has been sent to
+  the client, and
+- **rejects** if delivery failed before completing.

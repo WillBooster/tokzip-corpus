@@ -1,65 +1,87 @@
-import base64
-import importlib
-import re
-import sys
-import traceback
-from io import BytesIO
-from pathlib import Path
-from zipfile import ZipFile
+from typing import Annotated, Any
 
-import micropip
-import pyodide
 import pytest
 
-# this seems to be required for me on M1 Mac
-sys.setrecursionlimit(200)
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
-async def main(tests_zip: str, tag_name: str):
-    print(f'Using pyodide version: {pyodide.__version__}')
-    print(f'Extracting test files (size: {len(tests_zip):,})...')
-    # File saved on the GH release
-    pydantic_core_wheel = (
-        'https://githubproxy.samuelcolvin.workers.dev/pydantic/pydantic-core/releases/'
-        f'download/{tag_name}/pydantic_core-{tag_name.lstrip("v")}-cp312-cp312-emscripten_3_1_58_wasm32.whl'
-    )
-    zip_file = ZipFile(BytesIO(base64.b64decode(tests_zip)))
-    count = 0
-    for name in zip_file.namelist():
-        if name.endswith('.py'):
-            path, subs = re.subn(r'^pydantic-core-.+?/tests/', 'tests/', name)
-            if subs:
-                count += 1
-                path = Path(path)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with zip_file.open(name, 'r') as f:
-                    path.write_bytes(f.read())
+@pytest.fixture(scope='session', name='ModelWithStrictField')
+def model_with_strict_field():
+    class ModelWithStrictField(BaseModel):
+        a: Annotated[int, Field(strict=True)]
 
-    print(f'Mounted {count} test files, installing dependencies...')
-
-    await micropip.install(
-        [
-            'dirty-equals',
-            'hypothesis',
-            'pytest-speed',
-            'pytest-mock',
-            'tzdata',
-            'inline-snapshot<0.21',
-            'typing-extensions>=4.14.1',
-            'typing-inspection',
-            pydantic_core_wheel,
-        ]
-    )
-    importlib.invalidate_caches()
-
-    # print('installed packages:')
-    # print(micropip.list())
-    print('Running tests...')
-    pytest.main()
+    return ModelWithStrictField
 
 
-try:
-    await main(tests_zip, pydantic_core_version)  # noqa: F821,F704
-except Exception:
-    traceback.print_exc()
-    raise
+@pytest.mark.parametrize(
+    'value',
+    [
+        '1',
+        True,
+        1.0,
+    ],
+)
+def test_parse_strict_mode_on_field_invalid(value: Any, ModelWithStrictField: type[BaseModel]) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        ModelWithStrictField(a=value)
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'int_type', 'loc': ('a',), 'msg': 'Input should be a valid integer', 'input': value}
+    ]
+
+
+def test_parse_strict_mode_on_field_valid(ModelWithStrictField: type[BaseModel]) -> None:
+    value = ModelWithStrictField(a=1)
+    assert value.model_dump() == {'a': 1}
+
+
+@pytest.fixture(scope='session', name='ModelWithStrictConfig')
+def model_with_strict_config_false():
+    class ModelWithStrictConfig(BaseModel):
+        a: int
+        # strict=False overrides the Config
+        b: Annotated[int, Field(strict=False)]
+        # strict=None or not including it is equivalent
+        # lets this field be overridden by the Config
+        c: Annotated[int, Field(strict=None)]
+        d: Annotated[int, Field()]
+
+        model_config = ConfigDict(strict=True)
+
+    return ModelWithStrictConfig
+
+
+def test_parse_model_with_strict_config_enabled(ModelWithStrictConfig: type[BaseModel]) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        ModelWithStrictConfig(a='1', b=2, c=3, d=4)
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'int_type', 'loc': ('a',), 'msg': 'Input should be a valid integer', 'input': '1'}
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        ModelWithStrictConfig(a=1, b=2, c='3', d=4)
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'int_type', 'loc': ('c',), 'msg': 'Input should be a valid integer', 'input': '3'}
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        ModelWithStrictConfig(a=1, b=2, c=3, d='4')
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'int_type', 'loc': ('d',), 'msg': 'Input should be a valid integer', 'input': '4'}
+    ]
+    values = [
+        ModelWithStrictConfig(a=1, b='2', c=3, d=4),
+        ModelWithStrictConfig(a=1, b=2, c=3, d=4),
+    ]
+    assert all(v.model_dump() == {'a': 1, 'b': 2, 'c': 3, 'd': 4} for v in values)
+
+
+def test_parse_model_with_strict_config_disabled(ModelWithStrictConfig: type[BaseModel]) -> None:
+    class Model(ModelWithStrictConfig):
+        model_config = ConfigDict(strict=False)
+
+    values = [
+        Model(a='1', b=2, c=3, d=4),
+        Model(a=1, b=2, c='3', d=4),
+        Model(a=1, b=2, c=3, d='4'),
+        Model(a=1, b='2', c=3, d=4),
+        Model(a=1, b=2, c=3, d=4),
+    ]
+    assert all(v.model_dump() == {'a': 1, 'b': 2, 'c': 3, 'd': 4} for v in values)

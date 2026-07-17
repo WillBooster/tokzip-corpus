@@ -1,199 +1,21 @@
-There are two ways to specify the library:
+A common solution is to refactor the code to run the loop body asynchronously
+and capture the promises generated. After the loop finishes you can then await
+all the promises at once.
 
-- **A path with a separator** (for example `"./libexample.so"` or
-  `"/usr/lib/libexample.so"`) is opened from that exact location. A _relative_
-  path like `"./libexample.so"` is resolved against the **current working
-  directory of the process**, not against the location of your `.ts` file. This
-  is a common source of "could not open library" errors: running the same script
-  from a different directory changes where Deno looks.
-- **A bare name** with no separator (for example `"libexample.so"`) is left to
-  the OS to find on its standard search path. On Linux that means
-  `LD_LIBRARY_PATH` and the system cache (such as `/usr/lib`); on macOS the
-  `DYLD_*` paths; on Windows the executable's directory, the system directories,
-  and `PATH`. Use this form for libraries that are already installed
-  system-wide.
+**Invalid:**
 
-### Resolving the path relative to your module
-
-To load a library that ships next to your source file regardless of the current
-working directory, resolve the path against `import.meta.url` instead of using a
-bare relative string:
-
-```ts
-// Always points at libexample.so sitting next to this module.
-const path = new URL("./libexample.so", import.meta.url).pathname;
-
-const dylib = Deno.dlopen(
-  path,
-  {
-    add: { parameters: ["i32", "i32"], result: "i32" },
-  } as const,
-);
-```
-
-This pattern also works inside an executable produced by
-[`deno compile`](/runtime/reference/cli/compile/) (see below).
-
-### Bundling a library with `deno compile`
-
-[`Deno.dlopen`](/api/deno/~/Deno.dlopen) needs a real file on disk, so a dynamic
-library is not embedded in a compiled binary automatically. Include it
-explicitly with the `--include` flag:
-
-```sh
-deno compile --allow-ffi --include libexample.so main.ts
-```
-
-At runtime Deno unpacks the included library to a temporary directory and points
-`import.meta.url` at it, so a module that resolves its path with
-`new URL("./libexample.so", import.meta.url).pathname` (as shown above) finds
-the bundled copy and the resulting binary runs on a machine that does not have
-the library installed. If you do not bundle the library, ship it alongside the
-executable and load it by a path relative to the binary, or rely on the system
-search path described above.
-
-### Handling load failures
-
-[`Deno.dlopen`](/api/deno/~/Deno.dlopen) throws synchronously when the library
-cannot be loaded or when a declared symbol is missing, so wrap the call in a
-`try`/`catch` to fail gracefully:
-
-```ts
-let dylib;
-try {
-  dylib = Deno.dlopen(
-    "./libexample.so",
-    {
-      add: { parameters: ["i32", "i32"], result: "i32" },
-    } as const,
-  );
-} catch (err) {
-  // A missing or unreadable file reports "Could not open library: ...".
-  // A missing function reports "Failed to register symbol <name>: ...".
-  console.error("Failed to load native library:", err.message);
-  Deno.exit(1);
+```javascript
+async function doSomething(items) {
+  const results = [];
+  for (const item of items) {
+    // Each item in the array blocks on the previous one finishing
+    results.push(await someAsyncProcessing(item));
+  }
+  return processResults(results);
 }
 ```
 
-The error message distinguishes the two common cases: the file itself could not
-be opened (wrong path, missing file, or an architecture mismatch), or the file
-loaded but one of the symbols you declared was not found in it.
+**Valid:**
 
-## Supported types
-
-Deno's FFI supports a variety of data types for parameters and return values:
-
-| FFI Type               | Deno                 | C                        | Rust                      |
-| ---------------------- | -------------------- | ------------------------ | ------------------------- |
-| `i8`                   | `number`             | `char` / `signed char`   | `i8`                      |
-| `u8`                   | `number`             | `unsigned char`          | `u8`                      |
-| `i16`                  | `number`             | `short int`              | `i16`                     |
-| `u16`                  | `number`             | `unsigned short int`     | `u16`                     |
-| `i32`                  | `number`             | `int` / `signed int`     | `i32`                     |
-| `u32`                  | `number`             | `unsigned int`           | `u32`                     |
-| `i64`                  | `bigint`             | `long long int`          | `i64`                     |
-| `u64`                  | `bigint`             | `unsigned long long int` | `u64`                     |
-| `usize`                | `bigint`             | `size_t`                 | `usize`                   |
-| `isize`                | `bigint`             | `size_t`                 | `isize`                   |
-| `f32`                  | `number`             | `float`                  | `f32`                     |
-| `f64`                  | `number`             | `double`                 | `f64`                     |
-| `void`[1]              | `undefined`          | `void`                   | `()`                      |
-| `pointer`              | `{} \| null`         | `void *`                 | `*mut c_void`             |
-| `buffer`[2]            | `TypedArray \| null` | `uint8_t *`              | `*mut u8`                 |
-| `function`[3]          | `{} \| null`         | `void (*fun)()`          | `Option<extern "C" fn()>` |
-| `{ struct: [...] }`[4] | `TypedArray`         | `struct MyStruct`        | `MyStruct`                |
-
-As of Deno 1.25, the `pointer` type has been split into a `pointer` and a
-`buffer` type to ensure users take advantage of optimizations for Typed Arrays,
-and as of Deno 1.31 the JavaScript representation of `pointer` has become an
-opaque pointer object or `null` for null pointers.
-
-- [1] `void` type can only be used as a result type.
-- [2] `buffer` type accepts TypedArrays as parameter, but it always returns a
-  pointer object or `null` when used as result type like the `pointer` type.
-- [3] `function` type works exactly the same as the `pointer` type as a
-  parameter and result type.
-- [4] `struct` type is for passing and returning C structs by value (copy). The
-  `struct` array must enumerate each of the struct's fields' type in order. The
-  structs are padded automatically: Packed structs can be defined by using an
-  appropriate amount of `u8` fields to avoid padding. Only TypedArrays are
-  supported as structs, and structs are always returned as `Uint8Array`s.
-
-## Working with structs
-
-To pass or return a C struct by value, describe its layout with
-`{ struct: [...] }` — an array that lists each field's FFI type in declaration
-order. Struct values are passed as a `TypedArray` whose bytes match the C
-layout, and structs returned by value come back as a `Uint8Array` of the right
-length. The `struct` array in the type table earlier on this page is the
-authoritative shape.
-
-Suppose you have this small C library that operates on a 2D `Point`:
-
-```c title="point.c"
-typedef struct {
-  double x;
-  double y;
-} Point;
-
-double distance(Point a, Point b) {
-  double dx = a.x - b.x;
-  double dy = a.y - b.y;
-  return __builtin_sqrt(dx * dx + dy * dy);
-}
-
-Point midpoint(Point a, Point b) {
-  Point m;
-  m.x = (a.x + b.x) / 2.0;
-  m.y = (a.y + b.y) / 2.0;
-  return m;
-}
-```
-
-Build it as a shared library. The compiler flags and output filename vary by
-platform:
-
-<deno-tabs group-id="operating-systems">
-<deno-tab value="linux" label="Linux" default>
-
-```sh
-cc -shared -fPIC -O2 -o libpoint.so point.c
-```
-
-</deno-tab>
-<deno-tab value="mac" label="macOS">
-
-```sh
-cc -dynamiclib -O2 -o libpoint.dylib point.c
-```
-
-</deno-tab>
-<deno-tab value="windows" label="Windows">
-
-```sh
-cl /LD /O2 point.c /Fe:point.dll
-```
-
-</deno-tab>
-</deno-tabs>
-
-Then call into it from Deno, using the filename for your platform in
-[`Deno.dlopen`](/api/deno/~/Deno.dlopen). Note that the `struct` definition is
-an _array of field types_ in declaration order, not an object with named fields:
-
-```ts title="point.ts"
-// `Point` mirrors the C `struct Point { double x; double y; }`.
-const Point = { struct: ["f64", "f64"] } as const;
-
-const lib = Deno.dlopen(
-  "./libpoint.so",
-  {
-    distance: { parameters: [Point, Point], result: "f64" },
-    midpoint: { parameters: [Point, Point], result: Point },
-  } as const,
-);
-
-// Build struct values as a TypedArray whose bytes match the C layout.
-// Two f64 fields → two slots in a Float64Array.
-const a = new Float64Array([1.0, 2.0]); // Point { x: 1.0, y: 2.0 }
-const b = new Float64Array([4.0, 6.0]); // Point { x: 4.0, y: 6.0 }
+```javascript
+async function doSometh

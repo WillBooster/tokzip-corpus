@@ -1,88 +1,104 @@
-import {
-    ApplicableRefactorInfo,
-    codefix,
-    createFutureSourceFile,
-    Debug,
-    Diagnostics,
-    emptyArray,
-    findAncestor,
-    getLineAndCharacterOfPosition,
-    getLocaleSpecificMessage,
-    getTokenAtPosition,
-    hostGetCanonicalFileName,
-    isBlockLike,
-    isSourceFile,
-    LanguageServiceHost,
-    last,
-    ModuleKind,
-    Program,
-    RefactorContext,
-    RefactorEditInfo,
-    SourceFile,
-    textChanges,
-    UserPreferences,
-} from "../_namespaces/ts.js";
-import {
-    addNewFileToTsconfig,
-    createNewFileName,
-    getNewStatementsAndRemoveFromOldFile,
-    getStatementsToMove,
-    getUsageInfo,
-    registerRefactor,
-    ToMove,
-} from "../_namespaces/ts.refactor.js";
+import * as Harness from "../../_namespaces/Harness.js";
+import * as ts from "../../_namespaces/ts.js";
 
-const refactorName = "Move to a new file";
-const description = getLocaleSpecificMessage(Diagnostics.Move_to_a_new_file);
+describe("unittests:: services:: cancellableLanguageServiceOperations", () => {
+    const file = `
+        function foo(): void;
+        function foo<T>(x: T): T;
+        function foo<T>(x?: T): T | void {}
+        foo(f);
+        `;
+    it("can cancel signature help mid-request", () => {
+        verifyOperationCancelledAfter(file, 4, service =>
+            // Two calls are top-level in services, one is the root type, and the second should be for the parameter type
+            service.getSignatureHelpItems("file.ts", file.lastIndexOf("f"), ts.emptyOptions)!, r => assert.exists(r.items[0]));
+    });
 
-const moveToNewFileAction = {
-    name: refactorName,
-    description,
-    kind: "refactor.move.newFile",
-};
-registerRefactor(refactorName, {
-    kinds: [moveToNewFileAction.kind],
-    getAvailableActions: function getRefactorActionsToMoveToNewFile(context): readonly ApplicableRefactorInfo[] {
-        const statements = getStatementsToMove(context);
+    it("can cancel find all references mid-request", () => {
+        verifyOperationCancelledAfter(file, 3, service =>
+            // Two calls are top-level in services, one is the root type
+            service.findReferences("file.ts", file.lastIndexOf("o"))!, r => assert.exists(r[0].definition));
+    });
 
-        const file = context.file;
-        if (context.triggerReason === "implicit" && context.endPosition !== undefined) {
-            const startNodeAncestor = findAncestor(getTokenAtPosition(file, context.startPosition), isBlockLike);
-            const endNodeAncestor = findAncestor(getTokenAtPosition(file, context.endPosition), isBlockLike);
-            if (startNodeAncestor && !isSourceFile(startNodeAncestor) && endNodeAncestor && !isSourceFile(endNodeAncestor)) {
-                return emptyArray;
-            }
-        }
+    it("can cancel quick info mid-request", () => {
+        verifyOperationCancelledAfter(file, 1, service =>
+            // The LS doesn't do any top-level checks on the token for quickinfo, so the first check is within the checker
+            service.getQuickInfoAtPosition("file.ts", file.lastIndexOf("o"))!, r => assert.exists(r.displayParts));
+    });
 
-        if (context.preferences.allowTextChangesInNewFiles && statements) {
-            const file = context.file;
-            const affectedTextRange = {
-                start: { line: getLineAndCharacterOfPosition(file, statements.all[0].getStart(file)).line, offset: getLineAndCharacterOfPosition(file, statements.all[0].getStart(file)).character },
-                end: { line: getLineAndCharacterOfPosition(file, last(statements.all).end).line, offset: getLineAndCharacterOfPosition(file, last(statements.all).end).character },
-            };
-            return [{ name: refactorName, description, actions: [{ ...moveToNewFileAction, range: affectedTextRange }] }];
-        }
-        if (context.preferences.provideRefactorNotApplicableReason) {
-            return [{ name: refactorName, description, actions: [{ ...moveToNewFileAction, notApplicableReason: getLocaleSpecificMessage(Diagnostics.Selection_is_not_a_valid_statement_or_statements) }] }];
-        }
-        return emptyArray;
-    },
-    getEditsForAction: function getRefactorEditsToMoveToNewFile(context, actionName): RefactorEditInfo {
-        Debug.assert(actionName === refactorName, "Wrong refactor invoked");
-        const statements = Debug.checkDefined(getStatementsToMove(context));
-        const edits = textChanges.ChangeTracker.with(context, t => doChange(context.file, context.program, statements, t, context.host, context, context.preferences));
-        return { edits, renameFilename: undefined, renameLocation: undefined };
-    },
+    it("can cancel completion entry details mid-request", () => {
+        const options: ts.FormatCodeSettings = {
+            indentSize: 4,
+            tabSize: 4,
+            newLineCharacter: "\n",
+            convertTabsToSpaces: true,
+            indentStyle: ts.IndentStyle.Smart,
+            insertSpaceAfterConstructor: false,
+            insertSpaceAfterCommaDelimiter: true,
+            insertSpaceAfterSemicolonInForStatements: true,
+            insertSpaceBeforeAndAfterBinaryOperators: true,
+            insertSpaceAfterKeywordsInControlFlowStatements: true,
+            insertSpaceAfterFunctionKeywordForAnonymousFunctions: false,
+            insertSpaceAfterOpeningAndBeforeClosingNonemptyParenthesis: false,
+            insertSpaceAfterOpeningAndBeforeClosingNonemptyBrackets: false,
+            insertSpaceAfterOpeningAndBeforeClosingNonemptyBraces: true,
+            insertSpaceAfterOpeningAndBeforeClosingTemplateStringBraces: false,
+            insertSpaceAfterOpeningAndBeforeClosingJsxExpressionBraces: false,
+            insertSpaceBeforeFunctionParenthesis: false,
+            placeOpenBraceOnNewLineForFunctions: false,
+            placeOpenBraceOnNewLineForControlBlocks: false,
+        };
+        verifyOperationCancelledAfter(file, 1, service =>
+            // The LS doesn't do any top-level checks on the token for completion entry details, so the first check is within the checker
+            service.getCompletionEntryDetails("file.ts", file.lastIndexOf("f"), "foo", options, /*source*/ undefined, {}, /*data*/ undefined)!, r => assert.exists(r.displayParts));
+    });
+
+    it("can cancel suggestion diagnostics mid-request", () => {
+        verifyOperationCancelledAfter(
+            file,
+            1,
+            service =>
+                // The LS doesn't do any top-level checks on the token for suggestion diagnostics, so the first check is within the checker
+                service.getSuggestionDiagnostics("file.js"),
+            r => assert.notEqual(r.length, 0),
+            "file.js",
+            "function foo() { let a = 10; }",
+            { allowJs: true },
+        );
+    });
 });
 
-function doChange(oldFile: SourceFile, program: Program, toMove: ToMove, changes: textChanges.ChangeTracker, host: LanguageServiceHost, context: RefactorContext, preferences: UserPreferences): void {
-    const checker = program.getTypeChecker();
-    const usage = getUsageInfo(oldFile, toMove.all, checker);
-    const newFilename = createNewFileName(oldFile, program, host, toMove);
-    const newSourceFile = createFutureSourceFile(newFilename, oldFile.externalModuleIndicator ? ModuleKind.ESNext : oldFile.commonJsModuleIndicator ? ModuleKind.CommonJS : undefined, program, host);
+function verifyOperationCancelledAfter<T>(content: string, cancelAfter: number, operation: (service: ts.LanguageService) => T, validator: (arg: T) => void, fileName?: string, fileContent?: string, options?: ts.CompilerOptions) {
+    let checks = 0;
+    const token: ts.HostCancellationToken = {
+        isCancellationRequested() {
+            checks++;
+            const result = checks >= cancelAfter;
+            if (result) {
+                checks = -Infinity; // Cancel just once, then disable cancellation, effectively
+            }
+            return result;
+        },
+    };
+    const adapter = new Harness.LanguageService.NativeLanguageServiceAdapter(token, options);
+    const host = adapter.getHost();
+    host.addScript(fileName || "file.ts", fileContent || content, /*isRootFile*/ true);
+    const service = adapter.getLanguageService();
+    assertCancelled(() => operation(service));
+    validator(operation(service));
+}
 
-    const importAdderForOldFile = codefix.createImportAdder(oldFile, context.program, context.preferences, context.host);
-    const importAdderForNewFile = codefix.createImportAdder(newSourceFile, context.program, context.preferences, context.host);
-    getNewStatementsAndRemoveFromOldFile(oldFile, newSourceFile, usage, changes, toMove, program, host, preferences, importAdderForNewFile, importAdderForOldFile);
-    addNewFileToTsconfig(program, changes, oldFile.fileName, newFilename, hostGetCanonicalFileName(host));
+/**
+ * We don't just use `assert.throws` because it doesn't validate instances for thrown objects which do not inherit from `Error`
+ */
+function assertCancelled(cb: () => void) {
+    let caught: any;
+    try {
+        cb();
+    }
+    catch (e) {
+        caught = e;
+    }
+    assert.exists(caught, "Expected operation to be cancelled, but was not");
+    assert.instanceOf(caught, ts.OperationCanceledException);
 }

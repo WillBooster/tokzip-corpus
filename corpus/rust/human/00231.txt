@@ -1,238 +1,297 @@
-// Std
-use std::ffi::OsString;
-use std::mem;
-use std::ops::Deref;
+use std::{fmt::Write as _, io::Write};
 
-// Internal
-use crate::builder::{Arg, ArgPredicate, Command};
-use crate::parser::Identifier;
-use crate::parser::PendingArg;
-use crate::parser::{ArgMatches, MatchedArg, SubCommand, ValueSource};
-use crate::util::AnyValue;
-use crate::util::FlatMap;
-use crate::util::Id;
-use crate::INTERNAL_ERROR_MSG;
+use clap::{Arg, Command, ValueHint};
 
-#[derive(Debug, Default)]
-pub(crate) struct ArgMatcher {
-    matches: ArgMatches,
-    pending: Option<PendingArg>,
-}
+use crate::generator::{utils, Generator};
 
-impl ArgMatcher {
-    pub(crate) fn new(_cmd: &Command) -> Self {
-        ArgMatcher {
-            matches: ArgMatches {
-                #[cfg(debug_assertions)]
-                valid_args: {
-                    let args = _cmd.get_arguments().map(|a| a.get_id().clone());
-                    let groups = _cmd.get_groups().map(|g| g.get_id().clone());
-                    args.chain(groups).collect()
-                },
-                #[cfg(debug_assertions)]
-                valid_subcommands: _cmd
-                    .get_subcommands()
-                    .map(|sc| sc.get_name_str().clone())
-                    .collect(),
-                ..Default::default()
-            },
-            pending: None,
-        }
+/// Generate bash completion file
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Bash;
+
+impl Generator for Bash {
+    fn file_name(&self, name: &str) -> String {
+        format!("{name}.bash")
     }
 
-    pub(crate) fn into_inner(self) -> ArgMatches {
-        self.matches
-    }
+    fn generate(&self, cmd: &Command, buf: &mut dyn Write) {
+        let bin_name = cmd
+            .get_bin_name()
+            .expect("crate::generate should have set the bin_name");
 
-    pub(crate) fn propagate_globals(&mut self, global_arg_vec: &[Id]) {
-        debug!("ArgMatcher::get_global_values: global_arg_vec={global_arg_vec:?}");
-        let mut vals_map = FlatMap::new();
-        self.fill_in_global_values(global_arg_vec, &mut vals_map);
-    }
+        let fn_name = bin_name.replace('-', "__");
 
-    fn fill_in_global_values(
-        &mut self,
-        global_arg_vec: &[Id],
-        vals_map: &mut FlatMap<Id, MatchedArg>,
-    ) {
-        for global_arg in global_arg_vec {
-            if let Some(ma) = self.get(global_arg) {
-                // We have to check if the parent's global arg wasn't used but still exists
-                // such as from a default value.
-                //
-                // For example, `myprog subcommand --global-arg=value` where `--global-arg` defines
-                // a default value of `other` myprog would have an existing MatchedArg for
-                // `--global-arg` where the value is `other`
-                let to_update = if let Some(parent_ma) = vals_map.get(global_arg) {
-                    if parent_ma.source() > ma.source() {
-                        parent_ma
-                    } else {
-                        ma
-                    }
-                } else {
-                    ma
-                }
-                .clone();
-                vals_map.insert(global_arg.clone(), to_update);
-            }
-        }
-        if let Some(ref mut sc) = self.matches.subcommand {
-            let mut am = ArgMatcher {
-                matches: mem::take(&mut sc.matches),
-                pending: None,
-            };
-            am.fill_in_global_values(global_arg_vec, vals_map);
-            mem::swap(&mut am.matches, &mut sc.matches);
-        }
+        w!(
+            buf,
+            format!(
+                "_{name}() {{
+    local i cur prev opts cmd
+    COMPREPLY=()
+    cur=\"${{COMP_WORDS[COMP_CWORD]}}\"
+    prev=\"${{COMP_WORDS[COMP_CWORD-1]}}\"
+    cmd=\"\"
+    opts=\"\"
 
-        for (name, matched_arg) in vals_map.iter_mut() {
-            self.matches.args.insert(name.clone(), matched_arg.clone());
-        }
-    }
+    for i in ${{COMP_WORDS[@]}}
+    do
+        case \"${{cmd}},${{i}}\" in
+            \",$1\")
+                cmd=\"{cmd}\"
+                ;;{subcmds}
+            *)
+                ;;
+        esac
+    done
 
-    pub(crate) fn get(&self, arg: &Id) -> Option<&MatchedArg> {
-        self.matches.args.get(arg)
-    }
+    case \"${{cmd}}\" in
+        {cmd})
+            opts=\"{name_opts}\"
+            if [[ ${{cur}} == -* || ${{COMP_CWORD}} -eq 1 ]] ; then
+                COMPREPLY=( $(compgen -W \"${{opts}}\" -- \"${{cur}}\") )
+                return 0
+            fi
+            case \"${{prev}}\" in{name_opts_details}
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W \"${{opts}}\" -- \"${{cur}}\") )
+            return 0
+            ;;{subcmd_details}
+    esac
+}}
 
-    pub(crate) fn get_mut(&mut self, arg: &Id) -> Option<&mut MatchedArg> {
-        self.matches.args.get_mut(arg)
-    }
-
-    pub(crate) fn remove(&mut self, arg: &Id) -> bool {
-        self.matches.args.remove(arg).is_some()
-    }
-
-    pub(crate) fn contains(&self, arg: &Id) -> bool {
-        self.matches.args.contains_key(arg)
-    }
-
-    pub(crate) fn arg_ids(&self) -> std::slice::Iter<'_, Id> {
-        self.matches.args.keys()
-    }
-
-    pub(crate) fn args(&self) -> crate::util::flat_map::Iter<'_, Id, MatchedArg> {
-        self.matches.args.iter()
-    }
-
-    pub(crate) fn entry(&mut self, arg: Id) -> crate::util::Entry<'_, Id, MatchedArg> {
-        self.matches.args.entry(arg)
-    }
-
-    pub(crate) fn subcommand(&mut self, sc: SubCommand) {
-        self.matches.subcommand = Some(Box::new(sc));
-    }
-
-    pub(crate) fn subcommand_name(&self) -> Option<&str> {
-        self.matches.subcommand_name()
-    }
-
-    pub(crate) fn check_explicit(&self, arg: &Id, predicate: &ArgPredicate) -> bool {
-        self.get(arg)
-            .map(|a| a.check_explicit(predicate))
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn start_custom_arg(&mut self, arg: &Arg, source: ValueSource) {
-        let id = arg.get_id().clone();
-        debug!("ArgMatcher::start_custom_arg: id={id:?}, source={source:?}");
-        let ma = self.entry(id).or_insert(MatchedArg::new_arg(arg));
-        debug_assert_eq!(ma.type_id(), Some(arg.get_value_parser().type_id()));
-        ma.set_source(source);
-        ma.new_val_group();
-    }
-
-    pub(crate) fn start_custom_group(&mut self, id: Id, source: ValueSource) {
-        debug!("ArgMatcher::start_custom_arg: id={id:?}, source={source:?}");
-        let ma = self.entry(id).or_insert(MatchedArg::new_group());
-        debug_assert_eq!(ma.type_id(), None);
-        ma.set_source(source);
-        ma.new_val_group();
-    }
-
-    pub(crate) fn start_occurrence_of_external(&mut self, cmd: &Command) {
-        let id = Id::from_static_ref(Id::EXTERNAL);
-        debug!("ArgMatcher::start_occurrence_of_external: id={id:?}");
-        let ma = self.entry(id).or_insert(MatchedArg::new_external(cmd));
-        debug_assert_eq!(
-            ma.type_id(),
-            Some(
-                cmd.get_external_subcommand_value_parser()
-                    .expect(INTERNAL_ERROR_MSG)
-                    .type_id()
+if [[ \"${{BASH_VERSINFO[0]}}\" -eq 4 && \"${{BASH_VERSINFO[1]}}\" -ge 4 || \"${{BASH_VERSINFO[0]}}\" -gt 4 ]]; then
+    complete -F _{name} -o nosort -o bashdefault -o default {name}
+else
+    complete -F _{name} -o bashdefault -o default {name}
+fi
+",
+                name = bin_name,
+                cmd = fn_name,
+                name_opts = all_options_for_path(cmd, bin_name),
+                name_opts_details = option_details_for_path(cmd, bin_name),
+                subcmds = all_subcommands(cmd, &fn_name),
+                subcmd_details = subcommand_details(cmd)
             )
+            .as_bytes()
         );
-        ma.set_source(ValueSource::CommandLine);
-        ma.new_val_group();
-    }
-
-    pub(crate) fn add_val_to(&mut self, arg: &Id, val: AnyValue, raw_val: OsString) {
-        let ma = self.get_mut(arg).expect(INTERNAL_ERROR_MSG);
-        ma.append_val(val, raw_val);
-    }
-
-    pub(crate) fn add_index_to(&mut self, arg: &Id, idx: usize) {
-        let ma = self.get_mut(arg).expect(INTERNAL_ERROR_MSG);
-        ma.push_index(idx);
-    }
-
-    pub(crate) fn needs_more_vals(&self, o: &Arg) -> bool {
-        let num_pending = self
-            .pending
-            .as_ref()
-            .and_then(|p| (p.id == *o.get_id()).then_some(p.raw_vals.len()))
-            .unwrap_or(0);
-        debug!(
-            "ArgMatcher::needs_more_vals: o={}, pending={}",
-            o.get_id(),
-            num_pending
-        );
-        let expected = o.get_num_args().expect(INTERNAL_ERROR_MSG);
-        debug!("ArgMatcher::needs_more_vals: expected={expected}, actual={num_pending}");
-        expected.accepts_more(num_pending)
-    }
-
-    pub(crate) fn pending_arg_id(&self) -> Option<&Id> {
-        self.pending.as_ref().map(|p| &p.id)
-    }
-
-    pub(crate) fn pending_values_mut(
-        &mut self,
-        id: &Id,
-        ident: Option<Identifier>,
-        trailing_values: bool,
-    ) -> &mut Vec<OsString> {
-        let pending = self.pending.get_or_insert_with(|| PendingArg {
-            id: id.clone(),
-            ident,
-            raw_vals: Default::default(),
-            trailing_idx: None,
-        });
-        debug_assert_eq!(pending.id, *id, "{INTERNAL_ERROR_MSG}");
-        if ident.is_some() {
-            debug_assert_eq!(pending.ident, ident, "{INTERNAL_ERROR_MSG}");
-        }
-        if trailing_values {
-            pending.trailing_idx.get_or_insert(pending.raw_vals.len());
-        }
-        &mut pending.raw_vals
-    }
-
-    pub(crate) fn start_trailing(&mut self) {
-        if let Some(pending) = &mut self.pending {
-            // Allow asserting its started on subsequent calls
-            pending.trailing_idx.get_or_insert(pending.raw_vals.len());
-        }
-    }
-
-    pub(crate) fn take_pending(&mut self) -> Option<PendingArg> {
-        self.pending.take()
     }
 }
 
-impl Deref for ArgMatcher {
-    type Target = ArgMatches;
+fn all_subcommands(cmd: &Command, parent_fn_name: &str) -> String {
+    debug!("all_subcommands");
 
-    fn deref(&self) -> &Self::Target {
-        &self.matches
+    fn add_command(
+        parent_fn_name: &str,
+        cmd: &Command,
+        subcmds: &mut Vec<(String, String, String)>,
+    ) {
+        let fn_name = format!(
+            "{parent_fn_name}__{cmd_name}",
+            parent_fn_name = parent_fn_name,
+            cmd_name = cmd.get_name().to_string().replace('-', "__")
+        );
+        subcmds.push((
+            parent_fn_name.to_string(),
+            cmd.get_name().to_string(),
+            fn_name.clone(),
+        ));
+        for alias in cmd.get_visible_aliases() {
+            subcmds.push((
+                parent_fn_name.to_string(),
+                alias.to_string(),
+                fn_name.clone(),
+            ));
+        }
+        for subcmd in cmd.get_subcommands() {
+            add_command(&fn_name, subcmd, subcmds);
+        }
     }
+    let mut subcmds = vec![];
+    for subcmd in cmd.get_subcommands() {
+        add_command(parent_fn_name, subcmd, &mut subcmds);
+    }
+    subcmds.sort();
+
+    let mut cases = vec![String::new()];
+    for (parent_fn_name, name, fn_name) in subcmds {
+        cases.push(format!(
+            "{parent_fn_name},{name})
+                cmd=\"{fn_name}\"
+                ;;",
+        ));
+    }
+
+    cases.join("\n            ")
+}
+
+fn subcommand_details(cmd: &Command) -> String {
+    debug!("subcommand_details");
+
+    let mut subcmd_dets = vec![String::new()];
+    let mut scs = utils::all_subcommands(cmd)
+        .iter()
+        .map(|x| x.1.replace(' ', "__"))
+        .collect::<Vec<_>>();
+
+    scs.sort();
+
+    subcmd_dets.extend(scs.iter().map(|sc| {
+        format!(
+            "{subcmd})
+            opts=\"{sc_opts}\"
+            if [[ ${{cur}} == -* || ${{COMP_CWORD}} -eq {level} ]] ; then
+                COMPREPLY=( $(compgen -W \"${{opts}}\" -- \"${{cur}}\") )
+                return 0
+            fi
+            case \"${{prev}}\" in{opts_details}
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W \"${{opts}}\" -- \"${{cur}}\") )
+            return 0
+            ;;",
+            subcmd = sc.replace('-', "__"),
+            sc_opts = all_options_for_path(cmd, sc),
+            level = sc.split("__").map(|_| 1).sum::<u64>(),
+            opts_details = option_details_for_path(cmd, sc)
+        )
+    }));
+
+    subcmd_dets.join("\n        ")
+}
+
+fn option_details_for_path(cmd: &Command, path: &str) -> String {
+    debug!("option_details_for_path: path={path}");
+
+    let p = utils::find_subcommand_with_path(cmd, path.split("__").skip(1).collect());
+    let mut opts = vec![String::new()];
+
+    for o in p.get_opts() {
+        let compopt = match o.get_value_hint() {
+            ValueHint::FilePath => Some("compopt -o filenames"),
+            ValueHint::DirPath => Some("compopt -o plusdirs"),
+            ValueHint::Other => Some("compopt -o nospace"),
+            _ => None,
+        };
+
+        if let Some(longs) = o.get_long_and_visible_aliases() {
+            opts.extend(longs.iter().map(|long| {
+                let mut v = vec![format!("--{})", long)];
+
+                if o.get_value_hint() == ValueHint::FilePath {
+                    v.extend([
+                        "local oldifs".to_string(),
+                        r#"if [ -n "${IFS+x}" ]; then"#.to_string(),
+                        r#"    oldifs="$IFS""#.to_string(),
+                        "fi".to_string(),
+                        r#"IFS=$'\n'"#.to_string(),
+                        format!("COMPREPLY=({})", vals_for(o)),
+                        r#"if [ -n "${oldifs+x}" ]; then"#.to_string(),
+                        r#"    IFS="$oldifs""#.to_string(),
+                        "fi".to_string(),
+                    ]);
+                } else {
+                    v.push(format!("COMPREPLY=({})", vals_for(o)));
+                }
+
+                if let Some(copt) = compopt {
+                    v.extend([
+                        r#"if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then"#.to_string(),
+                        format!("    {}", copt),
+                        "fi".to_string(),
+                    ]);
+                }
+
+                v.extend(["return 0", ";;"].iter().map(|s| (*s).to_string()));
+                v.join("\n                    ")
+            }));
+        }
+
+        if let Some(shorts) = o.get_short_and_visible_aliases() {
+            opts.extend(shorts.iter().map(|short| {
+                let mut v = vec![format!("-{})", short)];
+
+                if o.get_value_hint() == ValueHint::FilePath {
+                    v.extend([
+                        "local oldifs".to_string(),
+                        r#"if [ -n "${IFS+x}" ]; then"#.to_string(),
+                        r#"    oldifs="$IFS""#.to_string(),
+                        "fi".to_string(),
+                        r#"IFS=$'\n'"#.to_string(),
+                        format!("COMPREPLY=({})", vals_for(o)),
+                        r#"if [ -n "${oldifs+x}" ]; then"#.to_string(),
+                        r#"    IFS="$oldifs""#.to_string(),
+                        "fi".to_string(),
+                    ]);
+                } else {
+                    v.push(format!("COMPREPLY=({})", vals_for(o)));
+                }
+
+                if let Some(copt) = compopt {
+                    v.extend([
+                        r#"if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then"#.to_string(),
+                        format!("    {}", copt),
+                        "fi".to_string(),
+                    ]);
+                }
+
+                v.extend(["return 0", ";;"].iter().map(|s| (*s).to_string()));
+                v.join("\n                    ")
+            }));
+        }
+    }
+
+    opts.join("\n                ")
+}
+
+fn vals_for(o: &Arg) -> String {
+    debug!("vals_for: o={}", o.get_id());
+
+    if let Some(vals) = utils::possible_values(o) {
+        format!(
+            "$(compgen -W \"{}\" -- \"${{cur}}\")",
+            vals.iter()
+                .filter(|pv| !pv.is_hide_set())
+                .map(|n| n.get_name())
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    } else if o.get_value_hint() == ValueHint::DirPath {
+        String::from("") // should be empty to avoid duplicate candidates
+    } else if o.get_value_hint() == ValueHint::Other {
+        String::from("\"${cur}\"")
+    } else {
+        String::from("$(compgen -f \"${cur}\")")
+    }
+}
+
+fn all_options_for_path(cmd: &Command, path: &str) -> String {
+    debug!("all_options_for_path: path={path}");
+
+    let p = utils::find_subcommand_with_path(cmd, path.split("__").skip(1).collect());
+
+    let mut opts = String::new();
+    for short in utils::shorts_and_visible_aliases(p) {
+        write!(&mut opts, "-{short} ").unwrap();
+    }
+    for long in utils::longs_and_visible_aliases(p) {
+        write!(&mut opts, "--{long} ").unwrap();
+    }
+    for pos in p.get_positionals() {
+        if let Some(vals) = utils::possible_values(pos) {
+            for value in vals {
+                write!(&mut opts, "{} ", value.get_name()).unwrap();
+            }
+        } else {
+            write!(&mut opts, "{pos} ").unwrap();
+        }
+    }
+    for (sc, _) in utils::subcommands(p) {
+        write!(&mut opts, "{sc} ").unwrap();
+    }
+    opts.pop();
+
+    opts
 }

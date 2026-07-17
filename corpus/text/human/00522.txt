@@ -1,23 +1,396 @@
-# Sinatra
+## Routes
 
-[![Gem Version](https://badge.fury.io/rb/sinatra.svg)](https://badge.fury.io/rb/sinatra)
-[![Testing](https://github.com/sinatra/sinatra/actions/workflows/test.yml/badge.svg)](https://github.com/sinatra/sinatra/actions/workflows/test.yml)
-
-Sinatra is a [DSL](https://en.wikipedia.org/wiki/Domain-specific_language) for
-quickly creating web applications in Ruby with minimal effort:
+In Sinatra, a route is an HTTP method paired with a URL-matching pattern.
+Each route is associated with a block:
 
 ```ruby
-# myapp.rb
-require 'sinatra'
-
 get '/' do
-  'Hello world!'
+  .. show something ..
+end
+
+post '/' do
+  .. create something ..
+end
+
+put '/' do
+  .. replace something ..
+end
+
+patch '/' do
+  .. modify something ..
+end
+
+delete '/' do
+  .. annihilate something ..
+end
+
+options '/' do
+  .. appease something ..
+end
+
+link '/' do
+  .. affiliate something ..
+end
+
+unlink '/' do
+  .. separate something ..
 end
 ```
 
-Install the gem:
+Routes are matched in the order they are defined. The first route that
+matches the request is invoked.
 
-```shell
-gem install sinatra
-gem install puma # or any other server
+Routes with trailing slashes are different from the ones without:
+
+```ruby
+get '/foo' do
+  # Does not match "GET /foo/"
+end
 ```
+
+Route patterns may include named parameters, accessible via the
+`params` hash:
+
+```ruby
+get '/hello/:name' do
+  # matches "GET /hello/foo" and "GET /hello/bar"
+  # params['name'] is 'foo' or 'bar'
+  "Hello #{params['name']}!"
+end
+```
+
+You can also access named parameters via block parameters:
+
+```ruby
+get '/hello/:name' do |n|
+  # matches "GET /hello/foo" and "GET /hello/bar"
+  # params['name'] is 'foo' or 'bar'
+  # n stores params['name']
+  "Hello #{n}!"
+end
+```
+
+Route patterns may also include splat (or wildcard) parameters, accessible
+via the `params['splat']` array:
+
+```ruby
+get '/say/*/to/*' do
+  # matches /say/hello/to/world
+  params['splat'] # => ["hello", "world"]
+end
+
+get '/download/*.*' do
+  # matches /download/path/to/file.xml
+  params['splat'] # => ["path/to/file", "xml"]
+end
+```
+
+Or with block parameters:
+
+```ruby
+get '/download/*.*' do |path, ext|
+  [path, ext] # => ["path/to/file", "xml"]
+end
+```
+
+Route matching with Regular Expressions:
+
+```ruby
+get /\/hello\/([\w]+)/ do
+  "Hello, #{params['captures'].first}!"
+end
+```
+
+Or with a block parameter:
+
+```ruby
+get %r{/hello/([\w]+)} do |c|
+  # Matches "GET /meta/hello/world", "GET /hello/world/1234" etc.
+  "Hello, #{c}!"
+end
+```
+
+Route patterns may have optional parameters:
+
+```ruby
+get '/posts/:format?' do
+  # matches "GET /posts/" and any extension "GET /posts/json", "GET /posts/xml" etc
+end
+```
+
+Routes may also utilize query parameters:
+
+```ruby
+get '/posts' do
+  # matches "GET /posts?title=foo&author=bar"
+  title = params['title']
+  author = params['author']
+  # uses title and author variables; query is optional to the /posts route
+end
+```
+
+By the way, unless you disable the path traversal attack protection (see
+[below](#configuring-attack-protection)), the request path might be modified before
+matching against your routes.
+
+You may customize the [Mustermann](https://github.com/sinatra/mustermann#readme)
+options used for a given route by passing in a `:mustermann_opts` hash:
+
+```ruby
+get '\A/posts\z', :mustermann_opts => { :type => :regexp, :check_anchors => false } do
+  # matches /posts exactly, with explicit anchoring
+  "If you match an anchored pattern clap your hands!"
+end
+```
+
+It looks like a [condition](#conditions), but it isn't one! These options will
+be merged into the global `:mustermann_opts` hash described
+[below](#available-settings).
+
+## Conditions
+
+Routes may include a variety of matching conditions, such as the user agent:
+
+```ruby
+get '/foo', :agent => /Songbird (\d\.\d)[\d\/]*?/ do
+  "You're using Songbird version #{params['agent'][0]}"
+end
+
+get '/foo' do
+  # Matches non-songbird browsers
+end
+```
+
+Other available conditions are `host_name` and `provides`:
+
+```ruby
+get '/', :host_name => /^admin\./ do
+  "Admin Area, Access denied!"
+end
+
+get '/', :provides => 'html' do
+  haml :index
+end
+
+get '/', :provides => ['rss', 'atom', 'xml'] do
+  builder :feed
+end
+```
+`provides` searches the request's Accept header.
+
+You can easily define your own conditions:
+
+```ruby
+set(:probability) { |value| condition { rand <= value } }
+
+get '/win_a_car', :probability => 0.1 do
+  "You won!"
+end
+
+get '/win_a_car' do
+  "Sorry, you lost."
+end
+```
+
+For a condition that takes multiple values use a splat:
+
+```ruby
+set(:auth) do |*roles|   # <- notice the splat here
+  condition do
+    unless logged_in? && roles.any? {|role| current_user.in_role? role }
+      redirect "/login/", 303
+    end
+  end
+end
+
+get "/my/account/", :auth => [:user, :admin] do
+  "Your Account Details"
+end
+
+get "/only/admin/", :auth => :admin do
+  "Only admins are allowed here!"
+end
+```
+
+## Return Values
+
+The return value of a route block determines at least the response body
+passed on to the HTTP client or at least the next middleware in the
+Rack stack. Most commonly, this is a string, as in the above examples.
+But other values are also accepted.
+
+You can return an object that would either be a valid Rack response, Rack
+body object or HTTP status code:
+
+* An Array with three elements: `[status (Integer), headers (Hash), response
+  body (responds to #each)]`
+* An Array with two elements: `[status (Integer), response body (responds to
+  #each)]`
+* An object that responds to `#each` and passes nothing but strings to
+  the given block
+* A Integer representing the status code
+
+That way we can, for instance, easily implement a streaming example:
+
+```ruby
+class Stream
+  def each
+    100.times { |i| yield "#{i}\n" }
+  end
+end
+
+get('/') { Stream.new }
+```
+
+You can also use the `stream` helper method ([described below](#streaming-responses)) to reduce
+boilerplate and embed the streaming logic in the route.
+
+## Custom Route Matchers
+
+As shown above, Sinatra ships with built-in support for using String
+patterns and regular expressions as route matches. However, it does not
+stop there. You can easily define your own matchers:
+
+```ruby
+class AllButPattern
+  def initialize(except)
+    @except = except
+  end
+
+  def to_pattern(options)
+    return self
+  end
+
+  def params(route)
+    return {} unless @except === route
+  end
+end
+
+def all_but(pattern)
+  AllButPattern.new(pattern)
+end
+
+get all_but("/index") do
+  # ...
+end
+```
+
+Note that the above example might be over-engineered, as it can also be
+expressed as:
+
+```ruby
+get /.*/ do
+  pass if request.path_info == "/index"
+  # ...
+end
+```
+
+## Static Files
+
+Static files are served from the `./public` directory. You can specify
+a different location by setting the `:public_folder` option:
+
+```ruby
+set :public_folder, __dir__ + '/static'
+```
+
+Note that the public directory name is not included in the URL. A file
+`./public/css/style.css` is made available as
+`http://example.com/css/style.css`.
+
+Use the `:static_cache_control` setting (see [below](#cache-control)) to add
+`Cache-Control` header info.
+
+## Views / Templates
+
+Each template language is exposed via its own rendering method. These
+methods simply return a string:
+
+```ruby
+get '/' do
+  erb :index
+end
+```
+
+This renders `views/index.erb`.
+
+Instead of a template name, you can also just pass in the template content
+directly:
+
+```ruby
+get '/' do
+  code = "<%= Time.now %>"
+  erb code
+end
+```
+
+Templates take a second argument, the options hash:
+
+```ruby
+get '/' do
+  erb :index, :layout => :post
+end
+```
+
+This will render `views/index.erb` embedded in the
+`views/post.erb` (default is `views/layout.erb`, if it exists).
+
+Any options not understood by Sinatra will be passed on to the template
+engine:
+
+```ruby
+get '/' do
+  haml :index, :format => :html5
+end
+```
+
+You can also set options per template language in general:
+
+```ruby
+set :haml, :format => :html5
+
+get '/' do
+  haml :index
+end
+```
+
+Options passed to the render method override options set via `set`.
+
+Available Options:
+
+<dl>
+  <dt>locals</dt>
+  <dd>
+    List of locals passed to the document. Handy with partials.
+    Example: <tt>erb "<%= foo %>", :locals => {:foo => "bar"}</tt>
+  </dd>
+
+  <dt>default_encoding</dt>
+  <dd>
+    String encoding to use if uncertain. Defaults to
+    <tt>settings.default_encoding</tt>.
+  </dd>
+
+  <dt>views</dt>
+  <dd>
+    Views folder to load templates from. Defaults to <tt>settings.views</tt>.
+  </dd>
+
+  <dt>layout</dt>
+  <dd>
+    Whether to use a layout (<tt>true</tt> or <tt>false</tt>). If it's a
+    Symbol, specifies what template to use. Example:
+    <tt>erb :index, :layout => !request.xhr?</tt>
+  </dd>
+
+  <dt>content_type</dt>
+  <dd>
+    Content-Type the template produces. Default depends on template language.
+  </dd>
+
+  <dt>scope</dt>
+  <dd>
+    Scope to render template under. Defaults to the application
+    instance. If you change this, instance variables and helper methods
+    will not be available.
+  </dd>

@@ -1,17 +1,57 @@
----
-title: EJS Vulnerabilities in CTF
-catalog: true
-date: 2023-06-22 14:10:44
-tags: [Security]
-categories: [Security]
-photos: /img/ejs-render-vulnerability-ctf/cover-en.png
----
+部分程式碼如下：
 
-Originally, I intended to write this article from a developer's perspective. However, due to time constraints, I will first write a CTF-oriented article to record this issue. I will write from a developer's perspective when I have more time.
+``` py
+@app.post('/upload')
+def upload():
+    try:
+        file_storage = request.files['file']
+        mimetype = file_storage.mimetype.lower() or 'application/octet-stream'
+        if 'script' in mimetype:
+            mimetype = 'application/octet-stream'
+        content = file_storage.read().decode('latin1')
+        # dont DOS please
+        if len(content) < 1024*1024:
+            data = {
+                'mimetype': mimetype,
+                'content': content
+            }
+            filename = token_hex(16)
+            store.set(filename, json.dumps(data), ex=300)
+            return redirect(f'/uploads/{filename}', code=302)
+    except:
+        pass
+    return 'Invalid Upload', 400
 
-In short, this article discusses the problems caused by using the following pattern:
+@app.get('/uploads/<filename>')
+def get_upload(filename):
+    data = store.get(filename)
+    if data:
+        data = json.loads(data)
+        return data['content'].encode('latin1'), 200, {'Content-Type': data['mimetype']}
+    else:
+        return "Not Found", 404
 
-``` js
-const express = require('express')
-const app = express()
-const port = 3000
+@app.after_request
+def headers(response):
+    response.headers["Content-Security-Policy"] = "script-src 'self'; object-src 'none';"
+    response.headers["X-Content-Type-Options"] = 'nosniff'
+    return response
+```
+
+簡單來說，你可以上傳任意檔案，但如果檔案的 MIME type 有 `script` 的話，就會變成 `application/octet-stream`。
+
+然後 `X-Content-Type-Options` 有設置成 `nosniff`，所以 MIME type 設置什麼就是什麼了。
+
+目標的話則是順利執行 XSS。
+
+從上面的程式碼不難看出，可以上傳一個 HTML 檔案，但因為 CSP 有 `script-src 'self'` 的關係，因此就算能上傳 HTML，也不能用 inline script，只能用 `<script src="/uploads/xxx">` 這種方式引入。
+
+而如果 `/uploads/xxx` 的 content type 是 `application/octet-stream` 的話，Chrome 會直接噴錯給你看：
+
+> Refused to execute script from 'https://uploader.c.hc.lc/uploads/xxx' because its MIME type ('application/octet-stream') is not executable, and strict MIME type checking is enabled.
+
+所以這題的目標很明確，要找到一個沒有包含 script 但是瀏覽器又可以成功載入的 MIME type。
+
+看到這題以後，我先去找了 Chromium 的原始碼來看，可以用 Google search 的方式搭配剛剛的錯誤訊息會比較好找：`"strict MIME type checking is enabled" site:https://chromium.googlesource.com/`
+
+透過搜尋結果，可以直接定位到這個檔案：https://chromium.googlesource.com/chromium/blink/+/refs/heads/main/Source/core/dom/ScriptLoader.cpp

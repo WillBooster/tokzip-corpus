@@ -1,43 +1,48 @@
-Therefore, this article uses a problem that I have encountered myself and that students often come to ask me as an example. You can also think about whether you can answer this question:
-
-> Suppose I have an SPA, using a library of some routers to implement routing, so `/list` will go to the list page, and `/about` will go to the about me page.
->
-> But strange, when I uploaded the SPA to GitHub Pages, the homepage is good, and when I go to `/list` from the homepage, it is also good, but when I refresh `/list`, it shows 404 not found. Why is this?
-
-To answer this question, you must first review some basic knowledge related to front-end and back-end networks.
-
 <!-- more -->
 
-## Dynamic and Static Web Pages
+## HITCON CTF 2024
 
-First of all, what do you think dynamic and static web pages are? What is the difference between them?
+### Private Browsing+
 
-When we talk about dynamic and static, what we are actually talking about is not whether the content on the webpage will change. It refers to whether the webpage I requested has been "processed" by the server. This definition may not be accurate, but you will understand it when I give a few examples below.
+This challenge is basically a proxy that proxies things under `/~huli/` to other websites, and the response varies based on the header:
 
-Let's start with the simplest example. Suppose there is a file called a.php, and the code is like this:
-
-``` php
-<?php
-  echo "hello!";
-?>
+``` js
+if (
+    req.headers['sec-fetch-mode'] &&
+    req.headers['sec-fetch-mode'] !== 'navigate' &&
+    req.headers['sec-fetch-site'] === 'same-origin'
+) {
+    req.url = chunks.slice(2).join('/')
+    proxy.handler(req, res)
+} else {
+    res.writeHead(200, { ...DEFAULT_HEADERS, 'content-type': 'text/html' })
+    res.end(VIEWER_HTML.replace('SITEB64', btoa(proxy.site)))
+}
 ```
 
-If I visit a.php today and see the content like this:
+If it's a navigation, it will return VIEWER_HTML, which will perform various sanitizations, so XSS is not possible.
 
+The bypass method is to use bfcache. It appeared in [SECCON CTF 2022 Quals - spanote](https://blog.huli.tw/2022/12/08/ctf-js-notes/#seccon-ctf-2022-quals-spanote). In simple terms, we first visit target.html, at which point the response will be VIEWER_HTML, and within VIEWER_HTML, `fetch('target.html')` will be executed to fetch the content, and at this time the response will be placed in the cache.
+
+Next, we redirect the same tab to our own origin, then execute `history.go(-1)` to redirect the URL back to `target.html`. At this point, due to bfcache, it will load the HTML fetched by `fetch('target.html')`, bypassing the original restrictions and allowing any HTML to be loaded.
+
+But the next issue is CSP: `default-src 'self';`, so scripts can only load from the same origin, but the proxy has restrictions:
+
+``` js
+if (
+    res.headers['content-type'].toLowerCase().includes('script') ||
+    req.headers['sec-fetch-dest'] === 'script'
+) {
+    res.headers['content-length'] = '0'
+    delete res.headers['transfer-encoding']
+}
 ```
-<?php
-  echo "hello!";
-?>
-```
 
-What does it mean? It means that this is a "static webpage", and the server did not process this file with PHP-related programs, but returned this a.php as a "file", which is commonly known as a static file.
+If the content type includes script, it directly sets the content-length to 0, so scripts cannot be loaded.
 
-If we see the content like this:
+At this point, we need to use response splitting because the proxy will directly pipe the received response out, so we can construct the following flow:
 
-```
-hello!
-```
-
-It means that the server executed this a.php and returned the output as a response. This type of webpage is called a "dynamic webpage". Although the content has not changed, it is indeed a dynamic webpage.
-
-This is the difference between dynamic and static. In fact, it has nothing to do with whether the content you see will change. Static will directly return the requested resource as a file, and dynamic will return the result as a response after processing on the server.
+1. The browser sends the first request, let's call it request A.
+2. In the response of request A, first output the `expect: '100-continue'` header, allowing the proxy server to output the header. At this point, for the browser, the first request has ended, and it has received the response.
+3. The browser sends the second request B, reusing the same connection.
+4. At this point, output the response of request B (but for the proxy, it is still the response of request A), bypassing the content type restriction because the proxy thinks this is response content.

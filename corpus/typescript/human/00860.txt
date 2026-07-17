@@ -1,69 +1,210 @@
-// checking subtype relations for function types as it relates to contextual signature instantiation
+import * as ts from "../../_namespaces/ts.js";
+import { jsonToReadableText } from "../helpers.js";
+import {
+    baselineTsserverLogs,
+    TestSession,
+    TestSessionRequest,
+} from "../helpers/tsserver.js";
+import { createServerHost } from "../helpers/virtualFileSystemWithWatch.js";
 
-class Base { foo: string; }
-class Derived extends Base { bar: string; }
-class Derived2 extends Derived { baz: string; }
-class OtherDerived extends Base { bing: string; }
+describe("unittests:: tsserver:: cancellationToken", () => {
+    // Disable sourcemap support for the duration of the test, as sourcemapping the errors generated during this test is slow and not something we care to test
+    let oldPrepare: ts.AnyFunction;
+    before(() => {
+        oldPrepare = (Error as any).prepareStackTrace;
+        delete (Error as any).prepareStackTrace;
+    });
 
-interface A { // T
-    // M's
-    a: new (x: number) => number[];
-    a2: new (x: number) => string[];
-    a3: new (x: number) => void;
-    a4: new (x: string, y: number) => string;
-    a5: new (x: (arg: string) => number) => string;
-    a6: new (x: (arg: Base) => Derived) => Base;
-    a7: new (x: (arg: Base) => Derived) => (r: Base) => Derived;
-    a8: new (x: (arg: Base) => Derived, y: (arg2: Base) => Derived) => (r: Base) => Derived;
-    a9: new (x: (arg: Base) => Derived, y: (arg2: Base) => Derived) => (r: Base) => Derived;
-    a10: new (...x: Derived[]) => Derived;
-    a11: new (x: { foo: string }, y: { foo: string; bar: string }) => Base;
-    a12: new (x: Array<Base>, y: Array<Derived2>) => Array<Derived>;
-    a13: new (x: Array<Base>, y: Array<Derived>) => Array<Derived>;
-    a14: new (x: { a: string; b: number }) => Object;
-    a15: {
-        new (x: number): number[];
-        new (x: string): string[];
-    };
-    a16: {
-        new <T extends Derived>(x: T): number[];
-        new <U extends Base>(x: U): number[];
-    };
-    a17: {
-        new (x: new (a: number) => number): number[];
-        new (x: new (a: string) => string): string[];
-    };
-    a18: {
-        new (x: {
-            new (a: number): number;
-            new (a: string): string;
-        }): any[];
-        new (x: {
-            new (a: boolean): boolean;
-            new (a: Date): Date;
-        }): any[];
-    };
-}
+    after(() => {
+        (Error as any).prepareStackTrace = oldPrepare;
+    });
 
-// S's
-interface I extends A {
-    // N's
-    a: new <T>(x: T) => T[]; // ok, instantiation of N is a subtype of M, T is number
-    a2: new <T>(x: T) => string[]; // ok
-    a3: new <T>(x: T) => T; // ok since Base returns void
-    a4: new <T, U>(x: T, y: U) => T; // ok, instantiation of N is a subtype of M, T is string, U is number
-    a5: new <T, U>(x: (arg: T) => U) => T; // ok, U is in a parameter position so inferences can be made
-    a6: new <T extends Base, U extends Derived>(x: (arg: T) => U) => T; // ok, same as a5 but with object type hierarchy
-    a7: new <T extends Base, U extends Derived>(x: (arg: T) => U) => (r: T) => U; // ok
-    a8: new <T extends Base, U extends Derived>(x: (arg: T) => U, y: (arg2: T) => U) => (r: T) => U; // ok
-    a9: new <T extends Base, U extends Derived>(x: (arg: T) => U, y: (arg2: { foo: string; bing: number }) => U) => (r: T) => U; // ok, same as a8 with compatible object literal
-    a10: new <T extends Derived>(...x: T[]) => T; // ok
-    a11: new <T extends Base>(x: T, y: T) => T; // ok
-    a12: new <T extends Array<Base>>(x: Array<Base>, y: T) => Array<Derived>; // ok, less specific parameter type
-    a13: new <T extends Array<Derived>>(x: Array<Base>, y: T) => T; // ok, T = Array<Derived>, satisfies constraint, contextual signature instantiation succeeds
-    a14: new <T, U>(x: { a: T; b: U }) => T; // ok
-    a15: new <T>(x: T) => T[]; // ok
-    a16: new <T extends Base>(x: T) => number[]; // ok
-    a17: new <T>(x: new (a: T) => T) => T[]; // ok
-    a18: new <T>(x: new (a: T) => T) => T[]; // ok, no inferences for T but assignable to any
-}
+    it("is attached to request", () => {
+        const f1 = {
+            path: "/a/b/app.ts",
+            content: "let xyz = 1;",
+        };
+        const host = createServerHost([f1]);
+        const session = new TestSession({ host, useCancellationToken: true });
+
+        session.executeCommandSeq<ts.server.protocol.OpenRequest>({
+            command: ts.server.protocol.CommandTypes.Open,
+            arguments: { file: f1.path },
+        });
+
+        session.executeCommandSeq<ts.server.protocol.GeterrRequest>({
+            command: ts.server.protocol.CommandTypes.Geterr,
+            arguments: { files: [f1.path], delay: 0 },
+        });
+
+        session.executeCommandSeq<ts.server.protocol.DocumentHighlightsRequest>({
+            command: ts.server.protocol.CommandTypes.DocumentHighlights,
+            arguments: { file: f1.path, line: 1, offset: 6, filesToSearch: [f1.path] },
+        });
+
+        host.runQueuedTimeoutCallbacks();
+        host.runQueuedImmediateCallbacks();
+        host.runQueuedImmediateCallbacks();
+        baselineTsserverLogs("cancellationT", "is attached to request", session);
+    });
+
+    it("Geterr is cancellable", () => {
+        const f1 = {
+            path: "/a/app.ts",
+            content: "let x = 1",
+        };
+        const config = {
+            path: "/a/tsconfig.json",
+            content: jsonToReadableText({
+                compilerOptions: {},
+            }),
+        };
+
+        const host = createServerHost([f1, config]);
+        const session = new TestSession({
+            host,
+            useCancellationToken: true,
+        });
+        {
+            session.executeCommandSeq<ts.server.protocol.OpenRequest>({
+                command: ts.server.protocol.CommandTypes.Open,
+                arguments: { file: f1.path },
+            });
+            // send geterr for missing file
+            session.executeCommandSeq<ts.server.protocol.GeterrRequest>({
+                command: ts.server.protocol.CommandTypes.Geterr,
+                arguments: { files: ["/a/missing"], delay: 0 },
+            });
+            // Queued files
+            host.runQueuedTimeoutCallbacks();
+            // Completed event since file is missing
+        }
+        {
+            const getErrId = session.getNextSeq();
+            // send geterr for a valid file
+            session.executeCommandSeq<ts.server.protocol.GeterrRequest>({
+                command: ts.server.protocol.CommandTypes.Geterr,
+                arguments: { files: [f1.path], delay: 0 },
+            });
+
+            // run new request
+            session.executeCommandSeq<ts.server.protocol.ProjectInfoRequest>({
+                command: ts.server.protocol.CommandTypes.ProjectInfo,
+                arguments: { file: f1.path, needFileNameList: false },
+            });
+
+            // cancel previously issued Geterr
+            session.serverCancellationToken.setRequestToCancel(getErrId);
+            host.runQueuedTimeoutCallbacks();
+            session.serverCancellationToken.resetToken();
+        }
+        {
+            const getErrId = session.getNextSeq();
+            session.executeCommandSeq<ts.server.protocol.GeterrRequest>({
+                command: ts.server.protocol.CommandTypes.Geterr,
+                arguments: { files: [f1.path], delay: 0 },
+            });
+
+            // run first step
+            host.runQueuedTimeoutCallbacks();
+
+            session.serverCancellationToken.setRequestToCancel(getErrId);
+            host.runQueuedImmediateCallbacks();
+
+            session.serverCancellationToken.resetToken();
+        }
+        {
+            session.executeCommandSeq<ts.server.protocol.GeterrRequest>({
+                command: ts.server.protocol.CommandTypes.Geterr,
+                arguments: { files: [f1.path], delay: 0 },
+            });
+            // run first step
+            host.runQueuedTimeoutCallbacks();
+            // the semanticDiag message
+            host.runQueuedImmediateCallbacks();
+            host.runQueuedImmediateCallbacks();
+            session.serverCancellationToken.resetToken();
+        }
+        {
+            session.executeCommandSeq<ts.server.protocol.GeterrRequest>({
+                command: ts.server.protocol.CommandTypes.Geterr,
+                arguments: { files: [f1.path], delay: 0 },
+            });
+            // run first step
+            host.runQueuedTimeoutCallbacks();
+            session.executeCommandSeq<ts.server.protocol.GeterrRequest>({
+                command: ts.server.protocol.CommandTypes.Geterr,
+                arguments: { files: [f1.path], delay: 0 },
+            });
+            // make sure that getErr1 is completed
+        }
+        baselineTsserverLogs("cancellationT", "Geterr is cancellable", session);
+    });
+
+    it("Lower priority tasks are cancellable", () => {
+        const f1 = {
+            path: "/a/app.ts",
+            content: `{ let x = 1; } var foo = "foo"; var bar = "bar"; var fooBar = "fooBar";`,
+        };
+        const config = {
+            path: "/a/tsconfig.json",
+            content: jsonToReadableText({
+                compilerOptions: {},
+            }),
+        };
+        const host = createServerHost([f1, config]);
+        const session = new TestSession({
+            host,
+            throttleWaitMilliseconds: 0,
+            useCancellationToken: 3,
+        });
+        {
+            session.executeCommandSeq<ts.server.protocol.OpenRequest>({
+                command: ts.server.protocol.CommandTypes.Open,
+                arguments: { file: f1.path },
+            });
+
+            // send navbar request (normal priority)
+            session.executeCommandSeq<ts.server.protocol.NavBarRequest>({
+                command: ts.server.protocol.CommandTypes.NavBar,
+                arguments: { file: f1.path },
+            });
+
+            // ensure the nav bar request can be canceled
+            verifyExecuteCommandSeqIsCancellable<ts.server.protocol.NavBarRequest>({
+                command: ts.server.protocol.CommandTypes.NavBar,
+                arguments: { file: f1.path },
+            });
+
+            // send outlining spans request (normal priority)
+            session.executeCommandSeq<ts.server.protocol.OutliningSpansRequestFull>({
+                command: ts.server.protocol.CommandTypes.GetOutliningSpansFull,
+                arguments: { file: f1.path },
+            });
+
+            // ensure the outlining spans request can be canceled
+            verifyExecuteCommandSeqIsCancellable<ts.server.protocol.OutliningSpansRequestFull>({
+                command: ts.server.protocol.CommandTypes.GetOutliningSpansFull,
+                arguments: { file: f1.path },
+            });
+        }
+        baselineTsserverLogs("cancellationT", "Lower priority tasks are cancellable", session);
+
+        function verifyExecuteCommandSeqIsCancellable<T extends ts.server.protocol.Request>(request: TestSessionRequest<T>) {
+            // Set the next request to be cancellable
+            // The cancellation token will cancel the request the third time
+            // isCancellationRequested() is called.
+            session.serverCancellationToken.setRequestToCancel(session.getNextSeq());
+            let operationCanceledExceptionThrown = false;
+
+            try {
+                session.executeCommandSeq(request);
+            }
+            catch (e) {
+                session.logger.log(`Exception is OperationCanceledException: ${e instanceof ts.OperationCanceledException}`);
+                operationCanceledExceptionThrown = true;
+            }
+            if (!operationCanceledExceptionThrown) session.logger.log("Operation Canceled Exception not thrown for request: " + jsonToReadableText(request));
+        }
+    });
+});

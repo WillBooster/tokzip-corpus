@@ -10,175 +10,214 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Command;
+namespace Composer\Command;
 
-use Composer\Test\TestCase;
-use Generator;
+use Composer\Factory;
+use Composer\IO\IOInterface;
+use Composer\Package\Loader\ValidatingArrayLoader;
+use Composer\Plugin\CommandEvent;
+use Composer\Plugin\PluginEvents;
+use Composer\Repository\InstalledRepository;
+use Composer\Repository\PlatformRepository;
+use Composer\Util\ConfigValidator;
+use Composer\Util\Filesystem;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
 
-class InstallCommandTest extends TestCase
+/**
+ * ValidateCommand
+ *
+ * @author Robert Schönthal <seroscho@googlemail.com>
+ * @author Jordi Boggiano <j.boggiano@seld.be>
+ */
+class ValidateCommand extends BaseCommand
 {
     /**
-     * @dataProvider errorCaseProvider
-     * @param array<mixed> $composerJson
-     * @param array<mixed> $command
+     * configure
      */
-    public function testInstallCommandErrors(
-        array $composerJson,
-        array $command,
-        string $expected
-    ): void {
-        $this->initTempComposer($composerJson);
+    protected function configure(): void
+    {
+        $this
+            ->setName('validate')
+            ->setDescription('Validates a composer.json and composer.lock')
+            ->setDefinition([
+                new InputOption('no-check-all', null, InputOption::VALUE_NONE, 'Do not validate requires for overly strict/loose constraints'),
+                new InputOption('check-lock', null, InputOption::VALUE_NONE, 'Check if lock file is up to date (even when config.lock is false)'),
+                new InputOption('no-check-lock', null, InputOption::VALUE_NONE, 'Do not check if lock file is up to date'),
+                new InputOption('no-check-publish', null, InputOption::VALUE_NONE, 'Do not check for publish errors'),
+                new InputOption('no-check-version', null, InputOption::VALUE_NONE, 'Do not report a warning if the version field is present'),
+                new InputOption('with-dependencies', 'A', InputOption::VALUE_NONE, 'Also validate the composer.json of all installed dependencies'),
+                new InputOption('strict', null, InputOption::VALUE_NONE, 'Return a non-zero exit code for warnings as well as errors'),
+                new InputArgument('file', InputArgument::OPTIONAL, 'path to composer.json file'),
+            ])
+            ->setHelp(
+                <<<EOT
+The validate command validates a given composer.json and composer.lock
 
-        $packages = [
-            self::getPackage('vendor/package', '1.2.3'),
-        ];
-        $devPackages = [
-            self::getPackage('vendor/devpackage', '2.3.4'),
-        ];
+Exit codes in case of errors are:
+1 validation warning(s), only when --strict is given
+2 validation error(s)
+3 file unreadable or missing
 
-        $this->createComposerLock($packages, $devPackages);
-        $this->createInstalledJson($packages, $devPackages);
-
-        $appTester = $this->getApplicationTester();
-        $appTester->run(array_merge(['command' => 'install'], $command));
-
-        self::assertSame(trim($expected), trim($appTester->getDisplay(true)));
+Read more at https://getcomposer.org/doc/03-cli.md#validate
+EOT
+            );
     }
 
-    public function errorCaseProvider(): Generator
+    protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        yield 'it writes an error when the dev flag is passed' => [
-            [
-                'repositories' => [],
-            ],
-            ['--dev' => true],
-            <<<OUTPUT
-<warning>You are using the deprecated option "--dev". It has no effect and will break in Composer 3.</warning>
-Installing dependencies from lock file (including require-dev)
-Verifying lock file contents can be installed on current platform.
-Nothing to install, update or remove
-Generating autoload files
-OUTPUT
-        ];
+        $file = $input->getArgument('file') ?: Factory::getComposerFile();
+        $io = $this->getIO();
 
-        yield 'it writes an error when no-suggest flag passed' => [
-            [
-                'repositories' => [],
-            ],
-            ['--no-suggest' => true],
-            <<<OUTPUT
-<warning>You are using the deprecated option "--no-suggest". It has no effect and will break in Composer 3.</warning>
-Installing dependencies from lock file (including require-dev)
-Verifying lock file contents can be installed on current platform.
-Nothing to install, update or remove
-Generating autoload files
-OUTPUT
-        ];
+        if (!file_exists($file)) {
+            $io->writeError('<error>' . $file . ' not found.</error>');
 
-        yield 'it writes an error when packages passed' => [
-            [
-                'repositories' => [],
-            ],
-            ['packages' => ['vendor/package']],
-            <<<OUTPUT
-Invalid argument vendor/package. Use "composer require vendor/package" instead to add packages to your composer.json.
-OUTPUT
-        ];
+            return 3;
+        }
+        if (!Filesystem::isReadable($file)) {
+            $io->writeError('<error>' . $file . ' is not readable.</error>');
 
-        yield 'it writes an error when no-install flag is passed' => [
-            [
-                'repositories' => [],
-            ],
-            ['--no-install' => true],
-            <<<OUTPUT
-Invalid option "--no-install". Use "composer update --no-install" instead if you are trying to update the composer.lock file.
-OUTPUT
-        ];
+            return 3;
+        }
+
+        $validator = new ConfigValidator($io);
+        $checkAll = $input->getOption('no-check-all') ? 0 : ValidatingArrayLoader::CHECK_ALL;
+        $checkPublish = !$input->getOption('no-check-publish');
+        $checkLock = !$input->getOption('no-check-lock');
+        $checkVersion = $input->getOption('no-check-version') ? 0 : ConfigValidator::CHECK_VERSION;
+        $isStrict = $input->getOption('strict');
+        [$errors, $publishErrors, $warnings] = $validator->validate($file, $checkAll, $checkVersion);
+
+        $lockErrors = [];
+        $composer = $this->createComposerInstance($input, $io, $file);
+        // config.lock = false ~= implicit --no-check-lock; --check-lock overrides
+        $checkLock = ($checkLock && $composer->getConfig()->get('lock')) || $input->getOption('check-lock');
+        $locker = $composer->getLocker();
+        if ($locker->isLocked() && !$locker->isFresh()) {
+            $lockErrors[] = '- The lock file is not up to date with the latest changes in composer.json, it is recommended that you run `composer update` or `composer update <package name>`.';
+        }
+
+        if ($locker->isLocked()) {
+            $lockErrors = array_merge($lockErrors, $locker->getMissingRequirementInfo($composer->getPackage(), true));
+        }
+
+        $this->outputResult($io, $file, $errors, $warnings, $checkPublish, $publishErrors, $checkLock, $lockErrors, true);
+
+        // $errors include publish and lock errors when exists
+        $exitCode = count($errors) > 0 ? 2 : (($isStrict && count($warnings) > 0) ? 1 : 0);
+
+        if ($input->getOption('with-dependencies')) {
+            $localRepo = $composer->getRepositoryManager()->getLocalRepository();
+            foreach ($localRepo->getPackages() as $package) {
+                $path = $composer->getInstallationManager()->getInstallPath($package);
+                if (null === $path) {
+                    continue;
+                }
+                $file = $path . '/composer.json';
+                if (is_dir($path) && file_exists($file)) {
+                    [$errors, $publishErrors, $warnings] = $validator->validate($file, $checkAll, $checkVersion);
+
+                    $this->outputResult($io, $package->getPrettyName(), $errors, $warnings, $checkPublish, $publishErrors);
+
+                    // $errors include publish errors when exists
+                    $depCode = count($errors) > 0 ? 2 : (($isStrict && count($warnings) > 0) ? 1 : 0);
+                    $exitCode = max($depCode, $exitCode);
+                }
+            }
+        }
+
+        $commandEvent = new CommandEvent(PluginEvents::COMMAND, 'validate', $input, $output);
+        $eventCode = $composer->getEventDispatcher()->dispatch($commandEvent->getName(), $commandEvent);
+
+        return max($eventCode, $exitCode);
     }
 
-    public function testInstallFromEmptyVendor(): void
+    /**
+     * @param string[] $errors
+     * @param string[] $warnings
+     * @param string[] $publishErrors
+     * @param string[] $lockErrors
+     */
+    private function outputResult(IOInterface $io, string $name, array &$errors, array &$warnings, bool $checkPublish = false, array $publishErrors = [], bool $checkLock = false, array $lockErrors = [], bool $printSchemaUrl = false): void
     {
-        $this->initTempComposer([
-            'require' => [
-                'root/req' => '1.*',
-            ],
-            'require-dev' => [
-                'root/another' => '1.*',
-            ],
-        ]);
+        $doPrintSchemaUrl = false;
 
-        $rootReqPackage = self::getPackage('root/req');
-        $anotherPackage = self::getPackage('root/another');
-        // Set as a metapackage so that we can do the whole post-remove update & install process without Composer trying to download them (DownloadManager::getDownloaderForPackage).
-        $rootReqPackage->setType('metapackage');
-        $anotherPackage->setType('metapackage');
+        if ($errors) {
+            $io->writeError('<error>' . $name . ' is invalid, the following errors/warnings were found:</error>');
+        } elseif ($publishErrors) {
+            $io->writeError('<info>' . $name . ' is valid for simple usage with Composer but has</info>');
+            $io->writeError('<info>strict errors that make it unable to be published as a package</info>');
+            $doPrintSchemaUrl = $printSchemaUrl;
+        } elseif ($warnings) {
+            $io->writeError('<info>' . $name . ' is valid, but with a few warnings</info>');
+            $doPrintSchemaUrl = $printSchemaUrl;
+        } elseif ($lockErrors) {
+            $io->write('<info>' . $name . ' is valid but your composer.lock has some '.($checkLock ? 'errors' : 'warnings').'</info>');
+        } else {
+            $io->write('<info>' . $name . ' is valid</info>');
+        }
 
-        $this->createComposerLock([$rootReqPackage], [$anotherPackage]);
+        if ($doPrintSchemaUrl) {
+            $io->writeError('<warning>See https://getcomposer.org/doc/04-schema.md for details on the schema</warning>');
+        }
 
-        $appTester = $this->getApplicationTester();
-        $appTester->run(['command' => 'install', '--no-progress' => true]);
+        if ($errors) {
+            $errors = array_map(static function ($err): string {
+                return '- ' . $err;
+            }, $errors);
+            array_unshift($errors, '# General errors');
+        }
+        if ($warnings) {
+            $warnings = array_map(static function ($err): string {
+                return '- ' . $err;
+            }, $warnings);
+            array_unshift($warnings, '# General warnings');
+        }
 
-        self::assertSame('Installing dependencies from lock file (including require-dev)
-Verifying lock file contents can be installed on current platform.
-Package operations: 2 installs, 0 updates, 0 removals
-  - Installing root/another (1.0.0)
-  - Installing root/req (1.0.0)
-Generating autoload files', trim($appTester->getDisplay(true)));
-    }
+        // Avoid setting the exit code to 1 in case --strict and --no-check-publish/--no-check-lock are combined
+        $extraWarnings = [];
 
-    public function testInstallFromEmptyVendorNoDev(): void
-    {
-        $this->initTempComposer([
-            'require' => [
-                'root/req' => '1.*',
-            ],
-            'require-dev' => [
-                'root/another' => '1.*',
-            ],
-        ]);
+        // If checking publish errors, display them as errors, otherwise just show them as warnings
+        if ($publishErrors) {
+            $publishErrors = array_map(static function ($err): string {
+                return '- ' . $err;
+            }, $publishErrors);
 
-        $rootReqPackage = self::getPackage('root/req');
-        $anotherPackage = self::getPackage('root/another');
-        // Set as a metapackage so that we can do the whole post-remove update & install process without Composer trying to download them (DownloadManager::getDownloaderForPackage).
-        $rootReqPackage->setType('metapackage');
-        $anotherPackage->setType('metapackage');
+            if ($checkPublish) {
+                array_unshift($publishErrors, '# Publish errors');
+                $errors = array_merge($errors, $publishErrors);
+            } else {
+                array_unshift($publishErrors, '# Publish warnings');
+                $extraWarnings = array_merge($extraWarnings, $publishErrors);
+            }
+        }
 
-        $this->createComposerLock([$rootReqPackage], [$anotherPackage]);
+        // If checking lock errors, display them as errors, otherwise just show them as warnings
+        if ($lockErrors) {
+            if ($checkLock) {
+                array_unshift($lockErrors, '# Lock file errors');
+                $errors = array_merge($errors, $lockErrors);
+            } else {
+                array_unshift($lockErrors, '# Lock file warnings');
+                $extraWarnings = array_merge($extraWarnings, $lockErrors);
+            }
+        }
 
-        $appTester = $this->getApplicationTester();
-        $appTester->run(['command' => 'install', '--no-progress' => true, '--no-dev' => true]);
+        $messages = [
+            'error' => $errors,
+            'warning' => array_merge($warnings, $extraWarnings),
+        ];
 
-        self::assertSame('Installing dependencies from lock file
-Verifying lock file contents can be installed on current platform.
-Package operations: 1 install, 0 updates, 0 removals
-  - Installing root/req (1.0.0)
-Generating autoload files', trim($appTester->getDisplay(true)));
-    }
-
-    public function testInstallNewPackagesWithExistingPartialVendor(): void
-    {
-        $this->initTempComposer([
-            'require' => [
-                'root/req' => '1.*',
-                'root/another' => '1.*',
-            ],
-        ]);
-        $rootReqPackage = self::getPackage('root/req');
-        $anotherPackage = self::getPackage('root/another');
-        // Set as a metapackage so that we can do the whole post-remove update & install process without Composer trying to download them (DownloadManager::getDownloaderForPackage).
-        $rootReqPackage->setType('metapackage');
-        $anotherPackage->setType('metapackage');
-
-        $this->createComposerLock([$rootReqPackage, $anotherPackage], []);
-        $this->createInstalledJson([$rootReqPackage], []);
-
-        $appTester = $this->getApplicationTester();
-        $appTester->run(['command' => 'install', '--no-progress' => true]);
-
-        self::assertSame('Installing dependencies from lock file (including require-dev)
-Verifying lock file contents can be installed on current platform.
-Package operations: 1 install, 0 updates, 0 removals
-  - Installing root/another (1.0.0)
-Generating autoload files', trim($appTester->getDisplay(true)));
+        foreach ($messages as $style => $msgs) {
+            foreach ($msgs as $msg) {
+                if (strpos($msg, '#') === 0) {
+                    $io->writeError('<' . $style . '>' . $msg . '</' . $style . '>');
+                } else {
+                    $io->writeError($msg);
+                }
+            }
+        }
     }
 }

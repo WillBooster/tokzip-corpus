@@ -10,480 +10,348 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Command;
+namespace Composer\DependencyResolver;
 
-use Composer\Package\CompletePackage;
+use Composer\Package\AliasPackage;
 use Composer\Package\Link;
-use Composer\Test\TestCase;
-use Symfony\Component\Console\Command\Command;
+use Composer\Package\PackageInterface;
+use Composer\Repository\PlatformRepository;
+use Composer\DependencyResolver\Operation\OperationInterface;
 
-class SuggestsCommandTest extends TestCase
+/**
+ * @author Nils Adermann <naderman@naderman.de>
+ * @internal
+ */
+class Transaction
 {
-    public function testInstalledPackagesWithNoSuggestions(): void
+    /**
+     * @var OperationInterface[]
+     */
+    protected $operations;
+
+    /**
+     * Packages present at the beginning of the transaction
+     * @var PackageInterface[]
+     */
+    protected $presentPackages;
+
+    /**
+     * Package set resulting from this transaction
+     * @var array<string, PackageInterface>
+     */
+    protected $resultPackageMap;
+
+    /**
+     * @var array<string, PackageInterface[]>
+     */
+    protected $resultPackagesByName = [];
+
+    /**
+     * @param PackageInterface[] $presentPackages
+     * @param PackageInterface[] $resultPackages
+     */
+    public function __construct(array $presentPackages, array $resultPackages)
     {
-        $this->initTempComposer([
-            'repositories' => [
-                'packages' => [
-                    'type' => 'package',
-                    'package' => [
-                        ['name' => 'vendor1/package1', 'version' => '1.0.0'],
-                        ['name' => 'vendor2/package2', 'version' => '1.0.0'],
-                    ],
-                ],
-            ],
-            'require' => [
-                'vendor1/package1' => '1.*',
-                'vendor2/package2' => '1.*',
-            ],
-        ]);
-
-        $packages = [
-            self::getPackage('vendor1/package1'),
-            self::getPackage('vendor2/package2'),
-        ];
-
-        $this->createInstalledJson($packages);
-        $this->createComposerLock($packages);
-
-        $appTester = $this->getApplicationTester();
-        self::assertEquals(Command::SUCCESS, $appTester->run(['command' => 'suggest']));
-        self::assertEmpty($appTester->getDisplay(true));
+        $this->presentPackages = $presentPackages;
+        $this->setResultPackageMaps($resultPackages);
+        $this->operations = $this->calculateOperations();
     }
 
     /**
-     * @dataProvider provideSuggest
-     * @param array<string, bool|string|array<int, string>> $command
+     * @return OperationInterface[]
      */
-    public function testSuggest(bool $hasLockFile, array $command, string $expected): void
+    public function getOperations(): array
     {
-        $this->initTempComposer([
-            'repositories' => [
-                'packages' => [
-                    'type' => 'package',
-                    'package' => [
-                        ['name' => 'vendor1/package1', 'version' => '1.0.0', 'suggests' => ['vendor3/suggested' => 'helpful for vendor1/package1'], 'require' => ['vendor6/package6' => '^1.0'], 'require-dev' => ['vendor3/suggested' => '^1.0', 'vendor4/dev-suggested' => '^1.0']],
-                        ['name' => 'vendor2/package2', 'version' => '1.0.0', 'suggests' => ['vendor4/dev-suggested' => 'helpful for vendor2/package2'], 'require' => ['vendor5/dev-package' => '^1.0']],
-                        ['name' => 'vendor5/dev-package', 'version' => '1.0.0', 'suggests' => ['vendor8/dev-transitive' => 'helpful for vendor5/dev-package'], 'require-dev' => ['vendor8/dev-transitive' => '^1.0']],
-                        ['name' => 'vendor6/package6', 'version' => '1.0.0', 'suggests' => ['vendor7/transitive' => 'helpful for vendor6/package6']],
-                    ],
-                ],
-            ],
-            'require' => ['vendor1/package1' => '^1'],
-            'require-dev' => ['vendor2/package2' => '^1'],
-        ]);
+        return $this->operations;
+    }
 
-        $packages = [
-            self::getPackageWithSuggestAndRequires(
-                'vendor1/package1',
-                '1.0.0',
-                [
-                    'vendor3/suggested' => 'helpful for vendor1/package1',
-                ],
-                [
-                    'vendor6/package6' => new Link('vendor1/package1', 'vendor6/package6', self::getVersionConstraint('>=', '1.0'), Link::TYPE_REQUIRE, '^1.0'),
-                ],
-                [
-                    'vendor4/dev-suggested' => new Link('vendor1/package1', 'vendor4/dev-suggested', self::getVersionConstraint('>=', '1.0'), Link::TYPE_DEV_REQUIRE, '^1.0'),
-                    'vendor3/suggested' => new Link('vendor1/package1', 'vendor3/suggested', self::getVersionConstraint('>=', '1.0'), Link::TYPE_DEV_REQUIRE, '^1.0'),
-                ]
-            ),
-            self::getPackageWithSuggestAndRequires(
-                'vendor6/package6',
-                '1.0.0',
-                [
-                    'vendor7/transitive' => 'helpful for vendor6/package6',
-                ]
-            ),
-        ];
-        $devPackages = [
-            self::getPackageWithSuggestAndRequires(
-                'vendor2/package2',
-                '1.0.0',
-                [
-                    'vendor4/dev-suggested' => 'helpful for vendor2/package2',
-                ],
-                [
-                    'vendor5/dev-package' => new Link('vendor2/package2', 'vendor5/dev-package', self::getVersionConstraint('>=', '1.0'), Link::TYPE_REQUIRE, '^1.0'),
-                ]
-            ),
-            self::getPackageWithSuggestAndRequires(
-                'vendor5/dev-package',
-                '1.0.0',
-                [
-                    'vendor8/dev-transitive' => 'helpful for vendor5/dev-package',
-                ],
-                [],
-                [
-                    'vendor8/dev-transitive' => new Link('vendor5/dev-package', 'vendor8/dev-transitive', self::getVersionConstraint('>=', '1.0'), Link::TYPE_DEV_REQUIRE, '^1.0'),
-                ]
-            )
-        ];
+    /**
+     * @param PackageInterface[] $resultPackages
+     */
+    private function setResultPackageMaps(array $resultPackages): void
+    {
+        $packageSort = static function (PackageInterface $a, PackageInterface $b): int {
+            // sort alias packages by the same name behind their non alias version
+            if ($a->getName() === $b->getName()) {
+                if ($a instanceof AliasPackage !== $b instanceof AliasPackage) {
+                    return $a instanceof AliasPackage ? -1 : 1;
+                }
+                // if names are the same, compare version, e.g. to sort aliases reliably, actual order does not matter
+                return strcmp($b->getVersion(), $a->getVersion());
+            }
 
-        $this->createInstalledJson($packages, $devPackages);
-        if ($hasLockFile) {
-            $this->createComposerLock($packages, $devPackages);
+            return strcmp($b->getName(), $a->getName());
+        };
+
+        $this->resultPackageMap = [];
+        foreach ($resultPackages as $package) {
+            $this->resultPackageMap[spl_object_hash($package)] = $package;
+            foreach ($package->getNames() as $name) {
+                $this->resultPackagesByName[$name][] = $package;
+            }
         }
 
-        $appTester = $this->getApplicationTester();
-        self::assertEquals(Command::SUCCESS, $appTester->run(array_merge(['command' => 'suggest'], $command)));
-        self::assertSame(trim($expected), trim($appTester->getDisplay(true)));
-    }
-
-    public static function provideSuggest(): \Generator
-    {
-        yield 'with lockfile, show suggested' => [
-            true,
-            [],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'without lockfile, show suggested' => [
-            false,
-            [],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'with lockfile, show suggested (excluding dev)' => [
-            true,
-            ['--no-dev' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-1 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'without lockfile, show suggested (excluding dev)' => [
-            false,
-            ['--no-dev' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'with lockfile, show all suggested' => [
-            true,
-            ['--all' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-vendor5/dev-package suggests:
- - vendor8/dev-transitive: helpful for vendor5/dev-package
-
-vendor6/package6 suggests:
- - vendor7/transitive: helpful for vendor6/package6'
-        ];
-
-        yield 'without lockfile, show all suggested' => [
-            false,
-            ['--all' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-vendor5/dev-package suggests:
- - vendor8/dev-transitive: helpful for vendor5/dev-package
-
-vendor6/package6 suggests:
- - vendor7/transitive: helpful for vendor6/package6'
-        ];
-
-        yield 'with lockfile, show all suggested (excluding dev)' => [
-            true,
-            ['--all' => true, '--no-dev' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor6/package6 suggests:
- - vendor7/transitive: helpful for vendor6/package6'
-        ];
-
-        yield 'without lockfile, show all suggested (excluding dev)' => [
-            false,
-            ['--all' => true, '--no-dev' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-vendor5/dev-package suggests:
- - vendor8/dev-transitive: helpful for vendor5/dev-package
-
-vendor6/package6 suggests:
- - vendor7/transitive: helpful for vendor6/package6'
-        ];
-
-        yield 'with lockfile, show suggested grouped by package' => [
-            true,
-            ['--by-package' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'without lockfile, show suggested grouped by package' => [
-            false,
-            ['--by-package' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'with lockfile, show suggested grouped by package (excluding dev)' => [
-            true,
-            ['--by-package' => true, '--no-dev' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-1 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'without lockfile, show suggested grouped by package (excluding dev)' => [
-            false,
-            ['--by-package' => true, '--no-dev' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'with lockfile, show suggested grouped by suggestion' => [
-            true,
-            ['--by-suggestion' => true],
-            'vendor3/suggested is suggested by:
- - vendor1/package1: helpful for vendor1/package1
-
-vendor4/dev-suggested is suggested by:
- - vendor2/package2: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'without lockfile, show suggested grouped by suggestion' => [
-            false,
-            ['--by-suggestion' => true],
-            'vendor3/suggested is suggested by:
- - vendor1/package1: helpful for vendor1/package1
-
-vendor4/dev-suggested is suggested by:
- - vendor2/package2: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'with lockfile, show suggested grouped by suggestion (excluding dev)' => [
-            true,
-            ['--by-suggestion' => true, '--no-dev' => true],
-            'vendor3/suggested is suggested by:
- - vendor1/package1: helpful for vendor1/package1
-
-1 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'without lockfile, show suggested grouped by suggestion (excluding dev)' => [
-            false,
-            ['--by-suggestion' => true, '--no-dev' => true],
-            'vendor3/suggested is suggested by:
- - vendor1/package1: helpful for vendor1/package1
-
-vendor4/dev-suggested is suggested by:
- - vendor2/package2: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'with lockfile, show suggested grouped by package and suggestion' => [
-            true,
-            ['--by-package' => true, '--by-suggestion' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-------------------------------------------------------------------------------
-vendor3/suggested is suggested by:
- - vendor1/package1: helpful for vendor1/package1
-
-vendor4/dev-suggested is suggested by:
- - vendor2/package2: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'without lockfile, show suggested grouped by package and suggestion' => [
-            false,
-            ['--by-package' => true, '--by-suggestion' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-------------------------------------------------------------------------------
-vendor3/suggested is suggested by:
- - vendor1/package1: helpful for vendor1/package1
-
-vendor4/dev-suggested is suggested by:
- - vendor2/package2: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'with lockfile, show suggested grouped by package and suggestion (excluding dev)' => [
-            true,
-            ['--by-package' => true, '--by-suggestion' => true, '--no-dev' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-------------------------------------------------------------------------------
-vendor3/suggested is suggested by:
- - vendor1/package1: helpful for vendor1/package1
-
-1 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'without lockfile, show suggested grouped by package and suggestion (excluding dev)' => [
-            false,
-            ['--by-package' => true, '--by-suggestion' => true, '--no-dev' => true],
-            'vendor1/package1 suggests:
- - vendor3/suggested: helpful for vendor1/package1
-
-vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2
-
-------------------------------------------------------------------------------
-vendor3/suggested is suggested by:
- - vendor1/package1: helpful for vendor1/package1
-
-vendor4/dev-suggested is suggested by:
- - vendor2/package2: helpful for vendor2/package2
-
-2 additional suggestions by transitive dependencies can be shown with --all'
-        ];
-
-        yield 'with lockfile, show suggested for package' => [
-            true,
-            ['packages' => ['vendor2/package2']],
-            'vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2'
-        ];
-
-        yield 'without lockfile, show suggested for package' => [
-            false,
-            ['packages' => ['vendor2/package2']],
-            'vendor2/package2 suggests:
- - vendor4/dev-suggested: helpful for vendor2/package2'
-        ];
-
-        yield 'with lockfile, list suggested' => [
-            true,
-            ['--list' => true],
-            'vendor3/suggested
-vendor4/dev-suggested',
-        ];
-
-        yield 'without lockfile, list suggested' => [
-            false,
-            ['--list' => true],
-            'vendor3/suggested
-vendor4/dev-suggested',
-        ];
-
-        yield 'with lockfile, list suggested with no transitive or no-dev dependencies' => [
-            true,
-            ['--list' => true, '--no-dev' => true],
-            'vendor3/suggested',
-        ];
-
-        yield 'without lockfile, list suggested with no transitive or no-dev dependencies' => [
-            false,
-            ['--list' => true, '--no-dev' => true],
-            'vendor3/suggested
-vendor4/dev-suggested',
-        ];
-
-        yield 'with lockfile, list suggested with all dependencies including transitive and dev dependencies' => [
-            true,
-            ['--list' => true, '--all' => true],
-            'vendor3/suggested
-vendor4/dev-suggested
-vendor7/transitive
-vendor8/dev-transitive',
-        ];
-
-        yield 'without lockfile, list suggested with all dependencies including transitive and dev dependencies' => [
-            false,
-            ['--list' => true, '--all' => true],
-            'vendor3/suggested
-vendor4/dev-suggested
-vendor7/transitive
-vendor8/dev-transitive',
-        ];
-
-        yield 'with lockfile, list all suggested (excluding dev)' => [
-            true,
-            ['--list' => true, '--all' => true, '--no-dev' => true],
-            'vendor3/suggested
-vendor7/transitive',
-        ];
-
-        yield 'without lockfile, list all suggested (excluding dev)' => [
-            false,
-            ['--list' => true, '--all' => true, '--no-dev' => true],
-            'vendor3/suggested
-vendor4/dev-suggested
-vendor7/transitive
-vendor8/dev-transitive',
-        ];
+        uasort($this->resultPackageMap, $packageSort);
+        foreach ($this->resultPackagesByName as $name => $packages) {
+            uasort($this->resultPackagesByName[$name], $packageSort);
+        }
     }
 
     /**
-     * @param array<string, string> $suggests
-     * @param array<string, Link> $requires
-     * @param array<string, Link> $requireDevs
+     * @return OperationInterface[]
      */
-    private function getPackageWithSuggestAndRequires(string $name = 'dummy/pkg', string $version = '1.0.0', array $suggests = [], array $requires = [], array $requireDevs = []): CompletePackage
+    protected function calculateOperations(): array
     {
-        $normVersion = self::getVersionParser()->normalize($version);
+        $operations = [];
 
-        $pkg = new CompletePackage($name, $normVersion, $version);
-        $pkg->setSuggests($suggests);
-        $pkg->setRequires($requires);
-        $pkg->setDevRequires($requireDevs);
+        $presentPackageMap = [];
+        $removeMap = [];
+        $presentAliasMap = [];
+        $removeAliasMap = [];
+        foreach ($this->presentPackages as $package) {
+            if ($package instanceof AliasPackage) {
+                $presentAliasMap[$package->getName().'::'.$package->getVersion()] = $package;
+                $removeAliasMap[$package->getName().'::'.$package->getVersion()] = $package;
+            } else {
+                $presentPackageMap[$package->getName()] = $package;
+                $removeMap[$package->getName()] = $package;
+            }
+        }
 
-        return $pkg;
+        $stack = $this->getRootPackages();
+
+        $visited = [];
+        $processed = [];
+
+        while (!empty($stack)) {
+            $package = array_pop($stack);
+
+            if (isset($processed[spl_object_hash($package)])) {
+                continue;
+            }
+
+            if (!isset($visited[spl_object_hash($package)])) {
+                $visited[spl_object_hash($package)] = true;
+
+                $stack[] = $package;
+                if ($package instanceof AliasPackage) {
+                    $stack[] = $package->getAliasOf();
+                } else {
+                    foreach ($package->getRequires() as $link) {
+                        $possibleRequires = $this->getProvidersInResult($link);
+
+                        foreach ($possibleRequires as $require) {
+                            $stack[] = $require;
+                        }
+                    }
+                }
+            } elseif (!isset($processed[spl_object_hash($package)])) {
+                $processed[spl_object_hash($package)] = true;
+
+                if ($package instanceof AliasPackage) {
+                    $aliasKey = $package->getName().'::'.$package->getVersion();
+                    if (isset($presentAliasMap[$aliasKey])) {
+                        unset($removeAliasMap[$aliasKey]);
+                    } else {
+                        $operations[] = new Operation\MarkAliasInstalledOperation($package);
+                    }
+                } else {
+                    if (isset($presentPackageMap[$package->getName()])) {
+                        $source = $presentPackageMap[$package->getName()];
+
+                        // do we need to update?
+                        // TODO different for lock?
+                        if ($package->getVersion() !== $presentPackageMap[$package->getName()]->getVersion() ||
+                            $package->getDistReference() !== $presentPackageMap[$package->getName()]->getDistReference() ||
+                            $package->getSourceReference() !== $presentPackageMap[$package->getName()]->getSourceReference()
+                        ) {
+                            $operations[] = new Operation\UpdateOperation($source, $package);
+                        }
+                        unset($removeMap[$package->getName()]);
+                    } else {
+                        $operations[] = new Operation\InstallOperation($package);
+                        unset($removeMap[$package->getName()]);
+                    }
+                }
+            }
+        }
+
+        foreach ($removeMap as $name => $package) {
+            array_unshift($operations, new Operation\UninstallOperation($package));
+        }
+        foreach ($removeAliasMap as $nameVersion => $package) {
+            $operations[] = new Operation\MarkAliasUninstalledOperation($package);
+        }
+
+        $operations = $this->movePluginsToFront($operations);
+        // TODO fix this:
+        // we have to do this again here even though the above stack code did it because moving plugins moves them before uninstalls
+        $operations = $this->moveUninstallsToFront($operations);
+
+        // TODO skip updates which don't update? is this needed? we shouldn't schedule this update in the first place?
+        /*
+        if ('update' === $opType) {
+            $targetPackage = $operation->getTargetPackage();
+            if ($targetPackage->isDev()) {
+                $initialPackage = $operation->getInitialPackage();
+                if ($targetPackage->getVersion() === $initialPackage->getVersion()
+                    && (!$targetPackage->getSourceReference() || $targetPackage->getSourceReference() === $initialPackage->getSourceReference())
+                    && (!$targetPackage->getDistReference() || $targetPackage->getDistReference() === $initialPackage->getDistReference())
+                ) {
+                    $this->io->writeError('  - Skipping update of ' . $targetPackage->getPrettyName() . ' to the same reference-locked version', true, IOInterface::DEBUG);
+                    $this->io->writeError('', true, IOInterface::DEBUG);
+
+                    continue;
+                }
+            }
+        }*/
+
+        return $this->operations = $operations;
+    }
+
+    /**
+     * Determine which packages in the result are not required by any other packages in it.
+     *
+     * These serve as a starting point to enumerate packages in a topological order despite potential cycles.
+     * If there are packages with a cycle on the top level the package with the lowest name gets picked
+     *
+     * @return array<string, PackageInterface>
+     */
+    protected function getRootPackages(): array
+    {
+        $roots = $this->resultPackageMap;
+
+        foreach ($this->resultPackageMap as $packageHash => $package) {
+            if (!isset($roots[$packageHash])) {
+                continue;
+            }
+
+            foreach ($package->getRequires() as $link) {
+                $possibleRequires = $this->getProvidersInResult($link);
+
+                foreach ($possibleRequires as $require) {
+                    if ($require !== $package) {
+                        unset($roots[spl_object_hash($require)]);
+                    }
+                }
+            }
+        }
+
+        return $roots;
+    }
+
+    /**
+     * @return PackageInterface[]
+     */
+    protected function getProvidersInResult(Link $link): array
+    {
+        if (!isset($this->resultPackagesByName[$link->getTarget()])) {
+            return [];
+        }
+
+        return $this->resultPackagesByName[$link->getTarget()];
+    }
+
+    /**
+     * Workaround: if your packages depend on plugins, we must be sure
+     * that those are installed / updated first; else it would lead to packages
+     * being installed multiple times in different folders, when running Composer
+     * twice.
+     *
+     * While this does not fix the root-causes of https://github.com/composer/composer/issues/1147,
+     * it at least fixes the symptoms and makes usage of composer possible (again)
+     * in such scenarios.
+     *
+     * @param  OperationInterface[] $operations
+     * @return OperationInterface[] reordered operation list
+     */
+    private function movePluginsToFront(array $operations): array
+    {
+        $dlModifyingPluginsNoDeps = [];
+        $dlModifyingPluginsWithDeps = [];
+        $dlModifyingPluginRequires = [];
+        $pluginsNoDeps = [];
+        $pluginsWithDeps = [];
+        $pluginRequires = [];
+
+        foreach (array_reverse($operations, true) as $idx => $op) {
+            if ($op instanceof Operation\InstallOperation) {
+                $package = $op->getPackage();
+            } elseif ($op instanceof Operation\UpdateOperation) {
+                $package = $op->getTargetPackage();
+            } else {
+                continue;
+            }
+
+            $isDownloadsModifyingPlugin = $package->getType() === 'composer-plugin' && ($extra = $package->getExtra()) && isset($extra['plugin-modifies-downloads']) && $extra['plugin-modifies-downloads'] === true;
+
+            // is this a downloads modifying plugin or a dependency of one?
+            if ($isDownloadsModifyingPlugin || count(array_intersect($package->getNames(), $dlModifyingPluginRequires))) {
+                // get the package's requires, but filter out any platform requirements
+                $requires = array_filter(array_keys($package->getRequires()), static function ($req): bool {
+                    return !PlatformRepository::isPlatformPackage($req);
+                });
+
+                // is this a plugin with no meaningful dependencies?
+                if ($isDownloadsModifyingPlugin && !count($requires)) {
+                    // plugins with no dependencies go to the very front
+                    array_unshift($dlModifyingPluginsNoDeps, $op);
+                } else {
+                    // capture the requirements for this package so those packages will be moved up as well
+                    $dlModifyingPluginRequires = array_merge($dlModifyingPluginRequires, $requires);
+                    // move the operation to the front
+                    array_unshift($dlModifyingPluginsWithDeps, $op);
+                }
+
+                unset($operations[$idx]);
+                continue;
+            }
+
+            // is this package a plugin?
+            $isPlugin = $package->getType() === 'composer-plugin' || $package->getType() === 'composer-installer';
+
+            // is this a plugin or a dependency of a plugin?
+            if ($isPlugin || count(array_intersect($package->getNames(), $pluginRequires))) {
+                // get the package's requires, but filter out any platform requirements
+                $requires = array_filter(array_keys($package->getRequires()), static function ($req): bool {
+                    return !PlatformRepository::isPlatformPackage($req);
+                });
+
+                // is this a plugin with no meaningful dependencies?
+                if ($isPlugin && !count($requires)) {
+                    // plugins with no dependencies go to the very front
+                    array_unshift($pluginsNoDeps, $op);
+                } else {
+                    // capture the requirements for this package so those packages will be moved up as well
+                    $pluginRequires = array_merge($pluginRequires, $requires);
+                    // move the operation to the front
+                    array_unshift($pluginsWithDeps, $op);
+                }
+
+                unset($operations[$idx]);
+            }
+        }
+
+        return array_merge($dlModifyingPluginsNoDeps, $dlModifyingPluginsWithDeps, $pluginsNoDeps, $pluginsWithDeps, $operations);
+    }
+
+    /**
+     * Removals of packages should be executed before installations in
+     * case two packages resolve to the same path (due to custom installers)
+     *
+     * @param  OperationInterface[] $operations
+     * @return OperationInterface[] reordered operation list
+     */
+    private function moveUninstallsToFront(array $operations): array
+    {
+        $uninstOps = [];
+        foreach ($operations as $idx => $op) {
+            if ($op instanceof Operation\UninstallOperation || $op instanceof Operation\MarkAliasUninstalledOperation) {
+                $uninstOps[] = $op;
+                unset($operations[$idx]);
+            }
+        }
+
+        return array_merge($uninstOps, $operations);
     }
 }

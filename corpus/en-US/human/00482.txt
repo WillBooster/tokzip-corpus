@@ -1,49 +1,178 @@
-In the “Sending Data Between Two Tasks Using Message
-Passing” section, we described waiting on
-`rx.recv`. The `recv` call returns a future, and awaiting the future polls it.
-We noted that a runtime will pause the future until it’s ready with either
-`Some(message)` or `None` when the channel closes. With our deeper
-understanding of the `Future` trait, and specifically `Future::poll`, we can
-see how that works. The runtime knows the future isn’t ready when it returns
-`Poll::Pending`. Conversely, the runtime knows the future *is* ready and
-advances it when `poll` returns `Poll::Ready(Some(message))` or
-`Poll::Ready(None)`.
+Listing 15-26: Creating a reference cycle of two `List` values pointing to each other
 
-The exact details of how a runtime does that are beyond the scope of this book,
-but the key is to see the basic mechanics of futures: a runtime *polls* each
-future it is responsible for, putting the future back to sleep when it is not
-yet ready.
+We create an `Rc<List>` instance holding a `List` value in the variable `a`
+with an initial list of `5, Nil`. We then create an `Rc<List>` instance holding
+another `List` value in the variable `b` that contains the value `10` and
+points to the list in `a`.
+
+We modify `a` so that it points to `b` instead of `Nil`, creating a cycle. We
+do that by using the `tail` method to get a reference to the
+`RefCell<Rc<List>>` in `a`, which we put in the variable `link`. Then, we use
+the `borrow_mut` method on the `RefCell<Rc<List>>` to change the value inside
+from an `Rc<List>` that holds a `Nil` value to the `Rc<List>` in `b`.
+
+When we run this code, keeping the last `println!` commented out for the
+moment, we’ll get this output:
+
+```
+$ cargo run
+   Compiling cons-list v0.1.0 (file:///projects/cons-list)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running `target/debug/cons-list`
+a initial rc count = 1
+a next item = Some(RefCell { value: Nil })
+a rc count after b creation = 2
+b initial rc count = 1
+b next item = Some(RefCell { value: Cons(5, RefCell { value: Nil }) })
+b rc count after changing a = 2
+a rc count after changing a = 2
+```
+
+The reference count of the `Rc<List>` instances in both `a` and `b` is 2 after
+we change the list in `a` to point to `b`. At the end of `main`, Rust drops the
+variable `b`, which decreases the reference count of the `b` `Rc<List>`
+instance from 2 to 1. The memory that `Rc<List>` has on the heap won’t be
+dropped at this point because its reference count is 1, not 0. Then, Rust drops
+`a`, which decreases the reference count of the `a` `Rc<List>` instance from 2
+to 1 as well. This instance’s memory can’t be dropped either, because the other
+`Rc<List>` instance still refers to it. The memory allocated to the list will
+remain uncollected forever. To visualize this reference cycle, we’ve created
+the diagram in Figure 15-4.
+
+<img alt="A rectangle labeled 'a' that points to a rectangle containing the integer 5. A rectangle labeled 'b' that points to a rectangle containing the integer 10. The rectangle containing 5 points to the rectangle containing 10, and the rectangle containing 10 points back to the rectangle containing 5, creating a cycle." src="img/trpl15-04.svg" class="center" />
+
+Figure 15-4: A reference cycle of lists `a` and `b`
+pointing to each other
+
+If you uncomment the last `println!` and run the program, Rust will try to
+print this cycle with `a` pointing to `b` pointing to `a` and so forth until it
+overflows the stack.
+
+Compared to a real-world program, the consequences of creating a reference
+cycle in this example aren’t very dire: Right after we create the reference
+cycle, the program ends. However, if a more complex program allocated lots of
+memory in a cycle and held onto it for a long time, the program would use more
+memory than it needed and might overwhelm the system, causing it to run out of
+available memory.
+
+Creating reference cycles is not easily done, but it’s not impossible either.
+If you have `RefCell<T>` values that contain `Rc<T>` values or similar nested
+combinations of types with interior mutability and reference counting, you must
+ensure that you don’t create cycles; you can’t rely on Rust to catch them.
+Creating a reference cycle would be a logic bug in your program that you should
+use automated tests, code reviews, and other software development practices to
+minimize.
+
+Another solution for avoiding reference cycles is reorganizing your data
+structures so that some references express ownership and some references don’t.
+As a result, you can have cycles made up of some ownership relationships and
+some non-ownership relationships, and only the ownership relationships affect
+whether or not a value can be dropped. In Listing 15-25, we always want `Cons`
+variants to own their list, so reorganizing the data structure isn’t possible.
+Let’s look at an example using graphs made up of parent nodes and child nodes
+to see when non-ownership relationships are an appropriate way to prevent
+reference cycles.
 
 <!-- Old headings. Do not remove or links may break. -->
 
-<a id="pinning-and-the-pin-and-unpin-traits"></a>
-<a id="the-pin-and-unpin-traits"></a>
+<a id="preventing-reference-cycles-turning-an-rct-into-a-weakt"></a>
 
-### The Pin Type and the Unpin Trait
+### Preventing Reference Cycles Using Weak<T>
 
-Back in Listing 17-13, we used the `trpl::join!` macro to await three
-futures. However, it’s common to have a collection such as a vector containing
-some number futures that won’t be known until runtime. Let’s change Listing
-17-13 to the code in Listing 17-23 that puts the three futures into a vector
-and calls the `trpl::join_all` function instead, which won’t compile yet.
+So far, we’ve demonstrated that calling `Rc::clone` increases the
+`strong_count` of an `Rc<T>` instance, and an `Rc<T>` instance is only cleaned
+up if its `strong_count` is 0. You can also create a weak reference to the
+value within an `Rc<T>` instance by calling `Rc::downgrade` and passing a
+reference to the `Rc<T>`. *Strong references* are how you can share ownership
+of an `Rc<T>` instance. *Weak references* don’t express an ownership
+relationship, and their count doesn’t affect when an `Rc<T>` instance is
+cleaned up. They won’t cause a reference cycle, because any cycle involving
+some weak references will be broken once the strong reference count of values
+involved is 0.
+
+When you call `Rc::downgrade`, you get a smart pointer of type `Weak<T>`.
+Instead of increasing the `strong_count` in the `Rc<T>` instance by 1, calling
+`Rc::downgrade` increases the `weak_count` by 1. The `Rc<T>` type uses
+`weak_count` to keep track of how many `Weak<T>` references exist, similar to
+`strong_count`. The difference is the `weak_count` doesn’t need to be 0 for the
+`Rc<T>` instance to be cleaned up.
+
+Because the value that `Weak<T>` references might have been dropped, to do
+anything with the value that a `Weak<T>` is pointing to you must make sure the
+value still exists. Do this by calling the `upgrade` method on a `Weak<T>`
+instance, which will return an `Option<Rc<T>>`. You’ll get a result of `Some`
+if the `Rc<T>` value has not been dropped yet and a result of `None` if the
+`Rc<T>` value has been dropped. Because `upgrade` returns an `Option<Rc<T>>`,
+Rust will ensure that the `Some` case and the `None` case are handled, and
+there won’t be an invalid pointer.
+
+As an example, rather than using a list whose items know only about the next
+item, we’ll create a tree whose items know about their child items *and* their
+parent items.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id="creating-a-tree-data-structure-a-node-with-child-nodes"></a>
+
+#### Creating a Tree Data Structure
+
+To start, we’ll build a tree with nodes that know about their child nodes.
+We’ll create a struct named `Node` that holds its own `i32` value as well as
+references to its child `Node` values:
+
+Filename: src/main.rs
+
+```
+use std::cell::RefCell;
+use std::rc::Rc;
+
+#[derive(Debug)]
+struct Node {
+    value: i32,
+    children: RefCell<Vec<Rc<Node>>>,
+}
+```
+
+We want a `Node` to own its children, and we want to share that ownership with
+variables so that we can access each `Node` in the tree directly. To do this,
+we define the `Vec<T>` items to be values of type `Rc<Node>`. We also want to
+modify which nodes are children of another node, so we have a `RefCell<T>` in
+`children` around the `Vec<Rc<Node>>`.
+
+Next, we’ll use our struct definition and create one `Node` instance named
+`leaf` with the value `3` and no children, and another instance named `branch`
+with the value `5` and `leaf` as one of its children, as shown in Listing 15-27.
 
 src/main.rs
 
 ```
-        let tx_fut = async move {
-            // --snip--
-        };
+fn main() {
+    let leaf = Rc::new(Node {
+        value: 3,
+        children: RefCell::new(vec![]),
+    });
 
-        let futures: Vec<Box<dyn Future<Output = ()>>> =
-            vec![Box::new(tx1_fut), Box::new(rx_fut), Box::new(tx_fut)];
-
-        trpl::join_all(futures).await;
+    let branch = Rc::new(Node {
+        value: 5,
+        children: RefCell::new(vec![Rc::clone(&leaf)]),
+    });
+}
 ```
 
-Listing 17-23: Awaiting futures in a collection
+Listing 15-27: Creating a `leaf` node with no children and a `branch` node with `leaf` as one of its children
 
-We put each future within a `Box` to make them into *trait objects*, just as
-we did in the “Returning Errors from `run`” section in Chapter 12. (We’ll cover
-trait objects in detail in Chapter 18.) Using trait objects lets us treat each
-of the anonymous futures produced by these types as the same type, because all
-of them implement the `Future` trait.
+We clone the `Rc<Node>` in `leaf` and store that in `branch`, meaning the
+`Node` in `leaf` now has two owners: `leaf` and `branch`. We can get from
+`branch` to `leaf` through `branch.children`, but there’s no way to get from
+`leaf` to `branch`. The reason is that `leaf` has no reference to `branch` and
+doesn’t know they’re related. We want `leaf` to know that `branch` is its
+parent. We’ll do that next.
+
+#### Adding a Reference from a Child to Its Parent
+
+To make the child node aware of its parent, we need to add a `parent` field to
+our `Node` struct definition. The trouble is in deciding what the type of
+`parent` should be. We know it can’t contain an `Rc<T>`, because that would
+create a reference cycle with `leaf.parent` pointing to `branch` and
+`branch.children` pointing to `leaf`, which would cause their `strong_count`
+values to never be 0.

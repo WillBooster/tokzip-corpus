@@ -1,343 +1,87 @@
-### Testing async functions
+## What gets reported
 
-When testing functions that return promises, always `await` the result. When the
-function calls a global like `fetch` or `Deno.readTextFile`, replace it with a
-stub from [`@std/testing/mock`](https://jsr.io/@std/testing/doc/mock/~) rather
-than reassigning the global directly. The stub matches the real signature (so
-the test file still type-checks), and combined with a `using` declaration it
-restores the original when the test scope exits — so one test can't poison the
-next.
+| Source                                       | Captured?                                     |
+| -------------------------------------------- | --------------------------------------------- |
+| Uncaught exception in Deno-side code         | Yes.                                          |
+| Unhandled rejection in Deno-side code        | Yes.                                          |
+| Uncaught exception in renderer-side JS       | Yes; caught via the renderer's `error` event. |
+| Rust panic in the Deno runtime               | Yes.                                          |
+| Rust panic in the rendering backend (CEF, …) | Yes; the backend bridges these.               |
+| `console.error` / `console.warn`             | No; these are not errors.                     |
+| Exceptions you `try`/`catch` yourself        | No.                                           |
 
-```ts title="async_function.ts"
-export async function fetchUserData(userId: string) {
-  const response = await fetch(`https://api.example.com/users/${userId}`);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch user: ${response.status}`);
-  }
-  return await response.json();
-}
-```
+Errors thrown inside a [binding](/runtime/desktop/bindings/) handler propagate
+to the webview side and reject the calling promise. They are **not** reported as
+uncaught errors; the webview catches them. To report them anyway, log them
+yourself in the binding handler.
 
-```ts title="async_function_test.ts"
-import { assertEquals, assertRejects } from "jsr:@std/assert";
-import { stub } from "jsr:@std/testing/mock";
-import { fetchUserData } from "./async_function.ts";
+## Suppressing the alert
 
-Deno.test("fetchUserData success", async () => {
-  using _fetchStub = stub(
-    globalThis,
-    "fetch",
-    () =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({ id: "123", name: "Test User" }),
-          { status: 200 },
-        ),
-      ),
-  );
+The alert is meant to keep the user informed when something goes wrong. It fires
+for every uncaught error, unhandled rejection, and panic, and there is currently
+no way to suppress it from user code: the runtime registers its `error` and
+`unhandledrejection` handlers before your code runs, so a `preventDefault()` in
+a listener you add later does not stop the alert or the report.
 
-  const userData = await fetchUserData("123");
-  assertEquals(userData.id, "123");
-  assertEquals(userData.name, "Test User");
-});
-
-Deno.test("fetchUserData failure", async () => {
-  using _fetchStub = stub(
-    globalThis,
-    "fetch",
-    () => Promise.resolve(new Response("Not Found", { status: 404 })),
-  );
-
-  await assertRejects(
-    () => fetchUserData("nonexistent"),
-    Error,
-    "Failed to fetch user: 404",
-  );
-});
-```
-
-Run the file with `deno test async_function_test.ts`:
-
-```console
-running 2 tests from ./async_function_test.ts
-fetchUserData success ... ok (1ms)
-fetchUserData failure ... ok (0ms)
-
-ok | 2 passed | 0 failed (5ms)
-```
-
-:::tip
-
-Why not just write `globalThis.fetch = async (url: string) => …`? Two reasons.
-First, the real `fetch` accepts `URL | RequestInfo`, not just `string`, so the
-assignment fails type-checking. Second, a plain assignment is never undone: any
-later test in the same file (or any code your test imports transitively) will
-keep seeing the mock. The `using` + `stub` pattern fixes both.
-
-:::
-
-For spies, fake timers, and more advanced mocking, see
-[Mocking data for tests](/runtime/test/mocking/).
-
-## Mocking in tests
-
-Mocking is an essential technique for isolating the code being tested from its
-dependencies. Deno provides built-in utilities and third-party libraries for
-creating mocks.
-
-### Basic Mocking
-
-You can create simple mocks by
-[replacing functions or objects with your own
-implementations](/runtime/test/mocking/). This allows you to control the
-behavior of dependencies and test how your code interacts with them.
+To keep an error from triggering the alert, prevent it from becoming uncaught:
+handle it with `try`/`catch` (or local error handling) in your code and binding
+implementations:
 
 ```ts
-// Example of a module with a function we want to mock
-const api = {
-  fetchData: async () => {
-    const response = await fetch("https://api.example.com/data");
-    return response.json();
-  },
-};
-
-// In your test file
-Deno.test("basic mocking example", async () => {
-  // Store the original function
-  const originalFetchData = api.fetchData;
-
-  // Replace with mock implementation
-  api.fetchData = async () => {
-    return { id: 1, name: "Test Data" };
-  };
-
+win.bind("readFile", async (path) => {
   try {
-    // Test using the mock
-    const result = await api.fetchData();
-    assertEquals(result, { id: 1, name: "Test Data" });
-  } finally {
-    // Restore the original function
-    api.fetchData = originalFetchData;
+    return await Deno.readTextFile(path);
+  } catch (e) {
+    reportToOwnTelemetry(e);
+    return null; // handled, no alert
   }
 });
 ```
 
-### Using Spy Functions
-
-Spies allow you to track function calls without changing their behavior:
-
-```ts
-import { spy } from "jsr:@std/testing/mock";
-
-Deno.test("spy example", () => {
-  // Create a spy on console.log
-  const consoleSpy = spy(console, "log");
-
-  // Call the function we're spying on
-  console.log("Hello");
-  console.log("World");
-
-  // Verify the function was called correctly
-  assertEquals(consoleSpy.calls.length, 2);
-  assertEquals(consoleSpy.calls[0].args, ["Hello"]);
-  assertEquals(consoleSpy.calls[1].args, ["World"]);
-
-  // Restore the original function
-  consoleSpy.restore();
-});
-```
-
-For more advanced mocking techniques, check our
-[dedicated guide on mocking in Deno](/runtime/test/mocking/).
-
-## Test hooks
-
-Deno provides test hooks for running setup and teardown code. Here's a simple
-example using `beforeEach` to ensure clean state between tests:
+You can still add your own `error` / `unhandledrejection` listeners for extra
+telemetry; they run after the built-in handler, alongside the alert and report:
 
 ```ts
-import { assertEquals } from "jsr:@std/assert";
-
-let testData: string[] = [];
-
-Deno.test.beforeEach(() => {
-  testData = ["initial", "data"];
-});
-
-Deno.test("first test", () => {
-  testData.push("first");
-  assertEquals(testData.length, 3);
-});
-
-Deno.test("second test", () => {
-  testData.push("second");
-  assertEquals(testData.length, 3); // Clean state from beforeEach
-});
+addEventListener("error", (e) => reportToOwnTelemetry(e.error));
+addEventListener("unhandledrejection", (e) => reportToOwnTelemetry(e.reason));
 ```
 
-For complete information on all available hooks (`beforeAll`, `beforeEach`,
-`afterEach`, `afterAll`), see the
-[Testing documentation](/runtime/test/#test-hooks).
+## Server-side example
 
-## Coverage
+A minimal reporter receiver:
 
-Code coverage is a metric that helps you understand how much of your code is
-being tested. It measures which lines, functions, and branches of your code are
-executed during your tests, giving you insight into areas that might lack proper
-testing.
+```ts title="server/report.ts"
+Deno.serve({ port: 8080 }, async (req) => {
+  if (req.method !== "POST") return new Response(null, { status: 405 });
 
-Coverage analysis helps you to:
+  const report = await req.json();
+  if (report.version !== 1) {
+    return new Response("unsupported version", { status: 400 });
+  }
 
-- Identify untested parts of your codebase
-- Ensure critical paths have tests
-- Prevent regressions when making changes
-- Measure testing progress over time
-
-:::note
-
-High coverage doesn't guarantee high-quality tests. It simply shows what code
-was executed, not whether your assertions are meaningful or if edge cases are
-handled correctly.
-
-:::
-
-Deno provides built-in coverage tools to help you analyze your test coverage. To
-collect coverage information:
-
-```bash
-deno test --coverage=coverage_dir
-```
-
-This generates coverage data in a specified directory (here, `coverage_dir`). To
-view a human-readable report:
-
-```bash
-deno coverage coverage_dir
-```
-
-You'll see output like:
-
-```sh
-file:///projects/my-project/src/utils.ts 85.7% (6/7)
-file:///projects/my-project/src/models/user.ts 100.0% (15/15)
-file:///projects/my-project/src/services/auth.ts 78.3% (18/23)
-
-total: 87.5% (39/45)
-```
-
-For more detailed insights, you can also generate an HTML report:
-
-```bash
-deno coverage --html coverage_dir
-```
-
-This creates an interactive HTML report in the specified directory that shows
-exactly which lines are covered and which are not.
-
-By default, the coverage tool automatically excludes:
-
-- Test files (matching patterns like `test.ts` or `test.js`)
-- Remote files (those not starting with `file:`)
-
-This ensures your coverage reports focus on your application code rather than
-test files or external dependencies.
-
-### Coverage Configuration
-
-You can exclude files from coverage reports by using the `--exclude` flag:
-
-```bash
-deno coverage --exclude="test_,vendor/,_build/,node_modules/" coverage_dir
-```
-
-### Integrating with CI
-
-For continuous integration environments, you might want to enforce a minimum
-coverage threshold:
-
-```yaml
-# In your GitHub Actions workflow
-- name: Run tests with coverage
-  run: deno test --coverage=coverage_dir
-
-- name: Check coverage meets threshold
-  run: |
-    COVERAGE=$(deno coverage coverage_dir | grep "total:" | grep -o '[0-9]\+\.[0-9]\+')
-    if (( $(echo "$COVERAGE < 80" | bc -l) )); then
-      echo "Test coverage is below 80%: $COVERAGE%"
-      exit 1
-    fi
-```
-
-When working on your test coverage, remember to set realistic goals, aim for
-meaningful coverage with high quality tests over 100% coverage.
-
-## Comparison with other testing frameworks
-
-If you're coming from other JavaScript testing frameworks, here's how Deno's
-testing capabilities compare:
-
-| Feature       | Deno             | Jest                   | Mocha                      | Jasmine               |
-| ------------- | ---------------- | ---------------------- | -------------------------- | --------------------- |
-| Setup         | Built-in         | Requires installation  | Requires installation      | Requires installation |
-| Syntax        | `Deno.test()`    | `test()`, `describe()` | `it()`, `describe()`       | `it()`, `describe()`  |
-| Assertions    | From std library | Built-in expect        | Requires assertion library | Built-in expect       |
-| Mocking       | From std library | Built-in jest.mock()   | Requires sinon or similar  | Built-in spies        |
-| Async support | Native           | Needs special handling | Supports promises          | Supports promises     |
-| File watching | `--watch` flag   | watch mode             | Requires nodemon           | Requires extra tools  |
-| Code coverage | Built-in         | Built-in               | Requires istanbul          | Requires istanbul     |
-
-### Testing Style Comparison
-
-**Deno:**
-
-```ts
-import { assertEquals } from "jsr:@std/assert";
-
-Deno.test("add function", () => {
-  assertEquals(1 + 2, 3);
+  await Deno.writeTextFile(
+    `./reports/${report.timestamp}.json`,
+    JSON.stringify(report, null, 2),
+  );
+  return new Response(null, { status: 204 });
 });
 ```
 
-**Jest:**
+In production you would write to a database or forward to a proper
+crash-collection service.
 
-```ts
-test("add function", () => {
-  expect(1 + 2).toBe(3);
-});
-```
+## Privacy considerations
 
-**Mocha:**
+The default report includes `stack` traces, which may contain user data embedded
+in error messages (filenames, URLs, query parameters, serialized object fields).
+If your app handles sensitive data, consider:
 
-```ts
-import { assert } from "chai";
+- Stripping arguments from stack frames before sending.
+- Redacting URLs of [`Deno.readTextFile`](/api/deno/~/Deno.readTextFile) calls
+  and similar.
+- Asking the user before sending the first report (a one-time consent prompt).
 
-describe("math", () => {
-  it("should add numbers", () => {
-    assert.equal(1 + 2, 3);
-  });
-});
-```
-
-**Jasmine:**
-
-```ts
-describe("math", () => {
-  it("should add numbers", () => {
-    expect(1 + 2).toBe(3);
-  });
-});
-```
-
-## Next steps
-
-🦕 Deno's built-in testing capabilities make it easy to write and run tests
-without needing to install extra testing frameworks or tools. By following the
-patterns and practices outlined in this tutorial, you can ensure your Deno
-applications are well-tested and reliable.
-
-For more information about testing in Deno, check out:
-
-- [Testing documentation](/runtime/test/)
-- [Mocking data for tests](/runtime/test/mocking/)
-- [Writing benchmark tests](/examples/write_benchmarks/)
+These are app-level decisions; the built-in reporter sends what it has and its
+payload can't be filtered from user code. For full control over what leaves the
+machine, leave `errorReporting.url` unset and send your own reports from `error`
+/ `unhandledrejection` handlers instead.

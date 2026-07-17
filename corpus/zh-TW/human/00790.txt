@@ -1,148 +1,223 @@
-``` js
-var Log = Java.use("android.util.Log");
-var Exception = Java.use("java.lang.Exception");
-Log.d.overload("java.lang.String", "java.lang.String").implementation = function (a, b) {
-   if (b.indexOf('root') >= 0) {
-    // print stack trace
-    console.log(Log.getStackTraceString( Exception.$new()));
-   }
-   return this.d.overload("java.lang.String", "java.lang.String").call(this, a, b)
-};
+frame->Client()->DidDispatchPingLoader(url);
+
+  FetchUtils::LogFetchKeepAliveRequestMetric(
+      params.GetResourceRequest().GetRequestContext(),
+      FetchUtils::FetchKeepAliveRequestState::kTotal);
+  Resource* resource =
+      RawResource::Fetch(params, frame->DomWindow()->Fetcher(), nullptr);
+  return resource->GetStatus() != ResourceStatus::kLoadError;
+}
 ```
 
-### Hook Reflect-related methods
+It first checks for CSP violations. If there are none, it sends a keepalive request and returns whether it was successful.
 
-In Java, in addition to calling methods directly, you can also call them through reflection (Reflect). Some obfuscated programs use this technique extensively to enhance the difficulty of static analysis. We can print out every dynamically called method to see if there are any clues:
+It is worth noting that in the same file, there is another function that does something similar, called `PingLoader::SendLinkAuditPing`. There is an attribute called `ping` on the `<a>` tag, and when the user clicks the link, the browser sends a request to the location specified by the ping:
 
-``` js
-// hook Class.forName
-var JavaClass = Java.use('java.lang.Class');
-JavaClass.forName.overload('java.lang.String', 'boolean', 'java.lang.ClassLoader').implementation = function(name, b, c) {
-  console.log('Class.forName', name)
-  // we can log all methods in certain class
-  if (name.indexOf('cymetrics') === 0) {
-    var TargetClass = Java.use(name);
-    var methodsList = TargetClass.class.getDeclaredMethods();
-    for (var k=0; k<methodsList.length; k++){
-        console.log(methodsList[k].getName());
-    }  
+``` html
+<a
+  href="https://example.com"
+  ping="https://blog.huli.tw"
+  >click me
+</a>
+```
+
+This is also implemented using a keepalive fetch:
+
+``` c
+void PingLoader::SendLinkAuditPing(LocalFrame* frame,
+                                   const KURL& ping_url,
+                                   const KURL& destination_url) {
+  if (!ping_url.ProtocolIsInHTTPFamily())
+    return;
+
+  ResourceRequest request(ping_url);
+  request.SetHttpMethod(http_names::kPOST);
+  request.SetHTTPContentType(AtomicString("text/ping"));
+  request.SetHttpBody(EncodedFormData::Create(base::span_from_cstring("PING")));
+  request.SetHttpHeaderField(http_names::kCacheControl,
+                             AtomicString("max-age=0"));
+  request.SetHttpHeaderField(http_names::kPingTo,
+                             AtomicString(destination_url.GetString()));
+  scoped_refptr<const SecurityOrigin> ping_origin =
+      SecurityOrigin::Create(ping_url);
+  if (ProtocolIs(frame->DomWindow()->Url().GetString(), "http") ||
+      frame->DomWindow()->GetSecurityOrigin()->CanAccess(ping_origin.get())) {
+    request.SetHttpHeaderField(
+        http_names::kPingFrom,
+        AtomicString(frame->DomWindow()->Url().GetString()));
   }
-  return this.forName.overload('java.lang.String', 'boolean', 'java.lang.ClassLoader').call(this, name, b, c)
-}
 
-// hook Method.invoke
-var Method = Java.use('java.lang.reflect.Method')
-Method.invoke.overload('java.lang.Object', '[Ljava.lang.Object;').implementation = function(a,b){
-  console.log('reflect', a, b)
-  return this.invoke.call(this,a,b)
+  request.SetKeepalive(true);
+  request.SetReferrerString(Referrer::NoReferrer());
+  request.SetReferrerPolicy(network::mojom::ReferrerPolicy::kNever);
+  request.SetRequestContext(mojom::blink::RequestContextType::PING);
+  FetchParameters params(
+      std::move(request),
+      ResourceLoaderOptions(frame->DomWindow()->GetCurrentWorld()));
+  params.MutableOptions().initiator_info.name =
+      fetch_initiator_type_names::kPing;
+
+  frame->Client()->DidDispatchPingLoader(ping_url);
+  FetchUtils::LogFetchKeepAliveRequestMetric(
+      params.GetResourceRequest().GetRequestContext(),
+      FetchUtils::FetchKeepAliveRequestState::kTotal);
+  RawResource::Fetch(params, frame->DomWindow()->Fetcher(), nullptr);
 }
 ```
 
-### Hook string operations
+### Implementation of sendBeacon in Safari
 
-Some obfuscated programs will scramble all the fixed strings in the program through various steps to make them difficult to search, such as turning strings into numbers and then restoring them. Usually, when restoring, string operations will be performed. At this time, we can directly hook the string operations and use the stack trace mentioned earlier to trace:
+The implementation in Safari can be found at [WebKit/Source/WebCore/Modules/beacon/NavigatorBeacon.cpp](https://github.com/WebKit/WebKit/blob/WebKit-7620.1.16.111.5/Source/WebCore/Modules/beacon/NavigatorBeacon.cpp):
 
-``` js
-['java.lang.StringBuilder', 'java.lang.StringBuffer'].forEach(function(clazz, i) {
-  Java.use(clazz)['toString'].implementation = function() {
-    var ret = this.toString();
-    console.log('ret:', ret)
-    return ret;
-  }   
-}); 
-```
+``` cpp
+ExceptionOr<bool> NavigatorBeacon::sendBeacon(Document& document, const String& url, std::optional<FetchBody::Init>&& body)
+{
+    URL parsedUrl = document.completeURL(url);
 
-### Hook encryption and decryption-related operations
+    // Set parsedUrl to the result of the URL parser steps with url and base. If the algorithm returns an error, or if
+    // parsedUrl's scheme is not "http" or "https", throw a "TypeError" exception and terminate these steps.
+    if (!parsedUrl.isValid())
+        return Exception { ExceptionCode::TypeError, "This URL is invalid"_s };
+    if (!parsedUrl.protocolIsInHTTPFamily())
+        return Exception { ExceptionCode::TypeError, "Beacons can only be sent over HTTP(S)"_s };
 
-Usually, in an Android app, if you want to perform encryption and decryption, you will use the built-in API, like this (source: [AES encryption in Android--Part 1](https://cloud.tencent.com/developer/article/1647740)):
+    if (!document.frame())
+        return false;
 
-``` java
-public static final String CODE_TYPE = "UTF-8";
-public static final String AES_TYPE = "AES/ECB/PKCS5Padding";
-private static final String AES_KEY="1111222233334444";
-
-public static String encrypt(String cleartext) {
-    try {
-        SecretKeySpec key = new SecretKeySpec(AES_KEY.getBytes(), "AES");
-        Cipher cipher = Cipher.getInstance(AES_TYPE);
-        cipher.init(Cipher.ENCRYPT_MODE, key); 
-        byte[] encryptedData = cipher.doFinal(cleartext.getBytes(CODE_TYPE));
-        return Base64.encodeToString(encryptedData,Base64.DEFAULT);
-    } catch (Exception e) {
-        e.printStackTrace();
-        return "";
+    if (!document.shouldBypassMainWorldContentSecurityPolicy() && !document.checkedContentSecurityPolicy()->allowConnectToSource(parsedUrl)) {
+        // We simulate a network error so we return true here. This is consistent with Blink.
+        return true;
     }
+
+    ResourceRequest request(parsedUrl);
+    request.setHTTPMethod("POST"_s);
+    request.setRequester(ResourceRequestRequester::Beacon);
+    if (RefPtr documentLoader = document.loader())
+        request.setIsAppInitiated(documentLoader->lastNavigationWasAppInitiated());
+
+    ResourceLoaderOptions options;
+    options.credentials = FetchOptions::Credentials::Include;
+    options.cache = FetchOptions::Cache::NoCache;
+    options.keepAlive = true;
+    options.sendLoadCallbacks = SendCallbackPolicy::SendCallbacks;
+
+    if (body) {
+        options.mode = FetchOptions::Mode::NoCors;
+        String mimeType;
+        auto result = FetchBody::extract(WTFMove(body.value()), mimeType);
+        if (result.hasException())
+            return result.releaseException();
+        auto fetchBody = result.releaseReturnValue();
+        if (fetchBody.isReadableStream())
+            return Exception { ExceptionCode::TypeError, "Beacons cannot send ReadableStream body"_s };
+
+        request.setHTTPBody(fetchBody.bodyAsFormData());
+        if (!mimeType.isEmpty()) {
+            request.setHTTPContentType(mimeType);
+            if (!isCrossOriginSafeRequestHeader(HTTPHeaderName::ContentType, mimeType)) {
+                options.mode = FetchOptions::Mode::Cors;
+                options.httpHeadersToKeep.add(HTTPHeadersToKeepFromCleaning::ContentType);
+            }
+        }
+    }
+
+    auto cachedResource = document.protectedCachedResourceLoader()->requestBeaconResource({ WTFMove(request), options });
+    if (!cachedResource) {
+        logError(cachedResource.error());
+        return false;
+    }
+
+    ASSERT(!m_inflightBeacons.contains(cachedResource.value().get()));
+    m_inflightBeacons.append(cachedResource.value().get());
+    cachedResource.value()->addClient(*this);
+    return true;
 }
 ```
 
-Therefore, as long as you can hook methods like `SecretKeySpec` or `doFinal`, you can intercept the key and plaintext before encryption.
+You can see that the entire process is quite similar to Chromium. It first checks the validity of the URL, then checks CSP, and then sends a keepalive request.
 
-This article is worth reading: [How Secure is your Android Keystore Authentication?](https://labs.f-secure.com/blog/how-secure-is-your-android-keystore-authentication/), which includes a bunch of Frida scripts related to encryption and decryption. Here: https://github.com/FSecureLABS/android-keystore-audit/blob/master/frida-scripts/tracer-cipher.js
+This echoes what we mentioned earlier and what is written in the specifications: the underlying sendBeacon is essentially a keepalive fetch. So where is the source code for when the keepalive queue size exceeds the limit?
 
-By the way, the script does not directly convert byte arrays to strings. Here is a more convenient way (source: [frida小技巧之string与byte转化](https://lingwu111.github.io/frida%E5%B0%8F%E6%8A%80%E5%B7%A7%E4%B9%8Bstring%E4%B8%8Ebyte%E8%BD%AC%E5%8C%96.html)):
+From the implementation, it can be seen that if the queue size exceeds, it is likely that this segment is where the error occurs, because only here will it return false:
 
-``` js
-function bytesToString(bytes) {
-    var javaString = Java.use('java.lang.String');
-    return javaString.$new(bytes);
-}
-
-var Base64 = Java.use('android.util.Base64')
-Base64.decode.overload('[B', 'int').implementation = function(a, b) {
-  console.log(bytesToString(a))
-  return this.decode.call(this, a, b)
+``` cpp
+auto cachedResource = document.protectedCachedResourceLoader()->requestBeaconResource({ WTFMove(request), options });
+if (!cachedResource) {
+    logError(cachedResource.error());
+    return false;
 }
 ```
 
-## SSL Pinning
+Therefore, we can trace down to `requestBeaconResource`. Additionally, we can also trace the source code from another direction.
 
-I saw a great script in [Defeating Android Certificate Pinning with Frida](https://httptoolkit.tech/blog/frida-certificate-pinning/) that automatically hooks various functions that do SSL pinning, allowing you to bypass this mechanism. I saved a copy here: https://gist.github.com/aszx87410/f7ae60826d436d8e5bd17deb3e40c249
+Do you remember the example that sent a string of length 10000 eight times? In Chrome, you will only see the request become pending, but in Safari, a helpful message will appear:
 
-After saving, run it like this:
+> Beacon API cannot load https://httpstat.us/200?log7. Reached maximum amount of queued data of 64Kb for keepalive requests
 
+You can directly use this error message to find the relevant source code at [WebKit/Source/WebCore/loader/cache/CachedResource.cpp](https://github.com/WebKit/WebKit/blob//WebKit-7620.1.16.111.5/Source/WebCore/loader/cache/CachedResource.cpp#L249):
+
+``` cpp
+if (
+    m_options.keepAlive && type() != Type::Ping &&
+    !cachedResourceLoader.keepaliveRequestTracker().tryRegisterRequest(*this)
+  ) {
+    setResourceError({
+      errorDomainWebKitInternal, 0, request.url(),
+      "Reached maximum amount of queued data of 64Kb for keepalive requests"_s,
+      ResourceError::Type::AccessControl
+    });
+    failBeforeStarting();
+    return;
+}
 ```
-frida -U --no-pause -l ssl.js -f "com.example"
+
+If it is a keepalive, and the type is not ping (the type of sendBeacon will be `Type::Beacon`), and there is no way to register a new request, then this error is returned.
+
+Therefore, the key point is the method `keepaliveRequestTracker().tryRegisterRequest`, located in [Source/WebCore/loader/cache/KeepaliveRequestTracker.cpp](https://github.com/WebKit/WebKit/blob/WebKit-7620.1.16.111.5/Source/WebCore/loader/cache/KeepaliveRequestTracker.cpp):
+
+``` cpp
+const uint64_t maxInflightKeepaliveBytes { 65536 }; // 64 kibibytes as per Fetch specification.
+
+bool KeepaliveRequestTracker::tryRegisterRequest(CachedResource& resource)
+{
+    ASSERT(resource.options().keepAlive);
+    auto body = resource.resourceRequest().httpBody();
+    if (!body)
+        return true;
+
+    uint64_t bodySize = body->lengthInBytes();
+    if (m_inflightKeepaliveBytes + bodySize > maxInflightKeepaliveBytes)
+        return false;
+
+    registerRequest(resource);
+    return true;
+}
 ```
 
-## Detecting Frida
+It actually just counts how many are still waiting, and checks if adding them would exceed the maximum value of 65536. The operation is quite similar to the last PR from Sentry.
 
-Since Frida is so powerful, some app security mechanisms naturally want to block it. Once Frida is detected, the app will either exit directly or cause a crash. You can refer to the following two articles:
+### Firefox's sendBeacon Implementation
 
-1. [Android Reverse Engineering: Multiple Feature Detection of Frida](https://www.jianshu.com/p/f679cb404524)
-2. [Multiple Feature Detection of Frida](https://blog.csdn.net/zhangmiaoping23/article/details/109697329)
+In the previous Sentry PR, it was mentioned that Firefox does not support keepalive, corresponding to this ticket: [[meta] Support Fetch keepalive flag and enforce limit on inflight keepalive bytes](https://bugzilla.mozilla.org/show_bug.cgi?id=1342484), which is still open. From the discussion, it seems there has been progress since about half a year ago, and support officially started in Firefox version 133, released in November 2024. Although there are still some bugs, it should become more stable over time.
 
-There are many ways to anti-detection, one of which is to hook the various methods mentioned in the above articles. After all, we have root privileges and Frida hook in front, so as long as we know how it is judged, we can definitely remove the check. If you can't find the check, you can use various hooks mentioned above to find it out step by step.
+I tested a scenario with three browsers, sending out 10 strings of length 60,000:
+
+``` html
+<script>
+  for(let i=1; i<=10; i++) {
+    navigator.sendBeacon("https://httpstat.us/200?log"+i, 'A'.repeat(60000));
+  }
+</script>
+```
+
+Both Chrome and Safari only sent one request, but Firefox 133.0.3 kindly sent them all out, currently without a 64 KiB limit:
+
+![Firefox Screenshot](/img/navigator-sendbeacon-64kib-and-source-code/p7.png)
+
+For those curious about the underlying implementation, the code is here: [gecko-dev/dom/base/Navigator.cpp](https://github.com/mozilla/gecko-dev/blob/94c62970ba2f9c40efd5a4f83a538595425820d9/dom/base/Navigator.cpp#L1163). It seems that keepalive has not been integrated yet, which is why the limit has not been triggered. In the future, it should follow the spec, using keepalive requests and adhering to the payload size limits.
 
 ## Conclusion
 
-In this article, we introduced the basic usage of Frida and learned how to use Frida to hook various methods to obtain various information we want.
+Small features can have great significance. A seemingly simple `sendBeacon` is actually quite interesting upon deeper research. Understanding its limitations and solutions, as well as learning from Sentry's patching process, and reviewing the browser's source code, provides a better understanding of the underlying implementation.
 
-In the first four articles, we covered some basic things, including:
-
-1. Basic Android App composition
-2. How to use Apktool to unpack and repack apk
-3. How to use jadx to restore smali to java files
-4. Familiar with a little bit of smali syntax, know how to modify code and add code
-5. How to intercept packets through a proxy on a computer
-6. How to modify the apk to allow the proxy to intercept smoothly
-7. How to use Frida to hook function
-8. Various tricks of Frida
-
-If you go further, you will enter the field of native.
-
-In addition to using Java to write Android Apps, you can also use [Android NDK](https://developer.android.com/ndk) to write code in C/C++, which can be provided to Android apps.
-
-When do you need it? The first is the more performance-consuming places, such as image recognition, using C++ to write will be faster than Java, so native is usually used. The second is some more secretive operations, such as encryption and decryption. If placed in the Java layer, it is easy to decompile and see what is being done. If written in native, more binary-related knowledge is required to crack it.
-
-In addition, the apps in the real world are not as simple as the apps we demonstrated earlier. They may be encapsulated or more strongly obfuscated. Even if the apk can be unpacked, if the shell cannot be removed, the real logic cannot be seen. Some shells also have mechanisms for anti-tampering and anti-dynamic analysis, which can block attackers with insufficient skills. Relevant introductions can refer to the agenda of [2019 Taiwan Cyber Security Week](http://confapi.ithome.com.tw/session/4186): [Building a Secure and Convenient App Security Protection Product](https://s.itho.me/cybersec/2019/slides/321/I_%E4%B8%96%E8%B2%BF%E4%B8%89/0321I51610%E7%8E%8B%E7%BE%BF%E5%BB%B7.pdf)
-
-The reason why this series is called "Introduction" is because it completely does not mention the practical things that will be encountered, and only focuses on the basics and tools of the introduction. However, for apps without special obfuscation or encapsulation, this should be enough.
-
-References:
-
-1. [Frida Handbook](https://github.com/hookmaster/frida-all-in-one)
-2. [Translation-N Ways to Unpack Android Malware](https://www.giantbranch.cn/2019/10/25/%E7%BF%BB%E8%AF%91%E2%80%94%E2%80%94N%E7%A7%8D%E8%84%B1%E5%A3%B3%E5%AE%89%E5%8D%93%E6%81%B6%E6%84%8F%E8%BD%AF%E4%BB%B6%E7%9A%84%E6%96%B9%E5%BC%8F/)
-4. [This is probably the most detailed notes for learning Frida](https://juejin.cn/post/6847902219757420552#heading-39)
-5. [frida-snippets](https://github.com/iddoeldor/frida-snippets#class-description)
-6. [Frida Tutorial](https://book.hacktricks.xyz/mobile-apps-pentesting/android-app-pentesting/frida-tutorial)
-7. [Practical FRIDA Advanced: Memory Roaming, Hook Anywhere, Packet Capture](https://www.anquanke.com/post/id/197657)
+In practice, if you are going to use `sendBeacon`, please remember to add error handling. When the return value is false, switch to a regular fetch or add a retry mechanism to enhance the stability of data transmission.

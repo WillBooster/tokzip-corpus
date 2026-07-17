@@ -1,643 +1,498 @@
 # frozen_string_literal: true
 
-# Note:
-# It is important to keep this file as light as possible
-# the goal for tests that require this is to test booting up
-# Rails from an empty state, so anything added here could
-# hide potential failures
-#
-# It is also good to know what is the bare minimum to get
-# Rails booted up.
-require "active_support/testing/strict_warnings"
-require "fileutils"
-require "shellwords"
+require "abstract_unit"
+require "rails/engine"
+require "action_dispatch/routing/inspector"
+require "io/console/size"
 
-require "bundler/setup" unless defined?(Bundler)
-require "active_support"
-require "active_support/testing/autorun"
-require "active_support/testing/stream"
-require "active_support/testing/method_call_assertions"
-require "active_support/test_case"
-require "minitest/retry"
-
-if ENV["BUILDKITE"]
-  Minitest::Retry.use!(verbose: false, retry_count: 1)
+class MountedRackApp
+  def self.call(env)
+  end
 end
 
-require_relative "../../../tools/test_common"
+class Rails::DummyController
+end
 
-RAILS_FRAMEWORK_ROOT = File.expand_path("../../..", __dir__)
-
-# These files do not require any others and are needed
-# to run the tests
-require "active_support/core_ext/object/blank"
-require "active_support/testing/isolation"
-require "active_support/core_ext/kernel/reporting"
-require "tmpdir"
-
-module TestHelpers
-  module Paths
-    def app_template_path
-      File.join RAILS_FRAMEWORK_ROOT, "tmp/templates/app_template"
-    end
-
-    def bootsnap_cache_path
-      File.join RAILS_FRAMEWORK_ROOT, "tmp/templates/bootsnap"
-    end
-
-    def tmp_path(*args)
-      @tmp_path ||= File.realpath(Dir.mktmpdir(nil, File.join(RAILS_FRAMEWORK_ROOT, "tmp")))
-      File.join(@tmp_path, *args)
-    end
-
-    def app_path(*args)
-      path = tmp_path(*%w[app] + args)
-      if block_given?
-        yield path
-      else
-        path
-      end
-    end
-
-    def framework_path
-      RAILS_FRAMEWORK_ROOT
-    end
-
-    def rails_root
-      app_path
-    end
-  end
-
-  module Rack
-    def app(env = "production")
-      old_env = ENV["RAILS_ENV"]
-      @app ||= begin
-        ENV["RAILS_ENV"] = env
-
-        require "#{app_path}/config/environment"
-
-        Rails.application
-      end
-    ensure
-      ENV["RAILS_ENV"] = old_env
-    end
-
-    def extract_body(response)
-      (+"").tap do |body|
-        response[2].each { |chunk| body << chunk }
-      end
-    end
-
-    def get(path)
-      @app.call(::Rack::MockRequest.env_for(path))
-    end
-
-    def assert_welcome(resp)
-      resp = Array(resp)
-
-      assert_equal 200, resp[0]
-      assert_match "text/html", resp[1]["Content-Type"]
-      assert_match "charset=utf-8", resp[1]["Content-Type"]
-      assert extract_body(resp).match(/Rails version:/)
-    end
-  end
-
-  module Generation
-    # Build an application by invoking the generator and going through the whole stack.
-    def build_app(options = {})
-      @prev_rails_env = ENV["RAILS_ENV"]
-      ENV["RAILS_ENV"] = "development"
-
-      FileUtils.rm_rf(app_path)
-      FileUtils.cp_r(app_template_path, app_path)
-
-      # Delete the initializers unless requested
-      unless options[:initializers]
-        Dir["#{app_path}/config/initializers/**/*.rb"].each do |initializer|
-          File.delete(initializer)
-        end
+module ActionDispatch
+  module Routing
+    class RoutesInspectorTest < ActiveSupport::TestCase
+      setup do
+        @set = ActionDispatch::Routing::RouteSet.new
       end
 
-      routes = File.read("#{app_path}/config/routes.rb")
-      if routes =~ /(\n\s*end\s*)\z/
-        File.open("#{app_path}/config/routes.rb", "w") do |f|
-          f.puts $` + "\nActionDispatch.deprecator.silence { match ':controller(/:action(/:id))(.:format)', via: :all }\n" + $1
-        end
-      end
-
-      File.open("#{app_path}/config/database.yml", "w") do |f|
-        if options[:multi_db]
-          f.puts multi_db_database_configs
-        else
-          f.puts default_database_configs
-        end
-      end
-
-      add_to_config <<-RUBY
-        config.hosts << proc { true }
-        config.eager_load = false
-        config.session_store :cookie_store, key: "_myapp_session"
-        config.cache_store = :mem_cache_store
-        config.active_support.deprecation = :log
-        config.action_controller.allow_forgery_protection = false
-      RUBY
-
-      add_to_env_config :development, "config.action_view.annotate_rendered_view_with_filenames = false"
-
-      remove_from_env_config("development", "config.generators.apply_rubocop_autocorrect_after_generate!")
-    end
-
-    def teardown_app
-      ENV["RAILS_ENV"] = @prev_rails_env if @prev_rails_env
-      FileUtils.rm_rf(tmp_path)
-    end
-
-    def default_database_configs
-      <<-YAML
-        default: &default
-          adapter: sqlite3
-          pool: 5
-          timeout: 5000
-        development:
-          <<: *default
-          database: storage/development.sqlite3
-        test:
-          <<: *default
-          database: storage/test.sqlite3
-        production:
-          <<: *default
-          database: storage/production.sqlite3
-      YAML
-    end
-
-    def multi_db_database_configs
-      <<-YAML
-        default: &default
-          adapter: sqlite3
-          pool: 5
-          timeout: 5000
-          variables:
-            statement_timeout: 1000
-        development:
-          primary:
-            <<: *default
-            database: storage/development.sqlite3
-          primary_readonly:
-            <<: *default
-            database: storage/development.sqlite3
-            replica: true
-          animals:
-            <<: *default
-            database: storage/development_animals.sqlite3
-            migrations_paths: db/animals_migrate
-          animals_readonly:
-            <<: *default
-            database: storage/development_animals.sqlite3
-            migrations_paths: db/animals_migrate
-            replica: true
-        test:
-          primary:
-            <<: *default
-            database: storage/test.sqlite3
-          primary_readonly:
-            <<: *default
-            database: storage/test.sqlite3
-            replica: true
-          animals:
-            <<: *default
-            database: storage/test_animals.sqlite3
-            migrations_paths: db/animals_migrate
-          animals_readonly:
-            <<: *default
-            database: storage/test_animals.sqlite3
-            migrations_paths: db/animals_migrate
-            replica: true
-        production:
-          primary:
-            <<: *default
-            database: storage/production.sqlite3
-          primary_readonly:
-            <<: *default
-            database: storage/production.sqlite3
-            replica: true
-          animals:
-            <<: *default
-            database: storage/production_animals.sqlite3
-            migrations_paths: db/animals_migrate
-          animals_readonly:
-            <<: *default
-            database: storage/production_animals.sqlite3
-            migrations_paths: db/animals_migrate
-            replica: true
-      YAML
-    end
-
-    def with_unhealthy_database(&block)
-      # The existing schema cache dump will contain ActiveRecord::ConnectionAdapters::SQLite3Adapter objects
-      require "active_record/connection_adapters/sqlite3_adapter"
-
-      # We need to change the `database_version` to match what is expected for MySQL
-      dump_path = File.join(app_path, "db/schema_cache.yml")
-      if File.exist?(dump_path)
-        schema_cache = ActiveRecord::ConnectionAdapters::SchemaCache._load_from(dump_path)
-        schema_cache.instance_variable_set(:@database_version, ActiveRecord::ConnectionAdapters::AbstractAdapter::Version.new("8.8.8"))
-        File.write(dump_path, YAML.dump(schema_cache))
-      end
-
-      # We load the app while pointing at a non-existing MySQL server
-      switch_env("DATABASE_URL", "mysql2://127.0.0.1:1", &block)
-    end
-
-    # Make a very basic app, without creating the whole directory structure.
-    # This is faster and simpler than the method above.
-    def make_basic_app
-      require "rails"
-      require "action_controller/railtie"
-      require "action_view/railtie"
-
-      @app = Class.new(Rails::Application) do
-        def self.name; "RailtiesTestApp"; end
-      end
-      @app.config.hosts << proc { true }
-      @app.config.eager_load = false
-      @app.config.session_store :cookie_store, key: "_myapp_session"
-      @app.config.active_support.deprecation = :log
-      @app.config.log_level = :info
-      @app.config.secret_key_base = "b3c631c314c0bbca50c1b2843150fe33"
-
-      yield @app if block_given?
-      @app.initialize!
-
-      @app.routes.draw do
-        get "/" => "omg#index"
-      end
-
-      require "rack/test"
-      extend ::Rack::Test::Methods
-    end
-
-    def simple_controller
-      controller :foo, <<-RUBY
-        class FooController < ApplicationController
-          def index
-            render plain: "foo"
+      def test_displaying_routes_for_engines
+        engine = Class.new(Rails::Engine) do
+          def self.inspect
+            "Blog::Engine"
           end
         end
-      RUBY
-
-      app_file "config/routes.rb", <<-RUBY
-        Rails.application.routes.draw do
-          get ':controller(/:action)'
-        end
-      RUBY
-    end
-
-    class Bukkit
-      attr_reader :path
-
-      def initialize(path)
-        @path = path
-      end
-
-      def write(file, string)
-        path = "#{@path}/#{file}"
-        FileUtils.mkdir_p(File.dirname(path))
-        File.open(path, "w") { |f| f.puts string }
-      end
-
-      def delete(file)
-        File.delete("#{@path}/#{file}")
-      end
-    end
-
-    def engine(name)
-      dir = "#{app_path}/random/#{name}"
-      FileUtils.mkdir_p(dir)
-
-      app = File.readlines("#{app_path}/config/application.rb")
-      app.insert(4, "$:.unshift(\"#{dir}/lib\")")
-      app.insert(5, "require #{name.inspect}")
-
-      File.open("#{app_path}/config/application.rb", "r+") do |f|
-        f.puts app
-      end
-
-      Bukkit.new(dir).tap do |bukkit|
-        yield bukkit if block_given?
-      end
-    end
-
-    # Invoke a bin/rails command inside the app
-    #
-    # allow_failure:: true to return normally if the command exits with
-    #   a non-zero status. By default, this method will raise.
-    # stderr:: true to pass STDERR output straight to the "real" STDERR.
-    #   By default, the STDERR and STDOUT of the process will be
-    #   combined in the returned string.
-    def rails(*args, allow_failure: false, stderr: false)
-      args = args.flatten
-      fork = true
-
-      command = "bin/rails #{Shellwords.join args}#{' 2>&1' unless stderr}"
-
-      # Don't fork if the environment has disabled it
-      fork = false if ENV["NO_FORK"]
-
-      # Don't fork if the runtime isn't able to
-      fork = false if !Process.respond_to?(:fork)
-
-      # Don't fork if we're re-invoking minitest
-      fork = false if args.first == "t" || args.grep(/\Atest(:|\z)/).any?
-
-      if fork
-        out_read, out_write = IO.pipe
-        if stderr
-          err_read, err_write = IO.pipe
-        else
-          err_write = out_write
+        engine.routes.draw do
+          get "/cart", to: "cart#show"
         end
 
-        pid = fork do
-          out_read.close
-          err_read.close if err_read
+        output = draw do
+          get "/custom/assets", to: "custom_assets#show"
+          mount engine => "/blog", :as => "blog"
+        end
 
-          $stdin.reopen(File::NULL, "r")
-          $stdout.reopen(out_write)
-          $stderr.reopen(err_write)
+        assert_equal [
+          "       Prefix Verb URI Pattern              Controller#Action",
+          "custom_assets GET  /custom/assets(.:format) custom_assets#show",
+          "         blog      /blog                    Blog::Engine",
+          "",
+          "Routes for Blog::Engine:",
+          "  cart GET  /cart(.:format) cart#show"
+        ], output
+      end
 
-          at_exit do
-            case $!
-            when SystemExit
-              exit! $!.status
-            when nil
-              exit! 0
-            else
-              err_write.puts "#{$!.class}: #{$!}"
-              exit! 1
-            end
+      def test_displaying_routes_for_engines_without_routes
+        engine = Class.new(Rails::Engine) do
+          def self.inspect
+            "Blog::Engine"
           end
-
-          Rails.instance_variable_set :@_env, nil
-
-          $-v = $-w = false
-          Dir.chdir app_path unless Dir.pwd == app_path
-
-          ARGV.replace(args)
-          load "./bin/rails"
-
-          exit! 0
+        end
+        engine.routes.draw do
         end
 
-        out_write.close
-
-        if err_read
-          err_write.close
-
-          $stderr.write err_read.read
+        output = draw do
+          mount engine => "/blog", as: "blog"
         end
 
-        output = out_read.read
-
-        Process.waitpid pid
-
-      else
-        ENV["BOOTSNAP_CACHE_DIR"] = bootsnap_cache_path
-        begin
-          output = `cd #{app_path}; #{command}`
-        ensure
-          ENV.delete("BOOTSNAP_CACHE_DIR")
-        end
+        assert_equal [
+          "Prefix Verb URI Pattern Controller#Action",
+          "  blog      /blog       Blog::Engine",
+          "",
+          "Routes for Blog::Engine:"
+        ], output
       end
 
-      raise "rails command failed (#{$?.exitstatus}): #{command}\n#{output}" unless allow_failure || $?.success?
-
-      output
-    end
-
-    def add_to_top_of_config(str)
-      environment = File.read("#{app_path}/config/application.rb")
-      if environment =~ /(Rails::Application\s*)/
-        File.open("#{app_path}/config/application.rb", "w") do |f|
-          f.puts $` + $1 + "\n#{str}\n" + $'
+      def test_cart_inspect
+        output = draw do
+          get "/cart", to: "cart#show"
         end
-      end
-    end
 
-    def add_to_config(str)
-      environment = File.read("#{app_path}/config/application.rb")
-      if environment =~ /(\n\s*end\s*end\s*)\z/
-        File.open("#{app_path}/config/application.rb", "w") do |f|
-          f.puts $` + "\n#{str}\n" + $1
-        end
-      end
-    end
-
-    def add_to_env_config(env, str)
-      environment = File.read("#{app_path}/config/environments/#{env}.rb")
-      if environment =~ /(\n\s*end\s*)\z/
-        File.open("#{app_path}/config/environments/#{env}.rb", "w") do |f|
-          f.puts $` + "\n#{str}\n" + $1
-        end
-      end
-    end
-
-    def remove_from_config(str)
-      remove_from_file("#{app_path}/config/application.rb", str)
-    end
-
-    def remove_from_env_config(env, str)
-      remove_from_file("#{app_path}/config/environments/#{env}.rb", str)
-    end
-
-    def remove_from_file(file, str)
-      contents = File.read(file)
-      contents.gsub!(/#{str}/, "")
-      File.write(file, contents)
-    end
-
-    def app_file(path, contents, mode = "w")
-      file_name = "#{app_path}/#{path}"
-      FileUtils.mkdir_p File.dirname(file_name)
-      File.open(file_name, mode) do |f|
-        f.puts contents
-      end
-      file_name
-    end
-
-    def app_dir(path)
-      FileUtils.mkdir_p("#{app_path}/#{path}")
-    end
-
-    def remove_file(path)
-      FileUtils.rm_rf "#{app_path}/#{path}"
-    end
-
-    def controller(name, contents)
-      app_file("app/controllers/#{name}_controller.rb", contents)
-    end
-
-    def use_frameworks(arr)
-      to_remove = [:actionmailer, :activerecord, :activestorage, :activejob, :actionmailbox] - arr
-
-      if to_remove.include?(:activerecord)
-        remove_from_config "config.active_record.*"
+        assert_equal [
+          "Prefix Verb URI Pattern     Controller#Action",
+          "  cart GET  /cart(.:format) cart#show"
+        ], output
       end
 
-      $:.reject! { |path| path =~ %r'/(#{to_remove.join('|')})/' }
-    end
+      def test_articles_inspect_with_multiple_verbs
+        output = draw do
+          match "articles/:id", to: "articles#update", via: [:put, :patch]
+        end
 
-    def use_postgresql(multi_db: false)
-      database_name = "railties_#{Process.pid}"
-      if multi_db
-        File.open("#{app_path}/config/database.yml", "w") do |f|
-          f.puts <<-YAML
-          default: &default
-            adapter: postgresql
-            pool: 5
-          development:
-            primary:
-              <<: *default
-              database: #{database_name}_test
-            animals:
-              <<: *default
-              database: #{database_name}_animals_test
-              migrations_paths: db/animals_migrate
-          YAML
-        end
-      else
-        File.open("#{app_path}/config/database.yml", "w") do |f|
-          f.puts <<-YAML
-          default: &default
-            adapter: postgresql
-            pool: 5
-          development:
-            <<: *default
-            database: #{database_name}_development
-          test:
-            <<: *default
-            database: #{database_name}_test
-          YAML
-        end
+        assert_equal [
+          "Prefix Verb      URI Pattern             Controller#Action",
+          "       PUT|PATCH /articles/:id(.:format) articles#update"
+        ], output
       end
-      database_name
-    end
 
-    def use_mysql2(multi_db: false)
-      database_name = "railties_#{Process.pid}"
-      if multi_db
-        File.open("#{app_path}/config/database.yml", "w") do |f|
-          f.puts <<-YAML
-          default: &default
-            adapter: mysql2
-            pool: 5
-            username: root
-          <% if ENV['MYSQL_HOST'] %>
-            host: <%= ENV['MYSQL_HOST'] %>
-          <% end %>
-          <% if ENV['MYSQL_SOCK'] %>
-            socket: "<%= ENV['MYSQL_SOCK'] %>"
-          <% end %>
-          development:
-            primary:
-              <<: *default
-              database: #{database_name}_test
-            animals:
-              <<: *default
-              database: #{database_name}_animals_test
-              migrations_paths: db/animals_migrate
-          YAML
+      def test_inspect_shows_custom_assets
+        output = draw do
+          get "/custom/assets", to: "custom_assets#show"
         end
-      else
-        File.open("#{app_path}/config/database.yml", "w") do |f|
-          f.puts <<-YAML
-          default: &default
-            adapter: mysql2
-            pool: 5
-            username: root
-          <% if ENV['MYSQL_HOST'] %>
-            host: <%= ENV['MYSQL_HOST'] %>
-          <% end %>
-          <% if ENV['MYSQL_SOCK'] %>
-            socket: "<%= ENV['MYSQL_SOCK'] %>"
-          <% end %>
-          development:
-            <<: *default
-            database: #{database_name}_development
-          test:
-            <<: *default
-            database: #{database_name}_test
-          YAML
-        end
+
+        assert_equal [
+          "       Prefix Verb URI Pattern              Controller#Action",
+          "custom_assets GET  /custom/assets(.:format) custom_assets#show"
+        ], output
       end
-      database_name
-    end
-  end
 
-  module Reload
-    def reload
-      ActiveSupport::Dependencies.clear
+      def test_inspect_routes_shows_resources_route
+        output = draw do
+          resources :articles
+        end
+
+        assert_equal [
+          "      Prefix Verb   URI Pattern                  Controller#Action",
+          "    articles GET    /articles(.:format)          articles#index",
+          "             POST   /articles(.:format)          articles#create",
+          " new_article GET    /articles/new(.:format)      articles#new",
+          "edit_article GET    /articles/:id/edit(.:format) articles#edit",
+          "     article GET    /articles/:id(.:format)      articles#show",
+          "             PATCH  /articles/:id(.:format)      articles#update",
+          "             PUT    /articles/:id(.:format)      articles#update",
+          "             DELETE /articles/:id(.:format)      articles#destroy"
+        ], output
+      end
+
+      def test_inspect_routes_shows_root_route
+        output = draw do
+          root to: "pages#main"
+        end
+
+        assert_equal [
+          "Prefix Verb URI Pattern Controller#Action",
+          "  root GET  /           pages#main"
+        ], output
+      end
+
+      def test_inspect_routes_shows_dynamic_action_route
+        output = draw do
+          ActionDispatch.deprecator.silence do
+            get "api/:action" => "api"
+          end
+        end
+
+        assert_equal [
+          "Prefix Verb URI Pattern            Controller#Action",
+          "       GET  /api/:action(.:format) api#:action"
+        ], output
+      end
+
+      def test_inspect_routes_shows_controller_and_action_only_route
+        output = draw do
+          ActionDispatch.deprecator.silence do
+            get ":controller/:action"
+          end
+        end
+
+        assert_equal [
+          "Prefix Verb URI Pattern                    Controller#Action",
+          "       GET  /:controller/:action(.:format) :controller#:action"
+        ], output
+      end
+
+      def test_inspect_routes_shows_controller_and_action_route_with_constraints
+        output = draw do
+          ActionDispatch.deprecator.silence do
+            get ":controller(/:action(/:id))", id: /\d+/
+          end
+        end
+
+        assert_equal [
+          "Prefix Verb URI Pattern                            Controller#Action",
+          "       GET  /:controller(/:action(/:id))(.:format) :controller#:action {:id=>/\\d+/}"
+        ], output
+      end
+
+      def test_rails_routes_shows_route_with_defaults
+        output = draw do
+          get "photos/:id" => "photos#show", :defaults => { format: "jpg" }
+        end
+
+        assert_equal [
+          "Prefix Verb URI Pattern           Controller#Action",
+          '       GET  /photos/:id(.:format) photos#show {:format=>"jpg"}'
+        ], output
+      end
+
+      def test_rails_routes_shows_route_with_constraints
+        output = draw do
+          get "photos/:id" => "photos#show", :id => /[A-Z]\d{5}/
+        end
+
+        assert_equal [
+          "Prefix Verb URI Pattern           Controller#Action",
+          "       GET  /photos/:id(.:format) photos#show {:id=>/[A-Z]\\d{5}/}"
+        ], output
+      end
+
+      def test_rails_routes_shows_routes_with_dashes
+        output = draw do
+          get "about-us" => "pages#about_us"
+          get "our-work/latest"
+
+          resources :photos, only: [:show] do
+            get "user-favorites", on: :collection
+            get "preview-photo", on: :member
+            get "summary-text"
+          end
+        end
+
+        assert_equal [
+          "               Prefix Verb URI Pattern                              Controller#Action",
+          "             about_us GET  /about-us(.:format)                      pages#about_us",
+          "      our_work_latest GET  /our-work/latest(.:format)               our_work#latest",
+          "user_favorites_photos GET  /photos/user-favorites(.:format)         photos#user_favorites",
+          "  preview_photo_photo GET  /photos/:id/preview-photo(.:format)      photos#preview_photo",
+          "   photo_summary_text GET  /photos/:photo_id/summary-text(.:format) photos#summary_text",
+          "                photo GET  /photos/:id(.:format)                    photos#show"
+        ], output
+      end
+
+      def test_rails_routes_shows_route_with_rack_app
+        output = draw do
+          get "foo/:id" => MountedRackApp, :id => /[A-Z]\d{5}/
+        end
+
+        assert_equal [
+          "Prefix Verb URI Pattern        Controller#Action",
+          "       GET  /foo/:id(.:format) MountedRackApp {:id=>/[A-Z]\\d{5}/}"
+        ], output
+      end
+
+      def test_rails_routes_shows_named_route_with_mounted_rack_app
+        output = draw do
+          mount MountedRackApp => "/foo"
+        end
+
+        assert_equal [
+          "          Prefix Verb URI Pattern Controller#Action",
+          "mounted_rack_app      /foo        MountedRackApp"
+        ], output
+      end
+
+      def test_rails_routes_shows_overridden_named_route_with_mounted_rack_app_with_name
+        output = draw do
+          mount MountedRackApp => "/foo", as: "blog"
+        end
+
+        assert_equal [
+          "Prefix Verb URI Pattern Controller#Action",
+          "  blog      /foo        MountedRackApp"
+        ], output
+      end
+
+      def test_rails_routes_shows_route_with_rack_app_nested_with_dynamic_constraints
+        constraint = Class.new do
+          def inspect
+            "( my custom constraint )"
+          end
+        end
+
+        output = draw do
+          scope constraint: constraint.new do
+            mount MountedRackApp => "/foo"
+          end
+        end
+
+        assert_equal [
+          "          Prefix Verb URI Pattern Controller#Action",
+          "mounted_rack_app      /foo        MountedRackApp {:constraint=>( my custom constraint )}"
+        ], output
+      end
+
+      def test_rails_routes_dont_show_app_mounted_in_assets_prefix
+        output = draw do
+          get "/sprockets" => MountedRackApp
+        end
+        assert_no_match(/MountedRackApp/, output.first)
+        assert_no_match(/\/sprockets/, output.first)
+      end
+
+      def test_rails_routes_shows_route_defined_in_under_assets_prefix
+        output = draw do
+          scope "/sprockets" do
+            get "/foo" => "foo#bar"
+          end
+        end
+        assert_equal [
+          "Prefix Verb URI Pattern              Controller#Action",
+          "   foo GET  /sprockets/foo(.:format) foo#bar"
+        ], output
+      end
+
+      def test_redirect
+        output = draw do
+          get "/foo"    => redirect("/foo/bar"), :constraints => { subdomain: "admin" }
+          get "/bar"    => redirect(path: "/foo/bar", status: 307)
+          get "/foobar" => redirect { "/foo/bar" }
+        end
+
+        assert_equal [
+          "Prefix Verb URI Pattern       Controller#Action",
+          "   foo GET  /foo(.:format)    redirect(301, /foo/bar) {:subdomain=>\"admin\"}",
+          "   bar GET  /bar(.:format)    redirect(307, path: /foo/bar)",
+          "foobar GET  /foobar(.:format) redirect(301)"
+        ], output
+      end
+
+      def test_routes_can_be_filtered
+        output = draw(grep: "posts") do
+          resources :articles
+          resources :posts
+        end
+
+        assert_equal ["   Prefix Verb   URI Pattern               Controller#Action",
+                      "    posts GET    /posts(.:format)          posts#index",
+                      "          POST   /posts(.:format)          posts#create",
+                      " new_post GET    /posts/new(.:format)      posts#new",
+                      "edit_post GET    /posts/:id/edit(.:format) posts#edit",
+                      "     post GET    /posts/:id(.:format)      posts#show",
+                      "          PATCH  /posts/:id(.:format)      posts#update",
+                      "          PUT    /posts/:id(.:format)      posts#update",
+                      "          DELETE /posts/:id(.:format)      posts#destroy"], output
+      end
+
+      def test_routes_when_expanded
+        ActionDispatch::Routing::Mapper.route_source_locations = true
+        engine = Class.new(Rails::Engine) do
+          def self.inspect
+            "Blog::Engine"
+          end
+        end
+        file_name = ActiveSupport::BacktraceCleaner.new.clean([__FILE__]).first
+        lineno = __LINE__
+        engine.routes.draw do
+          get "/cart", to: "cart#show"
+        end
+
+        output = draw(formatter: ActionDispatch::Routing::ConsoleFormatter::Expanded.new(width: 23)) do
+          get "/custom/assets", to: "custom_assets#show"
+          get "/custom/furnitures", to: "custom_furnitures#show"
+          mount engine => "/blog", :as => "blog"
+        end
+
+        expected = ["--[ Route 1 ]----------",
+                     "Prefix            | custom_assets",
+                     "Verb              | GET",
+                     "URI               | /custom/assets(.:format)",
+                     "Controller#Action | custom_assets#show",
+                     "Source Location   | #{file_name}:#{lineno + 6}",
+                     "--[ Route 2 ]----------",
+                     "Prefix            | custom_furnitures",
+                     "Verb              | GET",
+                     "URI               | /custom/furnitures(.:format)",
+                     "Controller#Action | custom_furnitures#show",
+                     "Source Location   | #{file_name}:#{lineno + 7}",
+                     "--[ Route 3 ]----------",
+                     "Prefix            | blog",
+                     "Verb              | ",
+                     "URI               | /blog",
+                     "Controller#Action | Blog::Engine",
+                     "Source Location   | #{file_name}:#{lineno + 8}",
+                     "",
+                     "[ Routes for Blog::Engine ]",
+                     "--[ Route 1 ]----------",
+                     "Prefix            | cart",
+                     "Verb              | GET",
+                     "URI               | /cart(.:format)",
+                     "Controller#Action | cart#show",
+                     "Source Location   | #{file_name}:#{lineno + 2}"]
+
+        assert_equal expected, output
+      ensure
+        ActionDispatch::Routing::Mapper.route_source_locations = false
+      end
+
+      def test_no_routes_matched_filter_when_expanded
+        output = draw(grep: "rails/dummy", formatter: ActionDispatch::Routing::ConsoleFormatter::Expanded.new) do
+          get "photos/:id" => "photos#show", :id => /[A-Z]\d{5}/
+        end
+
+        assert_equal [
+          "No routes were found for this grep pattern.",
+          "For more information about routes, see the Rails guide: https://guides.rubyonrails.org/routing.html."
+        ], output
+      end
+
+      def test_not_routes_when_expanded
+        output = draw(grep: "rails/dummy", formatter: ActionDispatch::Routing::ConsoleFormatter::Expanded.new) { }
+
+        assert_equal [
+          "You don't have any routes defined!",
+          "",
+          "Please add some routes in config/routes.rb.",
+          "",
+          "For more information about routes, see the Rails guide: https://guides.rubyonrails.org/routing.html."
+        ], output
+      end
+
+      def test_routes_can_be_filtered_with_namespaced_controllers
+        output = draw(grep: "admin/posts") do
+          resources :articles
+          namespace :admin do
+            resources :posts
+          end
+        end
+
+        assert_equal ["         Prefix Verb   URI Pattern                     Controller#Action",
+                      "    admin_posts GET    /admin/posts(.:format)          admin/posts#index",
+                      "                POST   /admin/posts(.:format)          admin/posts#create",
+                      " new_admin_post GET    /admin/posts/new(.:format)      admin/posts#new",
+                      "edit_admin_post GET    /admin/posts/:id/edit(.:format) admin/posts#edit",
+                      "     admin_post GET    /admin/posts/:id(.:format)      admin/posts#show",
+                      "                PATCH  /admin/posts/:id(.:format)      admin/posts#update",
+                      "                PUT    /admin/posts/:id(.:format)      admin/posts#update",
+                      "                DELETE /admin/posts/:id(.:format)      admin/posts#destroy"], output
+      end
+
+      def test_regression_route_with_controller_regexp
+        output = draw do
+          ActionDispatch.deprecator.silence do
+            get ":controller(/:action)", controller: /api\/[^\/]+/, format: false
+          end
+        end
+
+        assert_equal ["Prefix Verb URI Pattern            Controller#Action",
+                      "       GET  /:controller(/:action) :controller#:action"], output
+      end
+
+      def test_routes_with_undefined_filter
+        output = draw(controller: "Rails::MissingController") do
+          get "photos/:id" => "photos#show", :id => /[A-Z]\d{5}/
+        end
+
+        assert_equal [
+          "No routes were found for this controller.",
+          "For more information about routes, see the Rails guide: https://guides.rubyonrails.org/routing.html."
+        ], output
+      end
+
+      def test_no_routes_matched_filter
+        output = draw(grep: "rails/dummy") do
+          get "photos/:id" => "photos#show", :id => /[A-Z]\d{5}/
+        end
+
+        assert_equal [
+          "No routes were found for this grep pattern.",
+          "For more information about routes, see the Rails guide: https://guides.rubyonrails.org/routing.html."
+        ], output
+      end
+
+      def test_no_routes_were_defined
+        output = draw(grep: "Rails::DummyController") { }
+
+        assert_equal [
+          "You don't have any routes defined!",
+          "",
+          "Please add some routes in config/routes.rb.",
+          "",
+          "For more information about routes, see the Rails guide: https://guides.rubyonrails.org/routing.html."
+        ], output
+      end
+
+      def test_displaying_routes_for_internal_engines
+        engine = Class.new(Rails::Engine) do
+          def self.inspect
+            "Blog::Engine"
+          end
+        end
+        engine.routes.draw do
+          get "/cart", to: "cart#show"
+          post "/cart", to: "cart#create"
+          patch "/cart", to: "cart#update"
+        end
+
+        output = draw do
+          get "/custom/assets", to: "custom_assets#show"
+          mount engine => "/blog", as: "blog", internal: true
+        end
+
+        assert_equal [
+          "       Prefix Verb URI Pattern              Controller#Action",
+          "custom_assets GET  /custom/assets(.:format) custom_assets#show",
+        ], output
+      end
+
+      def test_route_with_proc_handler
+        output = draw do
+          get "/health", to: proc { [200, {}, ["OK"]] }
+        end
+        assert_equal [
+          "Prefix Verb URI Pattern       Controller#Action",
+          "health GET  /health(.:format) Inline handler (Proc/Lambda)"
+        ], output
+      end
+
+      private
+        def draw(formatter: ActionDispatch::Routing::ConsoleFormatter::Sheet.new, **options, &block)
+          @set.draw(&block)
+          inspector = ActionDispatch::Routing::RoutesInspector.new(@set.routes)
+          inspector.format(formatter, options).split("\n")
+        end
     end
   end
 end
-
-class ActiveSupport::TestCase
-  include TestHelpers::Paths
-  include TestHelpers::Rack
-  include TestHelpers::Generation
-  include TestHelpers::Reload
-  include ActiveSupport::Testing::Stream
-  include ActiveSupport::Testing::MethodCallAssertions
-end
-
-# Create a scope and build a fixture rails app
-Module.new do
-  extend TestHelpers::Paths
-
-  def self.sh(cmd)
-    output = `#{cmd}`
-    raise "Command #{cmd.inspect} failed. Output:\n#{output}" unless $?.success?
-  end
-
-  # Build a rails app
-  FileUtils.rm_rf(app_template_path)
-  FileUtils.mkdir_p(app_template_path)
-
-  sh "#{Gem.ruby} #{RAILS_FRAMEWORK_ROOT}/railties/exe/rails new #{app_template_path} --skip-bundle --no-rc --quiet"
-  File.open("#{app_template_path}/config/boot.rb", "w") do |f|
-    f.puts 'require "bootsnap/setup" if ENV["BOOTSNAP_CACHE_DIR"]'
-    f.puts 'require "rails/all"'
-  end
-
-  assets_path = "#{RAILS_FRAMEWORK_ROOT}/railties/test/isolation/assets"
-  unless Dir.exist?("#{assets_path}/node_modules")
-    Dir.chdir(assets_path) do
-      sh "yarn install"
-    end
-  end
-
-  FileUtils.mkdir_p "#{app_template_path}/app/javascript"
-  File.write("#{app_template_path}/app/javascript/application.js", "\n")
-
-  # Fake 'Bundler.require' -- we run using the repo's Gemfile, not an
-  # app-specific one: we don't want to require every gem that lists.
-  contents = File.read("#{app_template_path}/config/application.rb")
-  contents.sub!(/^Bundler\.require.*/, "%w(sprockets/railtie importmap-rails).each { |r| require r }")
-  File.write("#{app_template_path}/config/application.rb", contents)
-
-  require "rails"
-
-  require "active_model"
-  require "active_job"
-  require "active_record"
-  require "action_controller"
-  require "action_mailer"
-  require "action_view"
-  require "active_storage"
-  require "action_cable"
-  require "action_mailbox"
-  require "action_text"
-  require "sprockets"
-
-  require "action_view/helpers"
-  require "action_dispatch/routing/route_set"
-end unless defined?(RAILS_ISOLATED_ENGINE)

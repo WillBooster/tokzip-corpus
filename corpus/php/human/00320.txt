@@ -10,110 +10,85 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Util\Http;
+namespace Composer\Package\Version;
 
-/**
- * @internal
- * @author John Stevenson <john-stevenson@blueyonder.co.uk>
- */
-class ProxyItem
+use Composer\Pcre\Preg;
+use Composer\Repository\PlatformRepository;
+use Composer\Semver\VersionParser as SemverVersionParser;
+use Composer\Semver\Semver;
+use Composer\Semver\Constraint\ConstraintInterface;
+
+class VersionParser extends SemverVersionParser
 {
-    /** @var non-empty-string */
-    private $url;
-    /** @var non-empty-string */
-    private $safeUrl;
-    /** @var ?non-empty-string */
-    private $curlAuth;
-    /** @var string */
-    private $optionsProxy;
-    /** @var ?non-empty-string */
-    private $optionsAuth;
+    public const DEFAULT_BRANCH_ALIAS = '9999999-dev';
+
+    /** @var array<string, ConstraintInterface> Constraint parsing cache */
+    private static $constraints = [];
 
     /**
-     * @param string $proxyUrl The value from the environment
-     * @param string $envName The name of the environment variable
-     * @throws \RuntimeException If the proxy url is invalid
+     * @inheritDoc
      */
-    public function __construct(string $proxyUrl, string $envName)
+    public function parseConstraints($constraints): ConstraintInterface
     {
-        $syntaxError = sprintf('unsupported `%s` syntax', $envName);
-
-        if (strpbrk($proxyUrl, "\r\n\t") !== false) {
-            throw new \RuntimeException($syntaxError);
-        }
-        if (false === ($proxy = parse_url($proxyUrl))) {
-            throw new \RuntimeException($syntaxError);
-        }
-        if (!isset($proxy['host'])) {
-            throw new \RuntimeException('unable to find proxy host in ' . $envName);
+        if (!isset(self::$constraints[$constraints])) {
+            self::$constraints[$constraints] = parent::parseConstraints($constraints);
         }
 
-        $scheme = isset($proxy['scheme']) ? strtolower($proxy['scheme']) . '://' : 'http://';
-        $safe = '';
-
-        if (isset($proxy['user'])) {
-            $safe = '***';
-            $user = $proxy['user'];
-            $auth = rawurldecode($proxy['user']);
-
-            if (isset($proxy['pass'])) {
-                $safe .= ':***';
-                $user .= ':' . $proxy['pass'];
-                $auth .= ':' . rawurldecode($proxy['pass']);
-            }
-
-            $safe .= '@';
-
-            if (strlen($user) > 0) {
-                $this->curlAuth = $user;
-                $this->optionsAuth = 'Proxy-Authorization: Basic ' . base64_encode($auth);
-            }
-        }
-
-        $host = $proxy['host'];
-        $port = null;
-
-        if (isset($proxy['port'])) {
-            $port = $proxy['port'];
-        } elseif ($scheme === 'http://') {
-            $port = 80;
-        } elseif ($scheme === 'https://') {
-            $port = 443;
-        }
-
-        // We need a port because curl uses 1080 for http. Port 0 is reserved,
-        // but is considered valid depending on the PHP or Curl version.
-        if ($port === null) {
-            throw new \RuntimeException('unable to find proxy port in ' . $envName);
-        }
-        if ($port === 0) {
-            throw new \RuntimeException('port 0 is reserved in ' . $envName);
-        }
-
-        $this->url = sprintf('%s%s:%d', $scheme, $host, $port);
-        $this->safeUrl = sprintf('%s%s%s:%d', $scheme, $safe, $host, $port);
-
-        $scheme = str_replace(['http://', 'https://'], ['tcp://', 'ssl://'], $scheme);
-        $this->optionsProxy = sprintf('%s%s:%d', $scheme, $host, $port);
+        return self::$constraints[$constraints];
     }
 
     /**
-     * Returns a RequestProxy instance for the scheme of the request url
+     * Parses an array of strings representing package/version pairs.
      *
-     * @param string $scheme The scheme of the request url
+     * The parsing results in an array of arrays, each of which
+     * contain a 'name' key with value and optionally a 'version' key with value.
+     *
+     * @param string[] $pairs a set of package/version pairs separated by ":", "=" or " "
+     *
+     * @return list<array{name: string, version?: string}>
      */
-    public function toRequestProxy(string $scheme): RequestProxy
+    public function parseNameVersionPairs(array $pairs): array
     {
-        $options = ['http' => ['proxy' => $this->optionsProxy]];
+        $pairs = array_values($pairs);
+        $result = [];
 
-        if ($this->optionsAuth !== null) {
-            $options['http']['header'] = $this->optionsAuth;
+        for ($i = 0, $count = count($pairs); $i < $count; $i++) {
+            $pair = Preg::replace('{^([^=: ]+)[=: ](.*)$}', '$1 $2', trim($pairs[$i]));
+            if (false === strpos($pair, ' ') && isset($pairs[$i + 1]) && false === strpos($pairs[$i + 1], '/') && !Preg::isMatch('{(?<=[a-z0-9_/-])\*|\*(?=[a-z0-9_/-])}i', $pairs[$i + 1]) && !PlatformRepository::isPlatformPackage($pairs[$i + 1])) {
+                $pair .= ' '.$pairs[$i + 1];
+                $i++;
+            }
+
+            if (strpos($pair, ' ')) {
+                [$name, $version] = explode(' ', $pair, 2);
+                $result[] = ['name' => $name, 'version' => $version];
+            } else {
+                $result[] = ['name' => $pair];
+            }
         }
 
-        if ($scheme === 'http') {
-            $options['http']['request_fulluri'] = true;
+        return $result;
+    }
+
+    public static function isUpgrade(string $normalizedFrom, string $normalizedTo): bool
+    {
+        if ($normalizedFrom === $normalizedTo) {
+            return true;
         }
 
-        return new RequestProxy($this->url, $this->curlAuth, $options, $this->safeUrl);
+        if (in_array($normalizedFrom, ['dev-master', 'dev-trunk', 'dev-default'], true)) {
+            $normalizedFrom = VersionParser::DEFAULT_BRANCH_ALIAS;
+        }
+        if (in_array($normalizedTo, ['dev-master', 'dev-trunk', 'dev-default'], true)) {
+            $normalizedTo = VersionParser::DEFAULT_BRANCH_ALIAS;
+        }
+
+        if (strpos($normalizedFrom, 'dev-') === 0 || strpos($normalizedTo, 'dev-') === 0) {
+            return true;
+        }
+
+        $sorted = Semver::sort([$normalizedTo, $normalizedFrom]);
+
+        return $sorted[0] === $normalizedFrom;
     }
 }
