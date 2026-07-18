@@ -1,511 +1,436 @@
 const std = @import("std");
+const zls = @import("zls");
+const builtin = @import("builtin");
+
 const Ast = std.zig.Ast;
-const log = std.log.scoped(.zls_references);
+const ComptimeInterpreter = zls.ComptimeInterpreter;
+const InternPool = zls.analyser.InternPool;
+const Index = InternPool.Index;
+const Key = InternPool.Key;
+const ast = zls.ast;
+const offsets = zls.offsets;
 
-const Server = @import("../Server.zig");
-const DocumentStore = @import("../DocumentStore.zig");
-const Analyser = @import("../analysis.zig");
-const types = @import("../lsp.zig");
-const offsets = @import("../offsets.zig");
-const ast = @import("../ast.zig");
-const tracy = @import("tracy");
+const allocator: std.mem.Allocator = std.testing.allocator;
 
-fn labelReferences(
-    allocator: std.mem.Allocator,
-    decl: Analyser.DeclWithHandle,
-    encoding: offsets.Encoding,
-    include_decl: bool,
-) error{OutOfMemory}!std.ArrayListUnmanaged(types.Location) {
-    const tracy_zone = tracy.trace(@src());
-    defer tracy_zone.end();
+test "primitive types" {
+    try testExpr("true", .{ .simple_value = .bool_true });
+    try testExpr("false", .{ .simple_value = .bool_false });
+    try testExpr("5", .{ .int_u64_value = .{ .ty = .comptime_int_type, .int = 5 } });
+    // TODO try testExpr("-2", .{ .int_i64_value = .{ .ty = .comptime_int, .int = -2 } });
+    try testExpr("3.0", .{ .float_comptime_value = 3.0 });
 
-    std.debug.assert(decl.decl == .label); // use `symbolReferences` instead
-    const handle = decl.handle;
-    const tree = handle.tree;
-    const token_tags = tree.tokens.items(.tag);
-
-    // Find while / for / block from label -> iterate over children nodes, find break and continues, change their labels if they match.
-    // This case can be implemented just by scanning tokens.
-    const first_tok = decl.decl.label.identifier;
-    const last_tok = ast.lastToken(tree, decl.decl.label.block);
-
-    var locations = std.ArrayListUnmanaged(types.Location){};
-    errdefer locations.deinit(allocator);
-
-    if (include_decl) {
-        // The first token is always going to be the label
-        try locations.append(allocator, .{
-            .uri = handle.uri,
-            .range = offsets.tokenToRange(handle.tree, first_tok, encoding),
-        });
-    }
-
-    var curr_tok = first_tok + 1;
-    while (curr_tok < last_tok - 2) : (curr_tok += 1) {
-        const curr_id = token_tags[curr_tok];
-
-        if (curr_id != .keyword_break and curr_id != .keyword_continue) continue;
-        if (token_tags[curr_tok + 1] != .colon) continue;
-        if (token_tags[curr_tok + 2] != .identifier) continue;
-
-        if (!std.mem.eql(u8, tree.tokenSlice(curr_tok + 2), tree.tokenSlice(first_tok))) continue;
-
-        try locations.append(allocator, .{
-            .uri = handle.uri,
-            .range = offsets.tokenToRange(handle.tree, curr_tok + 2, encoding),
-        });
-    }
-
-    return locations;
+    try testExpr("null", .{ .simple_value = .null_value });
+    try testExpr("void", .{ .simple_type = .void });
+    try testExpr("undefined", .{ .simple_value = .undefined_value });
+    try testExpr("noreturn", .{ .simple_type = .noreturn });
 }
 
-const Builder = struct {
-    allocator: std.mem.Allocator,
-    locations: std.ArrayListUnmanaged(types.Location) = .{},
-    /// this is the declaration we are searching for
-    decl_handle: Analyser.DeclWithHandle,
-    analyser: *Analyser,
-    encoding: offsets.Encoding,
+test "expressions" {
+    if (true) return error.SkipZigTest; // TODO
+    try testExpr("5 + 3", .{ .int_u64_value = .{ .ty = .comptime_int_type, .int = 8 } });
+    // try testExpr("5.2 + 4.2", .{ .simple_type = .comptime_float }, null);
 
-    const Context = struct {
-        builder: *Builder,
-        handle: *DocumentStore.Handle,
-    };
+    try testExpr("3 == 3", .{ .simple_valueclear = .bool_true });
+    try testExpr("5.2 == 2.1", .{ .simple_value = .bool_false });
 
-    fn deinit(self: *Builder) void {
-        self.locations.deinit(self.allocator);
-    }
-
-    fn add(self: *Builder, handle: *DocumentStore.Handle, token_index: Ast.TokenIndex) error{OutOfMemory}!void {
-        try self.locations.append(self.allocator, .{
-            .uri = handle.uri,
-            .range = offsets.tokenToRange(handle.tree, token_index, self.encoding),
-        });
-    }
-
-    fn collectReferences(self: *Builder, handle: *DocumentStore.Handle, node: Ast.Node.Index) error{OutOfMemory}!void {
-        const context = Context{
-            .builder = self,
-            .handle = handle,
-        };
-        try referenceNode(&context, handle.tree, node);
-        try ast.iterateChildrenRecursive(handle.tree, node, &context, error{OutOfMemory}, referenceNode);
-    }
-
-    fn referenceNode(self: *const Context, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
-        const builder = self.builder;
-        const handle = self.handle;
-
-        const node_tags = tree.nodes.items(.tag);
-        const datas = tree.nodes.items(.data);
-        const token_tags = tree.tokens.items(.tag);
-        const starts = tree.tokens.items(.start);
-
-        switch (node_tags[node]) {
-            .identifier,
-            .test_decl,
-            => {
-                const identifier_token = Analyser.getDeclNameToken(tree, node) orelse return;
-                if (token_tags[identifier_token] != .identifier) return;
-
-                const child = (try builder.analyser.lookupSymbolGlobal(
-                    handle,
-                    offsets.tokenToSlice(tree, identifier_token),
-                    starts[identifier_token],
-                )) orelse return;
-
-                if (builder.decl_handle.eql(child)) {
-                    try builder.add(handle, identifier_token);
-                }
-            },
-            .field_access => {
-                const lhs = try builder.analyser.resolveTypeOfNode(.{ .node = datas[node].lhs, .handle = handle }) orelse return;
-                const deref_lhs = try builder.analyser.resolveDerefType(lhs) orelse lhs;
-
-                const symbol = offsets.tokenToSlice(tree, datas[node].rhs);
-                const child = (try deref_lhs.lookupSymbol(builder.analyser, symbol)) orelse return;
-
-                if (builder.decl_handle.eql(child)) {
-                    try builder.add(handle, datas[node].rhs);
-                }
-            },
-            .struct_init_one,
-            .struct_init_one_comma,
-            .struct_init,
-            .struct_init_comma,
-            .struct_init_dot,
-            .struct_init_dot_comma,
-            .struct_init_dot_two,
-            .struct_init_dot_two_comma,
-            => {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const struct_init = tree.fullStructInit(&buffer, node).?;
-                for (struct_init.ast.fields) |value_node| { // the node of `value` in `.name = value`
-                    const name_token = tree.firstToken(value_node) - 2; // math our way two token indexes back to get the `name`
-                    const name_loc = offsets.tokenToLoc(tree, name_token);
-                    const name = offsets.locToSlice(tree.source, name_loc);
-
-                    var nodes = [_]Ast.Node.Index{datas[node].lhs};
-                    const lookup = try builder.analyser.lookupSymbolFieldInit(handle, name, &nodes) orelse continue;
-
-                    if (builder.decl_handle.eql(lookup)) {
-                        try builder.add(handle, name_token);
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-};
-
-fn gatherReferences(
-    allocator: std.mem.Allocator,
-    analyser: *Analyser,
-    curr_handle: *DocumentStore.Handle,
-    skip_std_references: bool,
-    include_decl: bool,
-    builder: anytype,
-    handle_behavior: enum { get, get_or_load },
-) !void {
-    var dependencies = std.StringArrayHashMapUnmanaged(void){};
-    defer {
-        for (dependencies.keys()) |uri| {
-            allocator.free(uri);
-        }
-        dependencies.deinit(allocator);
-    }
-
-    for (analyser.store.handles.values()) |handle| {
-        if (skip_std_references and std.mem.indexOf(u8, handle.uri, "std") != null) {
-            if (!include_decl or !std.mem.eql(u8, handle.uri, curr_handle.uri))
-                continue;
-        }
-
-        var handle_dependencies = std.ArrayListUnmanaged([]const u8){};
-        defer handle_dependencies.deinit(allocator);
-        try analyser.store.collectDependencies(allocator, handle, &handle_dependencies);
-
-        try dependencies.ensureUnusedCapacity(allocator, handle_dependencies.items.len);
-        for (handle_dependencies.items) |uri| {
-            const gop = dependencies.getOrPutAssumeCapacity(uri);
-            if (gop.found_existing) {
-                allocator.free(uri);
-            }
-        }
-    }
-
-    for (dependencies.keys()) |uri| {
-        if (std.mem.eql(u8, uri, curr_handle.uri)) continue;
-        const handle = switch (handle_behavior) {
-            .get => analyser.store.getHandle(uri),
-            .get_or_load => analyser.store.getOrLoadHandle(uri),
-        } orelse continue;
-
-        try builder.collectReferences(handle, 0);
-    }
+    try testExpr("@as(?bool, null) orelse true", .{ .simple_value = .bool_true });
 }
 
-fn symbolReferences(
-    allocator: std.mem.Allocator,
-    analyser: *Analyser,
-    decl_handle: Analyser.DeclWithHandle,
-    encoding: offsets.Encoding,
-    /// add `decl_handle` as a references
-    include_decl: bool,
-    /// exclude references from the std library
-    skip_std_references: bool,
-    /// search other files for references
-    workspace: bool,
-) error{OutOfMemory}!std.ArrayListUnmanaged(types.Location) {
-    const tracy_zone = tracy.trace(@src());
-    defer tracy_zone.end();
-
-    std.debug.assert(decl_handle.decl != .label); // use `labelReferences` instead
-
-    var builder = Builder{
-        .allocator = allocator,
-        .analyser = analyser,
-        .decl_handle = decl_handle,
-        .encoding = encoding,
-    };
-    errdefer builder.deinit();
-
-    const curr_handle = decl_handle.handle;
-    if (include_decl) try builder.add(curr_handle, decl_handle.nameToken());
-
-    switch (decl_handle.decl) {
-        .ast_node => {
-            try builder.collectReferences(curr_handle, 0);
-            if (workspace) {
-                try gatherReferences(allocator, analyser, curr_handle, skip_std_references, include_decl, &builder, .get);
-            }
-        },
-        .optional_payload,
-        .error_union_payload,
-        .error_union_error,
-        .for_loop_payload,
-        .assign_destructure,
-        .switch_payload,
-        => {
-            try builder.collectReferences(curr_handle, 0);
-        },
-        .function_parameter => |payload| try builder.collectReferences(curr_handle, payload.func),
-        .label => unreachable, // handled separately by labelReferences
-        .error_token => {},
-    }
-
-    return builder.locations;
+test "builtins" {
+    if (true) return error.SkipZigTest; // TODO
+    try testExpr("@as(bool, true)", .{ .simple_value = .bool_true });
+    try testExpr("@as(u32, 3)", .{ .int_u64_value = .{ .ty = .u32_type, .int = 3 } });
 }
 
-pub const Callsite = struct {
-    uri: []const u8,
-    call_node: Ast.Node.Index,
-};
+test "@TypeOf" {
+    try testExpr("@TypeOf(bool)", .{ .simple_type = .type });
+    try testExpr("@TypeOf(5)", .{ .simple_type = .comptime_int });
+    try testExpr("@TypeOf(3.14)", .{ .simple_type = .comptime_float });
 
-const CallBuilder = struct {
-    allocator: std.mem.Allocator,
-    callsites: std.ArrayListUnmanaged(Callsite) = .{},
-    /// this is the declaration we are searching for
-    decl_handle: Analyser.DeclWithHandle,
-    analyser: *Analyser,
+    try testExpr("@TypeOf(bool, u32)", .{ .simple_type = .type });
+    try testExpr("@TypeOf(true, false)", .{ .simple_type = .bool });
+    try testExpr("@TypeOf(3, 2)", .{ .simple_type = .comptime_int });
+    try testExpr("@TypeOf(3.14, 2)", .{ .simple_type = .comptime_float });
 
-    const Context = struct {
-        builder: *CallBuilder,
-        handle: *DocumentStore.Handle,
-    };
-
-    fn deinit(self: *CallBuilder) void {
-        self.callsites.deinit(self.allocator);
-    }
-
-    fn add(self: *CallBuilder, handle: *DocumentStore.Handle, call_node: Ast.Node.Index) error{OutOfMemory}!void {
-        try self.callsites.append(self.allocator, .{
-            .uri = handle.uri,
-            .call_node = call_node,
-        });
-    }
-
-    fn collectReferences(self: *CallBuilder, handle: *DocumentStore.Handle, node: Ast.Node.Index) error{OutOfMemory}!void {
-        const context = Context{
-            .builder = self,
-            .handle = handle,
-        };
-        try ast.iterateChildrenRecursive(handle.tree, node, &context, error{OutOfMemory}, referenceNode);
-    }
-
-    fn referenceNode(self: *const Context, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
-        const builder = self.builder;
-        const handle = self.handle;
-
-        const node_tags = tree.nodes.items(.tag);
-        const datas = tree.nodes.items(.data);
-        const main_tokens = tree.nodes.items(.main_token);
-        // const token_tags = tree.tokens.items(.tag);
-        const starts = tree.tokens.items(.start);
-
-        switch (node_tags[node]) {
-            .call,
-            .call_comma,
-            .async_call,
-            .async_call_comma,
-            .call_one,
-            .call_one_comma,
-            .async_call_one,
-            .async_call_one_comma,
-            => {
-                var buf: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&buf, node).?;
-
-                const called_node = call.ast.fn_expr;
-
-                switch (node_tags[called_node]) {
-                    .identifier => {
-                        const identifier_token = main_tokens[called_node];
-
-                        const child = (try builder.analyser.lookupSymbolGlobal(
-                            handle,
-                            offsets.tokenToSlice(tree, identifier_token),
-                            starts[identifier_token],
-                        )) orelse return;
-
-                        if (builder.decl_handle.eql(child)) {
-                            try builder.add(handle, node);
-                        }
-                    },
-                    .field_access => {
-                        const lhs = (try builder.analyser.resolveTypeOfNode(.{ .node = datas[called_node].lhs, .handle = handle })) orelse return;
-                        const deref_lhs = try builder.analyser.resolveDerefType(lhs) orelse lhs;
-
-                        const symbol = offsets.tokenToSlice(tree, datas[called_node].rhs);
-                        const child = (try deref_lhs.lookupSymbol(builder.analyser, symbol)) orelse return;
-
-                        if (builder.decl_handle.eql(child)) {
-                            try builder.add(handle, node);
-                        }
-                    },
-                    else => {},
-                }
-            },
-            else => {},
-        }
-    }
-};
-
-pub fn callsiteReferences(
-    allocator: std.mem.Allocator,
-    analyser: *Analyser,
-    decl_handle: Analyser.DeclWithHandle,
-    /// add `decl_handle` as a references
-    include_decl: bool,
-    /// exclude references from the std library
-    skip_std_references: bool,
-    /// search other files for references
-    workspace: bool,
-) error{OutOfMemory}!std.ArrayListUnmanaged(Callsite) {
-    const tracy_zone = tracy.trace(@src());
-    defer tracy_zone.end();
-
-    std.debug.assert(decl_handle.decl == .ast_node);
-
-    var builder = CallBuilder{
-        .allocator = allocator,
-        .analyser = analyser,
-        .decl_handle = decl_handle,
-    };
-    errdefer builder.deinit();
-
-    const curr_handle = decl_handle.handle;
-    if (include_decl) try builder.add(curr_handle, decl_handle.nameToken());
-
-    try builder.collectReferences(curr_handle, 0);
-
-    if (!workspace) return builder.callsites;
-
-    try gatherReferences(allocator, analyser, curr_handle, skip_std_references, include_decl, &builder, .get_or_load);
-
-    return builder.callsites;
+    try testExpr("@TypeOf(null, 2)", .{ .optional_type = .{ .payload_type = .comptime_int_type } });
 }
 
-pub const GeneralReferencesRequest = union(enum) {
-    rename: types.RenameParams,
-    references: types.ReferenceParams,
-    highlight: types.DocumentHighlightParams,
-
-    fn uri(self: @This()) []const u8 {
-        return switch (self) {
-            .rename => |rename| rename.textDocument.uri,
-            .references => |ref| ref.textDocument.uri,
-            .highlight => |highlight| highlight.textDocument.uri,
-        };
-    }
-
-    fn position(self: @This()) types.Position {
-        return switch (self) {
-            .rename => |rename| rename.position,
-            .references => |ref| ref.position,
-            .highlight => |highlight| highlight.position,
-        };
-    }
-};
-
-pub const GeneralReferencesResponse = union {
-    rename: types.WorkspaceEdit,
-    references: []types.Location,
-    highlight: []types.DocumentHighlight,
-};
-
-pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: GeneralReferencesRequest) Server.Error!?GeneralReferencesResponse {
-    const tracy_zone = tracy.trace(@src());
-    defer tracy_zone.end();
-
-    const handle = server.document_store.getHandle(request.uri()) orelse return null;
-
-    if (request.position().character <= 0) return null;
-
-    const source_index = offsets.positionToIndex(handle.tree.source, request.position(), server.offset_encoding);
-    const name_loc = Analyser.identifierLocFromPosition(source_index, handle) orelse return null;
-    const name = offsets.locToSlice(handle.tree.source, name_loc);
-    const pos_context = try Analyser.getPositionContext(server.allocator, handle.tree.source, source_index, true);
-
-    var analyser = Analyser.init(
-        server.allocator,
-        &server.document_store,
-        &server.ip,
-        handle,
-        server.config.dangerous_comptime_experiments_do_not_enable,
+test "string literal" {
+    if (true) return error.SkipZigTest; // TODO
+    var tester = try Tester.init(
+        \\const foobarbaz = "hello world!";
+        \\
     );
-    defer analyser.deinit();
+    defer tester.deinit();
+    const result = try tester.interpret(tester.findVar("foobarbaz"));
 
-    // TODO: Make this work with branching types
-    const decl = switch (pos_context) {
-        .var_access => try analyser.getSymbolGlobal(source_index, handle, name),
-        .field_access => |loc| z: {
-            const held_loc = offsets.locMerge(loc, name_loc);
-            const a = try analyser.getSymbolFieldAccesses(arena, handle, source_index, held_loc, name);
-            if (a) |b| {
-                if (b.len != 0) break :z b[0];
-            }
+    try std.testing.expect(result.ty == .pointer_type);
 
-            break :z null;
-        },
-        .label => try Analyser.getLabelGlobal(source_index, handle, name),
-        .enum_literal => try analyser.getSymbolEnumLiteral(arena, handle, source_index, name),
-        else => null,
-    } orelse return null;
+    try std.testing.expectEqualStrings("hello world!", result.val.?.bytes);
+}
 
-    const include_decl = switch (request) {
-        .references => |ref| ref.context.includeDeclaration,
-        else => true,
-    };
+test "labeled block" {
+    try testExpr(
+        \\blk: {
+        \\    break :blk true;
+        \\}
+    , .{ .simple_value = .bool_true });
+    try testExpr(
+        \\blk: {
+        \\    break :blk 3;
+        \\}
+    , .{ .int_u64_value = .{ .ty = .comptime_int_type, .int = 3 } });
+}
 
-    const locations = if (decl.decl == .label)
-        try labelReferences(arena, decl, server.offset_encoding, include_decl)
-    else
-        try symbolReferences(
-            arena,
-            &analyser,
-            decl,
-            server.offset_encoding,
-            include_decl,
-            server.config.skip_std_references,
-            request != .highlight, // scan the entire workspace except for highlight
-        );
+test "if" {
+    try testExpr(
+        \\blk: {
+        \\    break :blk if (true) true else false;
+        \\}
+    , .{ .simple_value = .bool_true });
+    try testExpr(
+        \\blk: {
+        \\    break :blk if (false) true else false;
+        \\}
+    , .{ .simple_value = .bool_false });
+    try testExpr(
+        \\blk: {
+        \\    if (false) break :blk true;
+        \\    break :blk false;
+        \\}
+    , .{ .simple_value = .bool_false });
+    // TODO
+    // try testExpr(
+    //     \\outer: {
+    //     \\    if (:inner {
+    //     \\        break :inner true;
+    //     \\    }) break :outer true;
+    //     \\    break :outer false;
+    //     \\}
+    // , .{ .simple_value = .bool_true });
+}
 
-    switch (request) {
-        .rename => |rename| {
-            var changes = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(types.TextEdit)){};
+test "variable lookup" {
+    try testExpr(
+        \\blk: {
+        \\    var foo = 42;
+        \\    break :blk foo;
+        \\}
+    , .{ .int_u64_value = .{ .ty = .comptime_int_type, .int = 42 } });
+    try testExpr(
+        \\blk: {
+        \\    var foo = 1;
+        \\    var bar = 2;
+        \\    var baz = 3;
+        \\    break :blk bar;
+        \\}
+    , .{ .int_u64_value = .{ .ty = .comptime_int_type, .int = 2 } });
 
-            for (locations.items) |loc| {
-                const gop = try changes.getOrPutValue(arena, loc.uri, .{});
-                try gop.value_ptr.append(arena, .{
-                    .range = loc.range,
-                    .newText = rename.newName,
-                });
-            }
+    var tester = try Tester.init(
+        \\const bar = foo;
+        \\const foo = 3;
+    );
+    defer tester.deinit();
 
-            // TODO can we avoid having to move map from `changes` to `new_changes`?
-            var new_changes: types.Map(types.DocumentUri, []const types.TextEdit) = .{};
-            try new_changes.map.ensureTotalCapacity(arena, @intCast(changes.count()));
+    const result = try tester.interpret(tester.findVar("bar"));
+    try std.testing.expect(result.val.?.eql(Key{ .int_u64_value = .{ .ty = .comptime_int_type, .int = 3 } }, tester.ip));
+}
 
-            var changes_it = changes.iterator();
-            while (changes_it.next()) |entry| {
-                new_changes.map.putAssumeCapacityNoClobber(entry.key_ptr.*, try entry.value_ptr.toOwnedSlice(arena));
-            }
+test "field access" {
+    try testExpr(
+        \\blk: {
+        \\    const foo: struct {alpha: u64, beta: bool} = undefined;
+        \\    break :blk @TypeOf(foo.beta);
+        \\}
+    , .{ .simple_type = .bool });
+    try testExpr(
+        \\blk: {
+        \\    const foo: struct {alpha: u64, beta: bool} = undefined;
+        \\    break :blk @TypeOf(foo.alpha);
+        \\}
+    , .{ .int_type = .{
+        .signedness = .unsigned,
+        .bits = 64,
+    } });
+}
 
-            return .{ .rename = .{ .changes = new_changes } };
-        },
-        .references => return .{ .references = locations.items },
-        .highlight => {
-            var highlights = try std.ArrayListUnmanaged(types.DocumentHighlight).initCapacity(arena, locations.items.len);
-            const uri = handle.uri;
-            for (locations.items) |loc| {
-                if (!std.mem.eql(u8, loc.uri, uri)) continue;
-                highlights.appendAssumeCapacity(.{
-                    .range = loc.range,
-                    .kind = .Text,
-                });
-            }
-            return .{ .highlight = highlights.items };
-        },
+test "optional operations" {
+    if (true) return error.SkipZigTest; // TODO
+    try testExpr(
+        \\blk: {
+        \\    const foo: ?bool = true;
+        \\    break :blk foo.?;
+        \\}
+    , .{ .simple_value = .bool_true });
+    try testExpr(
+        \\blk: {
+        \\    const foo: ?bool = true;
+        \\    break :blk foo == null;
+        \\}
+    , .{ .simple_value = .bool_false });
+}
+
+test "pointer operations" {
+    if (true) return error.SkipZigTest; // TODO
+    try testExpr(
+        \\blk: {
+        \\    const foo: []const u8 = "";
+        \\    break :blk foo.len;
+        \\}
+    , .{ .int_u64_value = .{ .ty = .usize_type, .int = 0 } });
+    try testExpr(
+        \\blk: {
+        \\    const foo = true;
+        \\    break :blk &foo;
+        \\}
+    , .{ .simple_value = .bool_true });
+    try testExpr(
+        \\blk: {
+        \\    const foo = true;
+        \\    const bar = &foo;
+        \\    break :blk bar.*;
+        \\}
+    , .{ .simple_value = .bool_true });
+}
+
+test "call return primitive type" {
+    try testCall(
+        \\pub fn Foo() type {
+        \\    return bool;
+        \\}
+    , &.{}, .{ .simple_type = .bool });
+
+    try testCall(
+        \\pub fn Foo() type {
+        \\    return u32;
+        \\}
+    , &.{}, .{ .int_type = .{ .signedness = .unsigned, .bits = 32 } });
+
+    try testCall(
+        \\pub fn Foo() type {
+        \\    return i128;
+        \\}
+    , &.{}, .{ .int_type = .{ .signedness = .signed, .bits = 128 } });
+
+    try testCall(
+        \\pub fn Foo() type {
+        \\    const alpha = i128;
+        \\    return alpha;
+        \\}
+    , &.{}, .{ .int_type = .{ .signedness = .signed, .bits = 128 } });
+}
+
+test "call return struct" {
+    var tester = try Tester.init(
+        \\pub fn Foo() type {
+        \\    return struct {
+        \\        slay: bool,
+        \\        var abc = 123;
+        \\    };
+        \\}
+    );
+    defer tester.deinit();
+    const result = try tester.call(tester.findFn("Foo"), &.{});
+
+    try std.testing.expect(result.ty == .simple_type);
+    try std.testing.expect(result.ty.simple_type == .type);
+    const struct_info = tester.ip.getStruct(result.val.?.struct_type);
+    try std.testing.expectEqual(Index.none, struct_info.backing_int_ty);
+    try std.testing.expectEqual(std.builtin.Type.ContainerLayout.auto, struct_info.layout);
+
+    try std.testing.expectEqual(@as(usize, 1), struct_info.fields.count());
+    try std.testing.expectFmt("slay", "{}", .{tester.ip.fmtId(struct_info.fields.keys()[0])});
+    try std.testing.expect(struct_info.fields.values()[0].ty == Index.bool_type);
+}
+
+test "call comptime argument" {
+    var tester = try Tester.init(
+        \\pub fn Foo(comptime my_arg: bool) type {
+        \\    var abc = z: {break :z if (!my_arg) 123 else 0;};
+        \\    if (abc == 123) return u69;
+        \\    return u8;
+        \\}
+    );
+    defer tester.deinit();
+
+    const result1 = try tester.call(tester.findFn("Foo"), &.{KV{
+        .ty = .{ .simple_type = .bool },
+        .val = .{ .simple_value = .bool_true },
+    }});
+    try std.testing.expect(result1.ty == .simple_type);
+    try std.testing.expect(result1.ty.simple_type == .type);
+    try std.testing.expect(result1.val.?.eql(Key{ .int_type = .{ .signedness = .unsigned, .bits = 8 } }, tester.ip));
+
+    const result2 = try tester.call(tester.findFn("Foo"), &.{KV{
+        .ty = .{ .simple_type = .bool },
+        .val = .{ .simple_value = .bool_false },
+    }});
+    try std.testing.expect(result2.ty == .simple_type);
+    try std.testing.expect(result2.ty.simple_type == .type);
+    try std.testing.expect(result2.val.?.eql(Key{ .int_type = .{ .signedness = .unsigned, .bits = 69 } }, tester.ip));
+}
+
+test "call inner function" {
+    try testCall(
+        \\pub fn Inner() type {
+        \\    return bool;
+        \\}
+        \\pub fn Foo() type {
+        \\    return Inner();
+        \\}
+    , &.{}, .{ .simple_type = .bool });
+}
+
+//
+// Helper functions
+//
+
+const KV = struct {
+    ty: Key,
+    val: ?Key,
+};
+
+pub const Tester = struct {
+    context: Context,
+    handle: *zls.DocumentStore.Handle,
+    ip: *zls.analyser.InternPool,
+    interpreter: *zls.ComptimeInterpreter,
+
+    const Context = @import("../context.zig").Context;
+
+    pub fn init(source: []const u8) !Tester {
+        var context = try Context.init();
+        errdefer context.deinit();
+
+        const uri = try context.addDocument(source);
+        const handle = context.server.document_store.getHandle(uri).?;
+        const interpreter = try handle.getComptimeInterpreter(&context.server.document_store, &context.server.ip);
+
+        // TODO report handle.tree.errors
+        _ = try interpreter.interpret(0, .none, .{});
+        // TODO report handle.analysis_errors
+
+        return .{
+            .context = context,
+            .handle = handle,
+            .ip = &context.server.ip,
+            .interpreter = interpreter,
+        };
     }
+
+    pub fn deinit(self: *Tester) void {
+        self.context.deinit();
+        self.* = undefined;
+    }
+
+    pub fn call(self: *Tester, func_node: Ast.Node.Index, arguments: []const KV) !KV {
+        var args = try allocator.alloc(ComptimeInterpreter.Value, arguments.len);
+        defer allocator.free(args);
+
+        for (arguments, 0..) |argument, i| {
+            args[i] = .{
+                .interpreter = self.interpreter,
+                .node_idx = 0,
+                .index = if (argument.val) |val|
+                    try self.ip.get(allocator, val)
+                else
+                    try self.ip.get(allocator, .{
+                        .unknown_value = .{ .ty = try self.ip.get(allocator, argument.ty) },
+                    }),
+            };
+        }
+
+        const namespace: ComptimeInterpreter.Namespace.Index = @enumFromInt(0); // root namespace
+        const result = (try self.interpreter.call(namespace, func_node, args, .{})).result;
+
+        const val = result.value.index;
+        const ty = self.ip.typeOf(val);
+
+        return KV{
+            .ty = self.ip.indexToKey(ty),
+            .val = self.ip.indexToKey(val),
+        };
+    }
+
+    pub fn interpret(self: *Tester, node: Ast.Node.Index) !KV {
+        const namespace: ComptimeInterpreter.Namespace.Index = @enumFromInt(0); // root namespace
+        const result = try (try self.interpreter.interpret(node, namespace, .{})).getValue();
+
+        const val = result.index;
+        const ty = self.ip.typeOf(val);
+
+        return KV{
+            .ty = self.ip.indexToKey(ty),
+            .val = self.ip.indexToKey(val),
+        };
+    }
+
+    pub fn findFn(self: Tester, name: []const u8) Ast.Node.Index {
+        const handle = self.handle;
+        for (handle.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .fn_decl) continue;
+            const node: Ast.Node.Index = @intCast(i);
+            var buffer: [1]Ast.Node.Index = undefined;
+            const fn_decl = handle.tree.fullFnProto(&buffer, node).?;
+            const fn_name = offsets.tokenToSlice(handle.tree, fn_decl.name_token.?);
+            if (std.mem.eql(u8, fn_name, name)) return node;
+        }
+        std.debug.panic("failed to find function with name '{s}'", .{name});
+    }
+
+    pub fn findVar(self: Tester, name: []const u8) Ast.Node.Index {
+        const handle = self.handle;
+        var node: Ast.Node.Index = 0;
+        while (node < handle.tree.nodes.len) : (node += 1) {
+            const var_decl = handle.tree.fullVarDecl(node) orelse continue;
+            const name_token = var_decl.ast.mut_token + 1;
+            const var_name = offsets.tokenToSlice(handle.tree, name_token);
+            if (std.mem.eql(u8, var_name, name)) return var_decl.ast.init_node;
+        }
+        std.debug.panic("failed to find var declaration with name '{s}'", .{name});
+    }
+};
+
+fn testCall(
+    source: []const u8,
+    arguments: []const KV,
+    expected_ty: Key,
+) !void {
+    var tester = try Tester.init(source);
+    defer tester.deinit();
+
+    const result = try tester.call(tester.findFn("Foo"), arguments);
+
+    const ty = try tester.ip.get(allocator, result.ty);
+    const val = if (result.val) |key| try tester.ip.get(allocator, key) else .none;
+    const expected_ty_index = try tester.ip.get(allocator, expected_ty);
+
+    try expectEqualIndex(tester.ip, .type_type, ty);
+    try expectEqualIndex(tester.ip, expected_ty_index, val);
+}
+
+fn testExpr(
+    expr: []const u8,
+    expected: Key,
+) !void {
+    const source = try std.fmt.allocPrint(allocator,
+        \\const foobarbaz = {s};
+    , .{expr});
+    defer allocator.free(source);
+
+    var tester = try Tester.init(source);
+    defer tester.deinit();
+
+    const result = try tester.interpret(tester.findVar("foobarbaz"));
+
+    const expected_index = try tester.ip.get(allocator, expected);
+    const val = if (result.val) |key| try tester.ip.get(allocator, key) else .none;
+
+    try expectEqualIndex(tester.ip, expected_index, val);
+}
+
+fn expectEqualIndex(ip: *InternPool, expected: Index, actual: Index) !void {
+    if (expected == actual) return;
+    std.debug.print("expected `{}`, found `{}`\n", .{ expected.fmtDebug(ip), actual.fmtDebug(ip) });
+    return error.TestExpectedEqual;
 }

@@ -1,421 +1,285 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
-using System;
-using System.Collections.Generic;
-using System.Text;
-using NUnit.Framework.Api;
+using System.Collections.Concurrent;
+using System.Threading;
 using NUnit.Framework.Interfaces;
-using NUnit.Framework.Internal;
-using NUnit.TestData.ActionAttributeTests;
 
-namespace NUnit.Framework.Tests.Attributes
+namespace NUnit.Framework.Internal.Execution
 {
-    [TestFixture, NonParallelizable]
-    public class ActionAttributeTests
+    #region Individual Event Classes
+
+    /// <summary>
+    /// NUnit.Core.Event is the abstract base for all stored events.
+    /// An Event is the stored representation of a call to the
+    /// ITestListener interface and is used to record such calls
+    /// or to queue them for forwarding on another thread or at
+    /// a later time.
+    /// </summary>
+    public abstract class Event
     {
-        // NOTE: An earlier version of this fixture attempted to test
-        // the exact order of all actions. However, the order of execution
-        // of the individual tests cannot be predicted reliably across
-        // different runtimes, so we now look only at the relative position
-        // of before and after actions with respect to the test.
+        /// <summary>
+        /// The Send method is implemented by derived classes to send the event to the specified listener.
+        /// </summary>
+        /// <param name="listener">The listener.</param>
+        public abstract void Send(ITestListener listener);
+    }
 
-        private static readonly string ASSEMBLY_PATH = AssemblyHelper.GetAssemblyPath(typeof(ActionAttributeFixture).Assembly);
-        private static readonly string ASSEMBLY_NAME = System.IO.Path.GetFileName(ASSEMBLY_PATH);
+    /// <summary>
+    /// TestStartedEvent holds information needed to call the TestStarted method.
+    /// </summary>
+    public class TestStartedEvent : Event
+    {
+        private readonly ITest _test;
 
-        private ITestResult _result;
-        private int _numEvents = -1;
-
-        [OneTimeSetUp]
-        public void Setup()
+        /// <summary>
+        /// Initializes a new instance of the <see cref="TestStartedEvent"/> class.
+        /// </summary>
+        /// <param name="test">The test.</param>
+        public TestStartedEvent(ITest test)
         {
-            var runner = new NUnitTestAssemblyRunner(new DefaultTestAssemblyBuilder());
-
-            ActionAttributeFixture.ClearResults();
-
-            IDictionary<string, object> options = new Dictionary<string, object>
-            {
-                ["LOAD"] = new[] { "NUnit.TestData.ActionAttributeTests" },
-                // No need for the overhead of parallel execution here
-                ["NumberOfTestWorkers"] = 0
-            };
-
-            ITest test = runner.Load(ASSEMBLY_PATH, options);
-            Assert.Multiple(() =>
-            {
-                Assert.That(test, Is.Not.Null, "Assembly not loaded");
-                Assert.That(runner.LoadedTest, Is.SameAs(test));
-                Assert.That(test.RunState, Is.EqualTo(RunState.Runnable));
-            });
-
-            _result = runner.Run(TestListener.NULL, TestFilter.Empty);
-            _numEvents = ActionAttributeFixture.Events.Count;
+            _test = test;
         }
 
-        [Test]
-        public void TestsRunSuccessfully()
+        /// <summary>
+        /// Calls TestStarted on the specified listener.
+        /// </summary>
+        /// <param name="listener">The listener.</param>
+        public override void Send(ITestListener listener)
         {
-            Assert.That(_result.ResultState, Is.EqualTo(ResultState.Success));
+            listener.TestStarted(_test);
+        }
+    }
 
-            //foreach(string message in ActionAttributeFixture.Events)
-            //    Console.WriteLine(message);
+    /// <summary>
+    /// TestFinishedEvent holds information needed to call the TestFinished method.
+    /// </summary>
+    public class TestFinishedEvent : Event
+    {
+        private readonly ITestResult _result;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="TestFinishedEvent"/> class.
+        /// </summary>
+        /// <param name="result">The result.</param>
+        public TestFinishedEvent(ITestResult result)
+        {
+            _result = result;
         }
 
-        [Test]
-        public void ExpectedOutput_InCorrectOrder()
+        /// <summary>
+        /// Calls TestFinished on the specified listener.
+        /// </summary>
+        /// <param name="listener">The listener.</param>
+        public override void Send(ITestListener listener)
         {
-            var notFound = new List<string>();
-            var notExpected = new List<string>();
+            listener.TestFinished(_result);
+        }
+    }
 
-            foreach (var item in ExpectedEvents)
+    /// <summary>
+    /// TestOutputEvent holds information needed to call the TestOutput method.
+    /// </summary>
+    public class TestOutputEvent : Event
+    {
+        private readonly TestOutput _output;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="TestOutputEvent"/> class.
+        /// </summary>
+        /// <param name="output">The output object.</param>
+        public TestOutputEvent(TestOutput output)
+        {
+            _output = output;
+        }
+
+        /// <summary>
+        /// Calls TestOutput on the specified listener.
+        /// </summary>
+        /// <param name="listener">The listener.</param>
+        public override void Send(ITestListener listener)
+        {
+            listener.TestOutput(_output);
+        }
+    }
+
+    /// <summary>
+    /// TestMessageEvent holds information needed to call the SendMessage method.
+    /// </summary>
+    public class TestMessageEvent : Event
+    {
+        /// <summary>
+        /// Initializes a new instance of the <see cref="TestMessageEvent"/> class.
+        /// </summary>
+        /// <param name="testMessage">The test message object.</param>
+        public TestMessageEvent(TestMessage testMessage)
+        {
+            TestMessage = testMessage;
+        }
+
+        /// <summary>
+        /// Calls <see cref="Send(ITestListener)"/> on the specified listener.
+        /// </summary>
+        /// <param name="listener">The listener.</param>
+        public override void Send(ITestListener listener)
+        {
+            listener.SendMessage(TestMessage);
+        }
+
+        /// <summary>
+        /// Holds <see cref="TestMessage"/> object for sending to all listeners
+        /// </summary>
+        public TestMessage TestMessage { get; }
+    }
+
+    #endregion
+
+    /// <summary>
+    /// Implements a queue of work items each of which
+    /// is queued as a WaitCallback.
+    /// </summary>
+    public class EventQueue
+    {
+        private const int SpinCount = 5;
+
+        //        static readonly Logger log = InternalTrace.GetLogger("EventQueue");
+
+        private readonly ConcurrentQueue<Event> _queue = new();
+
+        /* This event is used solely for the purpose of having an optimized sleep cycle when
+         * we have to wait on an external event (Add or Remove for instance)
+         */
+        private readonly ManualResetEventSlim _mreAdd = new();
+
+        /* The whole idea is to use these two values in a transactional
+         * way to track and manage the actual data inside the underlying lock-free collection
+         * instead of directly working with it or using external locking.
+         *
+         * They are manipulated with CAS and are guaranteed to increase over time and use
+         * of the instance thus preventing ABA problems.
+         */
+        private int _addId = int.MinValue;
+        private int _removeId = int.MinValue;
+
+        private int _stopped;
+
+        /// <summary>
+        /// Gets the count of items in the queue.
+        /// </summary>
+        public int Count => _queue.Count;
+
+        /// <summary>
+        /// Enqueues the specified event
+        /// </summary>
+        /// <param name="e">The event to enqueue.</param>
+        public void Enqueue(Event e)
+        {
+            do
             {
-                if (!ActionAttributeFixture.Events.Contains(item))
-                    notFound.Add(item);
+                int cachedAddId = _addId;
+
+                // Validate that we have are the current enqueuer
+                if (Interlocked.CompareExchange(ref _addId, cachedAddId + 1, cachedAddId) != cachedAddId)
+                    continue;
+
+                // Add to the collection
+                _queue.Enqueue(e);
+
+                // Wake up threads that may have been sleeping
+                _mreAdd.Set();
+
+                break;
             }
+            while (true);
 
-            foreach (var item in ActionAttributeFixture.Events)
+            // Setting this to anything other than 0 causes NUnit to be sensitive
+            // to the windows timer resolution - see issue #2217
+            Thread.Sleep(0);  // give EventPump thread a chance to process the event
+        }
+
+        /// <summary>
+        /// Removes the first element from the queue and returns it (or <see langword="null"/>).
+        /// </summary>
+        /// <param name="blockWhenEmpty">
+        /// If <see langword="true"/> and the queue is empty, the calling thread is blocked until
+        /// either an element is enqueued, or <see cref="Stop"/> is called.
+        /// </param>
+        /// <returns>
+        /// <list type="bullet">
+        ///   <item>
+        ///     <term>If the queue not empty</term>
+        ///     <description>the first element.</description>
+        ///   </item>
+        ///   <item>
+        ///     <term>otherwise, if <paramref name="blockWhenEmpty"/>==<see langword="false"/>
+        ///       or <see cref="Stop"/> has been called</term>
+        ///     <description><see langword="null"/>.</description>
+        ///   </item>
+        /// </list>
+        /// </returns>
+        public Event? Dequeue(bool blockWhenEmpty)
+        {
+            SpinWait sw = new SpinWait();
+
+            do
             {
-                if (!ExpectedEvents.Contains(item))
-                    notExpected.Add(item);
-            }
+                int cachedRemoveId = _removeId;
+                int cachedAddId = _addId;
 
-            if (notFound.Count > 0 || notExpected.Count > 0)
-            {
-                var sb = new StringBuilder("Expected and actual events do not match.");
-
-                if (notFound.Count > 0)
+                // Empty case
+                if (cachedRemoveId == cachedAddId)
                 {
-                    sb.Append(Environment.NewLine + "   Missing:");
-                    foreach (var item in notFound)
-                        sb.Append(Environment.NewLine + "     " + item);
+                    if (!blockWhenEmpty || _stopped != 0)
+                        return null;
+
+                    // Spin a few times to see if something changes
+                    if (sw.Count <= SpinCount)
+                    {
+                        sw.SpinOnce();
+                    }
+                    else
+                    {
+                        // Reset to wait for an enqueue
+                        _mreAdd.Reset();
+
+                        // Recheck for an enqueue to avoid a Wait
+                        if (cachedRemoveId != _removeId || cachedAddId != _addId)
+                        {
+                            // Queue is not empty, set the event
+                            _mreAdd.Set();
+                            continue;
+                        }
+
+                        // Wait for something to happen
+                        _mreAdd.Wait(500);
+                    }
+
+                    continue;
                 }
 
-                if (notExpected.Count > 0)
+                // Validate that we are the current dequeuer
+                if (Interlocked.CompareExchange(ref _removeId, cachedRemoveId + 1, cachedRemoveId) != cachedRemoveId)
+                    continue;
+
+                // Dequeue our work item
+                Event? e;
+                while (!_queue.TryDequeue(out e))
                 {
-                    sb.Append(Environment.NewLine + "   Extra:");
-                    foreach (var item in notExpected)
-                        sb.Append(Environment.NewLine + "     " + item);
+                    if (!blockWhenEmpty || _stopped != 0)
+                        return null;
                 }
 
-                Assert.Fail(sb.ToString());
+                return e;
             }
+            while (true);
         }
 
-        [Test]
-        public void ActionsWrappingAssembly()
+        /// <summary>
+        /// Stop processing of the queue
+        /// </summary>
+        public void Stop()
         {
-            CheckActionsOnSuite(ASSEMBLY_NAME, 0, _numEvents - 1, ExpectedAssemblyActions);
+            if (Interlocked.CompareExchange(ref _stopped, 1, 0) == 0)
+                _mreAdd.Set();
         }
-
-        [Test]
-        public void ActionsWrappingSetUpFixture()
-        {
-            int firstAction = NumAssemblyActions;
-            int lastAction = _numEvents - firstAction - 1;
-            CheckActionsOnSuite("ActionAttributeTests", firstAction, lastAction, ExpectedSetUpFixtureActions);
-        }
-
-        [Test]
-        public void ActionsWrappingTestFixture()
-        {
-            int firstAction = NumAssemblyActions + NumSetUpFixtureActions;
-            int lastAction = _numEvents - firstAction - 1;
-            CheckActionsOnSuite("ActionAttributeFixture", firstAction, lastAction, ExpectedTestFixtureActions);
-        }
-
-        [Test]
-        public void ActionsWrappingParameterizedMethodSuite()
-        {
-            int case1 = ActionAttributeFixture.Events.IndexOf("CaseOne");
-            int case2 = ActionAttributeFixture.Events.IndexOf("CaseTwo");
-            Assume.That(case1, Is.GreaterThanOrEqualTo(0));
-            Assume.That(case2, Is.GreaterThanOrEqualTo(0));
-
-            int firstAction = Math.Min(case1, case2) - NumTestCaseActions - NumParameterizedTestActions;
-            int lastAction = Math.Max(case1, case2) + NumTestCaseActions + NumParameterizedTestActions;
-            CheckActionsOnSuite("ParameterizedTest", firstAction, lastAction, "OnMethod", "OnMethod");
-        }
-
-        [Test]
-        public void CorrectNumberOfEventsReceived()
-        {
-            Assert.That(ActionAttributeFixture.Events, Has.Count.EqualTo(
-                NumTestCaseEvents + 2 * (NumParameterizedTestActions + NumTestFixtureActions + NumSetUpFixtureActions + NumAssemblyActions)));
-        }
-
-        [TestCase("CaseOne")]
-        [TestCase("CaseTwo")]
-        [TestCase("SimpleTest")]
-        public void ActionsWrappingTestMethod(string testName)
-        {
-            CheckActionsOnTestCase(testName);
-        }
-
-        #region Helper Methods
-
-        private void CheckActionsOnSuite(string suiteName, int firstEvent, int lastEvent, params string[] tags)
-        {
-            for (int i = 0; i < tags.Length; i++)
-                CheckBeforeAfterActionPair(firstEvent + i, lastEvent - i, suiteName, tags[i]);
-
-            if (firstEvent > 0)
-            {
-                var beforeEvent = ActionAttributeFixture.Events[firstEvent - 1];
-                Assert.That(beforeEvent, Does.Not.StartWith(suiteName), $"Extra ActionAttribute Before: {beforeEvent}");
-            }
-
-            if (lastEvent < ActionAttributeFixture.Events.Count - 1)
-            {
-                var afterEvent = ActionAttributeFixture.Events[lastEvent + 1];
-                Assert.That(afterEvent, Does.Not.StartWith(suiteName), $"Extra ActionAttribute After: {afterEvent}");
-            }
-        }
-
-        private void CheckActionsOnTestCase(string testName)
-        {
-            var index = ActionAttributeFixture.Events.IndexOf(testName);
-            Assert.That(index, Is.GreaterThanOrEqualTo(0), $"{testName} did not execute");
-            var numActions = ExpectedTestCaseActions.Length;
-
-            for (int i = 0; i < numActions; i++)
-                CheckBeforeAfterActionPair(index - i - 1, index + i + 1, testName, ExpectedTestCaseActions[i]);
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(ActionAttributeFixture.Events[index - numActions - 1], Does.Not.StartWith(testName), "Extra ActionAttribute Before");
-                Assert.That(ActionAttributeFixture.Events[index + numActions + 1], Does.Not.StartWith(testName), "Extra ActionAttribute After");
-            });
-        }
-
-        private void CheckBeforeAfterActionPair(int index1, int index2, string testName, string tag)
-        {
-            var event1 = ActionAttributeFixture.Events[index1];
-            var event2 = ActionAttributeFixture.Events[index2];
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(event1, Does.StartWith(testName + "." + tag + ".Before"));
-                Assert.That(event2, Does.StartWith(testName + "." + tag + ".After"));
-            });
-
-            int index = event1.LastIndexOf('.');
-            var target1 = event1.Substring(index); // Target is last in string
-
-            Assert.That(event2, Does.EndWith(target1), "Event mismatch");
-        }
-
-        #endregion
-
-        #region Expected Attributes and Events
-
-        private static readonly string[] ExpectedAssemblyActions = new[]
-        {
-                "OnAssembly", "OnAssembly", "OnAssembly"
-        };
-
-        private static readonly string[] ExpectedSetUpFixtureActions = new[]
-        {
-                "OnBaseSetupFixture", "OnBaseSetupFixture", "OnBaseSetupFixture",
-                "OnSetupFixture", "OnSetupFixture", "OnSetupFixture"
-        };
-
-        private static readonly string[] ExpectedTestFixtureActions = new[]
-        {
-                "OnBaseInterface", "OnBaseInterface", "OnBaseInterface",
-                "OnBaseFixture", "OnBaseFixture", "OnBaseFixture",
-                "OnInterface", "OnInterface", "OnInterface",
-                "OnFixture", "OnFixture", "OnFixture"
-        };
-
-        private static readonly string[] ExpectedParameterizedTestActions = new[]
-        {
-                "OnMethod", "OnMethod"
-        };
-
-        private static readonly string[] ExpectedTestCaseActions = new[]
-        {
-                "OnMethod", "OnMethod", "OnMethod",
-                "SetUpTearDown",
-                "OnFixture", "OnFixture",
-                "OnInterface", "OnInterface",
-                "OnBaseFixture", "OnBaseFixture",
-                "OnBaseInterface", "OnBaseInterface",
-                "OnSetupFixture", "OnSetupFixture",
-                "OnBaseSetupFixture", "OnBaseSetupFixture",
-                "OnAssembly", "OnAssembly"
-        };
-
-        // The exact order of events may vary, depending on the runtime framework
-        // in use. Consequently, we test heuristically. The following list is
-        // only one possible ordering of events.
-        private static readonly List<string> ExpectedEvents = new(new[]
-        {
-                ASSEMBLY_NAME + ".OnAssembly.Before.Test, Suite",
-                ASSEMBLY_NAME + ".OnAssembly.Before.Suite",
-                ASSEMBLY_NAME + ".OnAssembly.Before.Default",
-                "ActionAttributeTests.OnBaseSetupFixture.Before.Test, Suite",
-                "ActionAttributeTests.OnBaseSetupFixture.Before.Suite",
-                "ActionAttributeTests.OnBaseSetupFixture.Before.Default",
-                "ActionAttributeTests.OnSetupFixture.Before.Test, Suite",
-                "ActionAttributeTests.OnSetupFixture.Before.Suite",
-                "ActionAttributeTests.OnSetupFixture.Before.Default",
-                "ActionAttributeFixture.OnBaseInterface.Before.Test, Suite",
-                "ActionAttributeFixture.OnBaseInterface.Before.Suite",
-                "ActionAttributeFixture.OnBaseInterface.Before.Default",
-                "ActionAttributeFixture.OnBaseFixture.Before.Test, Suite",
-                "ActionAttributeFixture.OnBaseFixture.Before.Suite",
-                "ActionAttributeFixture.OnBaseFixture.Before.Default",
-                "ActionAttributeFixture.OnInterface.Before.Test, Suite",
-                "ActionAttributeFixture.OnInterface.Before.Suite",
-                "ActionAttributeFixture.OnInterface.Before.Default",
-                "ActionAttributeFixture.OnFixture.Before.Test, Suite",
-                "ActionAttributeFixture.OnFixture.Before.Suite",
-                "ActionAttributeFixture.OnFixture.Before.Default",
-                "ParameterizedTest.OnMethod.Before.Test, Suite",
-                "ParameterizedTest.OnMethod.Before.Suite",
-                "CaseOne.OnAssembly.Before.Test, Suite",
-                "CaseOne.OnAssembly.Before.Test",
-                "CaseOne.OnBaseSetupFixture.Before.Test, Suite",
-                "CaseOne.OnBaseSetupFixture.Before.Test",
-                "CaseOne.OnSetupFixture.Before.Test, Suite",
-                "CaseOne.OnSetupFixture.Before.Test",
-                "CaseOne.OnBaseInterface.Before.Test, Suite",
-                "CaseOne.OnBaseInterface.Before.Test",
-                "CaseOne.OnBaseFixture.Before.Test, Suite",
-                "CaseOne.OnBaseFixture.Before.Test",
-                "CaseOne.OnInterface.Before.Test, Suite",
-                "CaseOne.OnInterface.Before.Test",
-                "CaseOne.OnFixture.Before.Test, Suite",
-                "CaseOne.OnFixture.Before.Test",
-                "CaseOne.SetUpTearDown.Before.Test",
-                "CaseOne.OnMethod.Before.Test, Suite",
-                "CaseOne.OnMethod.Before.Test",
-                "CaseOne.OnMethod.Before.Default",
-                "CaseOne",
-                "CaseOne.OnMethod.After.Default",
-                "CaseOne.OnMethod.After.Test",
-                "CaseOne.OnMethod.After.Test, Suite",
-                "CaseOne.SetUpTearDown.After.Test",
-                "CaseOne.OnFixture.After.Test",
-                "CaseOne.OnFixture.After.Test, Suite",
-                "CaseOne.OnInterface.After.Test",
-                "CaseOne.OnInterface.After.Test, Suite",
-                "CaseOne.OnBaseFixture.After.Test",
-                "CaseOne.OnBaseFixture.After.Test, Suite",
-                "CaseOne.OnBaseInterface.After.Test",
-                "CaseOne.OnBaseInterface.After.Test, Suite",
-                "CaseOne.OnSetupFixture.After.Test",
-                "CaseOne.OnSetupFixture.After.Test, Suite",
-                "CaseOne.OnBaseSetupFixture.After.Test",
-                "CaseOne.OnBaseSetupFixture.After.Test, Suite",
-                "CaseOne.OnAssembly.After.Test",
-                "CaseOne.OnAssembly.After.Test, Suite",
-                "CaseTwo.OnAssembly.Before.Test, Suite",
-                "CaseTwo.OnAssembly.Before.Test",
-                "CaseTwo.OnBaseSetupFixture.Before.Test, Suite",
-                "CaseTwo.OnBaseSetupFixture.Before.Test",
-                "CaseTwo.OnSetupFixture.Before.Test, Suite",
-                "CaseTwo.OnSetupFixture.Before.Test",
-                "CaseTwo.OnBaseInterface.Before.Test, Suite",
-                "CaseTwo.OnBaseInterface.Before.Test",
-                "CaseTwo.OnBaseFixture.Before.Test",
-                "CaseTwo.OnBaseFixture.Before.Test, Suite",
-                "CaseTwo.OnInterface.Before.Test, Suite",
-                "CaseTwo.OnInterface.Before.Test",
-                "CaseTwo.OnFixture.Before.Test, Suite",
-                "CaseTwo.OnFixture.Before.Test",
-                "CaseTwo.SetUpTearDown.Before.Test",
-                "CaseTwo.OnMethod.Before.Test, Suite",
-                "CaseTwo.OnMethod.Before.Test",
-                "CaseTwo.OnMethod.Before.Default",
-                "CaseTwo",
-                "CaseTwo.OnMethod.After.Default",
-                "CaseTwo.OnMethod.After.Test",
-                "CaseTwo.OnMethod.After.Test, Suite",
-                "CaseTwo.SetUpTearDown.After.Test",
-                "CaseTwo.OnFixture.After.Test",
-                "CaseTwo.OnFixture.After.Test, Suite",
-                "CaseTwo.OnInterface.After.Test",
-                "CaseTwo.OnInterface.After.Test, Suite",
-                "CaseTwo.OnBaseFixture.After.Test",
-                "CaseTwo.OnBaseFixture.After.Test, Suite",
-                "CaseTwo.OnBaseInterface.After.Test",
-                "CaseTwo.OnBaseInterface.After.Test, Suite",
-                "CaseTwo.OnSetupFixture.After.Test",
-                "CaseTwo.OnSetupFixture.After.Test, Suite",
-                "CaseTwo.OnBaseSetupFixture.After.Test",
-                "CaseTwo.OnBaseSetupFixture.After.Test, Suite",
-                "CaseTwo.OnAssembly.After.Test",
-                "CaseTwo.OnAssembly.After.Test, Suite",
-                "ParameterizedTest.OnMethod.After.Suite",
-                "ParameterizedTest.OnMethod.After.Test, Suite",
-                "SimpleTest.OnAssembly.Before.Test, Suite",
-                "SimpleTest.OnAssembly.Before.Test",
-                "SimpleTest.OnBaseSetupFixture.Before.Test, Suite",
-                "SimpleTest.OnBaseSetupFixture.Before.Test",
-                "SimpleTest.OnSetupFixture.Before.Test, Suite",
-                "SimpleTest.OnSetupFixture.Before.Test",
-                "SimpleTest.OnBaseInterface.Before.Test, Suite",
-                "SimpleTest.OnBaseInterface.Before.Test",
-                "SimpleTest.OnBaseFixture.Before.Test, Suite",
-                "SimpleTest.OnBaseFixture.Before.Test",
-                "SimpleTest.OnInterface.Before.Test, Suite",
-                "SimpleTest.OnInterface.Before.Test",
-                "SimpleTest.OnFixture.Before.Test, Suite",
-                "SimpleTest.OnFixture.Before.Test",
-                "SimpleTest.SetUpTearDown.Before.Test",
-                "SimpleTest.OnMethod.Before.Test, Suite",
-                "SimpleTest.OnMethod.Before.Test",
-                "SimpleTest.OnMethod.Before.Default",
-                "SimpleTest",
-                "SimpleTest.OnMethod.After.Default",
-                "SimpleTest.OnMethod.After.Test",
-                "SimpleTest.OnMethod.After.Test, Suite",
-                "SimpleTest.SetUpTearDown.After.Test",
-                "SimpleTest.OnFixture.After.Test",
-                "SimpleTest.OnFixture.After.Test, Suite",
-                "SimpleTest.OnInterface.After.Test",
-                "SimpleTest.OnInterface.After.Test, Suite",
-                "SimpleTest.OnBaseFixture.After.Test",
-                "SimpleTest.OnBaseFixture.After.Test, Suite",
-                "SimpleTest.OnBaseInterface.After.Test",
-                "SimpleTest.OnBaseInterface.After.Test, Suite",
-                "SimpleTest.OnSetupFixture.After.Test",
-                "SimpleTest.OnSetupFixture.After.Test, Suite",
-                "SimpleTest.OnBaseSetupFixture.After.Test",
-                "SimpleTest.OnBaseSetupFixture.After.Test, Suite",
-                "SimpleTest.OnAssembly.After.Test",
-                "SimpleTest.OnAssembly.After.Test, Suite",
-                "ActionAttributeFixture.OnFixture.After.Default",
-                "ActionAttributeFixture.OnFixture.After.Suite",
-                "ActionAttributeFixture.OnFixture.After.Test, Suite",
-                "ActionAttributeFixture.OnInterface.After.Default",
-                "ActionAttributeFixture.OnInterface.After.Suite",
-                "ActionAttributeFixture.OnInterface.After.Test, Suite",
-                "ActionAttributeFixture.OnBaseFixture.After.Default",
-                "ActionAttributeFixture.OnBaseFixture.After.Suite",
-                "ActionAttributeFixture.OnBaseFixture.After.Test, Suite",
-                "ActionAttributeFixture.OnBaseInterface.After.Default",
-                "ActionAttributeFixture.OnBaseInterface.After.Suite",
-                "ActionAttributeFixture.OnBaseInterface.After.Test, Suite",
-                "ActionAttributeTests.OnSetupFixture.After.Default",
-                "ActionAttributeTests.OnSetupFixture.After.Suite",
-                "ActionAttributeTests.OnSetupFixture.After.Test, Suite",
-                "ActionAttributeTests.OnBaseSetupFixture.After.Default",
-                "ActionAttributeTests.OnBaseSetupFixture.After.Suite",
-                "ActionAttributeTests.OnBaseSetupFixture.After.Test, Suite",
-                ASSEMBLY_NAME + ".OnAssembly.After.Default",
-                ASSEMBLY_NAME + ".OnAssembly.After.Suite",
-                ASSEMBLY_NAME + ".OnAssembly.After.Test, Suite"
-        });
-
-        private static readonly int NumTestCaseActions = ExpectedTestCaseActions.Length;
-        private static readonly int EventsPerTestCase = 2 * NumTestCaseActions + 1;
-        private static readonly int NumTestCaseEvents = 3 * EventsPerTestCase;
-        private static readonly int NumParameterizedTestActions = ExpectedParameterizedTestActions.Length;
-        private static readonly int NumTestFixtureActions = ExpectedTestFixtureActions.Length;
-        private static readonly int NumSetUpFixtureActions = ExpectedSetUpFixtureActions.Length;
-        private static readonly int NumAssemblyActions = ExpectedAssemblyActions.Length;
-
-        #endregion
     }
 }

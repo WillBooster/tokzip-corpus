@@ -10,376 +10,433 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Package\Version;
+namespace Composer\Test\Repository\Vcs;
 
-use Composer\Filter\PlatformRequirementFilter\PlatformRequirementFilterFactory;
-use Composer\IO\BufferIO;
-use Composer\Package\Version\VersionSelector;
-use Composer\Package\Package;
-use Composer\Package\Link;
-use Composer\Package\AliasPackage;
-use Composer\Repository\PlatformRepository;
-use Composer\Package\Version\VersionParser;
+use Composer\Repository\Vcs\GitHubDriver;
 use Composer\Test\TestCase;
-use Symfony\Component\Console\Output\StreamOutput;
+use Composer\Util\Filesystem;
+use Composer\Config;
+use Composer\Util\ProcessExecutor;
 
-class VersionSelectorTest extends TestCase
+class GitHubDriverTest extends TestCase
 {
-    // A) multiple versions, get the latest one
-    // B) targetPackageVersion will pass to repo set
-    // C) No results, throw exception
+    /** @var string */
+    private $home;
+    /** @var Config */
+    private $config;
 
-    public function testLatestVersionIsReturned(): void
+    public function setUp(): void
     {
-        $packageName = 'foo/bar';
-
-        $package1 = self::getPackage('foo/bar', '1.2.1');
-        $package2 = self::getPackage('foo/bar', '1.2.2');
-        $package3 = self::getPackage('foo/bar', '1.2.0');
-        $packages = [$package1, $package2, $package3];
-
-        $repositorySet = $this->createMockRepositorySet();
-        $repositorySet->expects($this->once())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
-
-        $versionSelector = new VersionSelector($repositorySet);
-        $best = $versionSelector->findBestCandidate($packageName);
-
-        // 1.2.2 should be returned because it's the latest of the returned versions
-        self::assertSame($package2, $best, 'Latest version should be 1.2.2');
+        $this->home = self::getUniqueTmpDirectory();
+        $this->config = new Config();
+        $this->config->merge([
+            'config' => [
+                'home' => $this->home,
+            ],
+        ]);
     }
 
-    public function testLatestVersionIsReturnedThatMatchesPhpRequirements(): void
+    protected function tearDown(): void
     {
-        $packageName = 'foo/bar';
+        parent::tearDown();
+        $fs = new Filesystem;
+        $fs->removeDirectory($this->home);
+    }
 
-        $platform = new PlatformRepository([], ['php' => '5.5.0']);
-        $repositorySet = $this->createMockRepositorySet();
-        $versionSelector = new VersionSelector($repositorySet, $platform);
+    public function testPrivateRepository(): void
+    {
+        $repoUrl = 'http://github.com/composer/packagist';
+        $repoApiUrl = 'https://api.github.com/repos/composer/packagist';
+        $repoSshUrl = 'git@github.com:composer/packagist.git';
+        $identifier = 'v0.0.0';
+        $sha = 'SOMESHA';
 
-        $parser = new VersionParser;
-        $package0 = self::getPackage('foo/bar', '0.9.0');
-        $package0->setRequires(['php' => new Link($packageName, 'php', $parser->parseConstraints('>=5.6'), Link::TYPE_REQUIRE, '>=5.6')]);
-        $package1 = self::getPackage('foo/bar', '1.0.0');
-        $package1->setRequires(['php' => new Link($packageName, 'php', $parser->parseConstraints('>=5.4'), Link::TYPE_REQUIRE, '>=5.4')]);
-        $package2 = self::getPackage('foo/bar', '2.0.0');
-        $package2->setRequires(['php' => new Link($packageName, 'php', $parser->parseConstraints('>=5.6'), Link::TYPE_REQUIRE, '>=5.6')]);
-        $package3 = self::getPackage('foo/bar', '2.1.0');
-        $package3->setRequires(['php' => new Link($packageName, 'php', $parser->parseConstraints('>=5.6'), Link::TYPE_REQUIRE, '>=5.6')]);
-        $packages = [$package0, $package1, $package2, $package3];
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $io->expects($this->any())
+            ->method('isInteractive')
+            ->will($this->returnValue(true));
 
-        $repositorySet->expects($this->any())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
-
-        $io = new BufferIO();
-        $best = $versionSelector->findBestCandidate($packageName, null, 'stable', null, 0, $io);
-        self::assertSame((string) $package1, (string) $best, 'Latest version supporting php 5.5 should be returned (1.0.0)');
-        self::assertSame("<warning>Cannot use foo/bar's latest version 2.1.0 as it requires php >=5.6 which is not satisfied by your platform.".PHP_EOL, $io->getOutput());
-
-        $io = new BufferIO('', StreamOutput::VERBOSITY_VERBOSE);
-        $best = $versionSelector->findBestCandidate($packageName, null, 'stable', null, 0, $io);
-        self::assertSame((string) $package1, (string) $best, 'Latest version supporting php 5.5 should be returned (1.0.0)');
-        self::assertSame(
-            "<warning>Cannot use foo/bar's latest version 2.1.0 as it requires php >=5.6 which is not satisfied by your platform.".PHP_EOL
-            ."<warning>Cannot use foo/bar 2.0.0 as it requires php >=5.6 which is not satisfied by your platform.".PHP_EOL,
-            $io->getOutput()
+        $httpDownloader = $this->getHttpDownloaderMock($io, $this->config);
+        $httpDownloader->expects(
+            [
+                ['url' => $repoApiUrl, 'status' => 404],
+                ['url' => 'https://api.github.com/', 'body' => '{}'],
+                ['url' => $repoApiUrl, 'body' => '{"master_branch": "test_master", "private": true, "owner": {"login": "composer"}, "name": "packagist"}'],
+            ],
+            true
         );
 
-        $best = $versionSelector->findBestCandidate($packageName, null, 'stable', PlatformRequirementFilterFactory::ignoreAll());
-        self::assertSame((string) $package3, (string) $best, 'Latest version should be returned when ignoring platform reqs (2.1.0)');
+        $process = $this->getProcessExecutorMock();
+        $process->expects([], false, ['return' => 1]);
+
+        $io->expects($this->once())
+            ->method('askAndHideAnswer')
+            ->with($this->equalTo('Token (hidden): '))
+            ->will($this->returnValue('sometoken'));
+
+        $io->expects($this->any())
+            ->method('setAuthentication')
+            ->with($this->equalTo('github.com'), $this->matchesRegularExpression('{sometoken}'), $this->matchesRegularExpression('{x-oauth-basic}'));
+
+        $configSource = $this->getMockBuilder('Composer\Config\ConfigSourceInterface')->getMock();
+        $authConfigSource = $this->getMockBuilder('Composer\Config\ConfigSourceInterface')->getMock();
+        $this->config->setConfigSource($configSource);
+        $this->config->setAuthConfigSource($authConfigSource);
+
+        $repoConfig = [
+            'url' => $repoUrl,
+        ];
+
+        $gitHubDriver = new GitHubDriver($repoConfig, $io, $this->config, $httpDownloader, $process);
+        $gitHubDriver->initialize();
+        $this->setAttribute($gitHubDriver, 'tags', [$identifier => $sha]);
+
+        self::assertEquals('test_master', $gitHubDriver->getRootIdentifier());
+
+        $dist = $gitHubDriver->getDist($sha);
+        self::assertIsArray($dist);
+        self::assertEquals('zip', $dist['type']);
+        self::assertEquals('https://api.github.com/repos/composer/packagist/zipball/SOMESHA', $dist['url']);
+        self::assertEquals('SOMESHA', $dist['reference']);
+
+        $source = $gitHubDriver->getSource($sha);
+        self::assertEquals('git', $source['type']);
+        self::assertEquals($repoSshUrl, $source['url']);
+        self::assertEquals('SOMESHA', $source['reference']);
     }
 
-    public function testLatestVersionIsReturnedThatMatchesExtRequirements(): void
+    public function testPublicRepository(): void
     {
-        $packageName = 'foo/bar';
+        $repoUrl = 'http://github.com/composer/packagist';
+        $repoApiUrl = 'https://api.github.com/repos/composer/packagist';
+        $identifier = 'v0.0.0';
+        $sha = 'SOMESHA';
 
-        $platform = new PlatformRepository([], ['ext-zip' => '5.3.0']);
-        $repositorySet = $this->createMockRepositorySet();
-        $versionSelector = new VersionSelector($repositorySet, $platform);
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $io->expects($this->any())
+            ->method('isInteractive')
+            ->will($this->returnValue(true));
 
-        $parser = new VersionParser;
-        $package1 = self::getPackage('foo/bar', '1.0.0');
-        $package1->setRequires(['ext-zip' => new Link($packageName, 'ext-zip', $parser->parseConstraints('^5.2'), Link::TYPE_REQUIRE, '^5.2')]);
-        $package2 = self::getPackage('foo/bar', '2.0.0');
-        $package2->setRequires(['ext-zip' => new Link($packageName, 'ext-zip', $parser->parseConstraints('^5.4'), Link::TYPE_REQUIRE, '^5.4')]);
-        $packages = [$package1, $package2];
+        $httpDownloader = $this->getHttpDownloaderMock($io, $this->config);
+        $httpDownloader->expects(
+            [
+                ['url' => $repoApiUrl, 'body' => '{"master_branch": "test_master", "owner": {"login": "composer"}, "name": "packagist"}'],
+            ],
+            true
+        );
 
-        $repositorySet->expects($this->any())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
+        $repoConfig = [
+            'url' => $repoUrl,
+        ];
+        $repoUrl = 'https://github.com/composer/packagist.git';
 
-        $best = $versionSelector->findBestCandidate($packageName);
-        self::assertSame($package1, $best, 'Latest version supporting ext-zip 5.3.0 should be returned (1.0.0)');
-        $best = $versionSelector->findBestCandidate($packageName, null, 'stable', PlatformRequirementFilterFactory::ignoreAll());
-        self::assertSame($package2, $best, 'Latest version should be returned when ignoring platform reqs (2.0.0)');
+        $gitHubDriver = new GitHubDriver($repoConfig, $io, $this->config, $httpDownloader, $this->getProcessExecutorMock());
+        $gitHubDriver->initialize();
+        $this->setAttribute($gitHubDriver, 'tags', [$identifier => $sha]);
+
+        self::assertEquals('test_master', $gitHubDriver->getRootIdentifier());
+
+        $dist = $gitHubDriver->getDist($sha);
+        self::assertIsArray($dist);
+        self::assertEquals('zip', $dist['type']);
+        self::assertEquals('https://api.github.com/repos/composer/packagist/zipball/SOMESHA', $dist['url']);
+        self::assertEquals($sha, $dist['reference']);
+
+        $source = $gitHubDriver->getSource($sha);
+        self::assertEquals('git', $source['type']);
+        self::assertEquals($repoUrl, $source['url']);
+        self::assertEquals($sha, $source['reference']);
     }
 
-    public function testLatestVersionIsReturnedThatMatchesPlatformExt(): void
+    public function testPublicRepository2(): void
     {
-        $packageName = 'foo/bar';
+        $repoUrl = 'http://github.com/composer/packagist';
+        $repoApiUrl = 'https://api.github.com/repos/composer/packagist';
+        $identifier = 'feature/3.2-foo';
+        $sha = 'SOMESHA';
 
-        $platform = new PlatformRepository();
-        $repositorySet = $this->createMockRepositorySet();
-        $versionSelector = new VersionSelector($repositorySet, $platform);
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $io->expects($this->any())
+            ->method('isInteractive')
+            ->will($this->returnValue(true));
 
-        $parser = new VersionParser;
-        $package1 = self::getPackage('foo/bar', '1.0.0');
-        $package2 = self::getPackage('foo/bar', '2.0.0');
-        $package2->setRequires(['ext-barfoo' => new Link($packageName, 'ext-barfoo', $parser->parseConstraints('*'), Link::TYPE_REQUIRE, '*')]);
-        $packages = [$package1, $package2];
+        $httpDownloader = $this->getHttpDownloaderMock($io, $this->config);
+        $httpDownloader->expects(
+            [
+                ['url' => $repoApiUrl, 'body' => '{"master_branch": "test_master", "owner": {"login": "composer"}, "name": "packagist"}'],
+                ['url' => 'https://api.github.com/repos/composer/packagist/contents/composer.json?ref=feature%2F3.2-foo', 'body' => '{"encoding":"base64","content":"'.base64_encode('{"support": {"source": "'.$repoUrl.'" }}').'"}'],
+                ['url' => 'https://api.github.com/repos/composer/packagist/commits/feature%2F3.2-foo', 'body' => '{"commit": {"committer":{ "date": "2012-09-10"}}}'],
+                ['url' => 'https://api.github.com/repos/composer/packagist/contents/.github/FUNDING.yml', 'body' => '{"encoding": "base64", "content": "'.base64_encode("custom: https://example.com").'"}'],
+            ],
+            true
+        );
 
-        $repositorySet->expects($this->any())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
+        $repoConfig = [
+            'url' => $repoUrl,
+        ];
+        $repoUrl = 'https://github.com/composer/packagist.git';
 
-        $best = $versionSelector->findBestCandidate($packageName);
-        self::assertSame($package1, $best, 'Latest version not requiring ext-barfoo should be returned (1.0.0)');
-        $best = $versionSelector->findBestCandidate($packageName, null, 'stable', PlatformRequirementFilterFactory::ignoreAll());
-        self::assertSame($package2, $best, 'Latest version should be returned when ignoring platform reqs (2.0.0)');
+        $gitHubDriver = new GitHubDriver($repoConfig, $io, $this->config, $httpDownloader, $this->getProcessExecutorMock());
+        $gitHubDriver->initialize();
+        $this->setAttribute($gitHubDriver, 'tags', [$identifier => $sha]);
+
+        self::assertEquals('test_master', $gitHubDriver->getRootIdentifier());
+
+        $dist = $gitHubDriver->getDist($sha);
+        self::assertIsArray($dist);
+        self::assertEquals('zip', $dist['type']);
+        self::assertEquals('https://api.github.com/repos/composer/packagist/zipball/SOMESHA', $dist['url']);
+        self::assertEquals($sha, $dist['reference']);
+
+        $source = $gitHubDriver->getSource($sha);
+        self::assertEquals('git', $source['type']);
+        self::assertEquals($repoUrl, $source['url']);
+        self::assertEquals($sha, $source['reference']);
+
+        $data = $gitHubDriver->getComposerInformation($identifier);
+
+        self::assertIsArray($data);
+        self::assertArrayNotHasKey('abandoned', $data);
     }
 
-    public function testLatestVersionIsReturnedThatMatchesComposerRequirements(): void
+    public function testInvalidSupportData(): void
     {
-        $packageName = 'foo/bar';
+        $repoUrl = 'http://github.com/composer/packagist';
+        $repoApiUrl = 'https://api.github.com/repos/composer/packagist';
+        $identifier = 'feature/3.2-foo';
+        $sha = 'SOMESHA';
 
-        $platform = new PlatformRepository([], ['composer-runtime-api' => '1.0.0']);
-        $repositorySet = $this->createMockRepositorySet();
-        $versionSelector = new VersionSelector($repositorySet, $platform);
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $io->expects($this->any())
+            ->method('isInteractive')
+            ->will($this->returnValue(true));
 
-        $parser = new VersionParser;
-        $package1 = self::getPackage('foo/bar', '1.0.0');
-        $package1->setRequires(['composer-runtime-api' => new Link($packageName, 'composer-runtime-api', $parser->parseConstraints('^1.0'), Link::TYPE_REQUIRE, '^1.0')]);
-        $package2 = self::getPackage('foo/bar', '1.1.0');
-        $package2->setRequires(['composer-runtime-api' => new Link($packageName, 'composer-runtime-api', $parser->parseConstraints('^2.0'), Link::TYPE_REQUIRE, '^2.0')]);
-        $packages = [$package1, $package2];
+        $httpDownloader = $this->getHttpDownloaderMock($io, $this->config);
+        $httpDownloader->expects(
+            [
+                ['url' => $repoApiUrl, 'body' => '{"master_branch": "test_master", "owner": {"login": "composer"}, "name": "packagist"}'],
+                ['url' => 'https://api.github.com/repos/composer/packagist/contents/composer.json?ref=feature%2F3.2-foo', 'body' => '{"encoding":"base64","content":"'.base64_encode('{"support": "'.$repoUrl.'" }').'"}'],
+                ['url' => 'https://api.github.com/repos/composer/packagist/commits/feature%2F3.2-foo', 'body' => '{"commit": {"committer":{ "date": "2012-09-10"}}}'],
+                ['url' => 'https://api.github.com/repos/composer/packagist/contents/.github/FUNDING.yml', 'body' => '{"encoding": "base64", "content": "'.base64_encode("custom: https://example.com").'"}'],
+            ],
+            true
+        );
 
-        $repositorySet->expects($this->any())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
+        $repoConfig = [
+            'url' => $repoUrl,
+        ];
 
-        $best = $versionSelector->findBestCandidate($packageName);
-        self::assertSame($package1, $best, 'Latest version supporting composer 1 should be returned (1.0.0)');
-        $best = $versionSelector->findBestCandidate($packageName, null, 'stable', PlatformRequirementFilterFactory::ignoreAll());
-        self::assertSame($package2, $best, 'Latest version should be returned when ignoring platform reqs (1.1.0)');
+        $gitHubDriver = new GitHubDriver($repoConfig, $io, $this->config, $httpDownloader, $this->getProcessExecutorMock());
+        $gitHubDriver->initialize();
+        $this->setAttribute($gitHubDriver, 'tags', [$identifier => $sha]);
+        $this->setAttribute($gitHubDriver, 'branches', ['test_master' => $sha]);
+
+        $data = $gitHubDriver->getComposerInformation($identifier);
+
+        self::assertIsArray($data);
+        self::assertSame('https://github.com/composer/packagist/tree/feature/3.2-foo', $data['support']['source']);
     }
 
-    public function testMostStableVersionIsReturned(): void
+    public function testPublicRepositoryArchived(): void
     {
-        $packageName = 'foo/bar';
+        $repoUrl = 'http://github.com/composer/packagist';
+        $repoApiUrl = 'https://api.github.com/repos/composer/packagist';
+        $identifier = 'v0.0.0';
+        $sha = 'SOMESHA';
+        $composerJsonUrl = 'https://api.github.com/repos/composer/packagist/contents/composer.json?ref=' . $sha;
 
-        $package1 = self::getPackage('foo/bar', '1.0.0');
-        $package2 = self::getPackage('foo/bar', '1.1.0-beta');
-        $packages = [$package1, $package2];
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $io->expects($this->any())
+            ->method('isInteractive')
+            ->will($this->returnValue(true));
 
-        $repositorySet = $this->createMockRepositorySet();
-        $repositorySet->expects($this->once())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
+        $httpDownloader = $this->getHttpDownloaderMock($io, $this->config);
+        $httpDownloader->expects(
+            [
+                ['url' => $repoApiUrl, 'body' => '{"master_branch": "test_master", "owner": {"login": "composer"}, "name": "packagist", "archived": true}'],
+                ['url' => $composerJsonUrl, 'body' => '{"encoding": "base64", "content": "' . base64_encode('{"name": "composer/packagist"}') . '"}'],
+                ['url' => 'https://api.github.com/repos/composer/packagist/commits/'.$sha, 'body' => '{"commit": {"committer":{ "date": "2012-09-10"}}}'],
+                ['url' => 'https://api.github.com/repos/composer/packagist/contents/.github/FUNDING.yml', 'body' => '{"encoding": "base64", "content": "'.base64_encode("custom: https://example.com").'"}'],
+            ],
+            true
+        );
 
-        $versionSelector = new VersionSelector($repositorySet);
-        $best = $versionSelector->findBestCandidate($packageName);
+        $repoConfig = [
+            'url' => $repoUrl,
+        ];
 
-        self::assertSame($package1, $best, 'Latest most stable version should be returned (1.0.0)');
+        $gitHubDriver = new GitHubDriver($repoConfig, $io, $this->config, $httpDownloader, $this->getProcessExecutorMock());
+        $gitHubDriver->initialize();
+        $this->setAttribute($gitHubDriver, 'tags', [$identifier => $sha]);
+
+        $data = $gitHubDriver->getComposerInformation($sha);
+
+        self::assertIsArray($data);
+        self::assertTrue($data['abandoned']);
     }
 
-    public function testMostStableVersionIsReturnedRegardlessOfOrder(): void
+    public function testPrivateRepositoryNoInteraction(): void
     {
-        $packageName = 'foo/bar';
+        $repoUrl = 'http://github.com/composer/packagist';
+        $repoApiUrl = 'https://api.github.com/repos/composer/packagist';
+        $repoSshUrl = 'git@github.com:composer/packagist.git';
+        $identifier = 'v0.0.0';
+        $sha = 'SOMESHA';
 
-        $package1 = self::getPackage('foo/bar', '2.x-dev');
-        $package2 = self::getPackage('foo/bar', '2.0.0-beta3');
-        $packages = [$package1, $package2];
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $io->expects($this->any())
+            ->method('isInteractive')
+            ->will($this->returnValue(false));
 
-        $repositorySet = $this->createMockRepositorySet();
-        $repositorySet->expects($this->exactly(2))
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->willReturnOnConsecutiveCalls(
-                $packages,
-                array_reverse($packages)
-            );
+        $httpDownloader = $this->getHttpDownloaderMock($io, $this->config);
+        $httpDownloader->expects(
+            [
+                ['url' => $repoApiUrl, 'status' => 404],
+            ],
+            true
+        );
 
-        $versionSelector = new VersionSelector($repositorySet);
-        $best = $versionSelector->findBestCandidate($packageName);
-        self::assertSame($package2, $best, 'Expecting 2.0.0-beta3, cause beta is more stable than dev');
+        // clean local clone if present
+        $fs = new Filesystem();
+        $fs->removeDirectory(sys_get_temp_dir() . '/composer-test');
+        $this->config->merge(['config' => ['cache-vcs-dir' => sys_get_temp_dir() . '/composer-test/cache']]);
 
-        $best = $versionSelector->findBestCandidate($packageName);
-        self::assertSame($package2, $best, 'Expecting 2.0.0-beta3, cause beta is more stable than dev');
-    }
+        $process = $this->getProcessExecutorMock();
+        $process->expects([
+            ['cmd' => 'git config github.accesstoken', 'return' => 1],
+            'git clone --mirror -- '.ProcessExecutor::escape($repoSshUrl).' '.ProcessExecutor::escape($this->config->get('cache-vcs-dir').'/git-github.com-composer-packagist.git/'),
+            [
+                'cmd' => 'git show-ref --tags --dereference',
+                'stdout' => $sha.' refs/tags/'.$identifier,
+            ],
+            [
+                'cmd' => 'git branch --no-color --no-abbrev -v',
+                'stdout' => '  test_master     edf93f1fccaebd8764383dc12016d0a1a9672d89 Fix test & behavior',
+            ],
+            [
+                'cmd' => 'git branch --no-color',
+                'stdout' => '* test_master',
+            ],
+        ], true);
 
-    public function testHighestVersionIsReturned(): void
-    {
-        $packageName = 'foo/bar';
+        $repoConfig = [
+            'url' => $repoUrl,
+        ];
 
-        $package1 = self::getPackage('foo/bar', '1.0.0');
-        $package2 = self::getPackage('foo/bar', '1.1.0-beta');
-        $packages = [$package1, $package2];
+        $gitHubDriver = new GitHubDriver($repoConfig, $io, $this->config, $httpDownloader, $process);
+        $gitHubDriver->initialize();
 
-        $repositorySet = $this->createMockRepositorySet();
-        $repositorySet->expects($this->once())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
+        self::assertEquals('test_master', $gitHubDriver->getRootIdentifier());
 
-        $versionSelector = new VersionSelector($repositorySet);
-        $best = $versionSelector->findBestCandidate($packageName, null, 'dev');
+        $dist = $gitHubDriver->getDist($sha);
+        self::assertIsArray($dist);
+        self::assertEquals('zip', $dist['type']);
+        self::assertEquals('https://api.github.com/repos/composer/packagist/zipball/SOMESHA', $dist['url']);
+        self::assertEquals($sha, $dist['reference']);
 
-        self::assertSame($package2, $best, 'Latest version should be returned (1.1.0-beta)');
-    }
+        $source = $gitHubDriver->getSource($identifier);
+        self::assertEquals('git', $source['type']);
+        self::assertEquals($repoSshUrl, $source['url']);
+        self::assertEquals($identifier, $source['reference']);
 
-    public function testHighestVersionMatchingStabilityIsReturned(): void
-    {
-        $packageName = 'foo/bar';
-
-        $package1 = self::getPackage('foo/bar', '1.0.0');
-        $package2 = self::getPackage('foo/bar', '1.1.0-beta');
-        $package3 = self::getPackage('foo/bar', '1.2.0-alpha');
-        $packages = [$package1, $package2, $package3];
-
-        $repositorySet = $this->createMockRepositorySet();
-        $repositorySet->expects($this->once())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
-
-        $versionSelector = new VersionSelector($repositorySet);
-        $best = $versionSelector->findBestCandidate($packageName, null, 'beta');
-
-        self::assertSame($package2, $best, 'Latest version should be returned (1.1.0-beta)');
-    }
-
-    public function testMostStableUnstableVersionIsReturned(): void
-    {
-        $packageName = 'foo/bar';
-
-        $package2 = self::getPackage('foo/bar', '1.1.0-beta');
-        $package3 = self::getPackage('foo/bar', '1.2.0-alpha');
-        $packages = [$package2, $package3];
-
-        $repositorySet = $this->createMockRepositorySet();
-        $repositorySet->expects($this->once())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
-
-        $versionSelector = new VersionSelector($repositorySet);
-        $best = $versionSelector->findBestCandidate($packageName, null, 'stable');
-
-        self::assertSame($package2, $best, 'Latest version should be returned (1.1.0-beta)');
-    }
-
-    public function testDefaultBranchAliasIsNeverReturned(): void
-    {
-        $packageName = 'foo/bar';
-
-        $package = self::getPackage('foo/bar', '1.1.0-beta');
-        $package2 = self::getPackage('foo/bar', 'dev-main');
-        $package2Alias = new AliasPackage($package2, VersionParser::DEFAULT_BRANCH_ALIAS, VersionParser::DEFAULT_BRANCH_ALIAS);
-        $packages = [$package, $package2Alias];
-
-        $repositorySet = $this->createMockRepositorySet();
-        $repositorySet->expects($this->once())
-            ->method('findPackages')
-            ->with($packageName, null)
-            ->will($this->returnValue($packages));
-
-        $versionSelector = new VersionSelector($repositorySet);
-        $best = $versionSelector->findBestCandidate($packageName, null, 'dev');
-
-        self::assertSame($package2, $best, 'Latest version should be returned (dev-main)');
-    }
-
-    public function testFalseReturnedOnNoPackages(): void
-    {
-        $repositorySet = $this->createMockRepositorySet();
-        $repositorySet->expects($this->once())
-            ->method('findPackages')
-            ->will($this->returnValue([]));
-
-        $versionSelector = new VersionSelector($repositorySet);
-        $best = $versionSelector->findBestCandidate('foobaz');
-        self::assertFalse($best, 'No versions are available returns false');
+        $source = $gitHubDriver->getSource($sha);
+        self::assertEquals('git', $source['type']);
+        self::assertEquals($repoSshUrl, $source['url']);
+        self::assertEquals($sha, $source['reference']);
     }
 
     /**
-     * @dataProvider provideRecommendedRequireVersionPackages
+     * @dataProvider invalidUrlProvider
      */
-    public function testFindRecommendedRequireVersion(string $prettyVersion, string $expectedVersion, ?string $branchAlias = null, string $packageName = 'foo/bar'): void
+    public function testInitializeInvalidRepoUrl(string $url): void
     {
-        $repositorySet = $this->createMockRepositorySet();
-        $versionSelector = new VersionSelector($repositorySet);
-        $versionParser = new VersionParser();
+        $this->expectException('\InvalidArgumentException');
 
-        $package = new Package($packageName, $versionParser->normalize($prettyVersion), $prettyVersion);
+        $repoConfig = [
+            'url' => $url,
+        ];
 
-        if ($branchAlias) {
-            $package->setExtra(['branch-alias' => [$prettyVersion => $branchAlias]]);
-        }
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $httpDownloader = $this->getMockBuilder('Composer\Util\HttpDownloader')
+            ->setConstructorArgs([$io, $this->config])
+            ->getMock();
 
-        $recommended = $versionSelector->findRecommendedRequireVersion($package);
-
-        // assert that the recommended version is what we expect
-        self::assertSame($expectedVersion, $recommended);
+        $gitHubDriver = new GitHubDriver($repoConfig, $io, $this->config, $httpDownloader, $this->getProcessExecutorMock());
+        $gitHubDriver->initialize();
     }
 
-    public static function provideRecommendedRequireVersionPackages(): array
+    /**
+     * @return list<array{string}>
+     */
+    public static function invalidUrlProvider()
     {
         return [
-            // real version, expected recommendation, [branch-alias], [pkg name]
-            ['1.2.1', '^1.2'],
-            ['1.2', '^1.2'],
-            ['v1.2.1', '^1.2'],
-            ['3.1.2-pl2', '^3.1'],
-            ['3.1.2-patch', '^3.1'],
-            ['2.0-beta.1', '^2.0@beta'],
-            ['3.1.2-alpha5', '^3.1@alpha'],
-            ['3.0-RC2', '^3.0@RC'],
-            ['0.1.0', '^0.1.0'],
-            ['0.1.3', '^0.1.3'],
-            ['0.0.3', '^0.0.3'],
-            ['0.0.3-alpha', '^0.0.3@alpha'],
-            ['0.0.3.4-alpha', '^0.0.3@alpha'],
-            ['3.0.0.2-RC2', '^3.0@RC'],
-            ['1.2.1.1020402', '^1.2'],
-            // date-based versions are not touched at all
-            ['v20121020', 'v20121020'],
-            ['v20121020.2', 'v20121020.2'],
-            // dev packages without alias are not touched at all
-            ['dev-master', 'dev-master'],
-            ['3.1.2-dev', '3.1.2-dev'],
-            // dev packages with alias inherit the alias
-            ['dev-master', '^2.1@dev', '2.1.x-dev'],
-            ['dev-master', '^2.1@dev', '2.1-dev'],
-            ['dev-master', '^2.1@dev', '2.1.3.x-dev'],
-            ['dev-master', '^2.0@dev', '2.x-dev'],
-            ['dev-master', '^0.3.0@dev', '0.3.x-dev'],
-            ['dev-master', '^0.0.3@dev', '0.0.3.x-dev'],
-            ['dev-master', 'dev-master', VersionParser::DEFAULT_BRANCH_ALIAS],
-            // numeric alias
-            ['3.x-dev', '^3.0@dev', '3.0.x-dev'],
-            ['3.x-dev', '^3.0@dev', '3.0-dev'],
-            // ext in sync with php
-            [PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '.' . PHP_RELEASE_VERSION,  '*', null, 'ext-filter'],
-            // ext versioned individually
-            ['3.0.5', '^3.0', null, 'ext-xdebug'],
+            ['https://github.com/acme'],
+            ['https://github.com/acme/repository/releases'],
+            ['https://github.com/acme/repository/pulls'],
         ];
     }
 
     /**
-     * @return \PHPUnit\Framework\MockObject\MockObject&\Composer\Repository\RepositorySet
+     * @dataProvider supportsProvider
      */
-    private function createMockRepositorySet()
+    public function testSupports(bool $expected, string $repoUrl): void
     {
-        return $this->getMockBuilder('Composer\Repository\RepositorySet')
-            ->disableOriginalConstructor()
-            ->getMock();
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+
+        self::assertSame($expected, GitHubDriver::supports($io, $this->config, $repoUrl));
+    }
+
+    /**
+     * @return list<array{bool, string}>
+     */
+    public static function supportsProvider(): array
+    {
+        return [
+            [false, 'https://github.com/acme'],
+            [true, 'https://github.com/acme/repository'],
+            [true, 'git@github.com:acme/repository.git'],
+            [false, 'https://github.com/acme/repository/releases'],
+            [false, 'https://github.com/acme/repository/pulls'],
+        ];
+    }
+
+    public function testGetEmptyFileContent(): void
+    {
+        $repoUrl = 'http://github.com/composer/packagist';
+
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $io->expects($this->any())
+            ->method('isInteractive')
+            ->will($this->returnValue(true));
+
+        $httpDownloader = $this->getHttpDownloaderMock($io, $this->config);
+        $httpDownloader->expects(
+            [
+                ['url' => 'https://api.github.com/repos/composer/packagist', 'body' => '{"master_branch": "test_master", "owner": {"login": "composer"}, "name": "packagist", "archived": true}'],
+                ['url' => 'https://api.github.com/repos/composer/packagist/contents/composer.json?ref=main', 'body' => '{"encoding":"base64","content":""}'],
+            ],
+            true
+        );
+
+        $repoConfig = [
+            'url' => $repoUrl,
+        ];
+
+        $gitHubDriver = new GitHubDriver($repoConfig, $io, $this->config, $httpDownloader, $this->getProcessExecutorMock());
+        $gitHubDriver->initialize();
+
+        self::assertSame('', $gitHubDriver->getFileContent('composer.json', 'main'));
+    }
+
+    /**
+     * @param string|object $object
+     * @param mixed         $value
+     */
+    protected function setAttribute($object, string $attribute, $value): void
+    {
+        $attr = new \ReflectionProperty($object, $attribute);
+        $attr->setAccessible(true);
+        $attr->setValue($object, $value);
     }
 }

@@ -1,45 +1,132 @@
-// @filename: node_modules/aws-lambda/index.d.ts
-export type Handler<TEvent = any, TResult = any> = (
-    event: TEvent,
-    context: {},
-    callback: Callback<TResult>,
-) => void | Promise<TResult>;
+import {
+    createCodeFixAction,
+    createCodeFixActionWithoutFixAll,
+    createCombinedCodeActions,
+    eachDiagnostic,
+    registerCodeFix,
+} from "../_namespaces/ts.codefix.js";
+import {
+    __String,
+    append,
+    CodeFixAction,
+    CodeFixContext,
+    Diagnostics,
+    factory,
+    firstDefined,
+    getHostSignatureFromJSDoc,
+    getJSDocHost,
+    getJSDocTags,
+    getTokenAtPosition,
+    HasJSDoc,
+    Identifier,
+    isIdentifier,
+    isJSDocParameterTag,
+    JSDocParameterTag,
+    JSDocTag,
+    length,
+    map,
+    SignatureDeclaration,
+    SourceFile,
+    textChanges,
+} from "../_namespaces/ts.js";
 
-export type Callback<TResult = any> = (error?: Error | string | null, result?: TResult) => void;
+const deleteUnmatchedParameter = "deleteUnmatchedParameter";
+const renameUnmatchedParameter = "renameUnmatchedParameter";
 
-// @filename: node_modules/lambda-tester/index.d.ts
-import { Handler, Callback } from 'aws-lambda';
-declare namespace lambdaTester {
-    type HandlerEvent<T extends Handler> = T extends Handler<infer TEvent> ? TEvent : never;
-    type HandlerResult<T extends Handler> = T extends Handler<any, infer TResult> ? TResult : never;
-    type HandlerError<T extends Handler> = T extends Handler<any, infer TResult>
-        ? NonNullable<Parameters<Callback<TResult>>['0']>
-        : never;
+const errorCodes = [
+    Diagnostics.JSDoc_param_tag_has_name_0_but_there_is_no_parameter_with_that_name.code,
+];
 
-    interface VerifierFn<S> {
-        (result: S, additional?: any): void | Promise<void>;
-        (result: S, additional?: any, done?: () => {}): void;
-    }
-    type Verifier<S> = S extends HandlerError<Handler>
-        ? S extends string
-            ? VerifierFn<string>
-            : S extends Error
-            ? VerifierFn<Error>
-            : never
-        : VerifierFn<S>;
+registerCodeFix({
+    fixIds: [deleteUnmatchedParameter, renameUnmatchedParameter],
+    errorCodes,
+    getCodeActions: function getCodeActionsToFixUnmatchedParameter(context) {
+        const { sourceFile, span } = context;
+        const actions: CodeFixAction[] = [];
+        const info = getInfo(sourceFile, span.start);
+        if (info) {
+            append(actions, getDeleteAction(context, info));
+            append(actions, getRenameAction(context, info));
+            return actions;
+        }
+        return undefined;
+    },
+    getAllCodeActions: function getAllCodeActionsToFixUnmatchedParameter(context) {
+        const tagsToSignature = new Map<SignatureDeclaration, JSDocTag[]>();
+        return createCombinedCodeActions(textChanges.ChangeTracker.with(context, changes => {
+            eachDiagnostic(context, errorCodes, ({ file, start }) => {
+                const info = getInfo(file, start);
+                if (info) {
+                    tagsToSignature.set(info.signature, append(tagsToSignature.get(info.signature), info.jsDocParameterTag));
+                }
+            });
 
-    class LambdaTester<T extends Handler> {
-        event(event: HandlerEvent<T>): this;
-    }
+            tagsToSignature.forEach((tags, signature) => {
+                if (context.fixId === deleteUnmatchedParameter) {
+                    const tagsSet = new Set(tags);
+                    changes.filterJSDocTags(signature.getSourceFile(), signature, t => !tagsSet.has(t));
+                }
+            });
+        }));
+    },
+});
+
+function getDeleteAction(context: CodeFixContext, { name, jsDocHost, jsDocParameterTag }: Info) {
+    const changes = textChanges.ChangeTracker.with(context, changeTracker => changeTracker.filterJSDocTags(context.sourceFile, jsDocHost, t => t !== jsDocParameterTag));
+    return createCodeFixAction(
+        deleteUnmatchedParameter,
+        changes,
+        [Diagnostics.Delete_unused_param_tag_0, name.getText(context.sourceFile)],
+        deleteUnmatchedParameter,
+        Diagnostics.Delete_all_unused_param_tags,
+    );
 }
 
-declare function lambdaTester<T extends Handler>(handler: T): lambdaTester.LambdaTester<T>;
+function getRenameAction(context: CodeFixContext, { name, jsDocHost, signature, jsDocParameterTag }: Info) {
+    if (!length(signature.parameters)) return undefined;
 
-export = lambdaTester;
-// @filename: index.ts
+    const sourceFile = context.sourceFile;
+    const tags = getJSDocTags(signature);
+    const names = new Set<__String>();
+    for (const tag of tags) {
+        if (isJSDocParameterTag(tag) && isIdentifier(tag.name)) {
+            names.add(tag.name.escapedText);
+        }
+    }
+    // @todo - match to all available names instead to the first parameter name
+    // @see /codeFixRenameUnmatchedParameter3.ts
+    const parameterName = firstDefined(signature.parameters, p => isIdentifier(p.name) && !names.has(p.name.escapedText) ? p.name.getText(sourceFile) : undefined);
+    if (parameterName === undefined) return undefined;
 
-import * as lambdaTester from 'lambda-tester';
-import { Handler } from 'aws-lambda';
+    const newJSDocParameterTag = factory.updateJSDocParameterTag(
+        jsDocParameterTag,
+        jsDocParameterTag.tagName,
+        factory.createIdentifier(parameterName),
+        jsDocParameterTag.isBracketed,
+        jsDocParameterTag.typeExpression,
+        jsDocParameterTag.isNameFirst,
+        jsDocParameterTag.comment,
+    );
+    const changes = textChanges.ChangeTracker.with(context, changeTracker => changeTracker.replaceJSDocComment(sourceFile, jsDocHost, map(tags, t => t === jsDocParameterTag ? newJSDocParameterTag : t)));
+    return createCodeFixActionWithoutFixAll(renameUnmatchedParameter, changes, [Diagnostics.Rename_param_tag_name_0_to_1, name.getText(sourceFile), parameterName]);
+}
 
-type Actual = lambdaTester.Verifier<lambdaTester.HandlerResult<Handler>>;
-type Expected = lambdaTester.Verifier<lambdaTester.HandlerResult<Handler<any, any>>>;
+interface Info {
+    readonly jsDocHost: HasJSDoc;
+    readonly signature: SignatureDeclaration;
+    readonly jsDocParameterTag: JSDocParameterTag;
+    readonly name: Identifier;
+}
+
+function getInfo(sourceFile: SourceFile, pos: number): Info | undefined {
+    const token = getTokenAtPosition(sourceFile, pos);
+    if (token.parent && isJSDocParameterTag(token.parent) && isIdentifier(token.parent.name)) {
+        const jsDocParameterTag = token.parent;
+        const jsDocHost = getJSDocHost(jsDocParameterTag);
+        const signature = getHostSignatureFromJSDoc(jsDocParameterTag);
+        if (jsDocHost && signature) {
+            return { jsDocHost, signature, name: token.parent.name, jsDocParameterTag };
+        }
+    }
+    return undefined;
+}

@@ -1,14 +1,82 @@
----
-title: 快速部署網站的新選擇：Zeabur 使用心得
-date: 2024-04-14 11:40:00
-catalog: true
-tags: [Web]
-categories: [Web]
-photos: /img/zeabur-introduction-deploy-service/cover.png
----
+在預約時需要提供一些基本資料，例如說姓名以及 email 等等，輸入後即可完成預約：
 
-以前當我想要部署一個簡單的服務時，我會去 Heroku 上面，因為簡單而且免費，雖然說還是有些使用限制，但整體而言還是很方便的，甚至還有一些簡單的 DB 可以用。如果是靜態網頁，會選擇 Netlify 或是 GitHub Pages，也都是簡單方便的選擇。
+![intro2](/img/wordpress-plugin-amelia-sensitive-information-disclosure/p2-intro-2.png)
 
-但 Heroku 從 2022 年年底之後就不再提供免費方案了，因此那時一堆人在尋找替代方案，包括 Render 或是 fly[dot]io 等等，都是很多人跳槽的新選擇。而我自己以前其實在 Heroku 上也有三四個專案，從 Heroku 改變方案之後就再也沒也動過了。
+完成預約以後，Amelia 會幫你在 WordPress 系統裡面新增一個低權限的帳號，並且把重設密碼的連結寄到剛剛提供的信箱。帳號開通以後，就可以登入 WordPress 管理剛剛的預約：
 
-前陣子收到 [Zeabur](https://zeabur.com/zh-TW) 創辦人的來信，希望有機會能跟我合作推廣這個平台，我自己試了之後發現體驗確實很不錯，因此就寫了這篇文章介紹一下。
+![intro3](/img/wordpress-plugin-amelia-sensitive-information-disclosure/p3-intro-3.png)
+
+使用方式介紹完以後，我們來看一下更技術的部分。
+
+## WordPress 外掛與 Amelia 架構介紹
+
+WordPress 的外掛有很多，每一個的寫法都不太一樣，但因為是外掛，所以會呼叫 WordPress 提供的函式來註冊事件。
+
+`add_action` 這個函式就扮演著很重要的角色，你可以幫特定的 action 加上一個 hook，當這個 action 被觸發時，就會呼叫到你提供的函式。
+
+其中由 `wp_ajax_nopriv_` 開頭的 action，可以透過 `wp-admin/admin-ajax.php` 來呼叫，相關程式碼節錄如下（[admin-ajax.php](https://github.com/WordPress/WordPress/blob/master/wp-admin/admin-ajax.php)）：
+
+``` php
+<?php
+
+$action = $_REQUEST['action'];
+
+if ( is_user_logged_in() ) {
+  // If no action is registered, return a Bad Request response.
+  if ( ! has_action( "wp_ajax_{$action}" ) ) {
+    wp_die( '0', 400 );
+  }
+
+  /**
+   * Fires authenticated Ajax actions for logged-in users.
+   *
+   * The dynamic portion of the hook name, `$action`, refers
+   * to the name of the Ajax action callback being fired.
+   *
+   * @since 2.1.0
+   */
+  do_action( "wp_ajax_{$action}" );
+} else {
+  // If no action is registered, return a Bad Request response.
+  if ( ! has_action( "wp_ajax_nopriv_{$action}" ) ) {
+    wp_die( '0', 400 );
+  }
+
+  /**
+   * Fires non-authenticated Ajax actions for logged-out users.
+   *
+   * The dynamic portion of the hook name, `$action`, refers
+   * to the name of the Ajax action callback being fired.
+   *
+   * @since 2.8.0
+   */
+  do_action( "wp_ajax_nopriv_{$action}" );
+}
+
+?>
+```
+
+以 Amelia 來說，在 `ameliabooking.php` 中註冊了兩個 hook：
+
+``` php
+/** Isolate API calls */
+add_action('wp_ajax_wpamelia_api', array('AmeliaBooking\Plugin', 'wpAmeliaApiCall'));
+add_action('wp_ajax_nopriv_wpamelia_api', array('AmeliaBooking\Plugin', 'wpAmeliaApiCall'));
+```
+
+有 `nopriv` 的代表沒有權限（未登入）也可以呼叫，沒有的代表需要登入 WordPress 系統才能呼叫，而許多的 plugin 會選擇自己處理身份驗證相關的邏輯，所以會把兩個動作都導到同一個地方。
+
+
+而 `wpAmeliaApiCall` 這個函式則是註冊了 routes：
+
+``` php
+/**
+ * API Call
+ *
+ * @throws \InvalidArgumentException
+ */
+public static function wpAmeliaApiCall()
+{
+    try {
+        /** @var Container $container */
+        $container = require AMELIA_PATH . '/src/Infrastructure/ContainerConfig/container.php';

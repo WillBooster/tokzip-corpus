@@ -1,78 +1,78 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
-using System.Diagnostics.CodeAnalysis;
-using System.Text.RegularExpressions;
-
+using System;
+using System.Reflection;
+using System.Threading;
 using NUnit.Framework.Internal;
 
-namespace NUnit.Framework.Constraints
+namespace NUnit.Framework.Tests.TestUtilities
 {
-    /// <summary>
-    /// RegexConstraint can test whether a string matches
-    /// the pattern provided.
-    /// </summary>
-    public class RegexConstraint : Constraint
+    public static class StressUtility
     {
-        private Regex _regex;
-
-        /// <summary>
-        /// The Description of what this constraint tests, for
-        /// use in messages and in the ConstraintResult.
-        /// </summary>
-        public override string Description
+        public static void RunParallel(Action action, int times, int maxParallelism, bool useThreadPool = true)
         {
-            get
+            if (action is null)
+                throw new ArgumentNullException(nameof(action));
+            if (times < 0)
+                throw new ArgumentOutOfRangeException(nameof(times), times, "Number of times to run must be greater than or equal to 0.");
+            if (maxParallelism < 1)
+                throw new ArgumentOutOfRangeException(nameof(maxParallelism), maxParallelism, "Max parallelism must be greater than or equal to 1.");
+
+            if (times == 0)
+                return;
+
+            maxParallelism = Math.Min(times, maxParallelism);
+            var exception = default(Exception);
+
+            var threadsToWaitFor = maxParallelism;
+            using (var noMoreThreadsEvent = new ManualResetEventSlim())
             {
-                var description = $"String matching \"{_regex}\"";
-                var caseInsensitive = (_regex.Options & RegexOptions.IgnoreCase) == RegexOptions.IgnoreCase;
-                if (caseInsensitive)
+                for (var i = 0; i < maxParallelism; i++)
                 {
-                    description += ", ignoring case";
+                    var work = new Action(() =>
+                    {
+                        try
+                        {
+                            while (Interlocked.Decrement(ref times) >= 0)
+                            {
+                                action.Invoke();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Volatile.Write(ref exception, ex);
+                            Volatile.Write(ref times, 0);
+                        }
+                        finally
+                        {
+                            if (Interlocked.Decrement(ref threadsToWaitFor) == 0)
+                                noMoreThreadsEvent.Set();
+                        }
+                    });
+
+                    if (useThreadPool)
+                    {
+                        ThreadPool.QueueUserWorkItem(_ => work.Invoke());
+                    }
+                    else
+                    {
+                        MethodInfo? actionMethod = action.GetMethodInfo();
+
+                        new Thread(work.Invoke)
+                        {
+                            Name = $"{nameof(StressUtility)}.{nameof(RunParallel)} ({actionMethod?.Name ?? "anonymous"}) dedicated thread {maxParallelism + 1}"
+                        }.Start();
+                    }
                 }
-                return description;
+
+                noMoreThreadsEvent.Wait();
+
+                Exception? readException = Volatile.Read(ref exception);
+                if (readException is not null)
+                {
+                    ExceptionHelper.Rethrow(readException);
+                }
             }
-        }
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="RegexConstraint"/> class.
-        /// </summary>
-        /// <param name="pattern">The pattern.</param>
-        public RegexConstraint([StringSyntax(StringSyntaxAttribute.Regex)] string pattern) : base(pattern)
-        {
-            _regex = new Regex(pattern);
-        }
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="RegexConstraint"/> class.
-        /// </summary>
-        /// <param name="regex">The Regex pattern object.</param>
-        public RegexConstraint(Regex regex) : base(regex.ToString())
-        {
-            _regex = regex;
-        }
-
-        /// <summary>
-        /// Modify the constraint to ignore case in matching.
-        /// </summary>
-        public RegexConstraint IgnoreCase
-        {
-            get
-            {
-                _regex = new Regex(_regex.ToString(), _regex.Options | RegexOptions.IgnoreCase);
-                return this;
-            }
-        }
-
-        /// <summary>
-        /// Applies the regex constraint to an actual value, returning a ConstraintResult.
-        /// </summary>
-        /// <param name="actual">The string to be tested.</param>
-        /// <returns>True for success, false for failure.</returns>
-        public override ConstraintResult ApplyTo<TActual>(TActual actual)
-        {
-            string actualString = ConstraintUtils.RequireActual<string>(actual, nameof(actual), allowNull: false);
-
-            return new ConstraintResult(this, actual, _regex.IsMatch(actualString));
         }
     }
 }

@@ -1,22 +1,194 @@
----
-title: LINE CTF 2023 筆記
-catalog: true
-date: 2023-03-27 09:10:44
-tags: [Security]
-categories: [Security]
-photos: /img/linectf-2023-writeup/cover.png
----
+通常在程式中會有兩種產生隨機數的方式，一種安全的，另一種不安全，這裡的安全專有名詞是「cryptographically strong」，密碼學上的安全。
 
-今年 Water Paddler 拿了第二名，總共 9 題 web 解掉了 8 題（我貢獻了 2 題），整體 web 的難度我覺得去年似乎比較難，今年比的人似乎也比較少一點。
+以 JavaScript 而言，不安全的是 `Math.random`，安全的是 `crypto.getRandomValues`，差別在於背後的實作為何，前者是可以預測的，而後者不行。
 
-話說最近我發現自己的 writeup 筆記沒有以前這麼多了，其中一個原因是最近比較忙，另一個原因是最近有興趣的題目（client side）沒這麼多，或我也有在想搞不好是隊友越變越強，還沒開題就被隊友解掉，我也懶得再去看題目，於是就懶得寫筆記了XD
+為什麼可以預測呢？因為大部分的隨機數都不是真的隨機數，而是「假裝成隨機數」，例如說有個簡單的產生隨機數的演算法叫 LCG（Linear Congruential Generator），寫成 JavaScript 程式碼是：
 
-這次只記幾題有參與或有興趣的，其他就先省略了。
+``` js
+class LCG {
+  constructor(seed) {
+    this.state = seed;
+  }
 
-<!-- more -->
+  next() {
+    const a = 1664525;
+    const c = 1013904223;
+    const m = 2 ** 32;
 
-## Flag Masker (9 solves)
+    this.state = (a * this.state + c) % m;
+    return this.state;
+  }
+}
 
-這題後端的程式碼很簡單，就是可以建立一個 note，然後輸出是安全的，沒有 XSS 的風險。
+const rng = new LCG(123);
 
-有趣的地方是 admin bot 接了一個 extension，程式碼有混淆過但幸好很短，worker.js 如下：
+console.log(rng.next());
+console.log(rng.next());
+console.log(rng.next());
+```
+
+你傳入一個 seed 當作初始狀態 `state`，然後透過固定的公式：`1664525 * state + 1013904223` 再對 `m` 取餘數，得到的結果就是隨機數，同時也會成為下一個狀態。上面這個負責產生隨機數的函式會被稱為 PRNG（Pseudo-Random Number Generator），中文是偽隨機數產生器。
+
+所以只要你的 seed 一樣，每次產生出來的隨機數序列都一樣。反過來講，當你拿到足夠的隨機數以後，就可以反推回去原本的 seed 是什麼，這就是為什麼它可以被預測，就是單純的數學而已。
+
+DNS resolver 背後用的軟體叫 BIND，而 BIND 在產生隨機數時，用的是一個叫 `Xoshiro128**` 的 PRNG，在拿到多個 output 之後，就可以往回推它的初始狀態，拿到初始狀態以後，就可以預測下一個以及之後每一個隨機數會是多少。
+
+這其實就是解聯立方程式啦，跟 `2x+y+z=3`、`5x+2y+3z=2`、`x+y+z=9`，請問 x、y、z 是多少的意思。
+
+那重點是這些 output 要怎麼拿到呢？除了 transaction ID 跟 port 以外，BIND 在其他地方也用了相同的隨機數產生器。舉例來說，當我 query `google.com` 的紀錄時，第一次的回覆是：
+
+```
+google.com.   252 IN  A 142.250.21.102
+google.com.   252 IN  A 142.250.21.138
+google.com.   252 IN  A 142.250.21.139
+google.com.   252 IN  A 142.250.21.113
+google.com.   252 IN  A 142.250.21.101
+google.com.   252 IN  A 142.250.21.100
+```
+
+而第二次的回覆是：
+
+```
+google.com.   247 IN  A 142.250.21.138
+google.com.   247 IN  A 142.250.21.139
+google.com.   247 IN  A 142.250.21.113
+google.com.   247 IN  A 142.250.21.101
+google.com.   247 IN  A 142.250.21.100
+google.com.   247 IN  A 142.250.21.102
+```
+
+每個結果都是針對 `google.com` 的 A type，我們把它稱為一組 Resource Record Set，簡稱 RRSet，而你可以清楚看見雖然兩次回覆的 IP 都是那一些，但順序不一樣。
+
+這個順序就是隨機決定的，因此當你 RRSet 裡面的紀錄夠多時（根據原文是 23 個以上），就可以從排序結果反推出 PRNG 其中一部分的 seed，多做幾次就可以還原所有 128 bits 的 seed，就破解隨機數了。
+
+隨機數被破解以後，port 跟 transaction ID 都一猜就中，40 億次的可能性被你偷看未來以後縮減到只剩下 1，前面加的保護措施都沒用了。而解法的話，就是把隨機數換成更安全的產生方式，以及重要的跟不重要的隨機數不要混在一起。
+
+像這個例子就是重要的隨機數如 transaction ID 跟 port，用的 PRNG instance 跟那些不重要的隨機數如 RRSet 排序相同，所以你可以從其他地方反推回去 seed 是什麼。
+
+這個漏洞已經在去年 10 月修復，官方公告在這：[CVE-2025-40780: Cache poisoning due to weak PRNG](https://kb.isc.org/docs/cve-2025-40780)。
+
+話說我也是意外找到這個還沒公開演講的研究，我問了 codex DNS 快取污染有哪些手法，它就找這個給我，如果是我自己去 google 搞不好搜尋不到，會先搜到其他文章。
+
+不過由於文章很新，所以無論是 ChatGPT 還是 Gemini，只要它沒有用到搜尋工具，給你的答案就會是一堆幻覺（但看起來很真而且頭頭是道），會講出一堆原文沒寫的東西。
+
+## 難道 DNS 真的如此不安全？談 DNSSEC 與 DNS cookie
+
+在 DNS Cache Poisoning Like it’s 2006 的 paper 中可以看到許多細節，其中一段是在講 DNS cookie，我看到的時候想說：「怎麼又來個我沒聽過的新名詞」，於是就去查了一下這是什麼。
+
+DNS cookie 的提案雖然在 2006 就有了，但一直到 2016 才正式變成 [RFC 7873](https://datatracker.ietf.org/doc/draft-ietf-dnsop-cookies/10/)，它想解決的主要就是封包偽造的問題。
+
+前面寫這麼多東西，根本就在於封包偽造這件事，而 DNS cookie 提出來的解法是當 DNS resolver 要問 DNS name server 問題時，先帶上一個 64 bits 的 client cookie，這個 client cookie 的產生方式可以類似這樣，用 client IP + server IP 搭配一個 secret 算出來：
+
+```
+HMAC-SHA256-64(Client IP Address | Server IP Address, Client Secret)
+```
+
+接著把這個 client cookie 跟想查詢的 domain 一起傳給 name server。
+
+當 name server 收到後，就用類似的方法產生出一個獨一無二的 server cookie（例如說把 client IP + client cookie + server secret 一起做個 hash），把查詢的答案跟 server cookie 一起發給 client，而 DNS resolver 收到後就把 server cookie 存起來。
+
+從這之後，所有從 DNS resolver 發給該 name server 的查詢請求，都會帶著 client cookie + server cookie。而 name server 也是，兩邊在收到請求時都會檢查 client cookie 與 server cookie 是否正確。
+
+當這個關係建立後，DNS resolver 如果收到偽造的回應，由於攻擊者不知道 client cookie，也沒辦法偽造 server cookie，所以驗證就不會通過。
+
+那在上一個小結討論的猜測隨機數的手法，是怎麼繞過這個 DNS cookie 的防禦呢？
+
+雖然 DNS cookie 這個機制在 BIND 裡面預設就是開啟的，但是新版的過期時間是 60 秒，每 60 秒就會把整個流程重來一次，因此攻擊者每 60 秒就有一次機會攻擊，只要你能比權威 DNS 更快回應，就能先傳送你自己的 client cookie，進而繞過這個保護機制。
+
+所以 DNS cookie 這整個機制看似沒問題，但因為過期時間太短了，所以在剛過期後的那一個 window 裡面，就等於是沒這個防護的。
+
+再者，DNS cookie 其實也沒這麼普及，在 Alexa 排名前一百萬的網站裡面，只有 32% 有支援。
+
+除了 DNS cookie 以外，還有一個保護措施叫做 DNSSEC，而論文中有提到他們假設 victim 沒有開啟這個機制，所以不用繞過。
+
+那 DNSSEC 又是什麼呢？
+
+全名為 DNS Security Extensions，要解決的問題是一樣的，就是該怎麼讓攻擊者無法偽造權威 DNS 的回應。
+
+前面提過的方法其實都治標不治本，一開始 transaction ID 能被猜中，所以加了個隨機的 port，就猜不到了，然後也有了 DNS cookie，再多一個你猜不到的 client cookie 外加 server cookie，以第一個連線的人為準。
+
+但這些方法沒有一個能保證 DNS resolver 收到的回應就是來自於權威 DNS，只是用隨機性來增加難度。真正能保證的，應該是像 HTTPS 那樣，建立一個信任鏈，能靠數位簽章來驗證。
+
+而 DNSSEC 就是如此，簡單來講，可以想成權威 DNS 的回應中會帶有一個 signature，而 DNS resolver 收到以後，可以用密碼學的方式來驗證這個 signature 是不是 `huli.tw` 簽出來的，是的話才承認，就能夠防止其他人偽造。
+
+但這個聽起來如此好用的機制，實際的使用率非常低，根據 [M11: DNSSEC Deployment in TLD and SLD](https://ithi.research.icann.org/graph-m11.html) 給的數字，世界前 100 名的網站只有 7% 有設置，而 `.tw` 也只有 12%。
+
+DNSSEC 是要自己配的，所以是每個 domain owner 自己要去處理，配錯的話可能 user 訪問網站就有問題。查了一圈，推不起來的原因看起來是部署比較麻煩外加沒有誘因。跟實作的成本比起來，帶來的收益似乎更低。
+
+不過現在有些網域代管的服務幫你把這些麻煩事做掉了，如 [TWNIC](https://www.twnic.tw/blog/contents.php?id=96&lang=zh-tw) 已經預設啟用 DNSSEC，而 [Cloudflare](https://www.cloudflare.com/zh-tw/learning/dns/dnssec/universal-dnssec/) 也可以一鍵開啟。但對於那些有技術債的大公司來說，或許成本還是相對較高的，並不是按個按鍵就能開啟這麼簡單。
+
+## DNS 天生的缺陷與隱私保護
+
+其實在討論 DNS 相關的攻擊時，都會先分成兩個種類：on-path 與 off-path。
+
+這個 path 指的是 DNS 封包的傳送路徑。DNS server 彼此之間溝通的封包並沒有任何加密，因此傳送封包時，中間的任何一個節點都可以看到內容或是篡改，這個攻擊路徑就叫 on-path。
+
+而 off-path 指的就是攻擊者並不在路徑上，看不到封包也沒辦法直接竄改，前面講的那些攻擊案例都是基於 off-path 的。由於 on-path 能看能改，因此上面所說的各種防禦手法，就只有 DNSSEC 能真正防禦 on-path 的攻擊，因為它依靠的是數位簽章，而不是某些隨機數。
+
+也因為 DNS 封包沒加密，因此你所使用的 DNS resolver，甚至是這整條鏈路上的節點，都能看到你的封包，知道你查詢了哪些網站，洩漏了你的隱私。
+
+因此呢，就有兩個技術出現了，一個是 DNS over TLS，簡稱 DoT，把 TLS 那套搬到 DNS 查詢身上，這次改走 TCP 連線外加 TLS 驗證，跟 HTTPS 類似，讓其他人都看不到封包內容。
+
+另一個技術是 DNS over HTTPS，簡稱 DoH，把 DNS 查詢那套換成 HTTPS，例如說要查 DNS 時就用 `POST /dns-query` 發送請求，也能達到防止隱私外洩的效果。像是 Google 的[公用 DNS](https://developers.google.com/speed/public-dns/docs/doh?hl=zh-tw) 就有提供這個功能：
+
+![Google public DNS](/img/learn-network-from-attack-dns/p2.png)
+
+這兩個技術都是運用在：「從你的電腦發封包去 DNS resolver」這個情境上，保護你的隱私不會外洩，讓 ISP 看不到你到底查詢哪些網站。
+
+<div class="dns-demo-embed">
+  <iframe
+    title="DNS over HTTPS comparison demo"
+    src="/demo/learn-network-from-attack-dns/07-doh-comparison.html?lang=zh-tw&theme=light"
+    data-src="/demo/learn-network-from-attack-dns/07-doh-comparison.html"
+    data-demo-frame
+    data-height-desktop="360"
+    data-height-tablet="360"
+    data-height-mobile="420"
+    loading="lazy"
+    style="width:100%;height:360px;border:0;border-radius:8px;overflow:hidden;display:block;"
+  ></iframe>
+</div>
+
+如果想知道你電腦現在有沒有開啟，可以用這個服務：https://one.one.one.one/help/
+
+像我的電腦預設就是沒開的：
+
+![檢查 DNS](/img/learn-network-from-attack-dns/p3.png)
+
+但要記住的是，這些技術保護的是「你的電腦到 DNS resolver」這段，所以如果你還是用中華電信的 DNS resolver，那中華電信照樣能看到你的 DNS query。
+
+那有沒有方法可以讓 DNS resolver 也不知道呢？
+
+有一個比較新的標準 [RFC 9230: Oblivious DNS over HTTPS](https://www.rfc-editor.org/info/rfc9230/)，簡稱 ODoH，就是為了解決這個問題。
+
+解法很簡單，就是在你的電腦跟 DNS resolver 中間加了一層 proxy。你加密封包以後傳給 proxy，proxy 只看得到你的 IP，但看不到你要查什麼，然後 proxy 把封包轉給 DNS resolver，這時 DNS resolver 雖然看得到查詢內容，但不知道來源 IP。
+
+所以 proxy 知道你的 IP，但不知道你要查什麼；DNS resolver 知道要查什麼，但不知道你是誰，因為所有封包都是從 proxy 來的。只要 proxy 跟 DNS resolver 不是同一個人控制的，就不會得到完整的資訊。（話說在 RFC 裡，其實是分成 proxy 跟 target，這個 target 不一定要是 DNS resolver，是個把封包轉送到 resolver 的另一個 proxy 也行）
+
+Apple 的 [iCloud 私密轉送](https://support.apple.com/zh-tw/102602) 就是這個設計。
+
+## 結語
+
+當我們想造訪 `huli.tw` 時，系統就會去問 DNS resolver 這個網域對應到的 IP，而 resolver 會先問 root name server，得到「你去問 `.tw`」的回覆，接著轉而去問管理 tw 的 TLD name server，得到「你去問 Cloudflare」的回答，而身為 authoritative name server 的 Cloudflare，最終給了 `104.21.51.169` 的回答。
+
+若是有攻擊者在 Cloudflare 回答之前，搶先回答：「我知道，答案是 `8.8.8.8`」，那我們訪問 `huli.tw` 時，就會連到這個假的地址，這就是 DNS 快取污染的攻擊。
+
+為了防止這個攻擊，必須讓攻擊者沒辦法偽造封包，因此出現了隨機的 transaction ID、隨機的 port，或是 DNS cookie 還有 DNSSEC 等機制，想解決的問題都是類似的：「該如何保證 DNS resolver 拿到的結果是正確的」。
+
+而除此之外，明文的 DNS 天生碰到的另一個問題是隱私，當系統在問 DNS resolver `huli.tw` 的 IP 是什麼的時候，大家都會知道我要造訪 `huli.tw`。
+
+為了解決這個隱私問題，就出現了 DoT 與 DoH 等機制，透過加密來保護 DNS 查詢的封包，就算攔截到了，也看不到裡面的內容，還有更新的 ODoH，又加了一層保護。
+
+以上就是這篇的精華版總結，供大家參考。
+
+最一開始，我只是對 DNS 快取污染有所好奇，去問了 AI 有什麼攻擊手法，得到了 DNS Cache Poisoning Like it's 2006 那篇論文，從這篇論文知道了 2008 年 Dan Kaminsky 的攻擊手法，也學到了什麼是 DNS cookie。
+
+接著不斷往前推進，再次學習 DNS 查詢的過程（以前學過但沒學這麼細），也順便查了會有哪些問題，把這方面的知識補足。在這學習的路途中，AI 幫了不少忙，很多疑問都直接問 AI 並且獲得答案，我會同時問 ChatGPT、Gemini 還有 Codex（GPT 5.5）交叉比對一下，順便自己動手去 google 相關資料，看是不是對的。
+
+DNS Cache Poisoning Like it's 2006 因為太新了所以出現不少幻覺：
+
+![Gemini 幻覺其一](/img/learn-network-from-attack-dns/p4.png)
+
+![Gemini 幻覺其二](/img/learn-network-from-attack-dns/p5.png)
+
+這樣看了一輪下來，覺得自己終於對 DNS 這整套系統有更多的一些理解，最有收穫的是我自己，然後也想把學到的東西整理過後分享給讀者。這次的文章還有一點不同，那就是開始嘗試搭配 AI 做一些互動式的網頁，希望能幫助理解，不曉得效果如何，有什麼建議都可以在底下留言或是透過表單跟我分享。

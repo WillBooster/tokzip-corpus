@@ -1,138 +1,114 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
-using NUnit.Framework.Internal;
-using NUnit.Framework.Tests.TestUtilities;
+using System.Collections.Generic;
+using System.Threading;
+using NUnit.Framework.Interfaces;
+using NUnit.Framework.Internal.Abstractions;
+using NUnit.Framework.Internal.Extensions;
 
-namespace NUnit.Framework.Tests.Internal.Filters
+namespace NUnit.Framework.Internal.Execution
 {
-    // Filter XML formats
-    //
-    // Empty Filter:
-    //    <filter/>
-    //
-    // Id Filter:
-    //    <id>1</id>
-    //    <id>1,2,3</id>
-    //
-    // TestName filter
-    //    <test>xxxxxxx.xxx</test>
-    //
-    // Name filter
-    //    <name>xxxxx</name>
-    //
-    // Namespace filter
-    //    <namespace>xxxxx</namespace>
-    //
-    // Category filter
-    //    <cat>cat1</cat>
-    //    <cat>cat1,cat2,cat3</cat>
-    //
-    // Property filter
-    //    <prop name="xxxx">value</prop>
-    //
-    // And Filter
-    //    <and><filter>...</filter><filter>...</filter></and>
-    //    <filter><filter>...</filter><filter>...</filter></filter>
-    //
-    // Or Filter
-    //    <or><filter>...</filter><filter>...</filter></or>
-
-    public abstract class TestFilterTests
+    /// <summary>
+    /// WorkItemBuilder class knows how to build a tree of work items from a tree of tests
+    /// </summary>
+    public static class WorkItemBuilder
     {
-        public const string DUMMY_CLASS = "NUnit.Framework.Tests.Internal.Filters.TestFilterTests+DummyFixture";
-        public const string ANOTHER_CLASS = "NUnit.Framework.Tests.Internal.Filters.TestFilterTests+AnotherFixture";
-        public const string DUMMY_CLASS_REGEX = "NUnit.*\\+DummyFixture";
-        public const string ANOTHER_CLASS_REGEX = "NUnit.*\\+AnotherFixture";
+        #region Static Factory Method
 
-        protected readonly TestSuite DummyFixtureSuite = TestBuilder.MakeFixture(typeof(DummyFixture));
-        protected readonly TestSuite AnotherFixtureSuite = TestBuilder.MakeFixture(typeof(AnotherFixture));
-        protected readonly TestSuite YetAnotherFixtureSuite = TestBuilder.MakeFixture(typeof(YetAnotherFixture));
-        protected readonly TestSuite FixtureWithMultipleTestsSuite = TestBuilder.MakeFixture(typeof(FixtureWithMultipleTests));
-        protected readonly TestSuite NestingFixtureSuite = TestBuilder.MakeFixture(typeof(NestingFixture));
-        protected readonly TestSuite NestedFixtureSuite = TestBuilder.MakeFixture(typeof(NestingFixture.NestedFixture));
-        protected readonly TestSuite EmptyNestedFixtureSuite = TestBuilder.MakeFixture(typeof(NestingFixture.EmptyNestedFixture));
-        protected readonly TestSuite TopLevelSuite = new TestSuite("MySuite");
-        protected readonly TestSuite ExplicitFixtureSuite = TestBuilder.MakeFixture(typeof(ExplicitFixture));
-        protected readonly TestSuite SpecialFixtureSuite = TestBuilder.MakeFixture(typeof(SpecialCharactersFixture));
-
-        [OneTimeSetUp]
-        public void SetUpSuite()
+        /// <summary>
+        /// Creates a work item.
+        /// </summary>
+        /// <param name="test">The test for which this WorkItem is being created.</param>
+        /// <param name="filter">The filter to be used in selecting any child Tests.</param>
+        /// <param name="recursive">True if child work items should be created and added.</param>
+        /// <returns></returns>
+        public static WorkItem? CreateWorkItem(ITest test, ITestFilter filter, bool recursive = false)
         {
-            TopLevelSuite.Add(DummyFixtureSuite);
-            TopLevelSuite.Add(AnotherFixtureSuite);
-            TopLevelSuite.Add(YetAnotherFixtureSuite);
-            TopLevelSuite.Add(FixtureWithMultipleTestsSuite);
-            TopLevelSuite.Add(NestingFixtureSuite);
-
-            NestingFixtureSuite.Add(NestedFixtureSuite);
-            NestingFixtureSuite.Add(EmptyNestedFixtureSuite);
+            return CreateWorkItem(test, filter, new DebuggerProxy(), recursive);
         }
 
-        #region Fixtures Used by Tests
-
-        [Category("Dummy"), Property("Priority", "High"), Author("Charlie Poole")]
-        private class DummyFixture
+        /// <summary>
+        /// Creates a work item.
+        /// </summary>
+        /// <param name="test">The test for which this WorkItem is being created.</param>
+        /// <param name="filter">The filter to be used in selecting any child Tests.</param>
+        /// <param name="debugger">An <see cref="IDebugger" /> instance.</param>
+        /// <param name="recursive">True if child work items should be created and added.</param>
+        /// <param name="root"><see langword="true"/> if work item needs to be created unconditionally, if <see langword="false"/> <see langword="null"/> will be returned for tests that don't match the filter.</param>
+        /// <returns></returns>
+        internal static WorkItem? CreateWorkItem(ITest test, ITestFilter filter, IDebugger debugger, bool recursive = false, bool root = true)
         {
-            [Test]
-            public void Test()
+            // Run filter on leaf nodes only
+            // use the presence of leaf nodes as an indicator that parent need to be created
+            // Always create a workitem for the root node
+            if (test is not TestSuite suite)
             {
-            }
-        }
-
-        [Category("Special,Character-Fixture+!")]
-        private class SpecialCharactersFixture
-        {
-            [Test]
-            public void Test()
-            {
-            }
-        }
-
-        [Category("Another"), Property("Priority", "Low"), Author("Fred Smith")]
-        private class AnotherFixture
-        {
-            [Test]
-            public void Test()
-            {
-            }
-        }
-
-        private class YetAnotherFixture
-        {
-        }
-
-        private class FixtureWithMultipleTests
-        {
-            [Test]
-            public void Test1()
-            {
-            }
-
-            [Test, Category("Dummy")]
-            public void Test2()
-            {
-            }
-        }
-
-        private class NestingFixture
-        {
-            public class NestedFixture
-            {
-                [Test]
-                public void Test()
+                if (root || filter.Pass(test))
                 {
+                    return new SimpleWorkItem((TestMethod)test, filter, debugger);
                 }
+                return null;
             }
 
-            internal class EmptyNestedFixture
+            CompositeWorkItem? work = root ? new CompositeWorkItem(suite, filter) : null;
+
+            if (recursive)
             {
+                int countOrderedItems = 0;
+
+                foreach (var childTest in suite.Tests)
+                {
+                    var childItem = CreateWorkItem(childTest, filter, debugger, recursive, root: false);
+                    if (childItem is null)
+                        continue;
+
+                    work ??= new CompositeWorkItem(suite, filter);
+
+                    if (childItem.TargetApartment == ApartmentState.Unknown && work.TargetApartment != ApartmentState.Unknown)
+                        childItem.TargetApartment = work.TargetApartment;
+
+                    if (childTest.Properties.ContainsKey(PropertyNames.Order))
+                    {
+                        work.Children.Insert(0, childItem);
+                        countOrderedItems++;
+                    }
+                    else
+                    {
+                        work.Children.Add(childItem);
+                    }
+                }
+
+                if (countOrderedItems > 0)
+                    work!.Children.Sort(0, countOrderedItems, new WorkItemOrderComparer());
             }
+            return work;
         }
 
-        [Explicit]
-        private class ExplicitFixture
-        {
-        }
         #endregion
+
+        private class WorkItemOrderComparer : IComparer<WorkItem>
+        {
+            /// <summary>
+            /// Compares two objects and returns a value indicating whether one is less than, equal to, or greater than the other.
+            /// </summary>
+            /// <returns>
+            /// A signed integer that indicates the relative values of <paramref name="x"/> and <paramref name="y"/>, as shown in the following table.Value Meaning Less than zero<paramref name="x"/> is less than <paramref name="y"/>.Zero<paramref name="x"/> equals <paramref name="y"/>.Greater than zero<paramref name="x"/> is greater than <paramref name="y"/>.
+            /// </returns>
+            /// <param name="x">The first object to compare.</param><param name="y">The second object to compare.</param>
+            public int Compare(WorkItem? x, WorkItem? y)
+            {
+                if (x is null && y is null)
+                    return 0;
+                if (x is null)
+                    return -1;
+                if (y is null)
+                    return 1;
+
+                var xKey = x.Test.Properties.TryGet(PropertyNames.Order, int.MaxValue);
+                var yKey = y.Test.Properties.TryGet(PropertyNames.Order, int.MaxValue);
+
+                return xKey.CompareTo(yKey);
+            }
+        }
     }
 }

@@ -1,53 +1,45 @@
-// Copyright (c) 2014, the Dart project authors.  Please see the AUTHORS file
+// Copyright (c) 2022, the Dart project authors.  Please see the AUTHORS file
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-@TestOn('vm')
-library;
-
 import 'dart:async';
-import 'dart:convert';
+import 'dart:io';
 
-import 'package:http/http.dart' as http;
-import 'package:test/test.dart';
+import 'package:stream_channel/stream_channel.dart';
 
-import '../utils.dart';
+/// Starts an HTTP server that captures the request headers.
+///
+/// Channel protocol:
+///    On Startup:
+///     - send port
+///    On Request Received:
+///     - send headers as Map<String, List<String>>
+///    When Receive Anything:
+///     - exit
+void hybridMain(StreamChannel<Object?> channel) async {
+  late HttpServer server;
 
-void main() {
-  late Uri serverUrl;
-  setUpAll(() async {
-    serverUrl = await startServer();
-  });
-
-  group('contentLength', () {
-    test('controls the Content-Length header', () async {
-      var request = http.StreamedRequest('POST', serverUrl)
-        ..contentLength = 10
-        ..sink.add([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-      unawaited(request.sink.close());
-      var response = await request.send();
-      expect(
-          await utf8.decodeStream(response.stream),
-          parse(
-              containsPair('headers', containsPair('content-length', ['10']))));
+  server = (await HttpServer.bind('localhost', 0))
+    ..listen((request) async {
+      request.response.headers.set('Access-Control-Allow-Origin', '*');
+      if (request.method == 'OPTIONS') {
+        // Handle a CORS preflight request:
+        // https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS#preflighted_requests
+        request.response.headers
+          ..set('Access-Control-Allow-Methods', 'GET')
+          ..set('Access-Control-Allow-Headers', '*');
+      } else {
+        final headers = <String, List<String>>{};
+        request.headers.forEach((field, value) {
+          headers[field] = value;
+        });
+        channel.sink.add(headers);
+      }
+      unawaited(request.response.close());
     });
 
-    test('defaults to sending no Content-Length', () async {
-      var request = http.StreamedRequest('POST', serverUrl);
-      request.sink.add([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-      unawaited(request.sink.close());
-      var response = await request.send();
-      expect(await utf8.decodeStream(response.stream),
-          parse(containsPair('headers', isNot(contains('content-length')))));
-    });
-  });
-
-  // Regression test.
-  test('.send() with a response with no content length', () async {
-    var request =
-        http.StreamedRequest('GET', serverUrl.resolve('/no-content-length'));
-    unawaited(request.sink.close());
-    var response = await request.send();
-    expect(await utf8.decodeStream(response.stream), equals('body'));
-  });
+  channel.sink.add(server.port);
+  await channel
+      .stream.first; // Any writes indicates that the server should exit.
+  unawaited(server.close());
 }

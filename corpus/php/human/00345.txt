@@ -10,267 +10,259 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Command;
+namespace Composer\Test;
 
-use Composer\Package\Link;
-use Composer\Package\PackageInterface;
-use Composer\Package\CompletePackageInterface;
-use Composer\Package\RootPackage;
-use Composer\Repository\InstalledArrayRepository;
-use Composer\Repository\CompositeRepository;
-use Composer\Repository\RootPackageRepository;
-use Composer\Repository\InstalledRepository;
-use Composer\Repository\PlatformRepository;
-use Composer\Repository\RepositoryFactory;
-use Composer\Plugin\CommandEvent;
-use Composer\Plugin\PluginEvents;
-use Symfony\Component\Console\Formatter\OutputFormatter;
-use Symfony\Component\Console\Formatter\OutputFormatterStyle;
-use Composer\Package\Version\VersionParser;
-use Symfony\Component\Console\Input\InputInterface;
-use Symfony\Component\Console\Output\OutputInterface;
-use Composer\Util\PackageInfo;
+use Composer\Pcre\Preg;
+use Composer\Util\Filesystem;
+use Composer\Util\Platform;
+use Symfony\Component\Finder\Finder;
+use Symfony\Component\Process\Process;
 
 /**
- * Base implementation for commands mapping dependency relationships.
- *
- * @author Niels Keurentjes <niels.keurentjes@omines.com>
+ * @group slow
  */
-abstract class BaseDependencyCommand extends BaseCommand
+class AllFunctionalTest extends TestCase
 {
-    protected const ARGUMENT_PACKAGE = 'package';
-    protected const ARGUMENT_CONSTRAINT = 'version';
-    protected const OPTION_RECURSIVE = 'recursive';
-    protected const OPTION_TREE = 'tree';
-
-    /** @var string[] */
-    protected $colors;
-
+    /** @var string|false */
+    protected $oldcwd;
+    /** @var ?string */
+    protected $testDir;
     /**
-     * Execute the command.
-     *
-     * @param  bool            $inverted Whether to invert matching process (why-not vs why behaviour)
-     * @return int             Exit code of the operation.
+     * @var string
      */
-    protected function doExecute(InputInterface $input, OutputInterface $output, bool $inverted = false): int
+    private static $pharPath;
+
+    public function setUp(): void
     {
-        // Emit command event on startup
-        $composer = $this->requireComposer();
-        $commandEvent = new CommandEvent(PluginEvents::COMMAND, $this->getName(), $input, $output);
-        $composer->getEventDispatcher()->dispatch($commandEvent->getName(), $commandEvent);
+        $this->oldcwd = Platform::getCwd();
 
-        $repos = [];
+        chdir(__DIR__.'/Fixtures/functional');
+    }
 
-        $repos[] = new RootPackageRepository(clone $composer->getPackage());
-
-        if ($input->getOption('locked')) {
-            $locker = $composer->getLocker();
-
-            if (!$locker->isLocked()) {
-                throw new \UnexpectedValueException('A valid composer.lock file is required to run this command with --locked');
-            }
-
-            $repos[] = $locker->getLockedRepository(true);
-            $repos[] = new PlatformRepository([], $locker->getPlatformOverrides());
-        } else {
-            $localRepo = $composer->getRepositoryManager()->getLocalRepository();
-            $rootPkg = $composer->getPackage();
-
-            if (count($localRepo->getPackages()) === 0 && (count($rootPkg->getRequires()) > 0 || count($rootPkg->getDevRequires()) > 0)) {
-                $output->writeln('<warning>No dependencies installed. Try running composer install or update, or use --locked.</warning>');
-
-                return 1;
-            }
-
-            $repos[] = $localRepo;
-
-            $platformOverrides = $composer->getConfig()->get('platform') ?: [];
-            $repos[] = new PlatformRepository([], $platformOverrides);
+    protected function tearDown(): void
+    {
+        parent::tearDown();
+        if ($this->oldcwd) {
+            chdir($this->oldcwd);
         }
 
-        $installedRepo = new InstalledRepository($repos);
+        if ($this->testDir) {
+            $fs = new Filesystem;
+            $fs->removeDirectory($this->testDir);
+            $this->testDir = null;
+        }
+    }
 
-        // Parse package name and constraint
-        $needle = $input->getArgument(self::ARGUMENT_PACKAGE);
-        $textConstraint = $input->hasArgument(self::ARGUMENT_CONSTRAINT) ? $input->getArgument(self::ARGUMENT_CONSTRAINT) : '*';
+    public static function setUpBeforeClass(): void
+    {
+        self::$pharPath = self::getUniqueTmpDirectory() . '/composer.phar';
+    }
 
-        // Find packages that are or provide the requested package first
-        $packages = $installedRepo->findPackagesWithReplacersAndProviders($needle);
-        if (empty($packages)) {
-            throw new \InvalidArgumentException(sprintf('Could not find package "%s" in your project', $needle));
+    public static function tearDownAfterClass(): void
+    {
+        $fs = new Filesystem;
+        $fs->removeDirectory(dirname(self::$pharPath));
+    }
+
+    public function testBuildPhar(): void
+    {
+        if (defined('HHVM_VERSION')) {
+            $this->markTestSkipped('Building the phar does not work on HHVM.');
         }
 
-        // If the version we ask for is not installed then we need to locate it in remote repos and add it.
-        // This is needed for why-not to resolve conflicts from an uninstalled version against installed packages.
-        if (!$installedRepo->findPackage($needle, $textConstraint)) {
-            $defaultRepos = new CompositeRepository(RepositoryFactory::defaultRepos($this->getIO(), $composer->getConfig(), $composer->getRepositoryManager()));
-            if ($match = $defaultRepos->findPackage($needle, $textConstraint)) {
-                $installedRepo->addRepository(new InstalledArrayRepository([clone $match]));
+        $target = dirname(self::$pharPath);
+        $fs = new Filesystem();
+        chdir($target);
+
+        $it = new \RecursiveDirectoryIterator(__DIR__.'/../../../', \RecursiveDirectoryIterator::SKIP_DOTS);
+        $ri = new \RecursiveIteratorIterator($it, \RecursiveIteratorIterator::SELF_FIRST);
+
+        foreach ($ri as $file) {
+            $targetPath = $target . DIRECTORY_SEPARATOR . $ri->getSubPathName();
+            if ($file->isDir()) {
+                $fs->ensureDirectoryExists($targetPath);
             } else {
-                $this->getIO()->writeError('<error>Package "'.$needle.'" could not be found with constraint "'.$textConstraint.'", results below will most likely be incomplete.</error>');
+                copy($file->getPathname(), $targetPath);
             }
         }
 
-        // Include replaced packages for inverted lookups as they are then the actual starting point to consider
-        $needles = [$needle];
-        if ($inverted) {
-            foreach ($packages as $package) {
-                $needles = array_merge($needles, array_map(static function (Link $link): string {
-                    return $link->getTarget();
-                }, $package->getReplaces()));
-            }
+        $proc = new Process([PHP_BINARY, '-dphar.readonly=0', './bin/compile'], $target);
+        $exitcode = $proc->run();
+
+        if ($exitcode !== 0 || trim($proc->getOutput())) {
+            $this->fail($proc->getOutput());
         }
 
-        // Parse constraint if one was supplied
-        if ('*' !== $textConstraint) {
-            $versionParser = new VersionParser();
-            $constraint = $versionParser->parseConstraints($textConstraint);
-        } else {
-            $constraint = null;
-        }
-
-        // Parse rendering options
-        $renderTree = $input->getOption(self::OPTION_TREE);
-        $recursive = $renderTree || $input->getOption(self::OPTION_RECURSIVE);
-
-        $return = $inverted ? 1 : 0;
-
-        // Resolve dependencies
-        $results = $installedRepo->getDependents($needles, $constraint, $inverted, $recursive);
-        if (empty($results)) {
-            $extra = (null !== $constraint) ? sprintf(' in versions %smatching %s', $inverted ? 'not ' : '', $textConstraint) : '';
-            $this->getIO()->writeError(sprintf(
-                '<info>There is no installed package depending on "%s"%s</info>',
-                $needle,
-                $extra
-            ));
-            $return = $inverted ? 0 : 1;
-        } elseif ($renderTree) {
-            $this->initStyles($output);
-            $root = $packages[0];
-            $this->getIO()->write(sprintf('<info>%s</info> %s %s', $root->getPrettyName(), $root->getPrettyVersion(), $root instanceof CompletePackageInterface ? $root->getDescription() : ''));
-            $this->printTree($results);
-        } else {
-            $this->printTable($output, $results);
-        }
-
-        if ($inverted && $input->hasArgument(self::ARGUMENT_CONSTRAINT)) {
-            $composerCommand = 'update';
-
-            foreach ($composer->getPackage()->getRequires() as $rootRequirement) {
-                if ($rootRequirement->getTarget() === $needle) {
-                    $composerCommand = 'require';
-                    break;
-                }
-            }
-
-            foreach ($composer->getPackage()->getDevRequires() as $rootRequirement) {
-                if ($rootRequirement->getTarget() === $needle) {
-                    $composerCommand = 'require --dev';
-                    break;
-                }
-            }
-
-            $this->getIO()->writeError('Not finding what you were looking for? Try calling `composer '.$composerCommand.' "'.$needle.':'.$textConstraint.'" --dry-run` to get another view on the problem.');
-        }
-
-        return $return;
+        self::assertFileExists(self::$pharPath);
+        copy(self::$pharPath, __DIR__.'/../../composer-test.phar');
     }
 
     /**
-     * Assembles and prints a bottom-up table of the dependencies.
-     *
-     * @param array{PackageInterface, Link, mixed}[] $results
+     * @dataProvider getTestFiles
+     * @depends testBuildPhar
      */
-    protected function printTable(OutputInterface $output, $results): void
+    public function testIntegration(string $testFile): void
     {
-        $table = [];
-        $doubles = [];
-        do {
-            $queue = [];
-            $rows = [];
-            foreach ($results as $result) {
-                /**
-                 * @var PackageInterface $package
-                 * @var Link             $link
-                 */
-                [$package, $link, $children] = $result;
-                $unique = (string) $link;
-                if (isset($doubles[$unique])) {
-                    continue;
-                }
-                $doubles[$unique] = true;
-                $version = $package->getPrettyVersion() === RootPackage::DEFAULT_PRETTY_VERSION ? '-' : $package->getPrettyVersion();
-                $packageUrl = PackageInfo::getViewSourceOrHomepageUrl($package);
-                $nameWithLink = $packageUrl !== null ? '<href=' . OutputFormatter::escape($packageUrl) . '>' . $package->getPrettyName() . '</>' : $package->getPrettyName();
-                $rows[] = [$nameWithLink, $version, $link->getDescription(), sprintf('%s (%s)', $link->getTarget(), $link->getPrettyConstraint())];
-                if ($children) {
-                    $queue = array_merge($queue, $children);
-                }
-            }
-            $results = $queue;
-            $table = array_merge($rows, $table);
-        } while (!empty($results));
+        $testData = $this->parseTestFile($testFile);
+        $this->testDir = self::getUniqueTmpDirectory();
 
-        $this->renderTable($table, $output);
-    }
+        // if a dir is present with the name of the .test file (without .test), we
+        // copy all its contents in the $testDir to be used to run the test with
+        $testFileSetupDir = substr($testFile, 0, -5);
+        if (is_dir($testFileSetupDir)) {
+            $fs = new Filesystem();
+            $fs->copy($testFileSetupDir, $this->testDir);
+        }
 
-    /**
-     * Init styles for tree
-     */
-    protected function initStyles(OutputInterface $output): void
-    {
-        $this->colors = [
-            'green',
-            'yellow',
-            'cyan',
-            'magenta',
-            'blue',
+        $env = [
+            'COMPOSER_HOME' => $this->testDir.'home',
+            'COMPOSER_CACHE_DIR' => $this->testDir.'cache',
         ];
 
-        foreach ($this->colors as $color) {
-            $style = new OutputFormatterStyle($color);
-            $output->getFormatter()->setStyle($color, $style);
+        $proc = Process::fromShellCommandline(escapeshellcmd(PHP_BINARY).' '.escapeshellarg(self::$pharPath).' --no-ansi '.$testData['RUN'], $this->testDir, $env, null, 300);
+        $output = '';
+
+        $exitCode = $proc->run(static function ($type, $buffer) use (&$output): void {
+            $output .= $buffer;
+        });
+
+        if (isset($testData['EXPECT'])) {
+            $output = trim($this->cleanOutput($output));
+            $expected = $testData['EXPECT'];
+
+            $line = 1;
+            for ($i = 0, $j = 0; $i < strlen($expected);) {
+                if ($expected[$i] === "\n") {
+                    $line++;
+                }
+                if ($expected[$i] === '%') {
+                    Preg::isMatchStrictGroups('{%(.+?)%}', substr($expected, $i), $match);
+                    $regex = $match[1];
+
+                    if (Preg::isMatch('{'.$regex.'}', substr($output, $j), $match)) {
+                        $i += strlen($regex) + 2;
+                        $j += strlen((string) $match[0]);
+                        continue;
+                    } else {
+                        $this->fail(
+                            'Failed to match pattern '.$regex.' at line '.$line.' / abs offset '.$i.': '
+                            .substr($output, $j, min(strpos($output, "\n", $j) - $j, 100)).PHP_EOL.PHP_EOL.
+                            'Output:'.PHP_EOL.$output
+                        );
+                    }
+                }
+                if ($expected[$i] !== $output[$j]) {
+                    $this->fail(
+                        'Output does not match expectation at line '.$line.' / abs offset '.$i.': '.PHP_EOL
+                        .'-'.substr($expected, $i, min(strpos($expected, "\n", $i) - $i, 100)).PHP_EOL
+                        .'+'.substr($output, $j, min(strpos($output, "\n", $j) - $j, 100)).PHP_EOL.PHP_EOL
+                        .'Output:'.PHP_EOL.$output
+                    );
+                }
+                $i++;
+                $j++;
+            }
+        }
+        if (isset($testData['EXPECT-REGEX'])) {
+            self::assertMatchesRegularExpression($testData['EXPECT-REGEX'], $this->cleanOutput($output));
+        }
+        if (isset($testData['EXPECT-REGEXES'])) {
+            $cleanOutput = $this->cleanOutput($output);
+            foreach (explode("\n", $testData['EXPECT-REGEXES']) as $regex) {
+                self::assertMatchesRegularExpression($regex, $cleanOutput, 'Output: '.$output);
+            }
+        }
+        if (isset($testData['EXPECT-EXIT-CODE'])) {
+            self::assertSame($testData['EXPECT-EXIT-CODE'], $exitCode);
         }
     }
 
     /**
-     * Recursively prints a tree of the selected results.
-     *
-     * @param array{PackageInterface, Link, mixed[]|bool}[] $results Results to be printed at this level.
-     * @param string  $prefix  Prefix of the current tree level.
-     * @param int     $level   Current level of recursion.
+     * @return array<string, array<string>>
      */
-    protected function printTree(array $results, string $prefix = '', int $level = 1): void
+    public static function getTestFiles(): array
     {
-        $count = count($results);
-        $idx = 0;
-        foreach ($results as $result) {
-            [$package, $link, $children] = $result;
-
-            $color = $this->colors[$level % count($this->colors)];
-            $prevColor = $this->colors[($level - 1) % count($this->colors)];
-            $isLast = (++$idx === $count);
-            $versionText = $package->getPrettyVersion() === RootPackage::DEFAULT_PRETTY_VERSION ? '' : $package->getPrettyVersion();
-            $packageUrl = PackageInfo::getViewSourceOrHomepageUrl($package);
-            $nameWithLink = $packageUrl !== null ? '<href=' . OutputFormatter::escape($packageUrl) . '>' . $package->getPrettyName() . '</>' : $package->getPrettyName();
-            $packageText = rtrim(sprintf('<%s>%s</%1$s> %s', $color, $nameWithLink, $versionText));
-            $linkText = sprintf('%s <%s>%s</%2$s> %s', $link->getDescription(), $prevColor, $link->getTarget(), $link->getPrettyConstraint());
-            $circularWarn = $children === false ? '(circular dependency aborted here)' : '';
-            $this->writeTreeLine(rtrim(sprintf("%s%s%s (%s) %s", $prefix, $isLast ? '└──' : '├──', $packageText, $linkText, $circularWarn)));
-            if ($children) {
-                $this->printTree($children, $prefix . ($isLast ? '   ' : '│  '), $level + 1);
-            }
+        $tests = [];
+        foreach (Finder::create()->in(__DIR__.'/Fixtures/functional')->name('*.test')->files() as $file) {
+            $tests[$file->getFilename()] = [(string) $file];
         }
+
+        return $tests;
     }
 
-    private function writeTreeLine(string $line): void
+    /**
+     * @return array{RUN: string, EXPECT?: string, EXPECT-EXIT-CODE?: int, EXPECT-REGEX?: string, EXPECT-REGEXES?: string, TEST?: string}
+     */
+    private function parseTestFile(string $file): array
     {
-        $io = $this->getIO();
-        if (!$io->isDecorated()) {
-            $line = str_replace(['└', '├', '──', '│'], ['`-', '|-', '-', '|'], $line);
+        $tokens = Preg::split('#(?:^|\n*)--([A-Z-]+)--\n#', file_get_contents($file), -1, PREG_SPLIT_DELIM_CAPTURE);
+        $data = [];
+        $section = null;
+
+        foreach ($tokens as $token) {
+            if ('' === $token && null === $section) {
+                continue;
+            }
+
+            // Handle section headers.
+            if (null === $section) {
+                $section = $token;
+                continue;
+            }
+
+            $sectionData = $token;
+
+            // Allow sections to validate, or modify their section data.
+            switch ($section) {
+                case 'EXPECT-EXIT-CODE':
+                    $sectionData = (int) $sectionData;
+                    break;
+
+                case 'RUN':
+                case 'EXPECT':
+                case 'EXPECT-REGEX':
+                case 'EXPECT-REGEXES':
+                    $sectionData = trim($sectionData);
+                    break;
+
+                case 'TEST':
+                    break;
+
+                default:
+                    throw new \RuntimeException(sprintf(
+                        'Unknown section "%s". Allowed sections: "RUN", "EXPECT", "EXPECT-EXIT-CODE", "EXPECT-REGEX", "EXPECT-REGEXES". '
+                       .'Section headers must be written as "--HEADER_NAME--".',
+                        $section
+                    ));
+            }
+
+            $data[$section] = $sectionData;
+            $section = $sectionData = null;
         }
 
-        $io->write($line);
+        // validate data
+        if (!isset($data['RUN'])) {
+            throw new \RuntimeException('The test file must have a section named "RUN".');
+        }
+        if (!isset($data['EXPECT']) && !isset($data['EXPECT-REGEX']) && !isset($data['EXPECT-REGEXES'])) {
+            throw new \RuntimeException('The test file must have a section named "EXPECT", "EXPECT-REGEX", or "EXPECT-REGEXES".');
+        }
+
+        return $data; // @phpstan-ignore return.type
+    }
+
+    private function cleanOutput(string $output): string
+    {
+        $processed = '';
+
+        for ($i = 0; $i < strlen($output); $i++) {
+            if ($output[$i] === "\x08") {
+                $processed = substr($processed, 0, -1);
+            } elseif ($output[$i] !== "\r") {
+                $processed .= $output[$i];
+            }
+        }
+
+        return $processed;
     }
 }

@@ -1,373 +1,112 @@
-from datetime import timedelta
+import datetime
+from collections import deque
+from decimal import Decimal
+from enum import Enum
+from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
+from pathlib import Path
+from re import Pattern
+from types import GeneratorType
+from typing import Any, Callable, Dict, Type, Union
+from uuid import UUID
 
-import pytest
+from pydantic.v1.color import Color
+from pydantic.v1.networks import NameEmail
+from pydantic.v1.types import SecretBytes, SecretStr
 
-from pydantic_core import SchemaSerializer, core_schema
-
-try:
-    import pandas
-except ImportError:
-    pandas = None
-
-
-def test_timedelta():
-    v = SchemaSerializer(core_schema.timedelta_schema())
-    assert v.to_python(timedelta(days=2, hours=3, minutes=4)) == timedelta(days=2, hours=3, minutes=4)
-
-    assert v.to_python(timedelta(days=2, hours=3, minutes=4), mode='json') == 'P2DT3H4M'
-    assert v.to_json(timedelta(days=2, hours=3, minutes=4)) == b'"P2DT3H4M"'
-
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `timedelta` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert v.to_python(123, mode='json') == 123
-
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `timedelta` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert v.to_json(123) == b'123'
+__all__ = 'pydantic_encoder', 'custom_pydantic_encoder', 'timedelta_isoformat'
 
 
-def test_timedelta_float():
-    v = SchemaSerializer(core_schema.timedelta_schema(), config={'ser_json_timedelta': 'float'})
-    assert v.to_python(timedelta(seconds=4, microseconds=500_000)) == timedelta(seconds=4, microseconds=500_000)
-
-    assert v.to_python(timedelta(seconds=4, microseconds=500_000), mode='json') == 4.5
-    assert v.to_json(timedelta(seconds=4, microseconds=500_000)) == b'4.5'
+def isoformat(o: Union[datetime.date, datetime.time]) -> str:
+    return o.isoformat()
 
 
-def test_timedelta_key():
-    v = SchemaSerializer(core_schema.dict_schema(core_schema.timedelta_schema(), core_schema.int_schema()))
-    assert v.to_python({timedelta(days=2, hours=3, minutes=4): 1}) == {timedelta(days=2, hours=3, minutes=4): 1}
-    assert v.to_python({timedelta(days=2, hours=3, minutes=4): 1}, mode='json') == {'P2DT3H4M': 1}
-    assert v.to_json({timedelta(days=2, hours=3, minutes=4): 1}) == b'{"P2DT3H4M":1}'
+def decimal_encoder(dec_value: Decimal) -> Union[int, float]:
+    """
+    Encodes a Decimal as int of there's no exponent, otherwise float
+
+    This is useful when we use ConstrainedDecimal to represent Numeric(x,0)
+    where a integer (but not int typed) is used. Encoding this as a float
+    results in failed round-tripping between encode and parse.
+    Our Id type is a prime example of this.
+
+    >>> decimal_encoder(Decimal("1.0"))
+    1.0
+
+    >>> decimal_encoder(Decimal("1"))
+    1
+    """
+    if dec_value.as_tuple().exponent >= 0:
+        return int(dec_value)
+    else:
+        return float(dec_value)
 
 
-@pytest.mark.skipif(not pandas, reason='pandas not installed')
-def test_pandas():
-    v = SchemaSerializer(core_schema.timedelta_schema())
-    d = pandas.Timestamp('2023-01-01T02:00:00Z') - pandas.Timestamp('2023-01-01T00:00:00Z')
-    assert v.to_python(d) == d
-    assert v.to_python(d, mode='json') == 'PT2H'
-    assert v.to_json(d) == b'"PT2H"'
+ENCODERS_BY_TYPE: Dict[Type[Any], Callable[[Any], Any]] = {
+    bytes: lambda o: o.decode(),
+    Color: str,
+    datetime.date: isoformat,
+    datetime.datetime: isoformat,
+    datetime.time: isoformat,
+    datetime.timedelta: lambda td: td.total_seconds(),
+    Decimal: decimal_encoder,
+    Enum: lambda o: o.value,
+    frozenset: list,
+    deque: list,
+    GeneratorType: list,
+    IPv4Address: str,
+    IPv4Interface: str,
+    IPv4Network: str,
+    IPv6Address: str,
+    IPv6Interface: str,
+    IPv6Network: str,
+    NameEmail: str,
+    Path: str,
+    Pattern: lambda o: o.pattern,
+    SecretBytes: str,
+    SecretStr: str,
+    set: list,
+    UUID: str,
+}
 
 
-@pytest.mark.parametrize(
-    'td,expected_to_python,expected_to_json,expected_to_python_dict,expected_to_json_dict,mode',
-    [
-        (timedelta(hours=2), 7200000.0, b'7200000.0', {'7200000': 'foo'}, b'{"7200000":"foo"}', 'milliseconds'),
-        (
-            timedelta(hours=-2),
-            -7200000.0,
-            b'-7200000.0',
-            {'-7200000': 'foo'},
-            b'{"-7200000":"foo"}',
-            'milliseconds',
-        ),
-        (timedelta(seconds=1.5), 1500.0, b'1500.0', {'1500': 'foo'}, b'{"1500":"foo"}', 'milliseconds'),
-        (timedelta(seconds=-1.5), -1500.0, b'-1500.0', {'-1500': 'foo'}, b'{"-1500":"foo"}', 'milliseconds'),
-        (timedelta(microseconds=1), 0.001, b'0.001', {'0.001': 'foo'}, b'{"0.001":"foo"}', 'milliseconds'),
-        (
-            timedelta(microseconds=-1),
-            -0.001,
-            b'-0.001',
-            {'-0.001': 'foo'},
-            b'{"-0.001":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=1),
-            86400000.0,
-            b'86400000.0',
-            {'86400000': 'foo'},
-            b'{"86400000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=-1),
-            -86400000.0,
-            b'-86400000.0',
-            {'-86400000': 'foo'},
-            b'{"-86400000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=1, seconds=1),
-            86401000.0,
-            b'86401000.0',
-            {'86401000': 'foo'},
-            b'{"86401000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=-1, seconds=-1),
-            -86401000.0,
-            b'-86401000.0',
-            {'-86401000': 'foo'},
-            b'{"-86401000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=1, seconds=-1),
-            86399000.0,
-            b'86399000.0',
-            {'86399000': 'foo'},
-            b'{"86399000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=1, seconds=1, microseconds=1),
-            86401000.001,
-            b'86401000.001',
-            {'86401000.001': 'foo'},
-            b'{"86401000.001":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=-1, seconds=-1, microseconds=-1),
-            -86401000.001,
-            b'-86401000.001',
-            {'-86401000.001': 'foo'},
-            b'{"-86401000.001":"foo"}',
-            'milliseconds',
-        ),
-        (timedelta(hours=2), 7200.0, b'7200.0', {'7200': 'foo'}, b'{"7200":"foo"}', 'seconds'),
-        (timedelta(hours=-2), -7200.0, b'-7200.0', {'-7200': 'foo'}, b'{"-7200":"foo"}', 'seconds'),
-        (timedelta(seconds=1.5), 1.5, b'1.5', {'1.5': 'foo'}, b'{"1.5":"foo"}', 'seconds'),
-        (timedelta(seconds=-1.5), -1.5, b'-1.5', {'-1.5': 'foo'}, b'{"-1.5":"foo"}', 'seconds'),
-        (timedelta(microseconds=1), 1e-6, b'1e-6', {'0.000001': 'foo'}, b'{"0.000001":"foo"}', 'seconds'),
-        (
-            timedelta(microseconds=-1),
-            -1e-6,
-            b'-1e-6',
-            {'-0.000001': 'foo'},
-            b'{"-0.000001":"foo"}',
-            'seconds',
-        ),
-        (timedelta(days=1), 86400.0, b'86400.0', {'86400': 'foo'}, b'{"86400":"foo"}', 'seconds'),
-        (timedelta(days=-1), -86400.0, b'-86400.0', {'-86400': 'foo'}, b'{"-86400":"foo"}', 'seconds'),
-        (timedelta(days=1, seconds=1), 86401.0, b'86401.0', {'86401': 'foo'}, b'{"86401":"foo"}', 'seconds'),
-        (
-            timedelta(days=-1, seconds=-1),
-            -86401.0,
-            b'-86401.0',
-            {'-86401': 'foo'},
-            b'{"-86401":"foo"}',
-            'seconds',
-        ),
-        (timedelta(days=1, seconds=-1), 86399.0, b'86399.0', {'86399': 'foo'}, b'{"86399":"foo"}', 'seconds'),
-        (
-            timedelta(days=1, seconds=1, microseconds=1),
-            86401.000001,
-            b'86401.000001',
-            {'86401.000001': 'foo'},
-            b'{"86401.000001":"foo"}',
-            'seconds',
-        ),
-        (
-            timedelta(days=-1, seconds=-1, microseconds=-1),
-            -86401.000001,
-            b'-86401.000001',
-            {'-86401.000001': 'foo'},
-            b'{"-86401.000001":"foo"}',
-            'seconds',
-        ),
-    ],
-)
-def test_config_timedelta(
-    td: timedelta, expected_to_python, expected_to_json, expected_to_python_dict, expected_to_json_dict, mode
-):
-    s = SchemaSerializer(core_schema.timedelta_schema(), config={'ser_json_temporal': mode})
-    assert s.to_python(td) == td
-    assert s.to_python(td, mode='json') == expected_to_python
-    assert s.to_json(td) == expected_to_json
+def pydantic_encoder(obj: Any) -> Any:
+    from dataclasses import asdict, is_dataclass
 
-    with pytest.warns(UserWarning):
-        assert s.to_python({td: 'foo'}) == {td: 'foo'}
-    with pytest.warns(UserWarning):
-        assert s.to_python({td: 'foo'}, mode='json') == expected_to_python_dict
-    with pytest.warns(
-        UserWarning,
-    ):
-        assert s.to_json({td: 'foo'}) == expected_to_json_dict
+    from pydantic.v1.main import BaseModel
+
+    if isinstance(obj, BaseModel):
+        return obj.dict()
+    elif is_dataclass(obj):
+        return asdict(obj)
+
+    # Check the class type and its superclasses for a matching encoder
+    for base in obj.__class__.__mro__[:-1]:
+        try:
+            encoder = ENCODERS_BY_TYPE[base]
+        except KeyError:
+            continue
+        return encoder(obj)
+    else:  # We have exited the for loop without finding a suitable encoder
+        raise TypeError(f"Object of type '{obj.__class__.__name__}' is not JSON serializable")
 
 
-@pytest.mark.parametrize(
-    'td,expected_to_python,expected_to_json,expected_to_python_dict,expected_to_json_dict,temporal_mode',
-    [
-        (timedelta(hours=2), 7200000.0, b'7200000.0', {'7200000': 'foo'}, b'{"7200000":"foo"}', 'milliseconds'),
-        (
-            timedelta(hours=-2),
-            -7200000.0,
-            b'-7200000.0',
-            {'-7200000': 'foo'},
-            b'{"-7200000":"foo"}',
-            'milliseconds',
-        ),
-        (timedelta(seconds=1.5), 1500.0, b'1500.0', {'1500': 'foo'}, b'{"1500":"foo"}', 'milliseconds'),
-        (timedelta(seconds=-1.5), -1500.0, b'-1500.0', {'-1500': 'foo'}, b'{"-1500":"foo"}', 'milliseconds'),
-        (timedelta(microseconds=1), 0.001, b'0.001', {'0.001': 'foo'}, b'{"0.001":"foo"}', 'milliseconds'),
-        (
-            timedelta(microseconds=-1),
-            -0.001,
-            b'-0.001',
-            {'-0.001': 'foo'},
-            b'{"-0.001":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=1),
-            86400000.0,
-            b'86400000.0',
-            {'86400000': 'foo'},
-            b'{"86400000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=-1),
-            -86400000.0,
-            b'-86400000.0',
-            {'-86400000': 'foo'},
-            b'{"-86400000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=1, seconds=1),
-            86401000.0,
-            b'86401000.0',
-            {'86401000': 'foo'},
-            b'{"86401000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=-1, seconds=-1),
-            -86401000.0,
-            b'-86401000.0',
-            {'-86401000': 'foo'},
-            b'{"-86401000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=1, seconds=-1),
-            86399000.0,
-            b'86399000.0',
-            {'86399000': 'foo'},
-            b'{"86399000":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=1, seconds=1, microseconds=1),
-            86401000.001,
-            b'86401000.001',
-            {'86401000.001': 'foo'},
-            b'{"86401000.001":"foo"}',
-            'milliseconds',
-        ),
-        (
-            timedelta(days=-1, seconds=-1, microseconds=-1),
-            -86401000.001,
-            b'-86401000.001',
-            {'-86401000.001': 'foo'},
-            b'{"-86401000.001":"foo"}',
-            'milliseconds',
-        ),
-        (timedelta(hours=2), 7200.0, b'7200.0', {'7200': 'foo'}, b'{"7200":"foo"}', 'seconds'),
-        (timedelta(hours=-2), -7200.0, b'-7200.0', {'-7200': 'foo'}, b'{"-7200":"foo"}', 'seconds'),
-        (timedelta(seconds=1.5), 1.5, b'1.5', {'1.5': 'foo'}, b'{"1.5":"foo"}', 'seconds'),
-        (timedelta(seconds=-1.5), -1.5, b'-1.5', {'-1.5': 'foo'}, b'{"-1.5":"foo"}', 'seconds'),
-        (timedelta(microseconds=1), 1e-6, b'1e-6', {'0.000001': 'foo'}, b'{"0.000001":"foo"}', 'seconds'),
-        (
-            timedelta(microseconds=-1),
-            -1e-6,
-            b'-1e-6',
-            {'-0.000001': 'foo'},
-            b'{"-0.000001":"foo"}',
-            'seconds',
-        ),
-        (timedelta(days=1), 86400.0, b'86400.0', {'86400': 'foo'}, b'{"86400":"foo"}', 'seconds'),
-        (timedelta(days=-1), -86400.0, b'-86400.0', {'-86400': 'foo'}, b'{"-86400":"foo"}', 'seconds'),
-        (timedelta(days=1, seconds=1), 86401.0, b'86401.0', {'86401': 'foo'}, b'{"86401":"foo"}', 'seconds'),
-        (
-            timedelta(days=-1, seconds=-1),
-            -86401.0,
-            b'-86401.0',
-            {'-86401': 'foo'},
-            b'{"-86401":"foo"}',
-            'seconds',
-        ),
-        (timedelta(days=1, seconds=-1), 86399.0, b'86399.0', {'86399': 'foo'}, b'{"86399":"foo"}', 'seconds'),
-        (
-            timedelta(days=1, seconds=1, microseconds=1),
-            86401.000001,
-            b'86401.000001',
-            {'86401.000001': 'foo'},
-            b'{"86401.000001":"foo"}',
-            'seconds',
-        ),
-        (
-            timedelta(days=-1, seconds=-1, microseconds=-1),
-            -86401.000001,
-            b'-86401.000001',
-            {'-86401.000001': 'foo'},
-            b'{"-86401.000001":"foo"}',
-            'seconds',
-        ),
-    ],
-)
-@pytest.mark.parametrize('timedelta_mode', ['iso8601', 'float'])
-def test_config_timedelta_timedelta_ser_flag_prioritised(
-    td: timedelta,
-    expected_to_python,
-    expected_to_json,
-    expected_to_python_dict,
-    expected_to_json_dict,
-    temporal_mode,
-    timedelta_mode,
-):
-    s = SchemaSerializer(
-        core_schema.timedelta_schema(),
-        config={'ser_json_temporal': temporal_mode, 'ser_json_timedelta': timedelta_mode},
-    )
-    assert s.to_python(td) == td
-    assert s.to_python(td, mode='json') == expected_to_python
-    with pytest.warns(
-        UserWarning,
-        match=(
-            r'Expected `timedelta` - serialized value may not be as expected '
-            r"\[input_value=\{datetime\.timedelta\([^)]*\): 'foo'\}, input_type=dict\]"
-        ),
-    ):
-        assert s.to_python({td: 'foo'}) == {td: 'foo'}
-    with pytest.warns(
-        UserWarning,
-        match=(
-            r'Expected `timedelta` - serialized value may not be as expected '
-            r"\[input_value=\{datetime\.timedelta\([^)]*\): 'foo'\}, input_type=dict\]"
-        ),
-    ):
-        assert s.to_python({td: 'foo'}, mode='json') == expected_to_python_dict
-    with pytest.warns(
-        UserWarning,
-        match=(
-            r'Expected `timedelta` - serialized value may not be as expected '
-            r"\[input_value=\{datetime\.timedelta\([^)]*\): 'foo'\}, input_type=dict\]"
-        ),
-    ):
-        assert s.to_json({td: 'foo'}) == expected_to_json_dict
+def custom_pydantic_encoder(type_encoders: Dict[Any, Callable[[Type[Any]], Any]], obj: Any) -> Any:
+    # Check the class type and its superclasses for a matching encoder
+    for base in obj.__class__.__mro__[:-1]:
+        try:
+            encoder = type_encoders[base]
+        except KeyError:
+            continue
+
+        return encoder(obj)
+    else:  # We have exited the for loop without finding a suitable encoder
+        return pydantic_encoder(obj)
 
 
-def test_union_timedelta_respects_instanceof_check():
-    serialization_schema = core_schema.plain_serializer_function_ser_schema(lambda v: None)
-    json_validation_schema = core_schema.no_info_plain_validator_function(
-        function=lambda v: v, serialization=serialization_schema
-    )
-
-    test_custom_ser_schema = core_schema.json_schema(
-        schema=json_validation_schema,
-        serialization=serialization_schema,
-    )
-
-    s = SchemaSerializer(core_schema.union_schema(choices=[core_schema.timedelta_schema(), test_custom_ser_schema]))
-    assert s.to_python('foo') is None
+def timedelta_isoformat(td: datetime.timedelta) -> str:
+    """
+    ISO 8601 encoding for Python timedelta object.
+    """
+    minutes, seconds = divmod(td.seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f'{"-" if td.days < 0 else ""}P{abs(td.days)}DT{hours:d}H{minutes:d}M{seconds:d}.{td.microseconds:06d}S'

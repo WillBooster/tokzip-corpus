@@ -1,51 +1,103 @@
-很多網路資源的說法都不太一樣，如果碰到有疑義的地方我會盡量以 RFC 上面寫的標準為主。如果有錯誤的話還麻煩不吝指正，感謝。
+當初看到這題以後，我就想說有沒有可能弄一個 JavaScript 的版本？於是 Math jail 就誕生了。
+
+原本其實沒有限制一定要由 `Math.` 開頭，但後來發現這樣做比較有趣，而且如果不這樣做的話，直接 `alert(document.domain.toString())` 就結束了，要過濾掉很多關鍵字才能封住，而且還可能會有 unintended。
+
+接下來就講一下 Math jail 解法大概的思路是什麼。
 
 <!-- more -->
 
-# 為什麼需要 Cache
+## 解法的整體概念
 
-多問為什麼是個好習慣，在你用一個東西之前，必須知道你為什麼要用它。於是，我們需要問自己一個問題：為什麼需要 Cache？
+概念就跟前面提到的 Python 版本一樣，找一個 list 然後 push 東西進去，最後 join 然後拿去給 eval 執行，大概會像這樣：
 
-很簡單，因為節省流量嘛，也節省時間，或是更宏觀地來說，減少資源的損耗。
-
-舉例來說，今天電商網站的首頁可能會有很多商品，如果你今天每一個訪客到首頁你都去資料庫重新抓一次所有的資料，那對資料庫的負擔會非常非常大。
-
-可是呢，其實首頁的這些資訊基本上短期之內是不會變的，一個商品的價格不可能上一秒是一千元，下一秒就變成兩千元。所以這些不常變動的資料就很適合儲存起來，也就是我們說的 Cache，台灣翻譯叫做快取，中國翻譯叫做緩存。
-
-上面這個例子可以把首頁的那些資訊在撈出來一次之後就存在某個地方，例如說 Redis，其實就是以一個簡單的 Key Value Pair 的形式存進去即可，接著只要是用到這些資訊的時候，都可以用極快的速度撈出來，而不是再到資料庫裡面重新算一次。
-
-上面講的是 Server side 的 Cache，藉由把 Database 的資料撈出來之後存到別的地方達成。但 Server side 的 Cache 並不是我們今天的重點，有興趣的讀者們可以參考我之前寫過的：[資料庫的好夥伴：Redis](http://blog.techbridge.cc/2016/06/18/redis-introduction/)。
-
-今天的重點是 Server 跟瀏覽器之間的 Cache 機制。
-
-例如說電商網站的商品圖好了。如果沒有 Cache 的話，那首頁出現的上百張商品圖，只要網頁被瀏覽幾次，就會被下載幾次，這個流量是非常驚人的。所以我們必須讓瀏覽器可以把這些圖片給 Cache 起來。這樣只有第一次瀏覽這個網頁的時候需要重新下載，第二次瀏覽的時候，圖片就可以直接從瀏覽器的快取裡面去抓，不用再跟 Server 拿資料了。
-
-# Expires
-
-要達成上述的功能，可以在 HTTP Response Header 裡面加上一個`Expires`的字段，裡面就是這個 Cache 到期的時間，例如說：
-
-```
-Expires: Wed, 21 Oct 2017 07:28:00 GMT
+``` js
+var arr = []
+eval(arr.join(''.toString(arr.push('a'.toString()))))
+// Uncaught ReferenceError: a is not defined
 ```
 
-瀏覽器收到這個 Response 之後就會把這個資源給快取起來，當下一次使用者再度造訪這個頁面或是要求這個圖片的資源的時候，瀏覽器會檢視「現在的時間」是否有超過這個 Expires。如果沒有超過的話，那瀏覽器「不會發送任何 Request」，而是直接從電腦裡面已經存好的 Cache 拿資料。
+上面的程式碼最後會執行 `a`，只要照著這個概念繼續做，就可以拼出 `alert()`，簡單舉個例子像是這樣：
 
-若是打開 Chrome dev tool，就會看到它寫著：「Status code 200 (from disk cache)」，代表這個 Request 其實沒有發出去，Response 是直接從 disk cache 裡面拿的。
+``` js
+var arr = ['a','l','e','r']
+eval(
+  arr.join(
+    ''.toString(
+        arr.push(
+          ')'.toString(
+            arr.push(
+              '('.toString(
+                arr.push('t'.toString())
+              )
+            )
+          )
+        )
+      )
+  )
+)
+```
 
-![disk cache](/img/http-cache/p1-disk.png)
+因為我們每一個 function call 都不能有參數，所以像是 `arr.join('')` 這種的，可以改成 `arr.join(''.toString())`，就能夠符合規則。
 
-可是這樣其實會碰到一個問題，因為瀏覽器檢視這個 Expires 的時間是用「電腦本身的時間」，那如果我喜歡活在未來，把電腦的時間改成 2100 年，會怎樣呢？
+有了這個基本概念以後，接下來的問題就可以分成幾個部分：
 
-瀏覽器就會覺得所有的 Cache 都是過期的，就會重新發送 Request。
+1. 怎麼找到一個可以用的陣列？
+2. 怎麼找到想要的字元？
+3. 怎麼 join？
+4. 怎麼不用 eval 來執行？
 
-# Cache-Control 與 max-age
+## 1. 找到陣列
 
-Expires 其實是 HTTP 1.0 就存在的 Header，而為了解決上面 Expires 會碰到的問題，HTTP 1.1 有一個新的 header 出現了，叫做：`Cache-Control`。（註：Cache-Control 是 HTTP 1.1 出現的 Header，但其實不單單只是解決這個問題，還解決許多 HTTP 1.0 沒辦法處理的快取相關問題）
+在題目中有特別給了一個陣列 `Math.seeds`，我們只要先 pop 就可以把它清空，像是這樣：
 
-其中一種用法是：`Cache-Control: max-age=30`，就代表這個 Response 的過期時間是 30 秒。假設使用者在收到這個 Response 之後的第 10 秒重新整理，那就會出現上面那樣被瀏覽器 Cache 住的現象。
+``` js
+Math.seeds = [1,2,3,4]
+Math.seeds.pop(Math.seeds.pop(Math.seeds.pop(Math.seeds.pop())))
+console.log(Math.seeds) // []
+```
 
-但假如使用者是過 60 秒之後才重新整理，瀏覽器就會發送新的 Request。
+如此一來，我們就有一個可以放東西的陣列能夠使用。
 
-![new cache](/img/http-cache/p2-new.png)
+## 2. 找到想要的字元
 
-仔細觀察 Google Logo 檔案的 Response header，你會發現它的`max-age`設定成`31536000`秒，也就是 365 天的意思。只要你在一年之內造訪這個網站，都不會對 Google logo 這張圖片送出 Request，而是會直接使
+首先，我們可以看看我們想要的字元是否存在於 `Math` 當中，例如說 `Math.abs.name` 就可以拿到 `"abs"` 這個字元，搭配 `at` 來使用的話，`Math.abs.name.at()` 就會是 `"a"`。
+
+所以呢，`Math.seeds.push(Math.abs.name.at())`，就可以讓 `Math.seeds` 的內容變成 `["a"]`。
+
+而 `Arrar.prototype.push` 的回傳值會是陣列的長度，因此目前是 1，所以如果能找到某個函式的第二個字是 l，就能減少函式呼叫的次數，是最好的方法。
+
+講到這裡，你應該已經意識到這一題如果用手動的方式大概會累死，自動化會是更好的方式，因此就來寫個函式吧！
+
+我們可以用遞迴的方式去尋找能接觸到的物件的每一個屬性是否符合我們想要的規則，並且回傳路徑是什麼，實作如下：
+
+``` js
+function findTargetFromScope(scope, matchFn, initPath='') {
+  let visited = new Set()
+  let result = []
+
+  findTarget(scope, initPath)
+
+  // return the shortest one
+  return result.sort((a, b) => a.length - b.length)[0]
+
+  function findTarget(obj, path) {
+    if(visited.has(obj)) return
+    visited.add(obj)
+    const list = Object.getOwnPropertyNames(obj)
+    for(let key of list) {
+      const item = obj[key]
+      const newPath = path ? path + "." + key : key
+      try {
+        if (matchFn(item)) {
+          result.push(newPath)
+          continue
+        }
+      } catch(err){}
+      
+      if (item && typeof item === 'object') {
+        findTarget(item, newPath)
+      }
+    }
+  }
+}
+```

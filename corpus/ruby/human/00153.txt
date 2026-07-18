@@ -1,117 +1,194 @@
 # frozen_string_literal: true
 
-require "active_support/core_ext/class/subclasses"
-require "active_model/attribute_set"
-require "active_model/attribute/user_provided_default"
+# :markup: markdown
 
-module ActiveModel
-  module AttributeRegistration # :nodoc:
-    extend ActiveSupport::Concern
+require "active_support/inflector/methods"
+require "active_support/dependencies"
 
-    module ClassMethods # :nodoc:
-      def attribute(name, type = nil, default: (no_default = true), **options)
-        name = resolve_attribute_name(name)
-        type = resolve_type_name(type, **options) if type.is_a?(Symbol)
-        type = hook_attribute_type(name, type) if type
+module ActionDispatch
+  # # Action Dispatch MiddlewareStack
+  #
+  # Read more about [Rails middleware
+  # stack](https://guides.rubyonrails.org/rails_on_rack.html#action-dispatcher-middleware-stack)
+  # in the guides.
+  class MiddlewareStack
+    class Middleware
+      attr_reader :args, :block, :klass
 
-        pending_attribute_modifications << PendingType.new(name, type) if type || no_default
-        pending_attribute_modifications << PendingDefault.new(name, default) unless no_default
-
-        reset_default_attributes
+      def initialize(klass, args, block)
+        @klass = klass
+        @args  = args
+        @block = block
       end
 
-      def decorate_attributes(names = nil, &decorator) # :nodoc:
-        names = names&.map { |name| resolve_attribute_name(name) }
+      def name; klass.name; end
 
-        pending_attribute_modifications << PendingDecorator.new(names, decorator)
-
-        reset_default_attributes
-      end
-
-      def _default_attributes # :nodoc:
-        @default_attributes ||= AttributeSet.new({}).tap do |attribute_set|
-          apply_pending_attribute_modifications(attribute_set)
+      def ==(middleware)
+        case middleware
+        when Middleware
+          klass == middleware.klass
+        when Module
+          klass == middleware
         end
       end
 
-      def attribute_types # :nodoc:
-        @attribute_types ||= _default_attributes.cast_types.tap do |hash|
-          hash.default = Type.default_value
-        end
-      end
-
-      def type_for_attribute(attribute_name, &block)
-        attribute_name = resolve_attribute_name(attribute_name)
-
-        if block
-          attribute_types.fetch(attribute_name, &block)
+      def inspect
+        if klass.is_a?(Module)
+          klass.to_s
         else
-          attribute_types[attribute_name]
+          klass.class.to_s
         end
       end
 
-      private
-        PendingType = Struct.new(:name, :type) do # :nodoc:
-          def apply_to(attribute_set)
-            attribute = attribute_set[name]
-            attribute_set[name] = attribute.with_type(type || attribute.type)
-          end
-        end
+      def build(app)
+        klass.new(app, *args, &block)
+      end
 
-        PendingDefault = Struct.new(:name, :default) do # :nodoc:
-          def apply_to(attribute_set)
-            attribute_set[name] = attribute_set[name].with_user_default(default)
-          end
-        end
-
-        PendingDecorator = Struct.new(:names, :decorator) do # :nodoc:
-          def apply_to(attribute_set)
-            (names || attribute_set.keys).each do |name|
-              attribute = attribute_set[name]
-              type = decorator.call(name, attribute.type)
-              attribute_set[name] = attribute.with_type(type) if type
-            end
-          end
-        end
-
-        def pending_attribute_modifications
-          @pending_attribute_modifications ||= []
-        end
-
-        def apply_pending_attribute_modifications(attribute_set)
-          if superclass.respond_to?(:apply_pending_attribute_modifications, true)
-            superclass.send(:apply_pending_attribute_modifications, attribute_set)
-          end
-
-          pending_attribute_modifications.each do |modification|
-            modification.apply_to(attribute_set)
-          end
-        end
-
-        def reset_default_attributes
-          reset_default_attributes!
-          subclasses.each { |subclass| subclass.send(:reset_default_attributes) }
-        end
-
-        def reset_default_attributes!
-          @default_attributes = nil
-          @attribute_types = nil
-        end
-
-        def resolve_attribute_name(name)
-          name.to_s
-        end
-
-        def resolve_type_name(name, **options)
-          Type.lookup(name, **options)
-        end
-
-        # Hook for other modules to override. The attribute type is passed
-        # through this method immediately after it is resolved, before any type
-        # decorations are applied.
-        def hook_attribute_type(attribute, type)
-          type
-        end
+      def build_instrumented(app)
+        InstrumentationProxy.new(build(app), inspect)
+      end
     end
+
+    # This class is used to instrument the execution of a single middleware. It
+    # proxies the `call` method transparently and instruments the method call.
+    class InstrumentationProxy
+      EVENT_NAME = "process_middleware.action_dispatch"
+
+      def initialize(middleware, class_name)
+        @middleware = middleware
+
+        @payload = {
+          middleware: class_name,
+        }
+      end
+
+      def call(env)
+        ActiveSupport::Notifications.instrument(EVENT_NAME, @payload) do
+          @middleware.call(env)
+        end
+      end
+    end
+
+    include Enumerable
+
+    attr_accessor :middlewares
+
+    def initialize(*args)
+      @middlewares = []
+      yield(self) if block_given?
+    end
+
+    def each(&block)
+      @middlewares.each(&block)
+    end
+
+    def size
+      middlewares.size
+    end
+
+    def last
+      middlewares.last
+    end
+
+    def [](i)
+      middlewares[i]
+    end
+
+    def unshift(klass, *args, &block)
+      middlewares.unshift(build_middleware(klass, args, block))
+    end
+    ruby2_keywords(:unshift)
+
+    def initialize_copy(other)
+      self.middlewares = other.middlewares.dup
+    end
+
+    def insert(index, klass, *args, &block)
+      index = assert_index(index, :before)
+      middlewares.insert(index, build_middleware(klass, args, block))
+    end
+    ruby2_keywords(:insert)
+
+    alias_method :insert_before, :insert
+
+    def insert_after(index, *args, &block)
+      index = assert_index(index, :after)
+      insert(index + 1, *args, &block)
+    end
+    ruby2_keywords(:insert_after)
+
+    def swap(target, *args, &block)
+      index = assert_index(target, :before)
+      insert(index, *args, &block)
+      middlewares.delete_at(index + 1)
+    end
+    ruby2_keywords(:swap)
+
+    # Deletes a middleware from the middleware stack.
+    #
+    # Returns the array of middlewares not including the deleted item, or returns
+    # nil if the target is not found.
+    def delete(target)
+      middlewares.reject! { |m| m.name == target.name }
+    end
+
+    # Deletes a middleware from the middleware stack.
+    #
+    # Returns the array of middlewares not including the deleted item, or raises
+    # `RuntimeError` if the target is not found.
+    def delete!(target)
+      delete(target) || (raise "No such middleware to remove: #{target.inspect}")
+    end
+
+    def move(target, source)
+      source_index = assert_index(source, :before)
+      source_middleware = middlewares.delete_at(source_index)
+
+      target_index = assert_index(target, :before)
+      middlewares.insert(target_index, source_middleware)
+    end
+
+    alias_method :move_before, :move
+
+    def move_after(target, source)
+      source_index = assert_index(source, :after)
+      source_middleware = middlewares.delete_at(source_index)
+
+      target_index = assert_index(target, :after)
+      middlewares.insert(target_index + 1, source_middleware)
+    end
+
+    def use(klass, *args, &block)
+      middlewares.push(build_middleware(klass, args, block))
+    end
+    ruby2_keywords(:use)
+
+    def build(app = nil, &block)
+      instrumenting = ActiveSupport::Notifications.notifier.listening?(InstrumentationProxy::EVENT_NAME)
+      middlewares.freeze.reverse.inject(app || block) do |a, e|
+        if instrumenting
+          e.build_instrumented(a)
+        else
+          e.build(a)
+        end
+      end
+    end
+
+    private
+      def assert_index(index, where)
+        i = index.is_a?(Integer) ? index : index_of(index)
+        raise "No such middleware to insert #{where}: #{index.inspect}" unless i
+        i
+      end
+
+      def build_middleware(klass, args, block)
+        Middleware.new(klass, args, block)
+      end
+
+      def index_of(klass)
+        middlewares.index do |m|
+          m.name == klass.name
+        end
+      end
   end
 end

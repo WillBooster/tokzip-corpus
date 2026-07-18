@@ -1,222 +1,200 @@
-namespace AutoMapper.UnitTests;
-
-public class When_overriding_global_ignore : AutoMapperSpecBase
+namespace AutoMapper.Configuration.Conventions;
+public interface ISourceToDestinationNameMapper
 {
-    Destination _destination;
-
-    public class Source
-    {
-        public int ShouldBeMapped { get; set; }
-    }
-
-    public class Destination
-    {
-        public int ShouldBeMapped { get; set; }
-    }
-
-    protected override MapperConfiguration CreateConfiguration() => new(cfg =>
-    {
-        cfg.AddGlobalIgnore("ShouldBeMapped");
-        cfg.CreateMap<Source, Destination>().ForMember(d => d.ShouldBeMapped, o => o.MapFrom(src => 12));
-    });
-
-    protected override void Because_of()
-    {
-        _destination = Mapper.Map<Destination>(new Source());
-    }
-
-    [Fact]
-    public void Should_not_ignore()
-    {
-        _destination.ShouldBeMapped.ShouldBe(12);
-    }
+    MemberInfo GetSourceMember(TypeDetails sourceTypeDetails, Type destType, Type destMemberType, string nameToSearch);
+    void Merge(ISourceToDestinationNameMapper other);
 }
-
-public class IgnoreAllTests
+[EditorBrowsable(EditorBrowsableState.Never)]
+public sealed class MemberConfiguration
 {
-    public class Source
+    NameSplitMember _nameSplitMember;
+    public INamingConvention SourceNamingConvention { get; set; } = PascalCaseNamingConvention.Instance;
+    public INamingConvention DestinationNamingConvention { get; set; } = PascalCaseNamingConvention.Instance;
+    public List<ISourceToDestinationNameMapper> NameToMemberMappers { get; } = new();
+    public bool IsMatch(ProfileMap options, TypeDetails sourceTypeDetails, Type destType, Type destMemberType, string nameToSearch, List<MemberInfo> resolvers, bool isReverseMap)
     {
-        public string ShouldBeMapped { get; set; }
-    }
-
-    public class Destination
-    {
-        public string ShouldBeMapped { get; set; }
-        public string StartingWith_ShouldNotBeMapped { get; set; }
-        public List<string> StartingWith_ShouldBeNullAfterwards { get; set; }
-        public string AnotherString_ShouldBeNullAfterwards { get; set; }
-    }
-
-    public class DestinationWrongType
-    {
-        public Destination ShouldBeMapped { get; set; }
-    }
-
-    public class FooProfile : Profile
-    {
-        public FooProfile()
+        var matchingMemberInfo = GetSourceMember(sourceTypeDetails, destType, destMemberType, nameToSearch);
+        if (matchingMemberInfo != null)
         {
-            CreateMap<Source, Destination>()
-                .ForMember(dest => dest.AnotherString_ShouldBeNullAfterwards, opt => opt.Ignore());
+            resolvers.Add(matchingMemberInfo);
+            return true;
+        }
+        return nameToSearch.Length == 0 || _nameSplitMember.IsMatch(options, sourceTypeDetails, destType, destMemberType, nameToSearch, resolvers, isReverseMap);
+    }
+    public MemberInfo GetSourceMember(TypeDetails sourceTypeDetails, Type destType, Type destMemberType, string nameToSearch)
+    {
+        var sourceMember = sourceTypeDetails.GetMember(nameToSearch);
+        if (sourceMember != null)
+        {
+            return sourceMember;
+        }
+        foreach (var mapper in NameToMemberMappers)
+        {
+            if ((sourceMember = mapper.GetSourceMember(sourceTypeDetails, destType, destMemberType, nameToSearch)) != null)
+            {
+                return sourceMember;
+            }
+        }
+        return null;
+    }
+    public void Seal()
+    {
+        var isDefault = SourceNamingConvention == PascalCaseNamingConvention.Instance && DestinationNamingConvention == PascalCaseNamingConvention.Instance;
+        _nameSplitMember = isDefault ? new DefaultNameSplitMember() : new ConventionsNameSplitMember();
+        _nameSplitMember.Parent = this;
+    }
+    public void Merge(MemberConfiguration other)
+    {
+        if (other == null)
+        {
+            return;
+        }
+        var initialCount = NameToMemberMappers.Count;
+        for (int index = 0; index < other.NameToMemberMappers.Count; index++)
+        {
+            var otherMapper = other.NameToMemberMappers[index];
+            if (index < initialCount)
+            {
+                var nameToMemberMapper = NameToMemberMappers[index];
+                if (nameToMemberMapper.GetType() == otherMapper.GetType())
+                {
+                    nameToMemberMapper.Merge(otherMapper);
+                    continue;
+                }
+            }
+            NameToMemberMappers.Add(otherMapper);
         }
     }
-
-    [Fact]
-    public void GlobalIgnore_ignores_all_properties_beginning_with_string()
+}
+public sealed class PrePostfixName : ISourceToDestinationNameMapper
+{
+    public List<string> DestinationPrefixes { get; } = new();
+    public List<string> DestinationPostfixes { get; } = new();
+    public MemberInfo GetSourceMember(TypeDetails sourceTypeDetails, Type destType, Type destMemberType, string nameToSearch)
     {
-        var config = new MapperConfiguration(cfg =>
+        MemberInfo member;
+        foreach (var possibleSourceName in TypeDetails.PossibleNames(nameToSearch, DestinationPrefixes, DestinationPostfixes))
         {
-            cfg.AddGlobalIgnore("StartingWith");
-            cfg.CreateMap<Source, Destination>()
-                .ForMember(dest => dest.AnotherString_ShouldBeNullAfterwards, opt => opt.Ignore());
-        });
-        
-        config.CreateMapper().Map<Source, Destination>(new Source{ShouldBeMapped = "true"});
-        config.AssertConfigurationIsValid();
+            if ((member = sourceTypeDetails.GetMember(possibleSourceName)) != null)
+            {
+                return member;
+            }
+        }
+        return null;
     }
-
-    [Fact]
-    public void GlobalIgnore_ignores_all_properties_beginning_with_string_in_profiles()
+    public void Merge(ISourceToDestinationNameMapper other)
     {
-        var config = new MapperConfiguration(cfg =>
-        {
-            cfg.AddGlobalIgnore("StartingWith");
-            cfg.AddProfile<FooProfile>();
-        });
-        
-        config.CreateMapper().Map<Source, Destination>(new Source{ShouldBeMapped = "true"});
-        config.AssertConfigurationIsValid();
-    }
-
-    [Fact]
-    public void GlobalIgnore_ignores_properties_with_names_matching_but_different_types()
-    {
-        var config = new MapperConfiguration(cfg =>
-        {
-            cfg.AddGlobalIgnore("ShouldBeMapped");
-            cfg.CreateMap<Source, DestinationWrongType>();
-        });
-
-        config.CreateMapper().Map<Source, DestinationWrongType>(new Source { ShouldBeMapped = "true" });
-        config.AssertConfigurationIsValid();
-    }
-
-    [Fact]
-    public void Ignored_properties_should_be_default_value()
-    {
-        var config = new MapperConfiguration(cfg =>
-        {
-            cfg.AddGlobalIgnore("StartingWith");
-            cfg.CreateMap<Source, Destination>()
-                .ForMember(dest => dest.AnotherString_ShouldBeNullAfterwards, opt => opt.Ignore());
-        });
-
-        Destination destination = config.CreateMapper().Map<Source, Destination>(new Source { ShouldBeMapped = "true" });
-        destination.StartingWith_ShouldBeNullAfterwards.ShouldBe(null);
-        destination.StartingWith_ShouldNotBeMapped.ShouldBe(null);
-    }
-
-    [Fact]
-    public void Ignore_supports_two_different_values()
-    {
-        var config = new MapperConfiguration(cfg =>
-        {
-            cfg.AddGlobalIgnore("StartingWith");
-            cfg.AddGlobalIgnore("AnotherString");
-            cfg.CreateMap<Source, Destination>();
-        });
-
-        Destination destination = config.CreateMapper().Map<Source, Destination>(new Source { ShouldBeMapped = "true" });
-        destination.AnotherString_ShouldBeNullAfterwards.ShouldBe(null);
-        destination.StartingWith_ShouldNotBeMapped.ShouldBe(null);
+        var typedOther = (PrePostfixName)other;
+        DestinationPrefixes.TryAdd(typedOther.DestinationPrefixes);
+        DestinationPostfixes.TryAdd(typedOther.DestinationPostfixes);
     }
 }
-public class IgnoreAttributeTests
+public sealed class ReplaceName : ISourceToDestinationNameMapper
 {
-    public class Source
+    public List<MemberNameReplacer> MemberNameReplacers { get; } = new();
+    public MemberInfo GetSourceMember(TypeDetails sourceTypeDetails, Type destType, Type destMemberType, string nameToSearch)
     {
-        public string ShouldBeMapped { get; set; }
-        public string ShouldNotBeMapped { get; set; }
-    }
-
-    public class Destination
-    {
-        public string ShouldBeMapped { get; set; }
-        [IgnoreMap]
-        public string ShouldNotBeMapped { get; set; }
-    }
-
-    [Fact]
-    public void Ignore_On_Source_Field()
-    {
-        var config = new MapperConfiguration(cfg =>
+        var possibleSourceNames = PossibleNames(nameToSearch);
+        if (possibleSourceNames.Length == 0)
         {
-            cfg.AddIgnoreMapAttribute();
-            cfg.CreateMap<Source, Destination>();
-        });
-        config.AssertConfigurationIsValid();
-
-        Source source = new Source
+            return null;
+        }
+        var possibleDestNames = sourceTypeDetails.ReadAccessors.Select(mi => (mi, possibles : PossibleNames(mi.Name))).ToArray();
+        foreach (var sourceName in possibleSourceNames)
         {
-            ShouldBeMapped = "Value1",
-            ShouldNotBeMapped = "Value2"
-        };
-
-        Destination destination = config.CreateMapper().Map<Source, Destination>(source);
-        destination.ShouldNotBeMapped.ShouldBe(null);
+            foreach (var (mi, possibles) in possibleDestNames)
+            {
+                if (possibles.Contains(sourceName, StringComparer.OrdinalIgnoreCase))
+                {
+                    return mi;
+                }
+            }
+        }
+        return null;
+    }
+    public void Merge(ISourceToDestinationNameMapper other)
+    {
+        var typedOther = (ReplaceName)other;
+        MemberNameReplacers.TryAdd(typedOther.MemberNameReplacers);
+    }
+    private string[] PossibleNames(string nameToSearch) =>
+            MemberNameReplacers.Select(r => nameToSearch.Replace(r.OriginalValue, r.NewValue))
+                .Concat(new[] { MemberNameReplacers.Aggregate(nameToSearch, (s, r) => s.Replace(r.OriginalValue, r.NewValue)), nameToSearch })
+                .ToArray();
+}
+[EditorBrowsable(EditorBrowsableState.Never)]
+public readonly record struct MemberNameReplacer(string OriginalValue, string NewValue);
+[EditorBrowsable(EditorBrowsableState.Never)]
+public abstract class NameSplitMember
+{
+    public MemberConfiguration Parent { get; set; }
+    public abstract bool IsMatch(ProfileMap options, TypeDetails sourceType, Type destType, Type destMemberType, string nameToSearch, List<MemberInfo> resolvers, bool isReverseMap);
+}
+[EditorBrowsable(EditorBrowsableState.Never)]
+public sealed class DefaultNameSplitMember : NameSplitMember
+{
+    public sealed override bool IsMatch(ProfileMap options, TypeDetails sourceType, Type destType, Type destMemberType, string nameToSearch, List<MemberInfo> resolvers, bool isReverseMap)
+    {
+        MemberInfo matchingMemberInfo = null;
+        int index = 1;
+        for (; index < nameToSearch.Length; index++)
+        {
+            if (char.IsUpper(nameToSearch[index]) && Found())
+            {
+                return true;
+            }
+        }
+        return matchingMemberInfo != null && Found();
+        bool Found()
+        {
+            var first = nameToSearch[..index];
+            matchingMemberInfo = Parent.GetSourceMember(sourceType, destType, destMemberType, first);
+            if (matchingMemberInfo == null)
+            {
+                return false;
+            }
+            resolvers.Add(matchingMemberInfo);
+            var second = nameToSearch[index..];
+            var details = options.CreateTypeDetails(matchingMemberInfo.GetMemberType());
+            if (Parent.IsMatch(options, details, destType, destMemberType, second, resolvers, isReverseMap))
+            {
+                return true;
+            }
+            resolvers.RemoveAt(resolvers.Count - 1);
+            return false;
+        }
     }
 }
-
-public class ReverseMapIgnoreAttributeTests
+[EditorBrowsable(EditorBrowsableState.Never)]
+public sealed class ConventionsNameSplitMember : NameSplitMember
 {
-    public class Source
+    public sealed override bool IsMatch(ProfileMap options, TypeDetails sourceType, Type destType, Type destMemberType, string nameToSearch, List<MemberInfo> resolvers, bool isReverseMap)
     {
-        public string ShouldBeMapped { get; set; }
-        public string ShouldNotBeMapped { get; set; }
-    }
-
-    public class Destination
-    {
-        public string ShouldBeMapped { get; set; }
-        [IgnoreMap]
-        public string ShouldNotBeMapped { get; set; }
-    }
-
-    [Fact]
-    public void Ignore_On_Source_Field()
-    {
-        var config = new MapperConfiguration(cfg =>
+        var destinationNamingConvention = isReverseMap ? Parent.SourceNamingConvention : Parent.DestinationNamingConvention;
+        var matches = destinationNamingConvention.Split(nameToSearch);
+        var length = matches.Length;
+        if (length < 2)
         {
-            cfg.AddIgnoreMapAttribute();
-            cfg.CreateMap<Source, Destination>().ReverseMap();
-        });
-        config.AssertConfigurationIsValid();
-
-        Destination source = new Destination
+            return false;
+        }
+        var sourceNamingConvention = isReverseMap ? Parent.DestinationNamingConvention : Parent.SourceNamingConvention;
+        var separator = sourceNamingConvention.SeparatorCharacter;
+        for (var index = 1; index <= length; index++)
         {
-            ShouldBeMapped = "Value1",
-            ShouldNotBeMapped = "Value2"
-        };
-
-        Source destination = config.CreateMapper().Map<Destination, Source>(source);
-        destination.ShouldNotBeMapped.ShouldBe(null);
-
-    }
-
-    public class Source2
-    {
-    }
-
-    public class Destination2
-    {
-        [IgnoreMap]
-        public string ShouldNotThrowExceptionOnReverseMapping { get; set; }
-    }
-
-    [Fact]
-    public void Sould_not_throw_exception_when_reverse_property_does_not_exist()
-    {
-        typeof(ArgumentOutOfRangeException).ShouldNotBeThrownBy(() => new MapperConfiguration(cfg => cfg.CreateMap<Source2, Destination2>()
-             .ReverseMap()));
+            var first = string.Join(separator, matches, 0, index);
+            var matchingMemberInfo = Parent.GetSourceMember(sourceType, destType, destMemberType, first);
+            if (matchingMemberInfo != null)
+            {
+                resolvers.Add(matchingMemberInfo);
+                var second = string.Join(separator, matches, index, length - index);
+                var details = options.CreateTypeDetails(matchingMemberInfo.GetMemberType());
+                if (Parent.IsMatch(options, details, destType, destMemberType, second, resolvers, isReverseMap))
+                {
+                    return true;
+                }
+                resolvers.RemoveAt(resolvers.Count - 1);
+            }
+        }
+        return false;
     }
 }

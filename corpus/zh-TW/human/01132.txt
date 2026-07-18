@@ -1,108 +1,19 @@
-The first reason for being faster is that they are originally doing CDN, so there may be nodes in different countries. Suppose your host is in the United States. If you use your own website, Taiwanese users have to connect to the US server to fetch these libraries. However, if you use the URL provided by the CDN, you may only need to connect to the Taiwanese node, saving some latency.
+If you're not interested, feel free to skip to the next section.
 
-The second reason is that if everyone is using this CDN, the probability of it being cached will increase. For example, suppose Facebook also uses cdnjs to load jQuery 3.6.0. If my website also uses the same service to load the same library, for browsers that have visited Facebook, they do not need to download the file again because it has already been downloaded and cached.
+In my current company, we work with both React and Vue, using the latest versions - Next.js 14 (we started with 13.4, the first version with RSC) and Vue3.
 
-(2021-08-09 Supplement: Thanks to Ho Hong Yip for correcting me in the front-end community on Facebook after the article was published. The current browser has added a limit to the cache, that is, the cache across websites (more specifically, based on eTLD+1) will be separated. Therefore, even if Facebook has loaded jQuery 3.6.0, when users visit your website, they still need to download it again. For more detailed introduction, you can see this article: [Gaining security and privacy by partitioning the cache](https://developers.google.com/web/updates/2020/10/http-cache-partitioning). In this way, it seems that there is one less reason to use public CDNs? But [Web Shared Libraries](https://docs.google.com/document/d/1lQykm9HgzkPlaKXwpQ9vNc3m2Eq2hF4TY-Vup5wg4qg/edit) mentioned at the end of the article wants to solve this problem, but it seems to be in the early stage.)
+Since we are using the latest version of Next.js, I decided to explore RSC to experience one of React's future key technologies. In conclusion: "Don't let me suffer alone, please come and use it."
 
-Taking the familiar [iT 邦幫忙](https://ithelp.ithome.com.tw/articles?tab=tech) website as an example, it uses resources from Google and cdnjs:
+(If you're not familiar with what RSC is or tend to confuse it with SSR, I recommend reading these two articles: [RSC From Scratch. Part 1: Server Components](https://github.com/reactwg/server-components/discussions/5) and [Understanding React Server Components](https://vercel.com/blog/understanding-react-server-components))
 
-![ithome](/img/front-end-supply-chain-attack-cdnjs/ithome.png)
+According to RSC's design principles, if used correctly, your bundle size may decrease, and your website's performance may improve. However, after using it myself, I believe that the benefits it brings are far outweighed by the complexity introduced by adopting this technology.
 
-We talked about the advantages of using third-party CDNs earlier, but what are the disadvantages?
+But first, let me emphasize that my experience is based on using Next.js's RSC, and it may not be the same for all RSC implementations. Therefore, this section will focus on "My Experience with Next.js's RSC" rather than "My Experience with RSC."
 
-The first disadvantage is that if the CDN goes down, your website may go down with it, or at least experience slow connections. For example, if my website loads jQuery from cdnjs, but cdnjs suddenly becomes slow, my website will also become slow, and be affected as well.
+Let's start with the drawbacks.
 
-And the company behind cdnjs, Cloudflare, has indeed had some issues, affecting many websites.
+Firstly, understanding the difference between client components and server components can be time-consuming. Perhaps I started experimenting too early, and even the official Next.js documentation was not very clear, requiring continuous trial and error to understand the concepts (for example, there was a post in the frontend community asking about this, and I had similar doubts at first).
 
-The second disadvantage is that if the CDN is hacked and the library you imported is injected with malicious code, your website will also be compromised. This type of attack is the topic of this article: "supply chain attack," which infiltrates from upstream and affects downstream.
+Furthermore, in the future, when writing components, you will need to consider whether they are for the client, server, or both, adding to the mental burden.
 
-Some people may think, "These big companies are unlikely to be hacked, right? And with so many people using this service, someone must be monitoring it."
-
-Next, let's look at a real case.
-
-## Analyzing the cdnjs RCE vulnerability
-
-On July 16, 2021, a security researcher [@ryotkak](https://twitter.com/ryotkak) published an article on his blog titled [Remote code execution in cdnjs of Cloudflare](https://blog.ryotak.me/post/cdnjs-remote-code-execution-en/) (hereinafter referred to as "the author").
-
-Remote code execution, or RCE for short, is a high-risk vulnerability that allows attackers to execute arbitrary code. The author discovered an RCE vulnerability in cdnjs, which, if exploited, could control the entire cdnjs service.
-
-The author's blog post describes the process in great detail. Here, I will briefly explain how the vulnerability was formed, which involves two vulnerabilities.
-
-First, Cloudflare has open-sourced cdnjs-related code on GitHub, and one of its automatic update features caught the author's attention. This feature automatically retrieves packaged files from npm, which are compressed files in .tgz format, and after decompressing them, processes the files and copies them to the appropriate location.
-
-The author knew that there might be vulnerabilities in using `archive/tar` to decompress files in Go, because the decompressed files are not processed, so the file names can look like this: `../../../../../tmp/temp`.
-
-What's the problem with this?
-
-Suppose you have a piece of code that copies files and does something like this:
-
-1. Concatenate the destination and file name to create the target location and create a new file.
-2. Read the original file and write it to the new file.
-
-If the destination is `/packages/test` and the file name is `abc.js`, a new file will be created at `/packages/test/abc.js`.
-
-If the destination is the same, but the file name is `../../../tmp/abc.js`, a file will be written to `/package/test/../../../tmp/abc.js`, which is `/tmp/abc.js`.
-
-Therefore, using this technique, files can be written to any location with permissions! And cdnjs's code has a similar vulnerability that can write files to any location. If this vulnerability can be exploited to overwrite the files that are scheduled to be automatically executed, RCE can be achieved.
-
-When the author was about to create a POC to verify this, he suddenly became curious about how the Git auto-update feature worked (the above discussion about compressed files was for npm).
-
-After researching it, the author found a piece of code for copying files related to Git repo auto-updates, which looks like this:
-
-``` go
-func MoveFile(sourcePath, destPath string) error {
-    inputFile, err := os.Open(sourcePath)
-    if err != nil {
-        return fmt.Errorf("Couldn't open source file: %s", err)
-    }
-    outputFile, err := os.Create(destPath)
-    if err != nil {
-        inputFile.Close()
-        return fmt.Errorf("Couldn't open dest file: %s", err)
-    }
-    defer outputFile.Close()
-    _, err = io.Copy(outputFile, inputFile)
-    inputFile.Close()
-    if err != nil {
-        return fmt.Errorf("Writing to output file failed: %s", err)
-    }
-    // The copy was successful, so now delete the original file
-    err = os.Remove(sourcePath)
-    if err != nil {
-        return fmt.Errorf("Failed removing original file: %s", err)
-    }
-    return nil
-}
-```
-
-It doesn't look like much, just copying files, opening a new file, and copying the contents of the old file into it.
-
-But if the original file is a symbolic link, it's different. Before we continue, let's briefly explain what a symbolic link is.
-
-The concept of a symbolic link is similar to the "shortcut" we used to see on Windows. This shortcut is just a link that points to the real target.
-
-In Unix-like systems, you can use `ln -s target_file link_name` to create a symbolic link. Here's an example that will make it easier to understand.
-
-First, I create a file with the content "hello" at `/tmp/hello`. Then I create a symbolic link in the current directory that points to the hello file I just created: `ln -s /tmp/hello link_file`.
-
-Next, if I print the contents of `link_file`, it will show `hello`, because it is actually printing the contents of `/tmp/hello`. If I write data to `link_file`, it is actually writing to `/tmp/hello`.
-
-![terminal](/img/front-end-supply-chain-attack-cdnjs/terminal.png)
-
-Next, let's try writing a piece of Node.js code to copy a file and see what happens:
-
-``` js
-node -e 'require("fs").copyFileSync("link_file", "test.txt")'
-```
-
-After execution, we found that there is a new file `test.txt` in the directory, and its contents are the contents of the file `/tmp/hello`.
-
-Therefore, when a program executes a file copy, it is not "copying a symbolic link", but "copying the content of the file it points to".
-
-Therefore, the file copying code mentioned earlier in Go, if there is a file that points to a symbolic link `/etc/passwd`, after copying, a file with the content `/etc/passwd` will be generated.
-
-We can add a symbolic link named `test.js` in the Git file, which points to `/etc/passwd`. After being copied by cdnjs, a `test.js` file will be generated, and its contents will be the contents of `/etc/passwd`!
-
-In this way, an arbitrary file read vulnerability is obtained.
-
-To summarize, the author found two vulnerabilities, one can write files and the other can read files. If you accidentally overwrite important files when writing files, the system will crash. Therefore, the author decided to start with reading files to do POC, created a Git repository and released a new version, waited for cdnjs to automatically update, and finally triggered the file reading vulnerability. The content read from the file can be seen in the JS published by cdnjs.
+Additionally, many server components may directly call APIs to fetch data, resulting in the client receiving pre-rendered results. While this may seem beneficial at first (after all, it's one of RSC's selling points), it actually makes frontend debugging very challenging.

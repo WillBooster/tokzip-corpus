@@ -1,129 +1,214 @@
-是一個現在已經跟空氣和水一樣存在的東西：XMLHttpRequest。
+因為缺少了這些官方函式庫，所以一堆功能都是靠 npm 上的套件堆起來的，只要任何一個小套件被攻擊，在安裝的時候就會裝到惡意套件。以攻擊者的角度來看，攻擊一個套件，可以影響到成千上萬個，怎麼想都很划算。
 
-想要不換頁就能獨立運作並且與 server 溝通，XMLHttpRequest 是必要條件，必須先有 XMLHttpRequest 這個 API，才能不換頁就能與 server 交換資料。
+除了上面兩種，還有另一個問題是：「我們自己不小心安裝到錯的套件」。
 
-不過在最剛開始的時候，並不是所有的瀏覽器都用 XMLHttpRequest，最早有這個概念的微軟用的是 ActiveXObject，從 2006 年第一版的 jQuery [原始碼](https://github.com/jquery/jquery/blob/1.0/src/ajax/ajax.js#L61)就能驗證這件事：
+例如說 express 多打一個 s，變成 expresss，就會安裝到別的套件。因此駭客可以先註冊很多打錯字的套件，放惡意程式碼在裡面，你不小心打錯字就會中招，這種攻擊手法叫做 typosquatting。
 
-``` js
-// If IE is used, create a wrapper for the XMLHttpRequest object
-if ( jQuery.browser.msie && typeof XMLHttpRequest == "undefined" )
-  XMLHttpRequest = function(){
-    return new ActiveXObject(
-      navigator.userAgent.indexOf("MSIE 5") >= 0 ?
-        "Microsoft.XMLHTTP" : "Msxml2.XMLHTTP"
-      );
-  };
+偷偷跟你說，每週有將近 600 人會多打一個 s，但慶幸的是這個套件是空的：
+
+![expresss 的下載次數](/img/dive-into-npm-supply-chain-attack/p3.png)
+
+有些服務會禁止註冊這種名字相近的，或是有些善良的資安人員會先註冊起來，以免其他人打錯或是被有心人士註冊走，例如說與知名套件 mongoose 一字之差的 [mongose](https://www.npmjs.com/package/mongose)，以前就被發起攻擊，因此後來被 npm 團隊註冊起來放著：
+
+![mongose](/img/dive-into-npm-supply-chain-attack/p4.png)
+
+## 安裝到有問題的套件會怎樣？如何防禦？
+
+既然是安裝套件，那只要不用它應該就不會有問題吧？雖然多打一個字安裝到錯的，但是在用的時候寫對就會發現套件不存在，只要沒用到套件，應該很安全吧？
+
+在 npm 生態系底下，只要裝到惡意套件就直接 game over 了。
+
+原因是，npm 有提供各種 [scripts](https://docs.npmjs.com/cli/v11/using-npm/scripts) 可以跑，如 `postinstall`，只要在套件裡面指定好，在你安裝完套件以後，寫在 `postinstall` 裡的 shell script 就會被執行。
+
+postinstall 的正常用法是在套件安裝完之後，自動再去下載需要的東西，像是拿來做瀏覽器自動化的 [puppeteer](https://github.com/puppeteer/puppeteer/blob/af1b9be6b6a178f7ea6e197f738ca3cf99d786f7/packages/puppeteer/package.json#L42)，它的 postinstall 寫著 `node install.mjs`，會去跑一個幫你下載瀏覽器的腳本，把環境設置好。
+
+那不正常用法就是把惡意程式碼埋在 postinstall 裡面，像是 [axios](https://cloud.google.com/blog/topics/threat-intelligence/north-korea-threat-actor-targets-axios-npm-package) 被攻擊的事件中，就是有個子依賴指定了 postinstall，會跑 `node setup.js`，然後 `setup.js` 含有惡意程式碼，安裝即中招。
+
+那我們該怎麼防禦呢？
+
+在 npm 裡面有一個參數可以設定：[ignore-scripts](https://docs.npmjs.com/cli/v11/commands/npm-install#ignore-scripts)，配成 true 的話，就可以關掉這些 pre/post 系列的 hook，不會執行。這個參數預設是 false，所以記得要主動設定。
+
+而 pnpm 從 v10 開始就預設阻止這些 scripts 的執行，你要主動把套件加到 `allowBuilds` 的清單裡面才能跑。當初還有開了一個 GitHub 的討論串以及投票：[Should we block lifecycle script of dependencies during installation? #8918](https://github.com/orgs/pnpm/discussions/8918)，有七成的人選應該預設擋掉。
+
+而 bun 的策略則是內建一個信任清單，預設只有這清單裡面的套件才可以執行 script，目前有 300 多個套件在上面：[src/install/default-trusted-dependencies.txt](https://github.com/oven-sh/bun/blob/main/src/install/default-trusted-dependencies.txt)
+
+雖然說 bun 在開發者體驗跟安全性之中取得了一個平衡，但我還是更喜歡 pnpm 的做法，直接把全部擋掉，開發者要明確 approve 才會執行。
+
+話說這種「安裝套件後可以執行腳本」的功能也不是 npm 獨有的，隔壁的 RubyGems 也有類似的功能。而這個機制也會有相同問題，就是安裝到惡意套件直接 game over，因此在 4 月份的時候，他們也加上了兩個 option 可以把這個行為關掉：[Add --no-build-extension and --no-install-plugin options to gem install #9473](https://github.com/ruby/rubygems/pull/9473)。
+
+但因為預設開啟怕會有現有專案壞掉，所以預設是關的，跟 npm 一樣要開發者主動開啟才有用。
+
+以 npm 來說，我們可以新增一個 user-level 的 npm config 放在 `~/.npmrc`，就不需要每個資料夾重複指定了：
+
+``` ini
+# 不執行 postinstall 等腳本
+ignore-scripts=true
 ```
 
-講到了 XMLHttpRequest 之後，理所當然就會提到 Ajax，這個詞來自於 2005 年 2 月 18 日 Jesse James Garrett 發表的這篇文章：[Ajax: A New Approach to Web Applications](https://web.archive.org/web/20061107032631/http://www.adaptivepath.com/publications/essays/archives/000385.php)，裡面描述了一種使用 HTML + CSS + DOM + XMLHttpRequest 的新型溝通模式，我認為就是 SPA 的雛型了
+## 如何不安裝到有問題的套件
 
-![ajax](/img/server-side-rendering-ssr-and-isomorphic/p2.png)
+若是安裝到了惡意套件，惡意套件可以經由那些 script 直接執行程式碼；就算我們把這功能關掉，若是我們的產品用到了這些套件，那產品本身也會被污染，到時候你的網站就可能被植入惡意程式。
 
+「把 script 關掉」算是第二層防禦，而第一層防禦，也就是大家最想要達成的，其實是：「不要安裝到惡意套件」，只要不安裝到就沒事了。
 
-（圖片來自於上面提到的文章）
+那要怎麼盡量做到這件事呢？有三個方法。
 
-另外，在文章裡也有提到 XMLHttpRequest 與 Ajax 的不同之處：
+### 第一招：延遲下載
 
-> Q. Is Ajax just another name for XMLHttpRequest?
-> A. No. XMLHttpRequest is only part of the Ajax equation. XMLHttpRequest is the technical component that makes the asynchronous server communication possible; Ajax is our name for the overall approach described in the article, which relies not only on XMLHttpRequest, but on CSS, DOM, and other technologies.
+既然有駭客鎖定供應鏈進行攻擊，那自然也會有相對應的資安廠商來注意這塊進行防禦。
 
-從歷史的資料看起來，微軟的 Outlook 似乎是最早提起並運用這些技術的產品，從 2000 年就開始了，但論起大量運用並讓這個名詞廣為人知的話，就屬 2004 ~ 2005 年左右的 Google 了。
+例如說開頭提到的 TanStack，在被攻擊後的 20 分鐘內就被 StepSecurity 發現，而 axios 也是約 1 小時後被發現，在惡意版本發布後的 3 小時被 npm 移除。
 
+因為這些資安公司的努力以及自動化偵測，這類的攻擊通常在幾小時之內就能被發現，並且 npm 也會盡快移除，避免更多人下載到惡意套件。
 
-而差不多在這個時期，JavaScript 的生態系也迎來了蓬勃的發展，出現了一堆 library 如 Prototype、Dojo Toolkit 以及 MooTools 等等，還有 2006 年誕生的 YUI（Yahoo! User Interface Library）以及至今靈壓依然存在的 jQuery，都讓網頁前端得到了更進一步的發展，2007 年也出現了 Ext JS 這種專門拿來寫網頁應用的框架。
+也就是說，如果我們在安裝的時候指定「我只下載 24 小時前發布的套件」，就能大幅降低下載到惡意套件的可能性（當然不是 100% 解決這問題，畢竟沒人發現的話一樣會下載到）。
 
-雖然說這些函式庫們都讓寫網頁變得更加容易，但 SPA 在這個時候還沒有流行起來，而是要等到兩位大前輩的誕生。
+pnpm 中有一個 [minimumReleaseAge](https://pnpm.io/settings#minimumreleaseage) 的設定，從 v11 開始預設為 1440 分鐘，也就是一天。所以當 codex 問你要不要更新你說好，安裝完以後又問你要不要更新一直鬼打牆，就是因為版本發布還沒過一天，所以沒裝到（真實案例，我自己碰到過一兩次，後來才發現原來是因為這個）。
 
-2010 年 10 月 13 日，Backbone.js 釋出了第一個版本，而一週後的 10 月 20 日，則是 AngularJS 首次發佈的日子。
+在 npm 中也有個 [min-release-age](https://docs.npmjs.com/cli/v11/commands/npm-install#ignore-scripts)，單位是天，效果也是一樣的，預設是空的。
 
-而過了一年之後，別的 SPA 前端框架也出現了，分別是 2011 年 12 月 8 日發布的 Ember.js，以及 2012 年 1 月 20 出現的 Meteor.js。
+bun 也有 [minimumReleaseAge](https://bun.com/docs/runtime/bunfig#install-minimumreleaseage)，單位是秒（bun 是秒，pnpm 是分鐘，npm 是天，你們是約好要故意不一樣的嗎⋯），預設也是空的。
 
-一般來說一個新的框架出現以後，大概至少都要過個半年一年左右才會真正流行起來，因此我認為 2011 以及 2012 這兩年是 SPA 興起的開端，但是該用什麼資料來佐證呢？
+所以如果你用 pnpm v11 以上的版本，預設就不會下載一天內發布的套件，能夠降低安裝到惡意套件的可能性。
 
-關鍵字搜尋趨勢一定程度代表了當時某些技術名詞的流行程度，從下圖可以看出來，SPA 一詞大概是從 2011、2012 年左右開始一路攀升，與我的推測吻合（但這個數據其實不太精確就是了，可我一時想不到更好的了）：
+若是用 npm，我也建議設定一下這個值，我自己是設定 3 天，更保險一點：
 
-![SPA 搜尋趨勢](/img/server-side-rendering-ssr-and-isomorphic/p3.png)
+``` ini
+# 不執行 postinstall 等腳本
+ignore-scripts=true
 
-（至於 2004、2005 那個高峰是什麼，我不知道，但很想知道的。或許跟一堆 Google 服務的流行有關？有線索的可以私訊或是留言討論）
+# 不下載 3 天內發布的套件
+min-release-age=3
+```
 
-之後的故事大家就比較熟悉了，2013 年 5 月 React 正式發佈，2014 年 2 月則是 Vue，隨著前端框架的盛行，SPA 也變得越來越流行，到了今天甚至變成了前端開發的主流。
+不過設定這個參數以後會碰到另一個問題，那就是若是有漏洞，這個修復的版本你也無法即時裝上，必須等個幾天或是在安裝時手動先把這個 config 蓋掉，例如說 `npm install -g @openai/codex --min-release-age=0`。
 
-## 早期的 SPA 如何解決 CSR 的問題？
+我自己覺得可以看漏洞的嚴重程度以及是否能被攻擊，若是被利用的可能性低的話，等個幾天會比較好。畢竟不能被利用的漏洞風險可控，相比之下安裝到惡意程式的風險會更高一點。
 
-從上面的發展史中可以得知開創 SPA 盛世的元老就屬 Backbone.js 以及 AngularJS 了，那他們是怎麼解決 CSR 的問題，例如說 SEO？
+舉例來說，現在很多套件雖然偶爾有一些 high 的漏洞，但若是你仔細看，會發現是特定狀況或是某個功能有問題，而你用的套件或你的產品本身不一定有用到這個功能，這狀況就可以等個幾天再來修。
 
-先來看 AngularJS 好了，我在 GitHub 上找到一個 2013 年的專案：[angular-on-server](https://github.com/runvnc/angular-on-server/tree/b84bcea97037adaffc83cf4869fe9a008c7db3a8)，在 wiki 的前言中寫著：
+若是 React2Shell 那種就另當別論，盡快修復才是上策。
 
-> We need to pre-render pages on the server for Google to index. We don't want to have to repeat ourselves on the back end. I found a few examples of server-side rendering for Backbone applications, but none showing how to do it with AngularJS. To make this work I have modified a couple of Node modules, jsdom and xmlhttprequest. They are loaded from local subdirectories (/jsdom-with-xmlhttprequest and /xmlhttprequest).
+### 第二招：鎖定版本
 
-如果他所言為真，就代表當時 AngularJS 的 SSR 解決方案並不多，大多數都是 Backbone.js 的。
+基本上同一個版本是沒辦法被覆蓋的，例如說 `2.0.0` 是安全的，那它就是安全的，駭客要發布惡意版本只能升一個版號變成 `2.0.1`。所以，只要下載過安全的版本，下次再下載也會是安全的（除非 registry 本身被駭啦）。
 
-從我找到的資料來看，似乎也是如此，像是這篇 2013 年的發問：[AngularJS - server-side rendering](https://stackoverflow.com/questions/16232631/angularjs-server-side-rendering)，從回答中就可以看出解法確實不多。
+當我們執行完 `npm install express` 之後，除了會下載套件以外，還會產生另一個檔案叫做 `package-lock.json`，這就是鎖定版本用的 JSON。
 
-而 AngularJS 官方正式支援 SSR，是要一直到 2015 年 6 月底的這個演講：[Angular 2 Server Rendering](https://www.youtube.com/watch?v=0wvZ7gakqV4)，在演講結束後幾天後開源了 [Universal Angular 2](https://github.com/angular/universal/tree/e5b088ef4a59e59461fee31a21c2a81b742a7df5)，也就是現在的 Angular Universal 的前身。
+舉例來說，`express` 的依賴有 `body-parser`，寫著 `^2.2.1`，而 `body-parser` 目前最新相容的版本是 `2.2.2`，安裝後 lockfile 就會寫死 `2.2.2`：
 
-在當時的 README 中，說明寫著：
+``` json
+{
+  "node_modules/body-parser": {
+    "version": "2.2.2",
+    "resolved": "https://registry.npmjs.org/body-parser/-/body-parser-2.2.2.tgz",
+    "integrity": "sha512-oP5VkATKlNwcgvxi0vM0p/D3n2C3EReYVX+DNYs5TjZFn/oQt2j+4sVJtSMr18pdRr8wjTcBl6LoV+FUwzPmNA=="
+  }
+}
+```
 
-> Universal (isomorphic) JavaScript support for Angular 2
+當我把 `node_modules` 全部刪掉之後，跑 `npm install`，就必定會下載到 `2.2.2` 版本，而且下載完會去驗那個 integrity，證明檔案沒有被動過，若是有被動過會導致 hash 不同，就會報錯失敗。
 
-看到 isomorphic 這個詞，應該勾起了不少人當年的回憶，但這個我們等等再談，先來看 Backbone.js 又是怎麼解決 SPA 問題的。
+若是沒有這個 `package-lock.json`，那我跑 `npm install` 的時候就會重新解析一次依賴，若是當時最新的版本是 `2.2.3`，就會安裝到 `2.2.3`。
 
-我有在 GitHub 上面找到一個 2011 年的古老範例：[Backbone-With-Server-Side-Rendering](https://github.com/runemadsen/Backbone-With-Server-Side-Rendering)，README 寫著：
+因此呢，當你產生 lockfile 以後，若是這批套件沒問題，只要沒有升級或是新增套件，「基本上」就能保證你每次下載都是安全的，因為安全套件的版本跟 hash 都被記起來了。
 
-> Backbone.js is a great tool for organizing your javascript code into models, collections and views, without tying your data to the DOM elements. However, most tutorials show how to render the HTML only via Backbone (client-side), which means that none of your content is crawled by search engines. This is possibly a major problem if you're not making an app hidden behind an authentication system.
+所以 lockfile 請務必放到版本控制裡面，這很重要。
 
-比較特別的地方在於這個專案的 SSR 是透過 Ruby on Rails 實作的，但我看了一下原始碼，感覺比較像一個實驗性質的專案，透過後端把HTML 輸出，接著到了前端再由 Backbone.js 接手，是一個簡單的小範例，而非完整的 demo。
+### 第三招：先掃描再下載
 
-如果想要更完整的解決方案，就屬 2013 年由 Airbnb 開源出來的 [Rendr](https://github.com/rendrjs/rendr) 了。
+既然電腦有防毒軟體，那自然也有資安公司推出針對 npm 的防護。
 
-在 2013 年 1 月 30 日，Airbnb 的技術部落格發表了一篇新的文章：[Our First Node.js App: Backbone on the Client and Server](https://web.archive.org/web/20130711035708/http://nerds.airbnb.com/weve-launched-our-first-nodejs-app-to-product/)，裡面講到了 SPA 會有的問題，以及有許多邏輯在前後端都各有一份，想要做整合。而最後的解法就是 Rendr 這個套件，能把 Backbone.js 搬到 server 去執行。
+目前最知名的就屬 Socket 推出的 [Socket Firewall](https://docs.socket.dev/docs/socket-firewall-overview)，簡稱 sfw，有分免費版跟付費企業版。
 
-至於 Rendr 的開源則是過了三個月以後的這篇文章宣布的：[We’ve open sourced Rendr: Run your Backbone.js apps in the browser and Node.js](https://web.archive.org/web/20130623194723/http://nerds.airbnb.com/weve-open-sourced-rendr-run-your-backbonejs-a/)，裡面寫說：
+前面我有提過這些資安公司能夠快速地偵測到哪些套件有問題，甚至比 npm 官方還要早一步。例如說之前講過惡意版本發布後 1 小時就被偵測到，但是 3 小時後才下架，中間還是有 2 個小時空窗期。
 
-> Many developers shared the same pain points with the traditional client-side MVC approach: poor pageload performance, lack of SEO, duplication of application logic, and context switching between languages. 
+當你使用 sfw 來下載套件時，會先去 Socket 內部的資料庫查這個套件有沒有問題，有的話直接攔下來。所以在 npm 官方還沒下架前，你也不會下載到惡意套件。
 
-可見當時有大量的開發者也都意識到了 SPA 的問題，並且想要一個比較完善的解決方案。
+對於那些還沒確定安不安全的套件，也會在 server 掃描，掃過一遍確認沒問題才下載（免費版只會提醒，付費版可以設置直接攔下來）。
 
-想要把 Backbone.js 搬到 server 去執行，有個先決條件，那就是 server 要可以執行 JavaScript。
+其實 Socket 的 sfw 也不只 npm 系能用，Python 的 pip 與 uv 或是 Rust 的 cargo 也可以，其他就要付費版才有了。
 
-Node.js 是在 2009 年釋出的，而 Express 是在 2010 年底，NPM 則是 2011 年。2012 年中的時候 Node.js 還在 [v0.8.0](https://nodejs.org/en/blog/release/v0.8.0/)，是很早期的階段。從現在回頭看，Node.js 開始被大量使用，應該就差不多是 2012 ~ 2013 開始的。
+寫到這裡，我們該做的看起來都做了，已經開了 cooldown，只會下載發布 3 天以上的套件，也忽略了那些 scripts，就算真的安裝到也不會立刻執行惡意程式碼，應該很安全了，對吧？
 
-總之呢，從我找到的資料來看，或許最早被廣泛運用於 SSR 的 library 就是 2013 推出的 Rendr 了，它能夠做到的事情是「在一開始由 server-side render，但是到了 client-side 以後由 JavaScript 接手」，如同 Airbnb 的文章中寫到的：
+這麼想的話，你就掉以輕心了，魔鬼永遠藏在細節裡。
 
-> Your great new product can run on both sides of the wire, serving up real HTML on first pageload, but then kicking off a client-side JavaScript app.  In other words, the Holy Grail.
+## 細節中的魔鬼：那些 registry 以外的套件
 
-底下這張圖就是所謂的 Holy Grail，取自 Airbnb 當初發表的文章：
+npm 是一個 registry，而你可以透過其他方式自己架一個 registry，如 [Verdaccio](https://www.verdaccio.org/) 就是一個可以自己架起來的 registry，可以把 private 套件放在上面。
 
-![holy grail](/img/server-side-rendering-ssr-and-isomorphic/p4.png)
+或是 [jsr](https://jsr.io/) 好了，是另一個開源的 registry，只要在 `.npmrc` 中加入 `@jsr:registry=https://npm.jsr.io` 就可以使用。
 
-寫到這邊，整理一下時間軸以及我個人的猜測。
+但既然都是 npm 支援的 registry，就表示背後一定是遵守同一套協議。
 
-從 2010 年底 Backbone.js 釋出以後，SPA 開始變得逐漸流行起來，而大家也意識到了畫面在前端渲染會碰到的問題，因此開始各自實作起不同的解決方案，也就是 server-side rendering。
+舉例來說，當你在 npm 安裝 [zod](https://www.npmjs.com/package/zod) 這個套件時，npm 會先去抓 `https://registry.npmjs.com/zod`，response 會是一個描述它的 JSON，包含了最新的穩定版以及每個版本的訊息等等，而 `time` 裡面則是記錄每個版本的發版時間，min release age 就是看這個時間來決定的：
 
-而 Backbone.js 一直到了 2013 年 Airbnb 開源了 Rendr 以後，才終於有了一個最理想的解法，那就是「首次渲染在 server side，而之後的話渲染都在 client side，並且 client 跟 server 是共用同一套程式碼」
+![registry json](/img/dive-into-npm-supply-chain-attack/p5.png)
 
-「同一行程式碼既可以跑在 client 又可以跑在 server」，這個概念就是前面所提到的 isomorphic。
+而每個版本的細節則在 versions 裡面，以最新版 `4.4.3` 為例，裡面寫的 `integrity` 就是拿來驗證套件有沒有被改的 hash，而 tarball 的 `https://registry.npmjs.org/zod/-/zod-4.4.3.tgz` 就是最後會被下載的套件：
 
-順帶一提，Ember.js 官方的 SSR 解法應該是要到 2014 年底的這篇：[Inside FastBoot: The Road to Server-Side Rendering](https://blog.emberjs.com/inside-fastboot-the-road-to-server-side-rendering/)
+![registry tar](/img/dive-into-npm-supply-chain-attack/p6.png)
 
-再補充一件事情，根據 [The History of React.js on a Timeline](https://blog.risingstack.com/the-history-of-react-js-on-a-timeline/) 這篇文章，[FaxJS](https://github.com/jordwalke/FaxJs/tree/5962e3a7268fc4fe0251631ec9d874f0c0f52b66) 是 React 的前身，而在 2011 年底開源的時候就有 server-side rendering 的 API，可以把元件渲染成 static HTML，並且在 client-side 把事件裝回去：https://github.com/jordwalke/FaxJs/tree/5962e3a7268fc4fe0251631ec9d874f0c0f52b66#optional-server-side-rendering
+若是你利用上面提到的方法，讓 npm 解析套件時跑去 jsr 的 URL，當你安裝 `@zod/zod` 時，解析到的 JSON URL 會是 `https://npm.jsr.io/@jsr/zod__zod`：
 
-## Isomorphic JavaScript
+![jsr registry](/img/dive-into-npm-supply-chain-attack/p7.png)
 
-Isomorphic JavaScript 一詞來自於 Charlie Robbins 在 2011 年 10 月 18 日發表的文章：[Scaling Isomorphic Javascript Code](https://web.archive.org/web/20170703210112/https://blog.nodejitsu.com/scaling-isomorphic-javascript-code/)
+雖然少了不少東西，但一樣有 time 有 versions，`4.4.3` 裡面一樣有 integrity 有 tarball：
 
-文章中有提到了 Isomorphic 的定義：
+![jsr tar url](/img/dive-into-npm-supply-chain-attack/p8.png)
 
-> Javascript is now an isomorphic language. By isomorphic we mean that any given line of code (with notable exceptions) can execute both on the client and the server.
+上面提到的這幾個方法，你還是從 registry 安裝套件，只是 registry 的 URL 不同而已。有點像是你可以把專案放到 GitHub、GitLab 或是 Bitbucket，但本質上都是 git，格式都一樣，只是你 URL 要換。
 
-而更多細節可以在 Airbnb 於 2013 年 11 月 12 日發布的這篇文章中找到：[Isomorphic JavaScript: The Future of Web Apps](https://medium.com/airbnb-engineering/isomorphic-javascript-the-future-of-web-apps-10882b7a2ebc)
+但除了從 registry 安裝套件以外，其實還有兩種方式：
 
-在文章裡面還有附上了一個實際案例，很值得參考：[isomorphic-tutorial](https://github.com/spikebrehm/isomorphic-tutorial/tree/b54098ba61f4e766fee8c660e3d074c5eca07dfa)。
+1. URL 直接下載
+2. git
 
-除此之外，文章裡面有提到在 Rendr 之前還有三個 Isomorphic JavaScript 的先行者，一個是 2012 年 Yahoo! 開源的 [Mojito](https://web.archive.org/web/20130722082828/https://developer.yahoo.com/blogs/ydn/yahoo-mojito-now-open-source-52490.html)，在文章中提到了一個美好的想像：
+第一種的話，以 n8n 的元件 [@n8n/instance-ai](https://www.npmjs.com/package/@n8n/instance-ai?activeTab=code) 為例，它的 dependencies 中大部分都很正常，如 `"csv-parse": "6.2.1"` 或是 `"nanoid": "3.3.8"`，前面名稱後面版本號，但仔細看會發現一個例外：
 
->  Imagine a framework where the first page-load was always rendered server-side, and desktop browsers subsequently just made calls to API endpoints returning JSON or XML, and the client only rendered the changed portions of the page.
+``` json
+{
+  "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.2/xlsx-0.20.2.tgz"
+}
+```
 
-基本上就是現在主流前端的運作方式。
+在安裝 `xlsx` 這個套件時，後面直接寫了 URL，而不是版本。也就是說，這個套件會直接從這個 URL 下載，而非 npm registry。
 
-另一個則是 Meteor.js，第三個是 Asana 的 [Luna](https://web.archive.org/web/20110211193136/https://asana.com/luna)，這個 Luna 挺有趣的，仔細看之後發現語法有點 React 的味道。
+為什麼要這樣呢？
+
+似乎是因為 SheetJS 團隊與 npm 有一些[糾紛](https://www.bleepingcomputer.com/news/software/npm-package-with-14m-weekly-downloads-ditches-npmjscom-for-own-cdn/)，所以直接搬家，導致目前 npm 上的 xlsx 已經是幾年前的舊版本，最新的在他們自己架的 [gitea](https://git.sheetjs.com/sheetjs/sheetjs)，而[官方文件](https://docs.sheetjs.com/docs/getting-started/installation/nodejs)也推薦你在安裝的時候直接裝 URL：
+
+```bash
+npm i --save https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+```
+
+這個的壞處是什麼呢？壞處就是除了 npm，你又多了一個地方需要擔心。若是這個 URL 被駭，內容被換成惡意版本，你就直接下載到了。而且 min release age 不起作用，因為不是 registry，所以根本不知道發布時間是什麼時候。
+
+所以這種第三方的 tarball URL 能避就避，盡量不要用到是最好的。
+
+而另外一種 git URL 應該有些公司內部的專案會用，當公司沒有內部的 private registry 的時候，就可能會用 git URL 來下載套件。
+
+例如說這個拿來抓系統字體列表的套件 [system-font-families](https://www.npmjs.com/package/system-font-families)，它的依賴是：
+
+``` json
+{
+  "dependencies": {
+    "babel-polyfill": "^6.23.0",
+    "file-type": "^10.11.0",
+    "read-chunk": "^3.2.0",
+    "ttfinfo": "https://github.com/rBurgett/ttfinfo.git"
+  }
+}
+```
+
+這個 `ttfinfo` 直接就寫 git URL，當我們用 `npm install system-font-families` 安裝這個套件後，會在 lockfile 中看到：
+
+``` json
+{
+  "node_modules/ttfinfo": {
+    "version": "0.2.0",
+    "resolved": "git+ssh://git@github.com/rBurgett/ttfinfo.git#f00e43e2a6d4c8a12a677df20b7804492d50863c",
+    "license": "MIT"
+  }
+}
+```

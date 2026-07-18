@@ -12,112 +12,66 @@
 
 namespace Composer\Util;
 
-use React\Promise\CancellablePromiseInterface;
-use Symfony\Component\Console\Helper\ProgressBar;
-use React\Promise\PromiseInterface;
+use Composer\Pcre\Preg;
 
 /**
+ * Composer mirror utilities
+ *
  * @author Jordi Boggiano <j.boggiano@seld.be>
  */
-class Loop
+class ComposerMirror
 {
-    /** @var HttpDownloader */
-    private $httpDownloader;
-    /** @var ProcessExecutor|null */
-    private $processExecutor;
-    /** @var array<int, array<PromiseInterface<mixed>>> */
-    private $currentPromises = [];
-    /** @var int */
-    private $waitIndex = 0;
-
-    public function __construct(HttpDownloader $httpDownloader, ?ProcessExecutor $processExecutor = null)
+    /**
+     * @param non-empty-string $mirrorUrl
+     * @return non-empty-string
+     */
+    public static function processUrl(string $mirrorUrl, string $packageName, string $version, ?string $reference, ?string $type, ?string $prettyVersion = null): string
     {
-        $this->httpDownloader = $httpDownloader;
-        $this->httpDownloader->enableAsync();
-
-        $this->processExecutor = $processExecutor;
-        if ($this->processExecutor) {
-            $this->processExecutor->enableAsync();
+        if ($reference) {
+            $reference = Preg::isMatch('{^([a-f0-9]*|%reference%)$}', $reference) ? $reference : md5($reference);
         }
-    }
+        $version = strpos($version, '/') === false ? $version : md5($version);
 
-    public function getHttpDownloader(): HttpDownloader
-    {
-        return $this->httpDownloader;
-    }
+        $from = ['%package%', '%version%', '%reference%', '%type%'];
+        $to = [$packageName, $version, $reference, $type];
+        if (null !== $prettyVersion) {
+            $from[] = '%prettyVersion%';
+            $to[] = $prettyVersion;
+        }
 
-    public function getProcessExecutor(): ?ProcessExecutor
-    {
-        return $this->processExecutor;
+        $url = str_replace($from, $to, $mirrorUrl);
+        assert($url !== '');
+
+        return $url;
     }
 
     /**
-     * @param array<PromiseInterface<mixed>> $promises
-     * @param ProgressBar|null              $progress
+     * @param non-empty-string $mirrorUrl
+     * @return string
      */
-    public function wait(array $promises, ?ProgressBar $progress = null): void
+    public static function processGitUrl(string $mirrorUrl, string $packageName, string $url, ?string $type): string
     {
-        $uncaught = null;
+        if (Preg::isMatch('#^(?:(?:https?|git)://github\.com/|git@github\.com:)([^/]+)/(.+?)(?:\.git)?$#', $url, $match)) {
+            $url = 'gh-'.$match[1].'/'.$match[2];
+        } elseif (Preg::isMatch('#^https://bitbucket\.org/([^/]+)/(.+?)(?:\.git)?/?$#', $url, $match)) {
+            $url = 'bb-'.$match[1].'/'.$match[2];
+        } else {
+            $url = Preg::replace('{[^a-z0-9_.-]}i', '-', trim($url, '/'));
+        }
 
-        \React\Promise\all($promises)->then(
-            static function (): void {
-            },
-            static function (\Throwable $e) use (&$uncaught): void {
-                $uncaught = $e;
-            }
+        return str_replace(
+            ['%package%', '%normalizedUrl%', '%type%'],
+            [$packageName, $url, $type],
+            $mirrorUrl
         );
-
-        // keep track of every group of promises that is waited on, so abortJobs can
-        // cancel them all, even if wait() was called within a wait()
-        $waitIndex = $this->waitIndex++;
-        $this->currentPromises[$waitIndex] = $promises;
-
-        if ($progress) {
-            $totalJobs = 0;
-            $totalJobs += $this->httpDownloader->countActiveJobs();
-            if ($this->processExecutor) {
-                $totalJobs += $this->processExecutor->countActiveJobs();
-            }
-            $progress->start($totalJobs);
-        }
-
-        $lastUpdate = 0;
-        while (true) {
-            $activeJobs = 0;
-
-            $activeJobs += $this->httpDownloader->countActiveJobs();
-            if ($this->processExecutor) {
-                $activeJobs += $this->processExecutor->countActiveJobs();
-            }
-
-            if ($progress && microtime(true) - $lastUpdate > 0.1) {
-                $lastUpdate = microtime(true);
-                $progress->setProgress($progress->getMaxSteps() - $activeJobs);
-            }
-
-            if (!$activeJobs) {
-                break;
-            }
-        }
-
-        // as we skip progress updates if they are too quick, make sure we do one last one here at 100%
-        if ($progress) {
-            $progress->finish();
-        }
-
-        unset($this->currentPromises[$waitIndex]);
-        if (null !== $uncaught) {
-            throw $uncaught;
-        }
     }
 
-    public function abortJobs(): void
+    /**
+     * @param non-empty-string $mirrorUrl
+     * @return string
+     */
+    public static function processHgUrl(string $mirrorUrl, string $packageName, string $url, string $type): string
     {
-        foreach ($this->currentPromises as $promiseGroup) {
-            foreach ($promiseGroup as $promise) {
-                // to support react/promise 2.x we wrap the promise in a resolve() call for safety
-                \React\Promise\resolve($promise)->cancel();
-            }
-        }
+        return self::processGitUrl($mirrorUrl, $packageName, $url, $type);
     }
 }

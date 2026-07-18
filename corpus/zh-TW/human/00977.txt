@@ -1,199 +1,116 @@
-With JavaScript disabled, the attack surface is greatly reduced, so we can only work with HTML and CSS. The CSS for this challenge has `unsafe-inline` enabled, so we can add CSS rules.
+# Expires
 
-However, it seems that we cannot send requests to external resources. So, either we need to find a bypass (such as DNS prefetch, but it may not be applicable to this challenge), or we need to combine it with other parts of the challenge.
+To achieve the above function, you can add an `Expires` field in the HTTP Response Header, which is the expiration time of this Cache, for example:
 
-The operation of the bot in this challenge is different:
-
-``` js
-import { createServer } from 'http';
-import { readFileSync } from 'fs';
-import { spawn } from 'child_process'
-import { randomInt } from 'crypto';
-
-const sleep = timeout => new Promise(resolve => setTimeout(resolve, timeout));
-const wait = child => new Promise(resolve => child.on('exit', resolve));
-const index = readFileSync('index.html', 'utf-8');
-
-let token = randomInt(2 ** 24).toString(16).padStart(6, '0');
-let browserOpen = false;
-
-const visit = async code => {
-  browserOpen = true;
-  const proc = spawn('node', ['visit.js', token, code], { detached: true });
-
-  await Promise.race([
-    wait(proc),
-    sleep(10000)
-  ]);
-
-  if (proc.exitCode === null) {
-    process.kill(-proc.pid);
-  }
-  browserOpen = false;
-}
-
-createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://localhost/');
-  if (url.pathname === '/') {
-    return res.end(index);
-  } else if (url.pathname === '/bot') {
-    if (browserOpen) return res.end('already open!');
-    const code = url.searchParams.get('code');
-    if (!code || code.length > 1000) return res.end('no');
-    visit(code);
-    return res.end('visiting');
-  } else if (url.pathname === '/flag') {
-    if (url.searchParams.get('token') !== token) {
-      res.end('wrong');
-      await sleep(1000);
-      process.exit(0);
-    }
-    return res.end(process.env.FLAG ?? 'dice{flag}');
-  }
-  return res.end();
-}).listen(8080);
+```
+Expires: Wed, 21 Oct 2017 07:28:00 GMT
 ```
 
-If `browserOpen` is true, we can obtain information from the response. So, when I saw the challenge, I had an idea: what would happen if we crash Chromium? Can we leak the token using this method?
+After the browser receives this Response, it will Cache this resource. When the user visits this page again or requests the resource of this image, the browser will check whether the "current time" has exceeded this Expires. If it has not exceeded, the browser "will not send any Request", but will directly retrieve the data from the Cache stored on the computer.
 
-For example, if we write a CSS rule like `h1[data-token^="0"] { /*crash*/ }` to crash Chromium, it might speed up or slow down the execution of the bot, allowing us to determine if this selector matches.
+If you open the Chrome dev tool, you will see that it says: "Status code 200 (from disk cache)", which means that this Request did not actually go out, and the Response was directly retrieved from the disk cache.
 
-Later, my teammate found a way to crash Chromium from the Chromium issues:
+![disk cache](/img/http-cache/p1-disk.png)
 
-``` html
-<style>
-  h1[data-token^="a"] {
-    --c1: color-mix(in srgb, blue 50%, red);
-    --c2: srgb(from var(--c1) r g b);
-    background-color: var(--c2);
-  }
-</style>
+However, this will actually encounter a problem, because the browser checks the expiration time of this Expires using the "computer's own time". What if I like to live in the future and change the time of my computer to 2100?
+
+The browser will think that all Cache has expired and will send the Request again.
+
+# Cache-Control and max-age
+
+Expires is actually a Header that existed in HTTP 1.0. In order to solve the problem encountered by Expires above, a new header appeared in HTTP 1.1, called `Cache-Control`. (Note: Cache-Control is a Header that appeared in HTTP 1.1, but it not only solves this problem, but also solves many Cache-related problems that HTTP 1.0 cannot handle.)
+
+One usage is: `Cache-Control: max-age=30`, which means that the expiration time of this response is 30 seconds. If the user refreshes the page after 10 seconds of receiving this response, the phenomenon of being cached by the browser will appear as shown above.
+
+But if the user refreshes the page after 60 seconds, the browser will send a new request.
+
+![new cache](/img/http-cache/p2-new.png)
+
+If you carefully observe the response header of the Google Logo file, you will find that its `max-age` is set to `31536000` seconds, which means 365 days. As long as you visit this website within a year, no request will be sent for the Google logo image, and the browser will directly use the cached response, which is `Status code 200 (from memory cache)` written here.
+
+Now we encounter a problem. Since both `Expires` and `max-age` can determine whether a response has expired, which one should the browser look at if both appear?
+
+According to the definition of [RFC2616](https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9.3):
+
+> If a response includes both an Expires header and a max-age directive, the max-age directive overrides the Expires header, even if the Expires header is more restrictive.
+
+`max-age` overrides `Expires`. Therefore, although both are placed in the cache, only `max-age` is actually used.
+
+# Expired, then what?
+
+Both of these headers are concerned with the "freshness" of a response. If the response is fresh enough (that is, it has not exceeded `Expire` or is within the period specified by `max-age`), the data is directly retrieved from the cache. If it has expired or is not fresh, a request is sent to the server to obtain new data.
+
+But here is a special point to note: "Expired does not mean unusable."
+
+What does this mean? It was mentioned earlier that Google's Logo cache time is one year, and the browser will send a new request after one year, right? But it is very likely that Google's Logo will not change even after a year, which means that the image cached by the browser can still be used.
+
+If this is the case, the server does not need to return a new image, just tell the browser: "You can continue to use the cached image for another year."
+
+# Last-Modified and If-Modified-Since
+
+To achieve the above function, both the server and the client must cooperate with each other. One way is to use the combination of `Last-Modified` and `If-Modified-Since`, which HTTP 1.0 already has.
+
+When the server sends a response, it can add a `Last-Modified` header to indicate when the file was last modified. When the cache expires, the browser can use this information to use `If-Modified-Since` to specify the data that has been changed since a certain point in time when making a request to the server.
+
+Let's take an example. Suppose I request the Google homepage image and receive the following response (for readability, the date format has been changed, and the actual content will not be like this):
+
+```
+Last-Modified: 2017-01-01 13:00:00
+Cache-Control: max-age=31536000
 ```
 
-In the post-competition discussion, I also saw someone in Discord posting a payload that made the webpage load extremely slowly, achieving a similar effect. This is what @Trixter posted:
+After receiving this response, the browser will cache this image and mark the last update time of this file as `2017-01-01 13:00:00`, and the expiration time is one year.
 
-``` html
-<style>
-  html:has([data-token^="a"]) {
-      --a: url(/?1),url(/?1),url(/?1),url(/?1),url(/?1);
-      --b: var(--a),var(--a),var(--a),var(--a),var(--a);
-      --c: var(--b),var(--b),var(--b),var(--b),var(--b);
-      --d: var(--c),var(--c),var(--c),var(--c),var(--c);
-      --e: var(--d),var(--d),var(--d),var(--d),var(--d);
-      --f: var(--e),var(--e),var(--e),var(--e),var(--e);
-  }
-</style>
-<style>
-  *{
-    background-image: var(--f)
-  }
-</style>
+If I request this image again after half a year, the browser will tell me: "You don't need to request it again. The expiration time of this file is one year, and only half a year has passed. Do you want the data? I have it here!" So no request will be sent, and the data will be obtained directly from the browser.
+
+Then, after one year, I request this image again, and the browser will say: "Hmm, my cache has indeed expired. I will ask the server if the file has been updated since `2017-01-01 13:00:00`." It will send the following request:
+
+```
+GET /logo.png
+If-Modified-Since: 2017-01-01 13:00:00
 ```
 
-It's somewhat similar to the Billion Laughs attack, constructing a super large payload repeatedly to slow down the speed.
+If the file has indeed been updated, the browser will receive a new file. If the new file has the same cache headers, it will be cached in the same way as before. What if the file has not been updated?
 
-After slowing down the speed, we can measure the time it takes for the webpage to load using the method mentioned earlier. If it exceeds 10 seconds, it will time out, allowing us to leak the flag.
+Assuming there are no updates, the server will return a `Status code: 304 (Not Modified)`, indicating that you can continue to use the cached file.
 
-## web/safestlist (2 solves)
+![304 not modified](/img/http-cache/p3-304.png)
 
-This challenge is a modified version of a challenge I previously solved: [SekaiCTF 2022 Notes and concurrent limit](https://blog.huli.tw/2022/10/08/en/sekaictf2022-safelist-and-connection/). Let me briefly describe the modified version.
+# Etag and If-None-Match
 
-This challenge is a classic note app. You can create new notes, but the problem is that the note content will be sanitized using `DOMPurify.sanitize`, so XSS is not possible. The CSP part is `default-src 'self'`, which means that requests can only be sent to the origin of the challenge.
+Although the above method seems to be good enough, there is still a small problem.
 
-In other words, you cannot send requests outside.
+The above mentioned whether the file has been "edited", but in fact, this editing time is the editing time of the file on your computer. If you open the file, do nothing, and then save it, this editing time will also be updated. However, even if the editing time is different, the content of the file is still exactly the same.
 
-In addition to creating notes, you can also delete notes using the index of the note.
+Compared with the editing time, if "whether the file content has changed" can be used as the condition for updating the cache, it would be even better.
 
-The core of this problem is the code for creating a note:
+And the `Etag` header is such a thing. You can think of Etag as the hash value of the content of this file (but it is not, but the principle is similar, in short, the same content will generate the same hash, and different content will generate different hash).
 
-```js
-fastify.post("/create", (req, reply) => {
-    const { text } = req.body;
-    if (!text || typeof text !== "string") {
-        return reply.type("text/html").send("Missing text");
-    }
+In the Response, the server will bring the Etag of this file. After the cache expires, the browser can use this Etag to ask if the file has been changed.
 
-    const userNotes = notes.get(req.cookies.id) ?? [];
-    const totalLen = userNotes.reduce((prev, curr) => prev + curr.length, 0);
+`Etag` and `If-None-Match` are also a pair used together, just like `Last-Modified` and `If-Modified-Since`.
 
-    const newLen = totalLen + text.length;
-    if (newLen > 16384) {
-        return reply.redirect(`/?message=Cannot add, please delete some notes first (${newLen} > 16384 chars)`);
-    }
+When returning the Response, the server brings the `Etag` to indicate the unique hash of this file. After the cache expires, the browser sends `If-None-Match` to ask the server if there is new data (data that does not match this `Etag`). If there is, it will return the new data. If not, it will only return 304. 
 
-    userNotes.push(text);
-    userNotes.sort();
-    notes.set(req.cookies.id, userNotes);
+The process can refer to the following figure on the Google website:
 
-    reply.redirect("/?message=Note added successfully");
-});
-```
+![etag](/img/http-cache/p4-etag.png)
 
-Note the `userNotes.sort();`, which sorts the notes based on their content. The format of the flag is `dice{[a-z]+}`. By using this sorting feature, a simple strategy can be derived.
+（source: https://web.dev/articles/http-cache ）
 
-Assuming the flag is `dice{c}`, and we first create a note with `dice{a`, after creating it, we delete the first note. At this point, `dice{a` will be deleted, leaving the flag `dice{c}`.
+# Intermission
 
-If we first create a note with `dice{d`, and then delete the first one, `dice{c}` will be deleted, leaving the newly created `dice{d`.
+Let's summarize what we have learned so far:
 
-In other words, depending on the order of creation and deletion of notes, the note that remains will be different.
+1. `Expires` and `Cache-Control: max-age` determine the "freshness" of this cache, that is, when it will "expire". Before it expires, the browser "will not" send any Request.
+2. When the cache expires, `If-Modified-Since` or `If-None-Match` can be used to ask the server if there is new data. If there is, it will return the new data. If not, it will return Status code 304, indicating that the resources in the cache can still be used.
 
-If I can know which note remains in the end, I can infer the order of the flag. If the note I created remains, it means that the flag must be at the beginning and in lexicographical order.
+With these headers, the world seems beautiful, as if all problems have been solved.
 
-Therefore, the key to this problem is how to know which note remains.
+Yes, I said "seems", which means that there are still some problems.
 
-Based on last year's solution, my initial idea was to make the server side busy. Node.js is single-threaded, so it cannot handle other requests until it finishes processing one (asynchronous is a different story).
+# What if you don't want to cache?
 
-So my idea is to create a note with a bunch of `<img src=/?{random_number}>`, which can send about 700-1000 requests within the word limit. By sending a bunch of requests to the server, we make the server busy.
+Some pages may not want any caching, such as pages containing some confidential information, and do not want anything to be retained on the client side.
 
-There is another difference in this problem, which is the bot:
-
-``` js
-const visit = async (url) => {
-    // clear all data
-    await fsp.rm(tmpDir, { recursive: true, force: true });
-
-    let browser;
-    try {
-        browser = await launchBrowser();
-        let page = await browser.newPage();
-
-        // set flag
-        await page.goto("http://localhost:3000", { timeout: 7500, waitUntil: "networkidle2" });
-        await sleep(2000);
-        await page.evaluate((flag) => {
-            document.querySelector("input[type=text]").value = flag;
-            document.querySelector("form[action='/create']").submit();
-        }, FLAG);
-        await page.waitForNavigation({ waitUntil: "networkidle2" });
-
-        // restart browser, which should close all windows
-        await browser.close();
-        browser = await launchBrowser();
-        page = await browser.newPage();
-
-        // go to the submitted site
-        await page.goto(url, { timeout: 7500, waitUntil: "networkidle2" })
-
-        // restart browser, which should close all windows
-        await browser.close();
-        browser = await launchBrowser();
-        page = await browser.newPage();
-
-        // check on notes now that all other windows are closed
-        await page.goto("http://localhost:3000", { timeout: 7500, waitUntil: "networkidle2" });
-        await sleep(8000);
-        await page.evaluate(() => {
-            document.querySelector("form[action='/view']").submit();
-        });
-        await page.waitForNavigation({ waitUntil: "networkidle2" });
-        await browser.close();
-        browser = null;
-    } catch (err) {
-        console.log(err);
-    } finally {
-        if (browser) await browser.close();
-    }
-};
-```
-
-After accessing the URL we provided, the bot visits the `/view` page. Therefore, we cannot measure the time from the browser this time, but we have to measure it from our local machine. If the idea mentioned earlier is correct, the server response time should be slower.
+Remember that we mentioned at the beginning that the `Cache-Control` header actually solves more problems? In addition to specifying `max-age`, you can directly use: `Cache-Control: no-store`, which means: "I don't want any caching".

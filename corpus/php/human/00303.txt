@@ -1,167 +1,187 @@
 <?php declare(strict_types=1);
 
-/*
- * This file is part of Composer.
- *
- * (c) Nils Adermann <naderman@naderman.de>
- *     Jordi Boggiano <j.boggiano@seld.be>
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
- */
+namespace Composer\Test\Command;
 
-namespace Composer\DependencyResolver;
+use Composer\Test\TestCase;
+use InvalidArgumentException;
 
-/**
- * The RuleWatchGraph efficiently propagates decisions to other rules
- *
- * All rules generated for solving a SAT problem should be inserted into the
- * graph. When a decision on a literal is made, the graph can be used to
- * propagate the decision to all other rules involving the literal, leading to
- * other trivial decisions resulting from unit clauses.
- *
- * @author Nils Adermann <naderman@naderman.de>
- */
-class RuleWatchGraph
+class DumpAutoloadCommandTest extends TestCase
 {
-    /** @var array<int, RuleWatchChain> */
-    protected $watchChains = [];
-
-    /**
-     * Inserts a rule node into the appropriate chains within the graph
-     *
-     * The node is prepended to the watch chains for each of the two literals it
-     * watches.
-     *
-     * Assertions are skipped because they only depend on a single package and
-     * have no alternative literal that could be true, so there is no need to
-     * watch changes in any literals.
-     *
-     * @param RuleWatchNode $node The rule node to be inserted into the graph
-     */
-    public function insert(RuleWatchNode $node): void
+    public function testDumpAutoload(): void
     {
-        if ($node->getRule()->isAssertion()) {
-            return;
-        }
+        $appTester = $this->getApplicationTester();
+        self::assertSame(0, $appTester->run(['command' => 'dump-autoload']));
 
-        if (!$node->getRule() instanceof MultiConflictRule) {
-            foreach ([$node->watch1, $node->watch2] as $literal) {
-                if (!isset($this->watchChains[$literal])) {
-                    $this->watchChains[$literal] = new RuleWatchChain;
-                }
-
-                $this->watchChains[$literal]->unshift($node);
-            }
-        } else {
-            foreach ($node->getRule()->getLiterals() as $literal) {
-                if (!isset($this->watchChains[$literal])) {
-                    $this->watchChains[$literal] = new RuleWatchChain;
-                }
-
-                $this->watchChains[$literal]->unshift($node);
-            }
-        }
+        $output = $appTester->getDisplay(true);
+        self::assertStringContainsString('Generating autoload files', $output);
+        self::assertStringContainsString('Generated autoload files', $output);
     }
 
-    /**
-     * Propagates a decision on a literal to all rules watching the literal
-     *
-     * If a decision, e.g. +A has been made, then all rules containing -A, e.g.
-     * (-A|+B|+C) now need to satisfy at least one of the other literals, so
-     * that the rule as a whole becomes true, since with +A applied the rule
-     * is now (false|+B|+C) so essentially (+B|+C).
-     *
-     * This means that all rules watching the literal -A need to be updated to
-     * watch 2 other literals which can still be satisfied instead. So literals
-     * that conflict with previously made decisions are not an option.
-     *
-     * Alternatively it can occur that a unit clause results: e.g. if in the
-     * above example the rule was (-A|+B), then A turning true means that
-     * B must now be decided true as well.
-     *
-     * @param  int       $decidedLiteral The literal which was decided (A in our example)
-     * @param  int       $level          The level at which the decision took place and at which
-     *                                   all resulting decisions should be made.
-     * @param  Decisions $decisions      Used to check previous decisions and to
-     *                                   register decisions resulting from propagation
-     * @return Rule|null If a conflict is found the conflicting rule is returned
-     */
-    public function propagateLiteral(int $decidedLiteral, int $level, Decisions $decisions): ?Rule
+    public function testDumpDevAutoload(): void
     {
-        // we invert the decided literal here, example:
-        // A was decided => (-A|B) now requires B to be true, so we look for
-        // rules which are fulfilled by -A, rather than A.
-        $literal = -$decidedLiteral;
+        $appTester = $this->getApplicationTester();
+        self::assertSame(0, $appTester->run(['command' => 'dump-autoload', '--dev' => true]));
 
-        if (!isset($this->watchChains[$literal])) {
-            return null;
-        }
-
-        $chain = $this->watchChains[$literal];
-
-        $chain->rewind();
-        while ($chain->valid()) {
-            $node = $chain->current();
-            if (!$node->getRule() instanceof MultiConflictRule) {
-                $otherWatch = $node->getOtherWatch($literal);
-
-                if (!$node->getRule()->isDisabled() && !$decisions->satisfy($otherWatch)) {
-                    $ruleLiterals = $node->getRule()->getLiterals();
-
-                    $alternativeLiterals = array_filter($ruleLiterals, static function ($ruleLiteral) use ($literal, $otherWatch, $decisions): bool {
-                        return $literal !== $ruleLiteral &&
-                            $otherWatch !== $ruleLiteral &&
-                            !$decisions->conflict($ruleLiteral);
-                    });
-
-                    if (\count($alternativeLiterals) > 0) {
-                        reset($alternativeLiterals);
-                        $this->moveWatch($literal, current($alternativeLiterals), $node);
-                        continue;
-                    }
-
-                    if ($decisions->conflict($otherWatch)) {
-                        return $node->getRule();
-                    }
-
-                    $decisions->decide($otherWatch, $level, $node->getRule());
-                }
-            } else {
-                foreach ($node->getRule()->getLiterals() as $otherLiteral) {
-                    if ($literal !== $otherLiteral && !$decisions->satisfy($otherLiteral)) {
-                        if ($decisions->conflict($otherLiteral)) {
-                            return $node->getRule();
-                        }
-
-                        $decisions->decide($otherLiteral, $level, $node->getRule());
-                    }
-                }
-            }
-
-            $chain->next();
-        }
-
-        return null;
+        $output = $appTester->getDisplay(true);
+        self::assertStringContainsString('Generating autoload files', $output);
+        self::assertStringContainsString('Generated autoload files', $output);
     }
 
-    /**
-     * Moves a rule node from one watch chain to another
-     *
-     * The rule node's watched literals are updated accordingly.
-     *
-     * @param int           $fromLiteral A literal the node used to watch
-     * @param int           $toLiteral   A literal the node should watch now
-     * @param RuleWatchNode $node        The rule node to be moved
-     */
-    protected function moveWatch(int $fromLiteral, int $toLiteral, RuleWatchNode $node): void
+    public function testDumpNoDevAutoload(): void
     {
-        if (!isset($this->watchChains[$toLiteral])) {
-            $this->watchChains[$toLiteral] = new RuleWatchChain;
-        }
+        $appTester = $this->getApplicationTester();
+        self::assertSame(0, $appTester->run(['command' => 'dump-autoload', '--dev' => true]));
 
-        $node->moveWatch($fromLiteral, $toLiteral);
-        $this->watchChains[$fromLiteral]->remove();
-        $this->watchChains[$toLiteral]->unshift($node);
+        $output = $appTester->getDisplay(true);
+        self::assertStringContainsString('Generating autoload files', $output);
+        self::assertStringContainsString('Generated autoload files', $output);
+    }
+
+    public function testUsingOptimizeAndStrictPsr(): void
+    {
+        $appTester = $this->getApplicationTester();
+        self::assertSame(0, $appTester->run(['command' => 'dump-autoload', '--optimize' => true, '--strict-psr' => true]));
+
+        $output = $appTester->getDisplay(true);
+        self::assertStringContainsString('Generating optimized autoload files', $output);
+        self::assertMatchesRegularExpression('/Generated optimized autoload files containing \d+ classes/', $output);
+    }
+
+    public function testFailsUsingStrictPsrIfClassMapViolationsAreFound(): void
+    {
+        $dir = $this->initTempComposer([
+            'autoload' => [
+                'psr-4' => [
+                    'Application\\' => 'src',
+                ]
+            ]
+        ]);
+        mkdir($dir . '/src/');
+        file_put_contents($dir . '/src/Foo.php', '<?php namespace Application\Src; class Foo {}');
+        $appTester = $this->getApplicationTester();
+        self::assertSame(1, $appTester->run(['command' => 'dump-autoload', '--optimize' => true, '--strict-psr' => true]));
+
+        $output = $appTester->getDisplay(true);
+        self::assertMatchesRegularExpression('#Class Application\\\\Src\\\\Foo located in .*? does not comply with psr-4 autoloading standard \(rule: Application\\\\ => \./src\)\. Skipping\.#', $output);
+    }
+
+    public function testUsingClassmapAuthoritative(): void
+    {
+        $appTester = $this->getApplicationTester();
+        self::assertSame(0, $appTester->run(['command' => 'dump-autoload', '--classmap-authoritative' => true]));
+
+        $output = $appTester->getDisplay(true);
+        self::assertStringContainsString('Generating optimized autoload files (authoritative)', $output);
+        self::assertMatchesRegularExpression('/Generated optimized autoload files \(authoritative\) containing \d+ classes/', $output);
+    }
+
+    public function testUsingClassmapAuthoritativeAndStrictPsr(): void
+    {
+        $appTester = $this->getApplicationTester();
+        self::assertSame(0, $appTester->run(['command' => 'dump-autoload', '--classmap-authoritative' => true, '--strict-psr' => true]));
+
+        $output = $appTester->getDisplay(true);
+        self::assertStringContainsString('Generating optimized autoload files', $output);
+        self::assertMatchesRegularExpression('/Generated optimized autoload files \(authoritative\) containing \d+ classes/', $output);
+    }
+
+    public function testStrictPsrDoesNotWorkWithoutOptimizedAutoloader(): void
+    {
+        $appTester = $this->getApplicationTester();
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('--strict-psr mode only works with optimized autoloader, use --optimize or --classmap-authoritative if you want a strict return value.');
+        $appTester->run(['command' => 'dump-autoload', '--strict-psr' => true]);
+    }
+
+    public function testDevAndNoDevCannotBeCombined(): void
+    {
+        $appTester = $this->getApplicationTester();
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('You can not use both --no-dev and --dev as they conflict with each other.');
+        $appTester->run(['command' => 'dump-autoload', '--dev' => true, '--no-dev' => true]);
+    }
+
+    public function testWithCustomAutoloaderSuffix(): void
+    {
+        $dir = $this->initTempComposer([
+            'config' => [
+                'autoloader-suffix' => 'Foobar',
+            ],
+        ]);
+
+        $appTester = $this->getApplicationTester();
+        self::assertSame(0, $appTester->run(['command' => 'dump-autoload']));
+
+        self::assertStringContainsString('ComposerAutoloaderInitFoobar', (string) file_get_contents($dir . '/vendor/autoload.php'));
+    }
+
+    public function testWithExistingComposerLockAndAutoloaderSuffix(): void
+    {
+        $dir = $this->initTempComposer(
+            [
+                'config' => [
+                    'autoloader-suffix' => 'Foobar',
+                ],
+            ],
+            [],
+            [
+                "_readme" => [
+                    "This file locks the dependencies of your project to a known state",
+                    "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+                    "This file is @generated automatically"
+                ],
+                "content-hash" => "d751713988987e9331980363e24189ce",
+                "packages" => [],
+                "packages-dev" => [],
+                "aliases" => [],
+                "minimum-stability" => "stable",
+                "stability-flags" => [],
+                "prefer-stable" => false,
+                "prefer-lowest" => false,
+                "platform" => [],
+                "platform-dev" => [],
+                "plugin-api-version" => "2.6.0"
+            ]
+        );
+
+        $appTester = $this->getApplicationTester();
+        self::assertSame(0, $appTester->run(['command' => 'dump-autoload']));
+
+        self::assertStringContainsString('ComposerAutoloaderInitFoobar', (string) file_get_contents($dir . '/vendor/autoload.php'));
+    }
+
+    public function testWithExistingComposerLockWithoutAutoloaderSuffix(): void
+    {
+        $dir = $this->initTempComposer(
+            [
+                'name' => 'foo/bar',
+            ],
+            [],
+            [
+                "_readme" => [
+                    "This file locks the dependencies of your project to a known state",
+                    "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+                    "This file is @generated automatically"
+                ],
+                "content-hash" => "2d4a6be9a93712c5d6a119b26734a047",
+                "packages" => [],
+                "packages-dev" => [],
+                "aliases" => [],
+                "minimum-stability" => "stable",
+                "stability-flags" => [],
+                "prefer-stable" => false,
+                "prefer-lowest" => false,
+                "platform" => [],
+                "platform-dev" => [],
+                "plugin-api-version" => "2.6.0"
+            ]
+        );
+
+        $appTester = $this->getApplicationTester();
+        self::assertSame(0, $appTester->run(['command' => 'dump-autoload']));
+
+        self::assertStringContainsString('ComposerAutoloaderInit2d4a6be9a93712c5d6a119b26734a047', (string) file_get_contents($dir . '/vendor/autoload.php'));
     }
 }

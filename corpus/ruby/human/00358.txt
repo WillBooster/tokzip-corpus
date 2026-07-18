@@ -1,299 +1,208 @@
 # frozen_string_literal: true
 
-require "concurrent/map"
-require "active_support/core_ext/module/attribute_accessors"
-require "action_view/template/resolver"
+require "cases/helper"
+require "models/post"
+require "models/author"
+require "models/project"
+require "models/developer"
+require "models/computer"
+require "models/company"
 
-module ActionView
-  # = Action View Lookup Context
-  #
-  # <tt>LookupContext</tt> is the object responsible for holding all information
-  # required for looking up templates, i.e. view paths and details.
-  # <tt>LookupContext</tt> is also responsible for generating a key, given to
-  # view paths, used in the resolver cache lookup. Since this key is generated
-  # only once during the request, it speeds up all cache accesses.
-  class LookupContext # :nodoc:
-    attr_accessor :prefixes
+class AssociationCallbacksTest < ActiveRecord::TestCase
+  fixtures :posts, :authors, :author_addresses, :projects, :developers
 
-    singleton_class.attr_accessor :registered_details
-    self.registered_details = []
+  def setup
+    @david = authors(:david)
+    @thinking = posts(:thinking)
+    @authorless = posts(:authorless)
+    assert_empty @david.post_log
+  end
 
-    def self.register_detail(name, &block)
-      registered_details << name
-      Accessors::DEFAULT_PROCS[name] = block
+  def test_adding_macro_callbacks
+    @david.posts_with_callbacks << @thinking
+    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @david.post_log
+    @david.posts_with_callbacks << @thinking
+    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}", "before_adding#{@thinking.id}",
+                  "after_adding#{@thinking.id}"], @david.post_log
+  end
 
-      Accessors.define_method(:"default_#{name}", &block)
-      Accessors.module_eval <<-METHOD, __FILE__, __LINE__ + 1
-        def #{name}
-          @details[:#{name}] || []
-        end
+  def test_adding_with_proc_callbacks
+    @david.posts_with_proc_callbacks << @thinking
+    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @david.post_log
+    @david.posts_with_proc_callbacks << @thinking
+    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}", "before_adding#{@thinking.id}",
+                  "after_adding#{@thinking.id}"], @david.post_log
+  end
 
-        def #{name}=(value)
-          value = value.present? ? Array(value) : default_#{name}
-          _set_detail(:#{name}, value) if value != @details[:#{name}]
-        end
-      METHOD
+  def test_removing_with_macro_callbacks
+    first_post, second_post = @david.posts_with_callbacks[0, 2]
+    @david.posts_with_callbacks.delete(first_post)
+    assert_equal ["before_removing#{first_post.id}", "after_removing#{first_post.id}"], @david.post_log
+    @david.posts_with_callbacks.delete(second_post)
+    assert_equal ["before_removing#{first_post.id}", "after_removing#{first_post.id}", "before_removing#{second_post.id}",
+                  "after_removing#{second_post.id}"], @david.post_log
+  end
+
+  def test_removing_with_proc_callbacks
+    first_post, second_post = @david.posts_with_callbacks[0, 2]
+    @david.posts_with_proc_callbacks.delete(first_post)
+    assert_equal ["before_removing#{first_post.id}", "after_removing#{first_post.id}"], @david.post_log
+    @david.posts_with_proc_callbacks.delete(second_post)
+    assert_equal ["before_removing#{first_post.id}", "after_removing#{first_post.id}", "before_removing#{second_post.id}",
+                  "after_removing#{second_post.id}"], @david.post_log
+  end
+
+  def test_multiple_callbacks
+    @david.posts_with_multiple_callbacks << @thinking
+    assert_equal ["before_adding#{@thinking.id}", "before_adding_proc#{@thinking.id}", "after_adding#{@thinking.id}",
+                  "after_adding_proc#{@thinking.id}"], @david.post_log
+    @david.posts_with_multiple_callbacks << @thinking
+    assert_equal ["before_adding#{@thinking.id}", "before_adding_proc#{@thinking.id}", "after_adding#{@thinking.id}",
+                  "after_adding_proc#{@thinking.id}", "before_adding#{@thinking.id}", "before_adding_proc#{@thinking.id}",
+                  "after_adding#{@thinking.id}", "after_adding_proc#{@thinking.id}"], @david.post_log
+  end
+
+  def test_has_many_callbacks_halt_execution_when_abort_is_trown_when_adding_to_association
+    author = Author.create!(name: "Roger")
+    post = Post.create!(title: "hello", body: "abc")
+    author.posts_with_thrown_callbacks << post
+
+    assert_empty(author.posts_with_callbacks)
+  end
+
+  def test_has_many_callbacks_halt_execution_when_abort_is_trown_when_removing_from_association
+    author = Author.create!(name: "Roger")
+    post = Post.create!(title: "hello", body: "abc", author: author)
+
+    assert_equal(1, author.posts_with_thrown_callbacks.size)
+    author.posts_with_thrown_callbacks.destroy(post.id)
+    assert_equal(1, author.posts_with_thrown_callbacks.size)
+  end
+
+  def test_has_many_callbacks_with_create
+    morten = Author.create name: "Morten"
+    post = morten.posts_with_proc_callbacks.create! title: "Hello", body: "How are you doing?"
+    assert_equal ["before_adding<new>", "after_adding#{post.id}"], morten.post_log
+  end
+
+  def test_has_many_callbacks_with_create!
+    morten = Author.create! name: "Morten"
+    post = morten.posts_with_proc_callbacks.create title: "Hello", body: "How are you doing?"
+    assert_equal ["before_adding<new>", "after_adding#{post.id}"], morten.post_log
+  end
+
+  def test_has_many_callbacks_for_save_on_parent
+    jack = Author.new name: "Jack"
+    jack.posts_with_callbacks.build title: "Call me back!", body: "Before you wake up and after you sleep"
+
+    callback_log = ["before_adding<new>", "after_adding#{jack.posts_with_callbacks.first.id}"]
+    assert_equal callback_log, jack.post_log
+    assert jack.save
+    assert_equal 1, jack.posts_with_callbacks.count
+    assert_equal callback_log, jack.post_log
+  end
+
+  def test_has_many_callbacks_for_destroy_on_parent
+    firm = Firm.create! name: "Firm"
+    client = firm.clients.create! name: "Client"
+    firm.destroy
+
+    assert_equal ["before_remove#{client.id}", "after_remove#{client.id}"], firm.log
+  end
+
+  def test_has_and_belongs_to_many_add_callback
+    david = developers(:david)
+    ar = projects(:active_record)
+    assert_empty ar.developers_log
+    ar.developers_with_callbacks << david
+    assert_equal ["before_adding#{david.id}", "after_adding#{david.id}"], ar.developers_log
+    ar.developers_with_callbacks << david
+    assert_equal ["before_adding#{david.id}", "after_adding#{david.id}", "before_adding#{david.id}",
+                  "after_adding#{david.id}"], ar.developers_log
+  end
+
+  def test_has_and_belongs_to_many_before_add_called_before_save
+    dev     = nil
+    new_dev = nil
+    klass = Class.new(Project) do
+      def self.name; Project.name; end
+      has_and_belongs_to_many :developers_with_callbacks,
+                                class_name: "Developer",
+                                before_add: lambda { |o, r|
+        dev     = r
+        new_dev = r.new_record?
+      }
     end
+    rec = klass.create!
+    alice = Developer.new(name: "alice")
+    rec.developers_with_callbacks << alice
+    assert_equal alice, dev
+    assert_not_nil new_dev
+    assert new_dev, "record should not have been saved"
+    assert_not_predicate alice, :new_record?
+  end
 
-    # Holds accessors for the registered details.
-    module Accessors # :nodoc:
-      DEFAULT_PROCS = {}
+  def test_has_and_belongs_to_many_after_add_called_after_save
+    ar = projects(:active_record)
+    assert_empty ar.developers_log
+    alice = Developer.new(name: "alice")
+    ar.developers_with_callbacks << alice
+    assert_equal "after_adding#{alice.id}", ar.developers_log.last
+
+    bob = ar.developers_with_callbacks.create(name: "bob")
+    assert_equal "after_adding#{bob.id}", ar.developers_log.last
+
+    ar.developers_with_callbacks.build(name: "charlie")
+    assert_equal "after_adding<new>", ar.developers_log.last
+  end
+
+  def test_has_and_belongs_to_many_remove_callback
+    david = developers(:david)
+    jamis = developers(:jamis)
+    activerecord = projects(:active_record)
+    assert_empty activerecord.developers_log
+    activerecord.developers_with_callbacks.delete(david)
+    assert_equal ["before_removing#{david.id}", "after_removing#{david.id}"], activerecord.developers_log
+
+    activerecord.developers_with_callbacks.delete(jamis)
+    assert_equal ["before_removing#{david.id}", "after_removing#{david.id}", "before_removing#{jamis.id}",
+                  "after_removing#{jamis.id}"], activerecord.developers_log
+  end
+
+  def test_has_and_belongs_to_many_does_not_fire_callbacks_on_clear
+    activerecord = projects(:active_record)
+    assert_empty activerecord.developers_log
+    if activerecord.developers_with_callbacks.size == 0
+      activerecord.developers << developers(:david)
+      activerecord.developers << developers(:jamis)
+      activerecord.reload
+      assert activerecord.developers_with_callbacks.size == 2
     end
+    activerecord.developers_with_callbacks.flat_map { |d| ["before_removing#{d.id}", "after_removing#{d.id}"] }.sort
+    assert activerecord.developers_with_callbacks.clear
+    assert_empty activerecord.developers_log
+  end
 
-    register_detail(:locale) do
-      locales = [I18n.locale]
-      locales.concat(I18n.fallbacks[I18n.locale]) if I18n.respond_to? :fallbacks
-      locales << I18n.default_locale
-      locales.uniq!
-      locales
+  def test_has_and_belongs_to_many_callbacks_for_save_on_parent
+    project = Project.new name: "Callbacks"
+    project.developers_with_callbacks.build name: "Jack", salary: 95000
+
+    callback_log = ["before_adding<new>", "after_adding<new>"]
+    assert_equal callback_log, project.developers_log
+    assert project.save
+    assert_equal 1, project.developers_with_callbacks.size
+    assert_equal callback_log, project.developers_log
+  end
+
+  def test_dont_add_if_before_callback_raises_exception
+    assert_not_includes @david.unchangeable_posts, @authorless
+    begin
+      @david.unchangeable_posts << @authorless
+    rescue Exception
     end
-    register_detail(:formats) { ActionView::Base.default_formats || [:html, :text, :js, :css,  :xml, :json] }
-    register_detail(:variants) { [] }
-    register_detail(:handlers) { Template::Handlers.extensions }
-
-    class DetailsKey # :nodoc:
-      alias :eql? :equal?
-
-      @details_keys = Concurrent::Map.new
-      @digest_cache = Concurrent::Map.new
-      @view_context_mutex = Mutex.new
-
-      def self.digest_cache(details)
-        @digest_cache[details_cache_key(details)] ||= Concurrent::Map.new
-      end
-
-      def self.details_cache_key(details)
-        @details_keys.fetch(details) do
-          if formats = details[:formats]
-            unless Template::Types.valid_symbols?(formats)
-              details = details.dup
-              details[:formats] &= Template::Types.symbols
-            end
-          end
-          @details_keys[details] ||= TemplateDetails::Requested.new(**details)
-        end
-      end
-
-      def self.clear
-        ActionView::PathRegistry.all_resolvers.each do |resolver|
-          resolver.clear_cache
-        end
-        @view_context_class = nil
-        @details_keys.clear
-        @digest_cache.clear
-      end
-
-      def self.digest_caches
-        @digest_cache.values
-      end
-
-      def self.view_context_class
-        @view_context_mutex.synchronize do
-          @view_context_class ||= ActionView::Base.with_empty_template_cache
-        end
-      end
-    end
-
-    # Add caching behavior on top of Details.
-    module DetailsCache
-      attr_accessor :cache
-
-      # Calculate the details key. Remove the handlers from calculation to improve performance
-      # since the user cannot modify it explicitly.
-      def details_key # :nodoc:
-        @details_key ||= DetailsKey.details_cache_key(@details) if @cache
-      end
-
-      # Temporary skip passing the details_key forward.
-      def disable_cache
-        old_value, @cache = @cache, false
-        yield
-      ensure
-        @cache = old_value
-      end
-
-    private
-      def _set_detail(key, value) # :doc:
-        @details = @details.dup if @digest_cache || @details_key
-        @digest_cache = nil
-        @details_key = nil
-        @details[key] = value
-      end
-    end
-
-    # Helpers related to template lookup using the lookup context information.
-    module ViewPaths
-      attr_reader :view_paths, :html_fallback_for_js
-
-      def find(name, prefixes = [], partial = false, keys = [], options = {})
-        name, prefixes = normalize_name(name, prefixes)
-        details, details_key = detail_args_for(options)
-        @view_paths.find(name, prefixes, partial, details, details_key, keys)
-      end
-      alias :find_template :find
-
-      def find_all(name, prefixes = [], partial = false, keys = [], options = {})
-        name, prefixes = normalize_name(name, prefixes)
-        details, details_key = detail_args_for(options)
-        @view_paths.find_all(name, prefixes, partial, details, details_key, keys)
-      end
-
-      def exists?(name, prefixes = [], partial = false, keys = [], **options)
-        name, prefixes = normalize_name(name, prefixes)
-        details, details_key = detail_args_for(options)
-        @view_paths.exists?(name, prefixes, partial, details, details_key, keys)
-      end
-      alias :template_exists? :exists?
-
-      def any?(name, prefixes = [], partial = false)
-        name, prefixes = normalize_name(name, prefixes)
-        details, details_key = detail_args_for_any
-        @view_paths.exists?(name, prefixes, partial, details, details_key, [])
-      end
-      alias :any_templates? :any?
-
-      def append_view_paths(paths)
-        @view_paths = build_view_paths(@view_paths.to_a + paths)
-      end
-
-      def prepend_view_paths(paths)
-        @view_paths = build_view_paths(paths + @view_paths.to_a)
-      end
-
-    private
-      # Whenever setting view paths, makes a copy so that we can manipulate them in
-      # instance objects as we wish.
-      def build_view_paths(paths)
-        if ActionView::PathSet === paths
-          paths
-        else
-          ActionView::PathSet.new(Array(paths))
-        end
-      end
-
-      # Compute details hash and key according to user options (e.g. passed from #render).
-      def detail_args_for(options) # :doc:
-        return @details, details_key if options.empty? # most common path.
-        user_details = @details.merge(options)
-
-        if @cache
-          details_key = DetailsKey.details_cache_key(user_details)
-        else
-          details_key = nil
-        end
-
-        [user_details, details_key]
-      end
-
-      def detail_args_for_any
-        @detail_args_for_any ||= begin
-          details = {}
-
-          LookupContext.registered_details.each do |k|
-            if k == :variants
-              details[k] = :any
-            else
-              details[k] = Accessors::DEFAULT_PROCS[k].call
-            end
-          end
-
-          if @cache
-            [details, DetailsKey.details_cache_key(details)]
-          else
-            [details, nil]
-          end
-        end
-      end
-
-      # Fix when prefix is specified as part of the template name
-      def normalize_name(name, prefixes)
-        name = name.to_s
-        idx = name.rindex("/")
-        return name, prefixes.presence || [""] unless idx
-
-        path_prefix = name[0, idx]
-        path_prefix = path_prefix.from(1) if path_prefix.start_with?("/")
-        name = name.from(idx + 1)
-
-        if !prefixes || prefixes.empty?
-          prefixes = [path_prefix]
-        else
-          prefixes = prefixes.map { |p| "#{p}/#{path_prefix}" }
-        end
-
-        return name, prefixes
-      end
-    end
-
-    include Accessors
-    include DetailsCache
-    include ViewPaths
-
-    def initialize(view_paths, details = {}, prefixes = [])
-      @details_key = nil
-      @digest_cache = nil
-      @cache = true
-      @prefixes = prefixes
-
-      @details = initialize_details({}, details)
-      @view_paths = build_view_paths(view_paths)
-    end
-
-    def digest_cache
-      @digest_cache ||= DetailsKey.digest_cache(@details)
-    end
-
-    def with_prepended_formats(formats)
-      details = @details.dup
-      details[:formats] = formats
-
-      self.class.new(@view_paths, details, @prefixes)
-    end
-
-    def initialize_details(target, details)
-      LookupContext.registered_details.each do |k|
-        target[k] = details[k] || Accessors::DEFAULT_PROCS[k].call
-      end
-      target
-    end
-    private :initialize_details
-
-    # Override formats= to expand ["*/*"] values and automatically
-    # add :html as fallback to :js.
-    def formats=(values)
-      if values
-        values = values.dup
-        values.concat(default_formats) if values.delete "*/*"
-        values.uniq!
-
-        unless Template::Types.valid_symbols?(values)
-          invalid_values = values - Template::Types.symbols
-          raise ArgumentError, "Invalid formats: #{invalid_values.map(&:inspect).join(", ")}"
-        end
-
-        if (values.length == 1) && (values[0] == :js)
-          values << :html
-          @html_fallback_for_js = true
-        end
-      end
-      super(values)
-    end
-
-    # Override locale to return a symbol instead of array.
-    def locale
-      @details[:locale].first
-    end
-
-    # Overload locale= to also set the I18n.locale. If the current I18n.config object responds
-    # to original_config, it means that it has a copy of the original I18n configuration and it's
-    # acting as proxy, which we need to skip.
-    def locale=(value)
-      if value
-        config = I18n.config.respond_to?(:original_config) ? I18n.config.original_config : I18n.config
-        config.locale = value
-      end
-
-      super(default_locale)
-    end
+    assert_empty @david.post_log
+    assert_not_includes @david.unchangeable_posts, @authorless
+    @david.reload
+    assert_not_includes @david.unchangeable_posts, @authorless
   end
 end

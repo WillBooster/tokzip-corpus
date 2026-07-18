@@ -1,153 +1,386 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:dio/dio.dart';
+import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
-void main() {
-  group(Transformer.urlEncodeMap, () {
-    final data = {
-      'a': '你好',
-      'b': [5, '6'],
-      'c': {
-        'd': 8,
-        'e': {
-          'a': 5,
-          'b': [66, 8],
+import '../../util.dart';
+
+void downloadTests(
+  Dio Function(String baseUrl) create,
+) {
+  group(
+    'download',
+    () {
+      late Dio dio;
+      late Directory tmp;
+
+      setUp(() {
+        dio = create(httpbunBaseUrl);
+      });
+
+      setUpAll(() {
+        tmp = Directory.systemTemp.createTempSync('dio_test_');
+        addTearDown(() {
+          tmp.deleteSync(recursive: true);
+        });
+      });
+
+      test('bytes', () async {
+        final path = p.join(tmp.path, 'bytes.txt');
+
+        final size = 50000;
+        int progressEventCount = 0;
+        int count = 0;
+        int total = 0;
+        await dio.download(
+          '/bytes/$size',
+          path,
+          onReceiveProgress: (c, t) {
+            count = c;
+            total = t;
+            progressEventCount++;
+          },
+        );
+
+        final f = File(path);
+        expect(count, f.readAsBytesSync().length);
+        expect(progressEventCount, greaterThanOrEqualTo(1));
+        expect(count, total);
+      });
+
+      test('cancels request', () async {
+        final cancelToken = CancelToken();
+
+        final res = await dio.get<ResponseBody>(
+          '/drip',
+          queryParameters: {'duration': '5', 'delay': '0'},
+          options: Options(responseType: ResponseType.stream),
+          cancelToken: cancelToken,
+        );
+
+        Future.delayed(const Duration(seconds: 2), () {
+          cancelToken.cancel();
+        });
+
+        final completer = Completer<Never>();
+        res.data!.stream.listen(
+          (event) {},
+          onError: (e, s) {
+            completer.completeError(e, s);
+          },
+        );
+
+        await expectLater(
+          completer.future,
+          throwsDioException(
+            DioExceptionType.cancel,
+            stackTraceContains: 'test/download_tests.dart',
+          ),
+        );
+      });
+
+      test('cancels download', () async {
+        final cancelToken = CancelToken();
+        final path = p.join(tmp.path, 'download.txt');
+
+        Future.delayed(const Duration(milliseconds: 50), () {
+          cancelToken.cancel();
+        });
+
+        await expectLater(
+          dio.download(
+            '/drip',
+            path,
+            queryParameters: {'duration': '5', 'delay': '0'},
+            cancelToken: cancelToken,
+          ),
+          throwsDioException(
+            DioExceptionType.cancel,
+            stackTraceContains: 'test/download_tests.dart',
+          ),
+        );
+
+        await Future.delayed(const Duration(milliseconds: 250), () {});
+        expect(File(path).existsSync(), false);
+      });
+
+      test('cancels streamed response mid request', () async {
+        final cancelToken = CancelToken();
+        final response = await dio.get(
+          '/bytes/${1024 * 1024 * 100}',
+          options: Options(responseType: ResponseType.stream),
+          cancelToken: cancelToken,
+          onReceiveProgress: (c, t) {
+            if (c > 5000) {
+              cancelToken.cancel();
+            }
+          },
+        );
+
+        await expectLater(
+          (response.data as ResponseBody).stream.last,
+          throwsDioException(
+            DioExceptionType.cancel,
+            stackTraceContains: 'test/download_tests.dart',
+          ),
+        );
+      });
+
+      test('cancels download mid request', () async {
+        final cancelToken = CancelToken();
+        final path = p.join(tmp.path, 'download_2.txt');
+
+        await expectLater(
+          dio.download(
+            '/bytes/${1024 * 1024 * 10}',
+            path,
+            cancelToken: cancelToken,
+            onReceiveProgress: (c, t) {
+              if (c > 5000) {
+                cancelToken.cancel();
+              }
+            },
+          ),
+          throwsDioException(
+            DioExceptionType.cancel,
+            stackTraceContains: 'test/download_tests.dart',
+          ),
+        );
+
+        await Future.delayed(const Duration(milliseconds: 250), () {});
+        expect(File(path).existsSync(), false);
+      });
+
+      test('does not change the response type', () async {
+        final savePath = p.join(tmp.path, 'download0.md');
+
+        final options = Options(responseType: ResponseType.plain);
+        await dio.download('/bytes/1000', savePath, options: options);
+        expect(options.responseType, ResponseType.plain);
+      });
+
+      test('text file', () async {
+        final savePath = p.join(tmp.path, 'download.txt');
+
+        int? total;
+        int? count;
+        await dio.download(
+          '/payload',
+          savePath,
+          data: 'I am a text file',
+          options: Options(
+            contentType: Headers.textPlainContentType,
+          ),
+          onReceiveProgress: (c, t) {
+            total = t;
+            count = c;
+          },
+        );
+
+        final f = File(savePath);
+        expect(
+          f.readAsStringSync(),
+          equals('I am a text file'),
+        );
+        expect(count, f.readAsBytesSync().length);
+        expect(count, total);
+      });
+
+      test('text file 2', () async {
+        final savePath = p.join(tmp.path, 'download2.txt');
+
+        await dio.downloadUri(
+          Uri.parse(dio.options.baseUrl).replace(path: '/payload'),
+          (header) => savePath,
+          data: 'I am a text file',
+          options: Options(
+            contentType: Headers.textPlainContentType,
+          ),
+        );
+
+        final f = File(savePath);
+        expect(
+          f.readAsStringSync(),
+          equals('I am a text file'),
+        );
+      });
+
+      test('error', () async {
+        final savePath = p.join(tmp.path, 'download_error.md');
+
+        expectLater(
+          dio.download(
+            '/mix/s=400/b64=${base64Encode('error'.codeUnits)}',
+            savePath,
+          ),
+          throwsDioException(
+            DioExceptionType.badResponse,
+            stackTraceContains: 'test/download_tests.dart',
+            matcher: isA<DioException>().having(
+              (e) => e.response!.data,
+              'data',
+              'error',
+            ),
+          ),
+        );
+
+        expectLater(
+          dio.download(
+            '/mix/s=400/b64=${base64Encode('error'.codeUnits)}',
+            savePath,
+            options: Options(receiveDataWhenStatusError: false),
+          ),
+          throwsDioException(
+            DioExceptionType.badResponse,
+            stackTraceContains: 'test/download_tests.dart',
+            matcher: isA<DioException>().having(
+              (e) => e.response!.data,
+              'data',
+              isNull,
+            ),
+          ),
+        );
+      });
+
+      test('receiveTimeout triggers if gaps are too big', () {
+        expectLater(
+          dio.download(
+            '/drip?delay=0&duration=6&numbytes=3',
+            p.join(tmp.path, 'download_timeout.md'),
+            options: Options(receiveTimeout: const Duration(seconds: 1)),
+          ),
+          throwsDioException(
+            DioExceptionType.receiveTimeout,
+            stackTraceContains: 'test/download_tests.dart',
+          ),
+        );
+      });
+
+      test(
+        'receiveTimeout does not trigger if constantly getting response bytes',
+        () {
+          expectLater(
+            dio.download(
+              '/drip?delay=0&duration=6&numbytes=12',
+              p.join(tmp.path, 'download_timeout.md'),
+              options: Options(receiveTimeout: const Duration(seconds: 1)),
+            ),
+            completes,
+          );
         },
-      },
-    };
-    test('default ', () {
-      // a=你好&b=5&b=6&c[d]=8&c[e][a]=5&c[e][b]=66&c[e][b]=8
-      final result =
-          'a=%E4%BD%A0%E5%A5%BD&b=5&b=6&c%5Bd%5D=8&c%5Be%5D%5Ba%5D=5&c%5Be%5D%5Bb%5D=66&c%5Be%5D%5Bb%5D=8';
-      expect(Transformer.urlEncodeMap(data), result);
-    });
-    test('csv', () {
-      // a=你好&b=5,6&c[d]=8&c[e][a]=5&c[e][b]=66,8
-      final result =
-          'a=%E4%BD%A0%E5%A5%BD&b=5%2C6&c%5Bd%5D=8&c%5Be%5D%5Ba%5D=5&c%5Be%5D%5Bb%5D=66%2C8';
-      expect(Transformer.urlEncodeMap(data, ListFormat.csv), result);
-    });
-    test('ssv', () {
-      // a=你好&b=5+6&c[d]=8&c[e][a]=5&c[e][b]=66+8
-      final result =
-          'a=%E4%BD%A0%E5%A5%BD&b=5+6&c%5Bd%5D=8&c%5Be%5D%5Ba%5D=5&c%5Be%5D%5Bb%5D=66+8';
-      expect(Transformer.urlEncodeMap(data, ListFormat.ssv), result);
-    });
-    test('tsv', () {
-      // a=你好&b=5\t6&c[d]=8&c[e][a]=5&c[e][b]=66\t8
-      final result =
-          'a=%E4%BD%A0%E5%A5%BD&b=5%5Ct6&c%5Bd%5D=8&c%5Be%5D%5Ba%5D=5&c%5Be%5D%5Bb%5D=66%5Ct8';
-      expect(Transformer.urlEncodeMap(data, ListFormat.tsv), result);
-    });
-    test('pipe', () {
-      //a=你好&b=5|6&c[d]=8&c[e][a]=5&c[e][b]=66|8
-      final result =
-          'a=%E4%BD%A0%E5%A5%BD&b=5%7C6&c%5Bd%5D=8&c%5Be%5D%5Ba%5D=5&c%5Be%5D%5Bb%5D=66%7C8';
-      expect(Transformer.urlEncodeMap(data, ListFormat.pipes), result);
-    });
-
-    test('multi', () {
-      //a=你好&b[]=5&b[]=6&c[d]=8&c[e][a]=5&c[e][b][]=66&c[e][b][]=8
-      final result =
-          'a=%E4%BD%A0%E5%A5%BD&b%5B%5D=5&b%5B%5D=6&c%5Bd%5D=8&c%5Be%5D%5Ba%5D=5&c%5Be%5D%5Bb%5D%5B%5D=66&c%5Be%5D%5Bb%5D%5B%5D=8';
-      expect(
-        Transformer.urlEncodeMap(data, ListFormat.multiCompatible),
-        result,
       );
-    });
 
-    test('multi2', () {
-      final data = {
-        'a': 'string',
-        'b': 'another_string',
-        'z': ['string'],
-      };
-      // a=string&b=another_string&z[]=string
-      final result = 'a=string&b=another_string&z%5B%5D=string';
-      expect(
-        Transformer.urlEncodeMap(data, ListFormat.multiCompatible),
-        result,
-      );
-    });
+      test('delete on error', () async {
+        final savePath = p.join(tmp.path, 'delete_on_error.txt');
+        final f = File(savePath)..createSync(recursive: true);
+        expect(f.existsSync(), isTrue);
 
-    test('custom', () {
-      final result =
-          'a=%E4%BD%A0%E5%A5%BD&b=5%7C6&c%5Bd%5D=8&c%5Be%5D%5Ba%5D=5&c%5Be%5D%5Bb%5D=foo%2Cbar&c%5Be%5D%5Bc%5D=foo+bar&c%5Be%5D%5Bd%5D=foo&c%5Be%5D%5Bd%5D=bar&c%5Be%5D%5Be%5D=foo%5Ctbar&c%5Be%5D%5Bf%5D%5B%5D=foo&c%5Be%5D%5Bf%5D%5B%5D=bar';
-      expect(
-        Transformer.urlEncodeMap(
-          {
-            'a': '你好',
-            'b': const ListParam<int>([5, 6], ListFormat.pipes),
-            'c': {
-              'd': 8,
-              'e': {
-                'a': 5,
-                'b': const ListParam<String>(['foo', 'bar'], ListFormat.csv),
-                'c': const ListParam<String>(['foo', 'bar'], ListFormat.ssv),
-                'd': const ListParam<String>(['foo', 'bar'], ListFormat.multi),
-                'e': const ListParam<String>(['foo', 'bar'], ListFormat.tsv),
-                'f': [
-                  'foo',
-                  'bar',
-                ], // this uses ListFormat.multiCompatible set below
-              },
+        await expectLater(
+          dio.download(
+            '/drip?delay=0&duration=5',
+            savePath,
+            deleteOnError: true,
+            onReceiveProgress: (count, total) => throw AssertionError(),
+          ),
+          throwsDioException(
+            DioExceptionType.unknown,
+            stackTraceContains: 'test/download_tests.dart',
+            matcher: isA<DioException>().having(
+              (e) => e.error,
+              'error',
+              isA<AssertionError>(),
+            ),
+          ),
+        );
+
+        await Future.delayed(const Duration(milliseconds: 100));
+        expect(f.existsSync(), isFalse);
+      });
+
+      test('delete on cancel', () async {
+        final savePath = p.join(tmp.path, 'delete_on_cancel.md');
+        final f = File(savePath)..createSync(recursive: true);
+        expect(f.existsSync(), isTrue);
+
+        final cancelToken = CancelToken();
+
+        await expectLater(
+          dio.download(
+            '/bytes/5000',
+            savePath,
+            deleteOnError: true,
+            cancelToken: cancelToken,
+            onReceiveProgress: (count, total) => cancelToken.cancel(),
+          ),
+          throwsDioException(
+            DioExceptionType.cancel,
+            stackTraceContains: 'test/download_tests.dart',
+          ),
+        );
+
+        await Future.delayed(const Duration(milliseconds: 100));
+        expect(f.existsSync(), isFalse);
+      });
+
+      test('cancel download mid stream', () async {
+        const savePath = 'test/download/_test.md';
+        final f = File(savePath)..createSync(recursive: true);
+        expect(f.existsSync(), isTrue);
+
+        final cancelToken = CancelToken();
+        final dio = Dio()..options.baseUrl = httpbunBaseUrl;
+
+        await expectLater(
+          dio.download(
+            '/bytes/10000',
+            savePath,
+            cancelToken: cancelToken,
+            deleteOnError: true,
+            onReceiveProgress: (c, t) {
+              if (c > 5000) {
+                cancelToken.cancel();
+              }
             },
-          },
-          ListFormat.multiCompatible,
-        ),
-        result,
-      );
-    });
-  });
+          ),
+          throwsDioException(
+            DioExceptionType.cancel,
+            stackTraceContains: 'test/download_tests.dart',
+          ),
+        );
 
-  group(Transformer.urlEncodeQueryMap, () {
-    test(ListFormat.csv, () {
-      expect(
-        Transformer.urlEncodeQueryMap({
-          'foo': const ListParam(['1', '%', '\$'], ListFormat.csv),
-        }),
-        'foo=1,%25,%24',
-      );
-    });
+        await Future.delayed(const Duration(milliseconds: 100));
+        expect(f.existsSync(), isFalse);
+      });
 
-    test('custom', () {
-      expect(
-        Transformer.urlEncodeQueryMap(
-          {
-            'a': '你好',
-            'b': const ListParam<int>([5, 6], ListFormat.pipes),
-            'c': {
-              'd': 8,
-              'e': {
-                'a': 5,
-                'b': const ListParam<Object>(
-                  ['foo', 'bar', 1, 2.2],
-                  ListFormat.csv,
-                ),
-                'c': const ListParam<Object>(
-                  ['foo', 'bar', 1, 2.2],
-                  ListFormat.ssv,
-                ),
-                'd': const ListParam<Object>(
-                  ['foo', 'bar', 1, 2.2],
-                  ListFormat.multi,
-                ),
-                'e': const ListParam<Object>(
-                  ['foo', 'bar', 1, 2.2],
-                  ListFormat.tsv,
-                ),
-                'f': [
-                  'foo',
-                  'bar',
-                  1,
-                  2.2,
-                ], // this uses ListFormat.multiCompatible set below
-              },
-            },
-          },
-          ListFormat.multiCompatible,
-        ),
-        'a=%E4%BD%A0%E5%A5%BD&b=5|6&c[d]=8&c[e][a]=5&c[e][b]=foo,bar,1,2.2&c[e][c]=foo%20bar%201%202.2&c[e][d]=foo&c[e][d]=bar&c[e][d]=1&c[e][d]=2.2&c[e][e]=foo\\tbar\\t1\\t2.2&c[e][f][]=foo&c[e][f][]=bar&c[e][f][]=1&c[e][f][]=2.2',
-      );
-    });
-  });
+      test('`savePath` types', () async {
+        final testPath = p.join(tmp.path, 'savePath.txt');
+
+        await expectLater(
+          dio.download(
+            '/bytes/5000',
+            testPath,
+          ),
+          completes,
+        );
+        await expectLater(
+          dio.download(
+            '/bytes/5000',
+            (headers) => testPath,
+          ),
+          completes,
+        );
+        await expectLater(
+          dio.download(
+            '/bytes/5000',
+            (headers) async => testPath,
+          ),
+          completes,
+        );
+      });
+    },
+    testOn: 'vm',
+  );
 }

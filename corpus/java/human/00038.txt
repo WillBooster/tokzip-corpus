@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2023 Google Inc.
+ * Copyright (C) 2021 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,261 +13,167 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.google.gson.native_test;
+
+package com.google.gson;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.InstanceCreator;
-import com.google.gson.TypeAdapter;
-import com.google.gson.annotations.JsonAdapter;
-import com.google.gson.annotations.SerializedName;
-import com.google.gson.reflect.TypeToken;
+import com.google.gson.internal.LazilyParsedNumber;
 import com.google.gson.stream.JsonReader;
-import com.google.gson.stream.JsonWriter;
+import com.google.gson.stream.MalformedJsonException;
 import java.io.IOException;
-import java.lang.reflect.Type;
-import java.util.List;
-import org.junit.jupiter.api.Test;
+import java.io.StringReader;
+import java.math.BigDecimal;
+import org.junit.Test;
 
-class ReflectionTest {
-  private static class ClassWithDefaultConstructor {
-    private int i;
+public class ToNumberPolicyTest {
+  @Test
+  public void testDouble() throws IOException {
+    ToNumberStrategy strategy = ToNumberPolicy.DOUBLE;
+    assertThat(strategy.readNumber(fromString("10.1"))).isEqualTo(10.1);
+    assertThat(strategy.readNumber(fromString("3.141592653589793238462643383279")))
+        .isEqualTo(3.141592653589793D);
+
+    MalformedJsonException e =
+        assertThrows(MalformedJsonException.class, () -> strategy.readNumber(fromString("1e400")));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "JSON forbids NaN and infinities: Infinity at line 1 column 6 path $\n"
+                + "See https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json");
+
+    assertThrows(
+        NumberFormatException.class, () -> strategy.readNumber(fromString("\"not-a-number\"")));
   }
 
   @Test
-  void testDefaultConstructor() {
-    Gson gson = new Gson();
-
-    ClassWithDefaultConstructor c = gson.fromJson("{\"i\":1}", ClassWithDefaultConstructor.class);
-    assertThat(c.i).isEqualTo(1);
-  }
-
-  private static class ClassWithCustomDefaultConstructor {
-    private int i;
-
-    private ClassWithCustomDefaultConstructor() {
-      i = 1;
-    }
+  public void testLazilyParsedNumber() throws IOException {
+    ToNumberStrategy strategy = ToNumberPolicy.LAZILY_PARSED_NUMBER;
+    assertThat(strategy.readNumber(fromString("10.1"))).isEqualTo(new LazilyParsedNumber("10.1"));
+    assertThat(strategy.readNumber(fromString("3.141592653589793238462643383279")))
+        .isEqualTo(new LazilyParsedNumber("3.141592653589793238462643383279"));
+    assertThat(strategy.readNumber(fromString("1e400"))).isEqualTo(new LazilyParsedNumber("1e400"));
   }
 
   @Test
-  void testCustomDefaultConstructor() {
-    Gson gson = new Gson();
+  public void testLongOrDouble() throws IOException {
+    ToNumberStrategy strategy = ToNumberPolicy.LONG_OR_DOUBLE;
+    assertThat(strategy.readNumber(fromString("10"))).isEqualTo(10L);
+    assertThat(strategy.readNumber(fromString("10.1"))).isEqualTo(10.1);
+    assertThat(strategy.readNumber(fromString("3.141592653589793238462643383279")))
+        .isEqualTo(3.141592653589793D);
 
-    ClassWithCustomDefaultConstructor c =
-        gson.fromJson("{\"i\":2}", ClassWithCustomDefaultConstructor.class);
-    assertThat(c.i).isEqualTo(2);
+    Exception e =
+        assertThrows(MalformedJsonException.class, () -> strategy.readNumber(fromString("1e400")));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo("JSON forbids NaN and infinities: Infinity; at path $");
 
-    c = gson.fromJson("{}", ClassWithCustomDefaultConstructor.class);
-    assertThat(c.i).isEqualTo(1);
-  }
+    e =
+        assertThrows(
+            JsonParseException.class, () -> strategy.readNumber(fromString("\"not-a-number\"")));
+    assertThat(e).hasMessageThat().isEqualTo("Cannot parse not-a-number; at path $");
 
-  private static class ClassWithoutDefaultConstructor {
-    private int i = -1;
+    assertThat(strategy.readNumber(fromStringLenient("NaN"))).isEqualTo(Double.NaN);
+    assertThat(strategy.readNumber(fromStringLenient("Infinity")))
+        .isEqualTo(Double.POSITIVE_INFINITY);
+    assertThat(strategy.readNumber(fromStringLenient("-Infinity")))
+        .isEqualTo(Double.NEGATIVE_INFINITY);
 
-    // Explicit constructor with args to remove implicit no-args default constructor
-    private ClassWithoutDefaultConstructor(int i) {
-      this.i = i;
-    }
-  }
+    e = assertThrows(MalformedJsonException.class, () -> strategy.readNumber(fromString("NaN")));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Use JsonReader.setStrictness(Strictness.LENIENT) to accept malformed JSON at line 1"
+                + " column 1 path $\n"
+                + "See https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json");
 
-  /**
-   * Tests deserializing a class without default constructor.
-   *
-   * <p>This should use JDK Unsafe, and would normally require specifying {@code "unsafeAllocated":
-   * true} in the reflection metadata for GraalVM, though for some reason it also seems to work
-   * without it? Possibly because GraalVM seems to have special support for Gson, see its class
-   * {@code com.oracle.svm.thirdparty.gson.GsonFeature}.
-   */
-  @Test
-  void testClassWithoutDefaultConstructor() {
-    Gson gson = new Gson();
+    e =
+        assertThrows(
+            MalformedJsonException.class, () -> strategy.readNumber(fromString("Infinity")));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Use JsonReader.setStrictness(Strictness.LENIENT) to accept malformed JSON at line 1"
+                + " column 1 path $\n"
+                + "See https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json");
 
-    ClassWithoutDefaultConstructor c =
-        gson.fromJson("{\"i\":1}", ClassWithoutDefaultConstructor.class);
-    assertThat(c.i).isEqualTo(1);
-
-    c = gson.fromJson("{}", ClassWithoutDefaultConstructor.class);
-    // Class is instantiated with JDK Unsafe, therefore field keeps its default value instead of
-    // assigned -1
-    assertThat(c.i).isEqualTo(0);
-  }
-
-  @Test
-  void testInstanceCreator() {
-    Gson gson =
-        new GsonBuilder()
-            .registerTypeAdapter(
-                ClassWithoutDefaultConstructor.class,
-                new InstanceCreator<ClassWithoutDefaultConstructor>() {
-                  @Override
-                  public ClassWithoutDefaultConstructor createInstance(Type type) {
-                    return new ClassWithoutDefaultConstructor(-2);
-                  }
-                })
-            .create();
-
-    ClassWithoutDefaultConstructor c =
-        gson.fromJson("{\"i\":1}", ClassWithoutDefaultConstructor.class);
-    assertThat(c.i).isEqualTo(1);
-
-    c = gson.fromJson("{}", ClassWithoutDefaultConstructor.class);
-    // Uses default value specified by InstanceCreator
-    assertThat(c.i).isEqualTo(-2);
-  }
-
-  private static class ClassWithFinalField {
-    // Initialize with value which is not inlined by compiler
-    private final int i = nonConstant();
-
-    private static int nonConstant() {
-      return "a".length(); // = 1
-    }
+    e =
+        assertThrows(
+            MalformedJsonException.class, () -> strategy.readNumber(fromString("-Infinity")));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Use JsonReader.setStrictness(Strictness.LENIENT) to accept malformed JSON at line 1"
+                + " column 1 path $\n"
+                + "See https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json");
   }
 
   @Test
-  void testFinalField() {
-    Gson gson = new Gson();
+  public void testBigDecimal() throws IOException {
+    ToNumberStrategy strategy = ToNumberPolicy.BIG_DECIMAL;
+    assertThat(strategy.readNumber(fromString("10.1"))).isEqualTo(new BigDecimal("10.1"));
+    assertThat(strategy.readNumber(fromString("3.141592653589793238462643383279")))
+        .isEqualTo(new BigDecimal("3.141592653589793238462643383279"));
+    assertThat(strategy.readNumber(fromString("1e400"))).isEqualTo(new BigDecimal("1e400"));
 
-    ClassWithFinalField c = gson.fromJson("{\"i\":2}", ClassWithFinalField.class);
-    assertThat(c.i).isEqualTo(2);
-
-    c = gson.fromJson("{}", ClassWithFinalField.class);
-    assertThat(c.i).isEqualTo(1);
-  }
-
-  private static class ClassWithSerializedName {
-    @SerializedName("custom-name")
-    private int i;
-  }
-
-  @Test
-  void testSerializedName() {
-    Gson gson = new Gson();
-    ClassWithSerializedName c = gson.fromJson("{\"custom-name\":1}", ClassWithSerializedName.class);
-    assertThat(c.i).isEqualTo(1);
-
-    c = new ClassWithSerializedName();
-    c.i = 2;
-    assertThat(gson.toJson(c)).isEqualTo("{\"custom-name\":2}");
-  }
-
-  @JsonAdapter(ClassWithCustomClassAdapter.CustomAdapter.class)
-  private static class ClassWithCustomClassAdapter {
-    private static class CustomAdapter extends TypeAdapter<ClassWithCustomClassAdapter> {
-      @Override
-      public ClassWithCustomClassAdapter read(JsonReader in) throws IOException {
-        return new ClassWithCustomClassAdapter(in.nextInt() + 5);
-      }
-
-      @Override
-      public void write(JsonWriter out, ClassWithCustomClassAdapter value) throws IOException {
-        out.value(value.i + 6);
-      }
-    }
-
-    private int i;
-
-    private ClassWithCustomClassAdapter(int i) {
-      this.i = i;
-    }
+    JsonParseException e =
+        assertThrows(
+            JsonParseException.class, () -> strategy.readNumber(fromString("\"not-a-number\"")));
+    assertThat(e).hasMessageThat().isEqualTo("Cannot parse not-a-number; at path $");
   }
 
   @Test
-  void testCustomClassAdapter() {
-    Gson gson = new Gson();
-    ClassWithCustomClassAdapter c = gson.fromJson("1", ClassWithCustomClassAdapter.class);
-    assertThat(c.i).isEqualTo(6);
+  public void testNullsAreNeverExpected() throws IOException {
+    IllegalStateException e =
+        assertThrows(
+            IllegalStateException.class,
+            () -> ToNumberPolicy.DOUBLE.readNumber(fromString("null")));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Expected a double but was NULL at line 1 column 5 path $\n"
+                + "See https://github.com/google/gson/blob/main/Troubleshooting.md#adapter-not-null-safe");
 
-    assertThat(gson.toJson(new ClassWithCustomClassAdapter(1))).isEqualTo("7");
+    e =
+        assertThrows(
+            IllegalStateException.class,
+            () -> ToNumberPolicy.LAZILY_PARSED_NUMBER.readNumber(fromString("null")));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Expected a string but was NULL at line 1 column 5 path $\n"
+                + "See https://github.com/google/gson/blob/main/Troubleshooting.md#adapter-not-null-safe");
+
+    e =
+        assertThrows(
+            IllegalStateException.class,
+            () -> ToNumberPolicy.LONG_OR_DOUBLE.readNumber(fromString("null")));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Expected a string but was NULL at line 1 column 5 path $\n"
+                + "See https://github.com/google/gson/blob/main/Troubleshooting.md#adapter-not-null-safe");
+
+    e =
+        assertThrows(
+            IllegalStateException.class,
+            () -> ToNumberPolicy.BIG_DECIMAL.readNumber(fromString("null")));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Expected a string but was NULL at line 1 column 5 path $\n"
+                + "See https://github.com/google/gson/blob/main/Troubleshooting.md#adapter-not-null-safe");
   }
 
-  private static class ClassWithCustomFieldAdapter {
-    private static class CustomAdapter extends TypeAdapter<Integer> {
-      @Override
-      public Integer read(JsonReader in) throws IOException {
-        return in.nextInt() + 5;
-      }
-
-      @Override
-      public void write(JsonWriter out, Integer value) throws IOException {
-        out.value(value + 6);
-      }
-    }
-
-    @JsonAdapter(ClassWithCustomFieldAdapter.CustomAdapter.class)
-    private int i;
-
-    private ClassWithCustomFieldAdapter(int i) {
-      this.i = i;
-    }
-
-    private ClassWithCustomFieldAdapter() {
-      this(-1);
-    }
+  private static JsonReader fromString(String json) {
+    return new JsonReader(new StringReader(json));
   }
 
-  @Test
-  void testCustomFieldAdapter() {
-    Gson gson = new Gson();
-    ClassWithCustomFieldAdapter c = gson.fromJson("{\"i\":1}", ClassWithCustomFieldAdapter.class);
-    assertThat(c.i).isEqualTo(6);
-
-    assertThat(gson.toJson(new ClassWithCustomFieldAdapter(1))).isEqualTo("{\"i\":7}");
-  }
-
-  private static class ClassWithRegisteredAdapter {
-    private int i;
-
-    private ClassWithRegisteredAdapter(int i) {
-      this.i = i;
-    }
-  }
-
-  @Test
-  void testCustomAdapter() {
-    Gson gson =
-        new GsonBuilder()
-            .registerTypeAdapter(
-                ClassWithRegisteredAdapter.class,
-                new TypeAdapter<ClassWithRegisteredAdapter>() {
-                  @Override
-                  public ClassWithRegisteredAdapter read(JsonReader in) throws IOException {
-                    return new ClassWithRegisteredAdapter(in.nextInt() + 5);
-                  }
-
-                  @Override
-                  public void write(JsonWriter out, ClassWithRegisteredAdapter value)
-                      throws IOException {
-                    out.value(value.i + 6);
-                  }
-                })
-            .create();
-
-    ClassWithRegisteredAdapter c = gson.fromJson("1", ClassWithRegisteredAdapter.class);
-    assertThat(c.i).isEqualTo(6);
-
-    assertThat(gson.toJson(new ClassWithRegisteredAdapter(1))).isEqualTo("7");
-  }
-
-  @Test
-  void testGenerics() {
-    Gson gson = new Gson();
-
-    List<ClassWithDefaultConstructor> list =
-        gson.fromJson("[{\"i\":1}]", new TypeToken<List<ClassWithDefaultConstructor>>() {});
-    assertThat(list).hasSize(1);
-    assertThat(list.get(0).i).isEqualTo(1);
-
-    @SuppressWarnings("unchecked")
-    List<ClassWithDefaultConstructor> list2 =
-        (List<ClassWithDefaultConstructor>)
-            gson.fromJson(
-                "[{\"i\":1}]",
-                TypeToken.getParameterized(List.class, ClassWithDefaultConstructor.class));
-    assertThat(list2).hasSize(1);
-    assertThat(list2.get(0).i).isEqualTo(1);
+  private static JsonReader fromStringLenient(String json) {
+    JsonReader jsonReader = fromString(json);
+    jsonReader.setStrictness(Strictness.LENIENT);
+    return jsonReader;
   }
 }

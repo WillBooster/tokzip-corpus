@@ -1,129 +1,123 @@
 {-# LANGUAGE NoImplicitPrelude   #-}
-{-# LANGUAGE DataKinds           #-}
-{-# LANGUAGE NoFieldSelectors    #-}
 {-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedStrings   #-}
 
--- | The facility for retrieving all files from the main Stack
--- 'Stack.Types.Package' type. This was moved into its own module to allow
--- component-level file-gathering without circular dependency at the Package
--- level.
-module Stack.Types.PackageFile
-  ( GetPackageFileContext (..)
-  , DotCabalPath (..)
-  , DotCabalDescriptor (..)
-  , PackageWarning (..)
-  , StackPackageFile (..)
-  , PackageComponentFile (..)
+-- | Types and functions related to Stack's @list@ command.
+module Stack.List
+  ( listCmd
+  , listPackages
   ) where
 
-import           Distribution.ModuleName ( ModuleName )
-import           RIO.Process ( HasProcessContext (..) )
+import           Pantry ( loadSnapshot )
+import qualified RIO.ByteString.Lazy as Lazy
+import qualified RIO.Map as Map
+import           RIO.Process ( HasProcessContext )
+import           Stack.Config ( makeConcreteResolver )
 import           Stack.Prelude
-import           Stack.Types.BuildConfig
-                   ( BuildConfig (..), HasBuildConfig (..) )
-import           Stack.Types.Config ( HasConfig (..) )
-import           Stack.Types.GHCVariant ( HasGHCVariant (..) )
-import           Stack.Types.NamedComponent ( NamedComponent )
-import           Stack.Types.Platform ( HasPlatform (..) )
-import           Stack.Types.Runner ( HasRunner (..) )
+import           Stack.Runners ( ShouldReexec (..), withConfig )
+import           Stack.Types.GlobalOpts ( GlobalOpts (..) )
+import           Stack.Types.Runner ( Runner, globalOptsL )
 
-data GetPackageFileContext = GetPackageFileContext
-  { file :: !(Path Abs File)
-  , distDir :: !(Path Abs Dir)
-  , buildConfig :: !BuildConfig
-  , cabalVer :: !Version
-  }
-
-instance HasPlatform GetPackageFileContext where
-  platformL = configL . platformL
-  {-# INLINE platformL #-}
-  platformVariantL = configL . platformVariantL
-  {-# INLINE platformVariantL #-}
-
-instance HasGHCVariant GetPackageFileContext where
-  ghcVariantL = configL . ghcVariantL
-  {-# INLINE ghcVariantL #-}
-
-instance HasLogFunc GetPackageFileContext where
-  logFuncL = configL . logFuncL
-
-instance HasRunner GetPackageFileContext where
-  runnerL = configL . runnerL
-
-instance HasStylesUpdate GetPackageFileContext where
-  stylesUpdateL = runnerL . stylesUpdateL
-
-instance HasTerm GetPackageFileContext where
-  useColorL = runnerL . useColorL
-  termWidthL = runnerL . termWidthL
-
-instance HasConfig GetPackageFileContext where
-  configL = buildConfigL . lens (.config) (\x y -> x { config = y })
-  {-# INLINE configL #-}
-
-instance HasBuildConfig GetPackageFileContext where
-  buildConfigL = lens (.buildConfig) (\x y -> x { buildConfig = y })
-
-instance HasPantryConfig GetPackageFileContext where
-  pantryConfigL = configL . pantryConfigL
-
-instance HasProcessContext GetPackageFileContext where
-  processContextL = configL . processContextL
-
--- | A path resolved from the Cabal file, which is either main-is or
--- an exposed/internal/referenced module.
-data DotCabalPath
-  = DotCabalModulePath !(Path Abs File)
-  | DotCabalMainPath !(Path Abs File)
-  | DotCabalFilePath !(Path Abs File)
-  | DotCabalCFilePath !(Path Abs File)
-  deriving (Eq, Ord, Show)
-
--- | A descriptor from a Cabal file indicating one of the following:
---
--- exposed-modules: Foo
--- other-modules: Foo
--- or
--- main-is: Foo.hs
---
-data DotCabalDescriptor
-  = DotCabalModule !ModuleName
-  | DotCabalMain !FilePath
-  | DotCabalFile !FilePath
-  | DotCabalCFile !FilePath
-  deriving (Eq, Ord, Show)
-
--- | Warning generated when reading a package
-data PackageWarning
-  = UnlistedModulesWarning NamedComponent [ModuleName]
-    -- ^ Modules found that are not listed in Cabal file
-  -- TODO: bring this back - see
-  -- https://github.com/commercialhaskell/stack/issues/2649
-  {-
-  | MissingModulesWarning (Path Abs File) (Maybe String) [ModuleName]
-    -- ^ Modules not found in file system, which are listed in Cabal file
-  -}
-
--- | This is the information from Cabal we need at the package level to track
--- files.
-data StackPackageFile = StackPackageFile
-  { extraSrcFiles :: [FilePath]
-  , dataDir :: FilePath
-  , dataFiles :: [FilePath]
-  }
+-- | Type representing exceptions thrown by functions exported by the
+-- "Stack.List" module.
+newtype ListPrettyException
+  = CouldNotParsePackageSelectors [StyleDoc]
   deriving (Show, Typeable)
 
--- | Files that the package depends on, relative to package directory.
-data PackageComponentFile = PackageComponentFile
-  { modulePathMap :: Map NamedComponent (Map ModuleName (Path Abs File))
-  , cabalFileMap :: !(Map NamedComponent [DotCabalPath])
-  , packageExtraFile :: Set (Path Abs File)
-  , warnings :: [PackageWarning]
-  }
+instance Pretty ListPrettyException where
+  pretty (CouldNotParsePackageSelectors errs) =
+    "[S-4926]"
+    <> line
+    <> bulletedList errs
 
-instance Semigroup PackageComponentFile where
-  PackageComponentFile x1 x2 x3 x4 <> PackageComponentFile y1 y2 y3 y4 =
-    PackageComponentFile (x1 <> y1) (x2 <> y2) (x3 <> y3) (x4 <> y4)
+instance Exception ListPrettyException
 
-instance Monoid PackageComponentFile where
-  mempty = PackageComponentFile mempty mempty mempty mempty
+-- | Function underlying the @stack list@ command. List packages.
+listCmd :: [String] -> RIO Runner ()
+listCmd names = withConfig NoReexec $ do
+  mresolver <- view $ globalOptsL . to (.resolver)
+  mSnapshot <- forM mresolver $ \resolver -> do
+    concrete <- makeConcreteResolver resolver
+    loc <- completeSnapshotLocation concrete
+    loadSnapshot loc
+  listPackages mSnapshot names
+
+-- | Intended to work for the command line command.
+listPackages ::
+     forall env. (HasPantryConfig env, HasProcessContext env, HasTerm env)
+  => Maybe RawSnapshot
+     -- ^ When looking up by name, take from this build plan.
+  -> [String]
+     -- ^ Names or identifiers.
+  -> RIO env ()
+listPackages mSnapshot input = do
+  let (errs1, names) = case mSnapshot of
+        Just snapshot | null input -> ([], Map.keys (rsPackages snapshot))
+        _ -> partitionEithers $ map parse input
+  (errs2, locs) <- partitionEithers <$> traverse toLoc names
+  case errs1 ++ errs2 of
+    [] -> pure ()
+    errs -> prettyThrowM $ CouldNotParsePackageSelectors errs
+  mapM_ (Lazy.putStrLn . fromPackageId) locs
+ where
+  toLoc | Just snapshot <- mSnapshot = toLocSnapshot snapshot
+        | otherwise = toLocNoSnapshot
+
+  toLocNoSnapshot :: PackageName -> RIO env (Either StyleDoc PackageIdentifier)
+  toLocNoSnapshot name = do
+    mloc1 <-
+      getLatestHackageLocation YesRequireHackageIndex name UsePreferredVersions
+    mloc <-
+      case mloc1 of
+        Just _ -> pure mloc1
+        Nothing -> do
+          updated <-
+            updateHackageIndex $ Just $
+                 "Could not find package "
+              <> fromPackageName name
+              <> ", updating"
+          case updated of
+            UpdateOccurred ->
+              getLatestHackageLocation
+                YesRequireHackageIndex
+                name
+                UsePreferredVersions
+            NoUpdateOccurred -> pure Nothing
+    case mloc of
+      Nothing -> do
+        candidates <- getHackageTypoCorrections name
+        pure $ Left $ fillSep
+          [ flow "Could not find package"
+          , style Current (fromPackageName name)
+          , flow "on Hackage."
+          , if null candidates
+              then mempty
+              else fillSep $
+                  flow "Perhaps you meant one of:"
+                : mkNarrativeList (Just Good) False
+                    (map fromPackageName candidates :: [StyleDoc])
+          ]
+      Just loc -> pure $ Right (packageLocationIdent loc)
+
+  toLocSnapshot ::
+       RawSnapshot
+    -> PackageName
+    -> RIO env (Either StyleDoc PackageIdentifier)
+  toLocSnapshot snapshot name =
+    case Map.lookup name (rsPackages snapshot) of
+      Nothing ->
+        pure $ Left $ fillSep
+          [ flow "Package does not appear in snapshot:"
+          , style Current (fromPackageName name) <> "."
+          ]
+      Just sp -> do
+        loc <- cplComplete <$> completePackageLocation (rspLocation sp)
+        pure $ Right (packageLocationIdent loc)
+
+  parse s =
+    case parsePackageName s of
+      Just x -> Right x
+      Nothing -> Left $ fillSep
+        [ flow "Could not parse as package name or identifier:"
+        , style Current (fromString s) <> "."
+        ]

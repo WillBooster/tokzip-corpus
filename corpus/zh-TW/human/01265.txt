@@ -1,53 +1,162 @@
-<!-- more -->
+The goal is to successfully execute XSS.
 
-## 起源
+From the above code, it is not difficult to see that you can upload an HTML file, but because CSP has `script-src 'self'`, even if you can upload HTML, you cannot use inline script, and can only use `<script src="/uploads/xxx">` to introduce it.
 
-第一篇裡面有提到過想寫這系列文的初衷，因為實在是看過太多人問 CORS 問題了，而且有些人也不管脈絡，一言不合就推薦用 proxy 或是 CORS Anywhere。如果是第三方資源沒有權限，那用這個解法合理，但如果是公司自己的服務，應該是要叫後端設定才對，而不是自己去接 proxy。
+And if the content type of `/uploads/xxx` is `application/octet-stream`, Chrome will directly display an error message:
 
-CORS 最常見的錯誤大概就那些，包括：
+> Refused to execute script from 'https://uploader.c.hc.lc/uploads/xxx' because its MIME type ('application/octet-stream') is not executable, and strict MIME type checking is enabled.
 
-1. 不知道 CORS 擋的是 response 而不是 request（有 preflight 的除外）
-2. 不知道為什麼要有 CORS
-3. 不知道怎麼解決 CORS 問題（到處亂試，以為 `no-cors` 是解法）
-4. 不知道怎麼 debug（應該要看 console 跟看 network tab）
-5. 錯誤地解決 CORS 問題（該後端改的卻自己用 proxy）
+So the goal of this question is clear: to find a MIME type that does not contain script but can still be successfully loaded by the browser.
 
-在 2020 年 4 月的時候，我有了寫這個系列文的念頭，接下來就開始研究，一開始就規劃了大家看到的這五篇文章，在 2020 年 7 月開始動筆，連續寫了大概兩三天，把第一篇寫完，第二篇大概寫一半，然後就從此擱置了。
+After seeing this question, I first went to look at the Chromium source code. Using Google search with the error message just now will make it easier to find: `"strict MIME type checking is enabled" site:https://chromium.googlesource.com/`
 
-那時候會擱置大概是因為第三篇：CORS 詳解不知道該怎麼寫，然後第四篇一起看 spec 也沒太多想法，所以就拖延症一直放著了。直到 2021 年 2 月份才開始繼續寫，並且一口氣把後續文章全部寫完。會重新開始動筆的理由是，這是我心中一顆放不下的石頭，沒有把這系列寫完，我做其他事情的時候就會有些不安，想著「這系列文是不是寫不完了」。
+Through the search results, we can directly locate this file: https://chromium.googlesource.com/chromium/blink/+/refs/heads/main/Source/core/dom/ScriptLoader.cpp
 
-## 後記
+However, this file is already very old, but at least we know that it is part of blink, so we can go to [blink](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/103.0.5012.1/third_party/blink) in Chromium to find similar files, and we can find [third_party/blink/renderer/core/script/script_loader.cc](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/103.0.5012.1/third_party/blink/renderer/core/script/script_loader.cc).
 
-但幸好我有寫完。因為從寫文章的過程中我也收穫很多，花了不少時間在理解一些細節，像是 Spectre 的攻擊我就研究了一段時間，雖然最後還是沒有很懂就是了，想要完全理解要把作業系統相關的知識補齊才行。而第五篇那些 COXX 的 header 也花了許多時間，找了很多資料，把當初提案的 issue 都稍微看了一下，會更理解這些 policy 提出的原因。
+After comparing the old and new versions, we can find the `IsValidClassicScriptTypeAndLanguage` function:
 
-在研究的過程中也發現許多安全性有關的東西其實是扣在一起的，例如說：
+``` cpp
+// <specdef href="https://html.spec.whatwg.org/C/#prepare-a-script">
+bool IsValidClassicScriptTypeAndLanguage(
+    const String& type,
+    const String& language,
+    ScriptLoader::LegacyTypeSupport support_legacy_types) {
+  // FIXME: IsLegacySupportedJavaScriptLanguage() is not valid HTML5. It is used
+  // here to maintain backwards compatibility with existing web tests. The
+  // specific violations are:
+  // - Allowing type=javascript. type= should only support MIME types, such as
+  //   text/javascript.
+  // - Allowing a different set of languages for language= and type=. language=
+  //   supports Javascript 1.1 and 1.4-1.6, but type= does not.
+  if (type.IsNull()) {
+    // <spec step="8">the script element has no type attribute but it has a
+    // language attribute and that attribute's value is the empty string,
+    // or</spec>
+    //
+    // <spec step="8">the script element has neither a type attribute
+    // nor a language attribute, then</spec>
+    if (language.IsEmpty())
+      return true;
+    // <spec step="8">Otherwise, the element has a non-empty language attribute;
+    // let the script block's type string for this script element be the
+    // concatenation of the string "text/" followed by the value of the language
+    // attribute.</spec>
+    if (MIMETypeRegistry::IsSupportedJavaScriptMIMEType("text/" + language))
+      return true;
+    // Not spec'ed.
+    if (MIMETypeRegistry::IsLegacySupportedJavaScriptLanguage(language))
+      return true;
+  } else if (type.IsEmpty()) {
+    // <spec step="8">the script element has a type attribute and its value is
+    // the empty string, or</spec>
+    return true;
+  } else {
+    // <spec step="8">Otherwise, if the script element has a type attribute, let
+    // the script block's type string for this script element be the value of
+    // that attribute with leading and trailing ASCII whitespace
+    // stripped.</spec>
+    if (MIMETypeRegistry::IsSupportedJavaScriptMIMEType(
+            type.StripWhiteSpace())) {
+      return true;
+    }
+    // Not spec'ed.
+    if (support_legacy_types == ScriptLoader::kAllowLegacyTypeInTypeAttribute &&
+        MIMETypeRegistry::IsLegacySupportedJavaScriptLanguage(type)) {
+      return true;
+    }
+  }
+  return false;
+}
+```
 
-1. Same-origin policy
-2. window.open
-3. iframe
-4. CSP
-5. SameSite cookie
+Then, using `IsSupportedJavaScriptMIMEType` to search, we can find the supported MIME types in [third_party/blink/common/mime_util/mime_util.cc](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/103.0.5012.1/third_party/blink/common/mime_util/mime_util.cc):
 
-在找資料的過程中可以看到不少重疊的地方，尤其是 SameSite cookie，越想越覺得這東西真的很重要，而且可以防止滿多的攻擊。對了，在寫這篇文的時候參考資料其實大多都來自於 Google Chrome，所以文中有許多使用「瀏覽器」的地方，有可能現在其實只有 Chrome 有實作而已，其他瀏覽器還沒跟進。
+``` js
+//  Support every script type mentioned in the spec, as it notes that "User
+//  agents must recognize all JavaScript MIME types." See
+//  https://html.spec.whatwg.org/#javascript-mime-type.
+const char* const kSupportedJavascriptTypes[] = {
+    "application/ecmascript",
+    "application/javascript",
+    "application/x-ecmascript",
+    "application/x-javascript",
+    "text/ecmascript",
+    "text/javascript",
+    "text/javascript1.0",
+    "text/javascript1.1",
+    "text/javascript1.2",
+    "text/javascript1.3",
+    "text/javascript1.4",
+    "text/javascript1.5",
+    "text/jscript",
+    "text/livescript",
+    "text/x-ecmascript",
+    "text/x-javascript",
+};
+```
 
-不過 Chrome 確實資源最多，而且常常會 po 一些技術好文在部落格上面，都是很值得參考的資源。
+From the comments, we can see the location of the spec, and the list provided is the same as the answer to the first question. All these MIME types can be loaded as scripts.
 
-我認為前後端工程師都要對 CORS 有一定的理解，碰到問題的時候才知道該怎麼解決。雖然說 CORS 是許多新手工程師都碰過的問題，但其實把脈絡理清楚之後，我覺得不是特別難，就是要花點時間把 CORS 的運作模式搞清楚。而且一旦弄懂之後，從此以後碰到這問題都不怕了。
+However, we can notice that each MIME type contains a script.
 
-再來有關於第五篇那些各種 COXX 的東西，我認為除非你需要用到那些被封印的功能，或是你的網站需要有高度的安全性，否則有時間再去研究就可以了，先聽過有個印象就好。
+At this point, I got stuck, but the author released a hint called `Origin trials`, which led to a feature under experimentation called [Web Bundles](https://web.dev/web-bundles/), which is the answer to this question.
 
-寫完這系列文之後，有些想講的東西我找不到地方放，因此底下的段落就講一些放不進去的遺珠。
+What is a Web Bundle?
 
-## 可能不是 CORS 問題的 CORS 問題
+Simply put, a Web Bundle is a package that bundles a bunch of data (HTML, CSS, JS...) into a .wbn file. The article mentioned an example: if your friend wants to share a standalone web game with you in an offline environment, it is generally impossible (without considering setting up a server on your own computer).
 
-瀏覽器的錯誤訊息是個很好的資訊來源，但是它有時候卻也不一定可靠。
+But with Web Bundles, it can package the game into a .wbn file and send it to you. When you receive it, you can simply throw it into the browser and open it, just like an app.
 
-有些 CORS 問題，不一定是因為 response header 沒設好，有可能是因為之前沒設定好的 response 被 cache 住，或者甚至是憑證問題！可以參考：
+In addition to loading the entire app, specific resources can also be loaded from the Web Bundle. Here is a complete introduction: [Explainer: Subresource loading with Web Bundles](https://github.com/WICG/webpackage/blob/main/explainers/subresource-loading.md). The example looks like this:
 
-1. [CORS request blocked in Firefox but not other browsers #2803](https://github.com/aws-amplify/amplify-js/issues/2803)
-2. [Firefox 'Cross-Origin Request Blocked' despite headers](https://stackoverflow.com/questions/24371734/firefox-cross-origin-request-blocked-despite-headers)
-3. [CORS request did not succeed on Firefox but works on Chrome](https://stackoverflow.com/questions/51831652/cors-request-did-not-succeed-on-firefox-but-works-on-chrome)
+``` html
+<script type="webbundle">
+{
+   "source": "https://example.com/dir/subresources.wbn",
+   "resources": ["https://example.com/dir/a.js", "https://example.com/dir/b.js", "https://example.com/dir/c.png"]
+}
+</script>
+```
 
-## Origin Policy
+In this way, when you load `https://example.com/dir/a.js` in a web page, the browser will first look for this resource in subresources.wbn instead of downloading it directly from the server.
 
-在使用 CORS 的時候其實我們花了許多時間在 preflight request 上面，先假設沒有快取而且都是非簡單請求的話，那跨來源跟同來源比起來，多了一倍的 request，因為每一個 request 都會額外再附加一個 preflight request。
+So the answer to the XSS challenge mentioned earlier is to package the JS you want to load into a web bundle. Its MIME type is `application/webbundle`, so it will not be blocked.
+
+Then, load it as shown above, and the MIME type of the JS file loaded from the web bundle will be correct, so it can be executed successfully.
+
+However, why didn't we see this feature when we were looking at the Chromium code earlier?
+
+This is because we were too focused on the MIME type, so we only looked at `IsValidClassicScriptTypeAndLanguage`, but we should actually look at [GetScriptTypeAtPrepare](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/103.0.5012.1/third_party/blink/renderer/core/script/script_loader.cc) that calls it:
+
+``` C++
+ScriptLoader::ScriptTypeAtPrepare ScriptLoader::GetScriptTypeAtPrepare(
+    const String& type,
+    const String& language,
+    LegacyTypeSupport support_legacy_types) {
+  if (IsValidClassicScriptTypeAndLanguage(type, language,
+                                          support_legacy_types)) {
+    // <spec step="8">... If the script block's type string is a JavaScript MIME
+    // type essence match, the script's type is "classic". ...</spec>
+    return ScriptTypeAtPrepare::kClassic;
+  }
+  if (EqualIgnoringASCIICase(type, script_type_names::kModule)) {
+    // <spec step="8">... If the script block's type string is an ASCII
+    // case-insensitive match for the string "module", the script's type is
+    // "module". ...</spec>
+    return ScriptTypeAtPrepare::kModule;
+  }
+  if (EqualIgnoringASCIICase(type, script_type_names::kImportmap)) {
+    return ScriptTypeAtPrepare::kImportMap;
+  }
+  if (EqualIgnoringASCIICase(type, script_type_names::kSpeculationrules)) {
+    return ScriptTypeAtPrepare::kSpeculationRules;
+  }
+  if (EqualIgnoringASCIICase(type, script_type_names::kWebbundle)) {
+    return ScriptTypeAtPrepare::kWebBundle;
+  }
+  // <spec step="8">... If neither of the above conditions are true, then
+  // return. No script is executed.</spec>
+  return ScriptTypeAtPrepare::kInvalid;
+}
+```

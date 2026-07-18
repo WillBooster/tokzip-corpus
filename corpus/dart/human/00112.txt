@@ -1,56 +1,78 @@
 import 'dart:async';
+import 'dart:convert';
 
-import 'package:dio/dio.dart';
-import 'package:test/test.dart';
+import '../adapter.dart';
+import '../headers.dart';
+import '../options.dart';
+import '../transformer.dart';
+import 'util/consolidate_bytes.dart';
 
-void main() {
-  group(Headers, () {
-    test('set', () {
-      final headers = Headers.fromMap({
-        'set-cookie': ['k=v', 'k1=v1'],
-        'content-length': ['200'],
-        'test': ['1', '2'],
-      });
-      headers.add('SET-COOKIE', 'k2=v2');
-      expect(headers.value('content-length'), '200');
-      expect(Future(() => headers.value('test')), throwsException);
-      expect(headers['set-cookie']?.length, 3);
-      headers.remove('set-cookie', 'k=v');
-      expect(headers['set-cookie']?.length, 2);
-      headers.removeAll('set-cookie');
-      expect(headers['set-cookie'], isNull);
-      final ls = [];
-      headers.forEach((k, list) => ls.addAll(list));
-      expect(ls.length, 3);
-      expect(headers.toString(), 'content-length: 200\ntest: 1\ntest: 2\n');
-      headers.set('content-length', '300');
-      expect(headers.value('content-length'), '300');
-      headers.set('content-length', ['400']);
-      expect(headers.value('content-length'), '400');
-    });
+@Deprecated('Use BackgroundTransformer instead')
+typedef DefaultTransformer = SyncTransformer;
 
-    test('clear', () {
-      final headers1 = Headers();
-      headers1.set('xx', 'v');
-      expect(headers1.value('xx'), 'v');
-      headers1.clear();
-      expect(headers1.map.isEmpty, isTrue);
-    });
-
-    test('case-sensitive', () {
-      final headers = Headers.fromMap(
-        {
-          'SET-COOKIE': ['k=v', 'k1=v1'],
-          'content-length': ['200'],
-          'Test': ['1', '2'],
-        },
-        preserveHeaderCase: true,
-      );
-      expect(headers['SET-COOKIE']?.length, 2);
-      // Although it's case-sensitive, we still use case-insensitive map.
-      expect(headers['set-cookie']?.length, 2);
-      expect(headers['content-length']?.length, 1);
-      expect(headers['Test']?.length, 2);
-    });
+/// If you want to custom the transformation of request/response data,
+/// you can provide a [Transformer] by your self, and replace
+/// the transformer by setting the [Dio.transformer].
+class SyncTransformer extends Transformer {
+  SyncTransformer({
+    this.jsonDecodeCallback = jsonDecode,
+    this.jsonEncodeCallback = jsonEncode,
   });
+
+  JsonDecodeCallback jsonDecodeCallback;
+  JsonEncodeCallback jsonEncodeCallback;
+
+  @override
+  Future<String> transformRequest(RequestOptions options) async {
+    return Transformer.defaultTransformRequest(options, jsonEncodeCallback);
+  }
+
+  @override
+  Future<dynamic> transformResponse(
+    RequestOptions options,
+    ResponseBody responseBody,
+  ) async {
+    final responseType = options.responseType;
+    // Do not handled the body for streams.
+    if (responseType == ResponseType.stream) {
+      return responseBody;
+    }
+
+    final responseBytes = await consolidateBytes(responseBody.stream);
+
+    // Return the finalized bytes if the response type is bytes.
+    if (responseType == ResponseType.bytes) {
+      return responseBytes;
+    }
+
+    final isJsonContent = Transformer.isJsonMimeType(
+      responseBody.headers[Headers.contentTypeHeader]?.first,
+    );
+    final String? response;
+    if (options.responseDecoder != null) {
+      final decodeResponse = options.responseDecoder!(
+        responseBytes,
+        options,
+        responseBody..stream = const Stream.empty(),
+      );
+
+      if (decodeResponse is Future) {
+        response = await decodeResponse;
+      } else {
+        response = decodeResponse;
+      }
+    } else if (!isJsonContent || responseBytes.isNotEmpty) {
+      response = utf8.decode(responseBytes, allowMalformed: true);
+    } else {
+      response = null;
+    }
+
+    if (response != null &&
+        response.isNotEmpty &&
+        responseType == ResponseType.json &&
+        isJsonContent) {
+      return jsonDecodeCallback(response);
+    }
+    return response;
+  }
 }

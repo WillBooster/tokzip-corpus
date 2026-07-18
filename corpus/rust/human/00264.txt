@@ -1,149 +1,119 @@
-use std::io::Write;
+// Copyright 2018 Guillaume Pinot (@TeXitoi) <texitoi@texitoi.eu>,
+// Kevin Knapp (@kbknapp) <kbknapp@gmail.com>, and
+// Ana Hobden (@hoverbear) <operator@hoverbear.org>
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+//
+// This work was derived from Structopt (https://github.com/TeXitoi/structopt)
+// commit#ea76fa1b1b273e65e3b0b1046643715b49bec51f which is licensed under the
+// MIT/Apache 2.0 license.
 
-use clap::builder::StyledStr;
-use clap::{Arg, Command};
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::Ident;
+use syn::Variant;
+use syn::{
+    self, punctuated::Punctuated, token::Comma, Data, DataStruct, DeriveInput, Field, Fields,
+    Generics,
+};
 
-use crate::generator::{utils, Generator};
-use crate::INTERNAL_ERROR_MSG;
+use crate::derives::args::collect_args_fields;
+use crate::derives::{args, into_app, subcommand};
+use crate::item::Item;
+use crate::item::Name;
 
-/// Generate powershell completion file
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct PowerShell;
+pub(crate) fn derive_parser(input: &DeriveInput) -> Result<TokenStream, syn::Error> {
+    let ident = &input.ident;
+    let pkg_name = std::env::var("CARGO_PKG_NAME").ok().unwrap_or_default();
 
-impl Generator for PowerShell {
-    fn file_name(&self, name: &str) -> String {
-        format!("_{name}.ps1")
-    }
-
-    fn generate(&self, cmd: &Command, buf: &mut dyn Write) {
-        let bin_name = cmd
-            .get_bin_name()
-            .expect("crate::generate should have set the bin_name");
-
-        let subcommands_cases = generate_inner(cmd, "");
-
-        let result = format!(
-            r#"
-using namespace System.Management.Automation
-using namespace System.Management.Automation.Language
-
-Register-ArgumentCompleter -Native -CommandName '{bin_name}' -ScriptBlock {{
-    param($wordToComplete, $commandAst, $cursorPosition)
-
-    $commandElements = $commandAst.CommandElements
-    $command = @(
-        '{bin_name}'
-        for ($i = 1; $i -lt $commandElements.Count; $i++) {{
-            $element = $commandElements[$i]
-            if ($element -isnot [StringConstantExpressionAst] -or
-                $element.StringConstantType -ne [StringConstantType]::BareWord -or
-                $element.Value.StartsWith('-') -or
-                $element.Value -eq $wordToComplete) {{
-                break
-        }}
-        $element.Value
-    }}) -join ';'
-
-    $completions = @(switch ($command) {{{subcommands_cases}
-    }})
-
-    $completions.Where{{ $_.CompletionText -like "$wordToComplete*" }} |
-        Sort-Object -Property ListItemText
-}}
-"#
-        );
-
-        w!(buf, result.as_bytes());
+    match input.data {
+        Data::Struct(DataStruct {
+            fields: Fields::Named(ref fields),
+            ..
+        }) => {
+            let name = Name::Assigned(quote!(#pkg_name));
+            let item = Item::from_args_struct(input, name)?;
+            let fields = collect_args_fields(&item, fields)?;
+            gen_for_struct(&item, ident, &input.generics, &fields)
+        }
+        Data::Struct(DataStruct {
+            fields: Fields::Unit,
+            ..
+        }) => {
+            let name = Name::Assigned(quote!(#pkg_name));
+            let item = Item::from_args_struct(input, name)?;
+            let fields = Punctuated::<Field, Comma>::new();
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let item = Item::from_args_field(field, item.casing(), item.env_casing())?;
+                    Ok((field, item))
+                })
+                .collect::<Result<Vec<_>, syn::Error>>()?;
+            gen_for_struct(&item, ident, &input.generics, &fields)
+        }
+        Data::Enum(ref e) => {
+            let name = Name::Assigned(quote!(#pkg_name));
+            let item = Item::from_subcommand_enum(input, name)?;
+            let variants = e
+                .variants
+                .iter()
+                .map(|variant| {
+                    let item =
+                        Item::from_subcommand_variant(variant, item.casing(), item.env_casing())?;
+                    Ok((variant, item))
+                })
+                .collect::<Result<Vec<_>, syn::Error>>()?;
+            gen_for_enum(&item, ident, &input.generics, &variants)
+        }
+        _ => abort_call_site!("`#[derive(Parser)]` only supports non-tuple structs and enums"),
     }
 }
 
-// Escape string inside single quotes
-fn escape_string(string: &str) -> String {
-    string.replace('\'', "''")
+fn gen_for_struct(
+    item: &Item,
+    item_name: &Ident,
+    generics: &Generics,
+    fields: &[(&Field, Item)],
+) -> Result<TokenStream, syn::Error> {
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let into_app = into_app::gen_for_struct(item, item_name, generics)?;
+    let args = args::gen_for_struct(item, item_name, generics, fields)?;
+
+    Ok(quote! {
+        #[automatically_derived]
+        #[allow(
+            unused_qualifications,
+            clippy::redundant_locals,
+        )]
+        impl #impl_generics clap::Parser for #item_name #ty_generics #where_clause {}
+
+        #into_app
+        #args
+    })
 }
 
-fn escape_help<T: ToString>(help: Option<&StyledStr>, data: T) -> String {
-    match help {
-        Some(help) => escape_string(&help.to_string().replace('\n', " ")),
-        _ => data.to_string(),
-    }
-}
+fn gen_for_enum(
+    item: &Item,
+    item_name: &Ident,
+    generics: &Generics,
+    variants: &[(&Variant, Item)],
+) -> Result<TokenStream, syn::Error> {
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-fn generate_inner(p: &Command, previous_command_name: &str) -> String {
-    debug!("generate_inner");
+    let into_app = into_app::gen_for_enum(item, item_name, generics)?;
+    let subcommand = subcommand::gen_for_enum(item, item_name, generics, variants)?;
 
-    let command_names = if previous_command_name.is_empty() {
-        vec![p.get_bin_name().expect(INTERNAL_ERROR_MSG).to_string()]
-    } else {
-        p.get_name_and_visible_aliases()
-            .into_iter()
-            .map(|name| format!("{};{}", previous_command_name, name))
-            .collect()
-    };
+    Ok(quote! {
+        #[automatically_derived]
+        impl #impl_generics clap::Parser for #item_name #ty_generics #where_clause {}
 
-    let mut completions = String::new();
-    let preamble = String::from("\n            [CompletionResult]::new(");
-
-    for option in p.get_opts() {
-        generate_aliases(&mut completions, &preamble, option);
-    }
-
-    for flag in utils::flags(p) {
-        generate_aliases(&mut completions, &preamble, &flag);
-    }
-
-    for subcommand in p.get_subcommands() {
-        for name in subcommand.get_name_and_visible_aliases() {
-            let tooltip = escape_help(subcommand.get_about(), name);
-            completions.push_str(&preamble);
-            completions.push_str(&format!(
-                "'{name}', '{name}', [CompletionResultType]::ParameterValue, '{tooltip}')"
-            ));
-        }
-    }
-
-    let mut subcommands_cases = String::new();
-    for command_name in &command_names {
-        subcommands_cases.push_str(&format!(
-            r"
-        '{}' {{{}
-            break
-        }}",
-            command_name, completions
-        ));
-    }
-
-    for subcommand in p.get_subcommands() {
-        for command_name in &command_names {
-            let subcommand_subcommands_cases = generate_inner(subcommand, command_name);
-            subcommands_cases.push_str(&subcommand_subcommands_cases);
-        }
-    }
-
-    subcommands_cases
-}
-
-fn generate_aliases(completions: &mut String, preamble: &String, arg: &Arg) {
-    use std::fmt::Write as _;
-
-    if let Some(aliases) = arg.get_short_and_visible_aliases() {
-        let tooltip = escape_help(arg.get_help(), aliases[0]);
-        for alias in aliases {
-            let _ = write!(
-                completions,
-                "{preamble}'-{alias}', '{alias}{}', [CompletionResultType]::ParameterName, '{tooltip}')",
-                // make PowerShell realize there is a difference between `-s` and `-S`
-                if alias.is_uppercase() { " " } else { "" },
-            );
-        }
-    }
-    if let Some(aliases) = arg.get_long_and_visible_aliases() {
-        let tooltip = escape_help(arg.get_help(), aliases[0]);
-        for alias in aliases {
-            let _ = write!(
-                completions,
-                "{preamble}'--{alias}', '{alias}', [CompletionResultType]::ParameterName, '{tooltip}')"
-            );
-        }
-    }
+        #into_app
+        #subcommand
+    })
 }

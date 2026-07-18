@@ -1,676 +1,350 @@
-import json
-from dataclasses import dataclass
-from datetime import date, datetime
-from typing import Annotated, Any, ForwardRef, Generic, NamedTuple, TypeAlias, TypeVar, Union
-
-import pytest
-from pydantic_core import ValidationError
-from typing_extensions import TypedDict
-
-from pydantic import BaseModel, Field, TypeAdapter, ValidationInfo, create_model, field_validator
-from pydantic._internal import _mock_val_ser
-from pydantic._internal._typing_extra import annotated_type
-from pydantic.config import ConfigDict
-from pydantic.dataclasses import dataclass as pydantic_dataclass
-from pydantic.errors import PydanticUndefinedAnnotation, PydanticUserError
-from pydantic.type_adapter import _type_has_config
-
-ItemType = TypeVar('ItemType')
-
-NestedList = list[list[ItemType]]
-
-
-class PydanticModel(BaseModel):
-    x: int
-
-
-T = TypeVar('T')
-
-
-class GenericPydanticModel(BaseModel, Generic[T]):
-    x: NestedList[T]
-
-
-class SomeTypedDict(TypedDict):
-    x: int
-
-
-class SomeNamedTuple(NamedTuple):
-    x: int
-
-
-@pytest.mark.parametrize(
-    'tp, val, expected',
-    [
-        (PydanticModel, PydanticModel(x=1), PydanticModel(x=1)),
-        (PydanticModel, {'x': 1}, PydanticModel(x=1)),
-        (SomeTypedDict, {'x': 1}, {'x': 1}),
-        (SomeNamedTuple, SomeNamedTuple(x=1), SomeNamedTuple(x=1)),
-        (list[str], ['1', '2'], ['1', '2']),
-        (tuple[str], ('1',), ('1',)),
-        (tuple[str, int], ('1', 1), ('1', 1)),
-        (tuple[str, ...], ('1',), ('1',)),
-        (dict[str, int], {'foo': 123}, {'foo': 123}),
-        (Union[int, str], 1, 1),  # noqa: UP007
-        (Union[int, str], '2', '2'),  # noqa: UP007
-        (GenericPydanticModel[int], {'x': [[1]]}, GenericPydanticModel[int](x=[[1]])),
-        (GenericPydanticModel[int], {'x': [['1']]}, GenericPydanticModel[int](x=[[1]])),
-        (NestedList[int], [[1]], [[1]]),
-        (NestedList[int], [['1']], [[1]]),
-    ],
-)
-def test_types(tp: Any, val: Any, expected: Any):
-    v = TypeAdapter(tp).validate_python
-    assert expected == v(val)
-
-
-IntList = list[int]
-OuterDict = dict[str, 'IntList']
-
-
-@pytest.mark.parametrize('defer_build', [False, True])
-@pytest.mark.parametrize('method', ['validate', 'serialize', 'json_schema', 'json_schemas'])
-def test_global_namespace_variables(defer_build: bool, method: str, generate_schema_calls):
-    config = ConfigDict(defer_build=True) if defer_build else None
-    ta = TypeAdapter(OuterDict, config=config)
-
-    assert generate_schema_calls.count == (0 if defer_build else 1), 'Should be built deferred'
-
-    if method == 'validate':
-        assert ta.validate_python({'foo': [1, '2']}) == {'foo': [1, 2]}
-    elif method == 'serialize':
-        assert ta.dump_python({'foo': [1, 2]}) == {'foo': [1, 2]}
-    elif method == 'json_schema':
-        assert ta.json_schema()['type'] == 'object'
-    else:
-        assert method == 'json_schemas'
-        schemas, _ = TypeAdapter.json_schemas([(OuterDict, 'validation', ta)])
-        assert schemas[(OuterDict, 'validation')]['type'] == 'object'
-
-
-@pytest.mark.parametrize('defer_build', [False, True])
-@pytest.mark.parametrize('method', ['validate', 'serialize', 'json_schema', 'json_schemas'])
-def test_model_global_namespace_variables(defer_build: bool, method: str, generate_schema_calls):
-    class MyModel(BaseModel):
-        model_config = ConfigDict(defer_build=defer_build)
-        x: OuterDict
-
-    ta = TypeAdapter(MyModel)
-
-    assert generate_schema_calls.count == (0 if defer_build else 1), 'Should be built deferred'
-
-    if method == 'validate':
-        assert ta.validate_python({'x': {'foo': [1, '2']}}) == MyModel(x={'foo': [1, 2]})
-    elif method == 'serialize':
-        assert ta.dump_python(MyModel(x={'foo': [1, 2]})) == {'x': {'foo': [1, 2]}}
-    elif method == 'json_schema':
-        assert ta.json_schema()['title'] == 'MyModel'
-    else:
-        assert method == 'json_schemas'
-        _, json_schema = TypeAdapter.json_schemas([(MyModel, 'validation', TypeAdapter(MyModel))])
-        assert 'MyModel' in json_schema['$defs']
-
-
-@pytest.mark.parametrize('defer_build', [False, True])
-@pytest.mark.parametrize('method', ['validate', 'serialize', 'json_schema', 'json_schemas'])
-def test_local_namespace_variables(defer_build: bool, method: str, generate_schema_calls):
-    IntList = list[int]  # noqa: F841
-    OuterDict = dict[str, 'IntList']
-
-    config = ConfigDict(defer_build=True) if defer_build else None
-    ta = TypeAdapter(OuterDict, config=config)
-
-    assert generate_schema_calls.count == (0 if defer_build else 1), 'Should be built deferred'
-
-    if method == 'validate':
-        assert ta.validate_python({'foo': [1, '2']}) == {'foo': [1, 2]}
-    elif method == 'serialize':
-        assert ta.dump_python({'foo': [1, 2]}) == {'foo': [1, 2]}
-    elif method == 'json_schema':
-        assert ta.json_schema()['type'] == 'object'
-    else:
-        assert method == 'json_schemas'
-        schemas, _ = TypeAdapter.json_schemas([(OuterDict, 'validation', ta)])
-        assert schemas[(OuterDict, 'validation')]['type'] == 'object'
-
-
-@pytest.mark.parametrize('defer_build', [False, True])
-@pytest.mark.parametrize('method', ['validate', 'serialize', 'json_schema', 'json_schemas'])
-def test_model_local_namespace_variables(defer_build: bool, method: str, generate_schema_calls):
-    IntList = list[int]  # noqa: F841
-
-    class MyModel(BaseModel):
-        model_config = ConfigDict(defer_build=defer_build)
-        x: dict[str, 'IntList']
-
-    ta = TypeAdapter(MyModel)
-
-    assert generate_schema_calls.count == (0 if defer_build else 1), 'Should be built deferred'
-
-    if method == 'validate':
-        assert ta.validate_python({'x': {'foo': [1, '2']}}) == MyModel(x={'foo': [1, 2]})
-    elif method == 'serialize':
-        assert ta.dump_python(MyModel(x={'foo': [1, 2]})) == {'x': {'foo': [1, 2]}}
-    elif method == 'json_schema':
-        assert ta.json_schema()['title'] == 'MyModel'
-    else:
-        assert method == 'json_schemas'
-        _, json_schema = TypeAdapter.json_schemas([(MyModel, 'validation', ta)])
-        assert 'MyModel' in json_schema['$defs']
-
-
-@pytest.mark.parametrize('defer_build', [False, True])
-@pytest.mark.parametrize('method', ['validate', 'serialize', 'json_schema', 'json_schemas'])
-def test_top_level_fwd_ref(defer_build: bool, method: str, generate_schema_calls):
-    config = ConfigDict(defer_build=True) if defer_build else None
-
-    FwdRef = ForwardRef('OuterDict', module=__name__)
-    ta = TypeAdapter(FwdRef, config=config)
-
-    assert generate_schema_calls.count == (0 if defer_build else 1), 'Should be built deferred'
-
-    if method == 'validate':
-        assert ta.validate_python({'foo': [1, '2']}) == {'foo': [1, 2]}
-    elif method == 'serialize':
-        assert ta.dump_python({'foo': [1, 2]}) == {'foo': [1, 2]}
-    elif method == 'json_schema':
-        assert ta.json_schema()['type'] == 'object'
-    else:
-        assert method == 'json_schemas'
-        schemas, _ = TypeAdapter.json_schemas([(FwdRef, 'validation', ta)])
-        assert schemas[(FwdRef, 'validation')]['type'] == 'object'
-
-
-MyUnion: TypeAlias = 'str | int'
-
-
-def test_type_alias():
-    MyList = list[MyUnion]
-    v = TypeAdapter(MyList).validate_python
-    res = v([1, '2'])
-    assert res == [1, '2']
-
-
-def test_validate_python_strict() -> None:
-    class Model(TypedDict):
-        x: int
-
-    class ModelStrict(Model):
-        __pydantic_config__ = ConfigDict(strict=True)  # type: ignore
-
-    lax_validator = TypeAdapter(Model)
-    strict_validator = TypeAdapter(ModelStrict)
-
-    assert lax_validator.validate_python({'x': '1'}, strict=None) == Model(x=1)
-    assert lax_validator.validate_python({'x': '1'}, strict=False) == Model(x=1)
-    with pytest.raises(ValidationError) as exc_info:
-        lax_validator.validate_python({'x': '1'}, strict=True)
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'int_type', 'loc': ('x',), 'msg': 'Input should be a valid integer', 'input': '1'}
-    ]
-
-    with pytest.raises(ValidationError) as exc_info:
-        strict_validator.validate_python({'x': '1'})
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'int_type', 'loc': ('x',), 'msg': 'Input should be a valid integer', 'input': '1'}
-    ]
-    assert strict_validator.validate_python({'x': '1'}, strict=False) == Model(x=1)
-    with pytest.raises(ValidationError) as exc_info:
-        strict_validator.validate_python({'x': '1'}, strict=True)
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'int_type', 'loc': ('x',), 'msg': 'Input should be a valid integer', 'input': '1'}
-    ]
-
-
-@pytest.mark.xfail(reason='Need to fix this in https://github.com/pydantic/pydantic/pull/5944')
-def test_validate_json_strict() -> None:
-    class Model(TypedDict):
-        x: int
-
-    class ModelStrict(Model):
-        __pydantic_config__ = ConfigDict(strict=True)  # type: ignore
-
-    lax_validator = TypeAdapter(Model, config=ConfigDict(strict=False))
-    strict_validator = TypeAdapter(ModelStrict)
-
-    assert lax_validator.validate_json(json.dumps({'x': '1'}), strict=None) == Model(x=1)
-    assert lax_validator.validate_json(json.dumps({'x': '1'}), strict=False) == Model(x=1)
-    with pytest.raises(ValidationError) as exc_info:
-        lax_validator.validate_json(json.dumps({'x': '1'}), strict=True)
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'int_type', 'loc': ('x',), 'msg': 'Input should be a valid integer', 'input': '1'}
-    ]
-
-    with pytest.raises(ValidationError) as exc_info:
-        strict_validator.validate_json(json.dumps({'x': '1'}), strict=None)
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'int_type', 'loc': ('x',), 'msg': 'Input should be a valid integer', 'input': '1'}
-    ]
-    assert strict_validator.validate_json(json.dumps({'x': '1'}), strict=False) == Model(x=1)
-    with pytest.raises(ValidationError) as exc_info:
-        strict_validator.validate_json(json.dumps({'x': '1'}), strict=True)
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'int_type', 'loc': ('x',), 'msg': 'Input should be a valid integer', 'input': '1'}
-    ]
-
-
-def test_validate_python_extra() -> None:
-    class Model(TypedDict):
-        x: int
-
-    class ModelForbid(Model):
-        __pydantic_config__ = ConfigDict(extra='forbid')  # type: ignore
-
-    ignore_validator = TypeAdapter(Model)
-    forbid_validator = TypeAdapter(ModelForbid)
-
-    assert ignore_validator.validate_python({'x': '1', 'y': '2'}) == Model(x=1)
-    with pytest.raises(ValidationError) as exc_info:
-        ignore_validator.validate_python({'x': '1', 'y': '2'}, extra='forbid')
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'extra_forbidden', 'loc': ('y',), 'msg': 'Extra inputs are not permitted', 'input': '2'}
-    ]
-
-    with pytest.raises(ValidationError) as exc_info:
-        forbid_validator.validate_python({'x': '1', 'y': '2'})
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'extra_forbidden', 'loc': ('y',), 'msg': 'Extra inputs are not permitted', 'input': '2'}
-    ]
-    assert forbid_validator.validate_python({'x': '1', 'y': '2'}, extra='ignore') == Model(x=1)
-
-
-def test_validate_json_extra() -> None:
-    class Model(TypedDict):
-        x: int
-
-    class ModelForbid(Model):
-        __pydantic_config__ = ConfigDict(extra='forbid')  # type: ignore
-
-    ignore_validator = TypeAdapter(Model)
-    forbid_validator = TypeAdapter(ModelForbid)
-
-    assert ignore_validator.validate_json(json.dumps({'x': '1', 'y': '2'})) == Model(x=1)
-    with pytest.raises(ValidationError) as exc_info:
-        ignore_validator.validate_json(json.dumps({'x': '1', 'y': '2'}), extra='forbid')
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'extra_forbidden', 'loc': ('y',), 'msg': 'Extra inputs are not permitted', 'input': '2'}
-    ]
-
-    with pytest.raises(ValidationError) as exc_info:
-        forbid_validator.validate_json(json.dumps({'x': '1', 'y': '2'}))
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'extra_forbidden', 'loc': ('y',), 'msg': 'Extra inputs are not permitted', 'input': '2'}
-    ]
-    assert forbid_validator.validate_json(json.dumps({'x': '1', 'y': '2'}), extra='ignore') == Model(x=1)
-
-
-def test_validate_strings_extra() -> None:
-    class Model(TypedDict):
-        x: bool
-
-    class ModelForbid(Model):
-        __pydantic_config__ = ConfigDict(extra='forbid')  # type: ignore
-
-    ignore_validator = TypeAdapter(Model)
-    forbid_validator = TypeAdapter(ModelForbid)
-
-    assert ignore_validator.validate_strings({'x': 'true', 'y': 'true'}) == Model(x=True)
-    with pytest.raises(ValidationError) as exc_info:
-        ignore_validator.validate_strings({'x': 'true', 'y': 'true'}, extra='forbid')
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'extra_forbidden', 'loc': ('y',), 'msg': 'Extra inputs are not permitted', 'input': 'true'}
-    ]
-
-    with pytest.raises(ValidationError) as exc_info:
-        forbid_validator.validate_strings({'x': 'true', 'y': 'true'})
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'extra_forbidden', 'loc': ('y',), 'msg': 'Extra inputs are not permitted', 'input': 'true'}
-    ]
-    assert forbid_validator.validate_strings({'x': 'true', 'y': 'true'}, extra='ignore') == Model(x=True)
-
-
-def test_validate_python_context() -> None:
-    contexts: list[Any] = [None, None, {'foo': 'bar'}]
-
-    class Model(BaseModel):
-        x: int
-
-        @field_validator('x')
-        def val_x(cls, v: int, info: ValidationInfo) -> int:
-            assert info.context == contexts.pop(0)
-            return v
-
-    validator = TypeAdapter(Model)
-    validator.validate_python({'x': 1})
-    validator.validate_python({'x': 1}, context=None)
-    validator.validate_python({'x': 1}, context={'foo': 'bar'})
-    assert contexts == []
-
-
-def test_validate_json_context() -> None:
-    contexts: list[Any] = [None, None, {'foo': 'bar'}]
-
-    class Model(BaseModel):
-        x: int
-
-        @field_validator('x')
-        def val_x(cls, v: int, info: ValidationInfo) -> int:
-            assert info.context == contexts.pop(0)
-            return v
-
-    validator = TypeAdapter(Model)
-    validator.validate_json(json.dumps({'x': 1}))
-    validator.validate_json(json.dumps({'x': 1}), context=None)
-    validator.validate_json(json.dumps({'x': 1}), context={'foo': 'bar'})
-    assert contexts == []
-
-
-def test_validate_python_from_attributes() -> None:
-    class Model(BaseModel):
-        x: int
-
-    class ModelFromAttributesTrue(Model):
-        model_config = ConfigDict(from_attributes=True)
-
-    class ModelFromAttributesFalse(Model):
-        model_config = ConfigDict(from_attributes=False)
-
-    @dataclass
-    class UnrelatedClass:
-        x: int = 1
-
-    input = UnrelatedClass(1)
-
-    ta = TypeAdapter(Model)
-
-    for from_attributes in (False, None):
-        with pytest.raises(ValidationError) as exc_info:
-            ta.validate_python(UnrelatedClass(), from_attributes=from_attributes)
-        assert exc_info.value.errors(include_url=False) == [
-            {
-                'type': 'model_type',
-                'loc': (),
-                'msg': 'Input should be a valid dictionary or instance of Model',
-                'input': input,
-                'ctx': {'class_name': 'Model'},
-            }
-        ]
-
-    res = ta.validate_python(UnrelatedClass(), from_attributes=True)
-    assert res == Model(x=1)
-
-    ta = TypeAdapter(ModelFromAttributesTrue)
-
-    with pytest.raises(ValidationError) as exc_info:
-        ta.validate_python(UnrelatedClass(), from_attributes=False)
-    assert exc_info.value.errors(include_url=False) == [
-        {
-            'type': 'model_type',
-            'loc': (),
-            'msg': 'Input should be a valid dictionary or instance of ModelFromAttributesTrue',
-            'input': input,
-            'ctx': {'class_name': 'ModelFromAttributesTrue'},
-        }
-    ]
-
-    for from_attributes in (True, None):
-        res = ta.validate_python(UnrelatedClass(), from_attributes=from_attributes)
-        assert res == ModelFromAttributesTrue(x=1)
-
-    ta = TypeAdapter(ModelFromAttributesFalse)
-
-    for from_attributes in (False, None):
-        with pytest.raises(ValidationError) as exc_info:
-            ta.validate_python(UnrelatedClass(), from_attributes=from_attributes)
-        assert exc_info.value.errors(include_url=False) == [
-            {
-                'type': 'model_type',
-                'loc': (),
-                'msg': 'Input should be a valid dictionary or instance of ModelFromAttributesFalse',
-                'input': input,
-                'ctx': {'class_name': 'ModelFromAttributesFalse'},
-            }
-        ]
-
-    res = ta.validate_python(UnrelatedClass(), from_attributes=True)
-    assert res == ModelFromAttributesFalse(x=1)
-
-
-@pytest.mark.parametrize(
-    'field_type,input_value,expected,raises_match,strict',
-    [
-        (bool, 'true', True, None, False),
-        (bool, 'true', True, None, True),
-        (bool, 'false', False, None, False),
-        (bool, 'e', ValidationError, 'type=bool_parsing', False),
-        (int, '1', 1, None, False),
-        (int, '1', 1, None, True),
-        (int, 'xxx', ValidationError, 'type=int_parsing', True),
-        (float, '1.1', 1.1, None, False),
-        (float, '1.10', 1.1, None, False),
-        (float, '1.1', 1.1, None, True),
-        (float, '1.10', 1.1, None, True),
-        (date, '2017-01-01', date(2017, 1, 1), None, False),
-        (date, '2017-01-01', date(2017, 1, 1), None, True),
-        (date, '2017-01-01T12:13:14.567', ValidationError, 'type=date_from_datetime_inexact', False),
-        (date, '2017-01-01T12:13:14.567', ValidationError, 'type=date_parsing', True),
-        (date, '2017-01-01T00:00:00', date(2017, 1, 1), None, False),
-        (date, '2017-01-01T00:00:00', ValidationError, 'type=date_parsing', True),
-        (datetime, '2017-01-01T12:13:14.567', datetime(2017, 1, 1, 12, 13, 14, 567_000), None, False),
-        (datetime, '2017-01-01T12:13:14.567', datetime(2017, 1, 1, 12, 13, 14, 567_000), None, True),
-    ],
-    ids=repr,
-)
-@pytest.mark.parametrize('defer_build', [False, True])
-def test_validate_strings(
-    field_type, input_value, expected, raises_match, strict, defer_build: bool, generate_schema_calls
-):
-    config = ConfigDict(defer_build=True) if defer_build else None
-    ta = TypeAdapter(field_type, config=config)
-
-    assert generate_schema_calls.count == (0 if defer_build else 1), 'Should be built deferred'
-
-    if raises_match is not None:
-        with pytest.raises(expected, match=raises_match):
-            ta.validate_strings(input_value, strict=strict)
-    else:
-        assert ta.validate_strings(input_value, strict=strict) == expected
-
-    assert generate_schema_calls.count == 1, 'Should not build duplicates'
-
-
-@pytest.mark.parametrize('strict', [True, False])
-def test_validate_strings_dict(strict):
-    assert TypeAdapter(dict[int, date]).validate_strings({'1': '2017-01-01', '2': '2017-01-02'}, strict=strict) == {
-        1: date(2017, 1, 1),
-        2: date(2017, 1, 2),
-    }
-
-
-def test_annotated_type_disallows_config() -> None:
-    class Model(BaseModel):
-        x: int
-
-    with pytest.raises(PydanticUserError, match='Cannot use `config`'):
-        TypeAdapter(Annotated[Model, ...], config=ConfigDict(strict=False))
-
-
-def test_ta_config_with_annotated_type() -> None:
-    class TestValidator(BaseModel):
-        x: str
-
-        model_config = ConfigDict(str_to_lower=True)
-
-    assert TestValidator(x='ABC').x == 'abc'
-    assert TypeAdapter(TestValidator).validate_python({'x': 'ABC'}).x == 'abc'
-    assert TypeAdapter(Annotated[TestValidator, ...]).validate_python({'x': 'ABC'}).x == 'abc'
-
-    class TestSerializer(BaseModel):
-        some_bytes: bytes
-        model_config = ConfigDict(ser_json_bytes='base64')
-
-    result = TestSerializer(some_bytes=b'\xaa')
-    assert result.model_dump(mode='json') == {'some_bytes': 'qg=='}
-    assert TypeAdapter(TestSerializer).dump_python(result, mode='json') == {'some_bytes': 'qg=='}
-
-    # cases where SchemaSerializer is constructed within TypeAdapter's __init__
-    assert TypeAdapter(Annotated[TestSerializer, ...]).dump_python(result, mode='json') == {'some_bytes': 'qg=='}
-    assert TypeAdapter(Annotated[list[TestSerializer], ...]).dump_python([result], mode='json') == [
-        {'some_bytes': 'qg=='}
-    ]
-
-
-def defer_build_test_models(config: ConfigDict) -> list[Any]:
-    class Model(BaseModel):
-        model_config = config
-        x: int
-
-    class SubModel(Model):
-        y: int | None = None
-
-    @pydantic_dataclass(config=config)
-    class DataClassModel:
-        x: int
-
-    @pydantic_dataclass
-    class SubDataClassModel(DataClassModel):
-        y: int | None = None
-
-    class TypedDictModel(TypedDict):
-        __pydantic_config__ = config  # type: ignore
-        x: int
-
-    models = [
-        Model,
-        SubModel,
-        create_model('DynamicModel', __base__=Model),
-        create_model('DynamicSubModel', __base__=SubModel),
-        DataClassModel,
-        SubDataClassModel,
-        TypedDictModel,
-        dict[str, int],
-    ]
-    return [
-        *models,
-        # FastAPI heavily uses Annotated so test that as well
-        *[Annotated[model, Field(title='abc')] for model in models],
-    ]
-
-
-CONFIGS = [
-    ConfigDict(defer_build=False),
-    ConfigDict(defer_build=True),
-]
-MODELS_CONFIGS: list[tuple[Any, ConfigDict]] = [
-    (model, config) for config in CONFIGS for model in defer_build_test_models(config)
-]
-
-
-@pytest.mark.parametrize('model, config', MODELS_CONFIGS)
-@pytest.mark.parametrize('method', ['schema', 'validate', 'dump'])
-def test_core_schema_respects_defer_build(model: Any, config: ConfigDict, method: str, generate_schema_calls) -> None:
-    type_ = annotated_type(model) or model
-    dumped = dict(x=1) if 'dict[' in str(type_) else type_(x=1)
-    generate_schema_calls.reset()
-
-    type_adapter = TypeAdapter(model) if _type_has_config(model) else TypeAdapter(model, config=config)
-
-    if config.get('defer_build'):
-        assert generate_schema_calls.count == 0, 'Should be built deferred'
-        assert isinstance(type_adapter.core_schema, _mock_val_ser.MockCoreSchema), 'Should be initialized deferred'
-        assert isinstance(type_adapter.validator, _mock_val_ser.MockValSer), 'Should be initialized deferred'
-        assert isinstance(type_adapter.serializer, _mock_val_ser.MockValSer), 'Should be initialized deferred'
-    else:
-        built_inside_type_adapter = 'dict' in str(model).lower() or 'Annotated' in str(model)
-        assert generate_schema_calls.count == (1 if built_inside_type_adapter else 0), f'Should be built ({model})'
-        assert not isinstance(type_adapter.core_schema, _mock_val_ser.MockCoreSchema), (
-            'Should be initialized before usage'
+import os
+import warnings
+from pathlib import Path
+from typing import AbstractSet, Any, Callable, ClassVar, Dict, List, Mapping, Optional, Tuple, Type, Union
+
+from pydantic.v1.config import BaseConfig, Extra
+from pydantic.v1.fields import ModelField
+from pydantic.v1.main import BaseModel
+from pydantic.v1.types import JsonWrapper
+from pydantic.v1.typing import StrPath, display_as_type, get_origin, is_union
+from pydantic.v1.utils import deep_update, lenient_issubclass, path_type, sequence_like
+
+env_file_sentinel = str(object())
+
+SettingsSourceCallable = Callable[['BaseSettings'], Dict[str, Any]]
+DotenvType = Union[StrPath, List[StrPath], Tuple[StrPath, ...]]
+
+
+class SettingsError(ValueError):
+    pass
+
+
+class BaseSettings(BaseModel):
+    """
+    Base class for settings, allowing values to be overridden by environment variables.
+
+    This is useful in production for secrets you do not wish to save in code, it plays nicely with docker(-compose),
+    Heroku and any 12 factor app design.
+    """
+
+    def __init__(
+        __pydantic_self__,
+        _env_file: Optional[DotenvType] = env_file_sentinel,
+        _env_file_encoding: Optional[str] = None,
+        _env_nested_delimiter: Optional[str] = None,
+        _secrets_dir: Optional[StrPath] = None,
+        **values: Any,
+    ) -> None:
+        # Uses something other than `self` the first arg to allow "self" as a settable attribute
+        super().__init__(
+            **__pydantic_self__._build_values(
+                values,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _secrets_dir=_secrets_dir,
+            )
         )
-        assert not isinstance(type_adapter.validator, _mock_val_ser.MockValSer), 'Should be initialized before usage'
-        assert not isinstance(type_adapter.validator, _mock_val_ser.MockValSer), 'Should be initialized before usage'
 
-    if method == 'schema':
-        json_schema = type_adapter.json_schema()  # Use it
-        assert "'type': 'integer'" in str(json_schema)  # Sanity check
-        # Do not check generate_schema_calls count here as the json_schema generation uses generate schema internally
-        # assert generate_schema_calls.count < 2, 'Should not build duplicates'
-    elif method == 'validate':
-        validated = type_adapter.validate_python({'x': 1})  # Use it
-        assert (validated['x'] if isinstance(validated, dict) else validated.x) == 1  # Sanity check
-        assert generate_schema_calls.count < 2, 'Should not build duplicates'
+    def _build_values(
+        self,
+        init_kwargs: Dict[str, Any],
+        _env_file: Optional[DotenvType] = None,
+        _env_file_encoding: Optional[str] = None,
+        _env_nested_delimiter: Optional[str] = None,
+        _secrets_dir: Optional[StrPath] = None,
+    ) -> Dict[str, Any]:
+        # Configure built-in sources
+        init_settings = InitSettingsSource(init_kwargs=init_kwargs)
+        env_settings = EnvSettingsSource(
+            env_file=(_env_file if _env_file != env_file_sentinel else self.__config__.env_file),
+            env_file_encoding=(
+                _env_file_encoding if _env_file_encoding is not None else self.__config__.env_file_encoding
+            ),
+            env_nested_delimiter=(
+                _env_nested_delimiter if _env_nested_delimiter is not None else self.__config__.env_nested_delimiter
+            ),
+            env_prefix_len=len(self.__config__.env_prefix),
+        )
+        file_secret_settings = SecretsSettingsSource(secrets_dir=_secrets_dir or self.__config__.secrets_dir)
+        # Provide a hook to set built-in sources priority and add / remove sources
+        sources = self.__config__.customise_sources(
+            init_settings=init_settings, env_settings=env_settings, file_secret_settings=file_secret_settings
+        )
+        if sources:
+            return deep_update(*reversed([source(self) for source in sources]))
+        else:
+            # no one should mean to do this, but I think returning an empty dict is marginally preferable
+            # to an informative error and much better than a confusing error
+            return {}
+
+    class Config(BaseConfig):
+        env_prefix: str = ''
+        env_file: Optional[DotenvType] = None
+        env_file_encoding: Optional[str] = None
+        env_nested_delimiter: Optional[str] = None
+        secrets_dir: Optional[StrPath] = None
+        validate_all: bool = True
+        extra: Extra = Extra.forbid
+        arbitrary_types_allowed: bool = True
+        case_sensitive: bool = False
+
+        @classmethod
+        def prepare_field(cls, field: ModelField) -> None:
+            env_names: Union[List[str], AbstractSet[str]]
+            field_info_from_config = cls.get_field_info(field.name)
+
+            env = field_info_from_config.get('env') or field.field_info.extra.get('env')
+            if env is None:
+                if field.has_alias:
+                    warnings.warn(
+                        'aliases are no longer used by BaseSettings to define which environment variables to read. '
+                        'Instead use the "env" field setting. '
+                        'See https://pydantic-docs.helpmanual.io/usage/settings/#environment-variable-names',
+                        FutureWarning,
+                    )
+                env_names = {cls.env_prefix + field.name}
+            elif isinstance(env, str):
+                env_names = {env}
+            elif isinstance(env, (set, frozenset)):
+                env_names = env
+            elif sequence_like(env):
+                env_names = list(env)
+            else:
+                raise TypeError(f'invalid field env: {env!r} ({display_as_type(env)}); should be string, list or set')
+
+            if not cls.case_sensitive:
+                env_names = env_names.__class__(n.lower() for n in env_names)
+            field.field_info.extra['env_names'] = env_names
+
+        @classmethod
+        def customise_sources(
+            cls,
+            init_settings: SettingsSourceCallable,
+            env_settings: SettingsSourceCallable,
+            file_secret_settings: SettingsSourceCallable,
+        ) -> Tuple[SettingsSourceCallable, ...]:
+            return init_settings, env_settings, file_secret_settings
+
+        @classmethod
+        def parse_env_var(cls, field_name: str, raw_val: str) -> Any:
+            return cls.json_loads(raw_val)
+
+    # populated by the metaclass using the Config class defined above, annotated here to help IDEs only
+    __config__: ClassVar[Type[Config]]
+
+
+class InitSettingsSource:
+    __slots__ = ('init_kwargs',)
+
+    def __init__(self, init_kwargs: Dict[str, Any]):
+        self.init_kwargs = init_kwargs
+
+    def __call__(self, settings: BaseSettings) -> Dict[str, Any]:
+        return self.init_kwargs
+
+    def __repr__(self) -> str:
+        return f'InitSettingsSource(init_kwargs={self.init_kwargs!r})'
+
+
+class EnvSettingsSource:
+    __slots__ = ('env_file', 'env_file_encoding', 'env_nested_delimiter', 'env_prefix_len')
+
+    def __init__(
+        self,
+        env_file: Optional[DotenvType],
+        env_file_encoding: Optional[str],
+        env_nested_delimiter: Optional[str] = None,
+        env_prefix_len: int = 0,
+    ):
+        self.env_file: Optional[DotenvType] = env_file
+        self.env_file_encoding: Optional[str] = env_file_encoding
+        self.env_nested_delimiter: Optional[str] = env_nested_delimiter
+        self.env_prefix_len: int = env_prefix_len
+
+    def __call__(self, settings: BaseSettings) -> Dict[str, Any]:  # noqa C901
+        """
+        Build environment variables suitable for passing to the Model.
+        """
+        d: Dict[str, Any] = {}
+
+        if settings.__config__.case_sensitive:
+            env_vars: Mapping[str, Optional[str]] = os.environ
+        else:
+            env_vars = {k.lower(): v for k, v in os.environ.items()}
+
+        dotenv_vars = self._read_env_files(settings.__config__.case_sensitive)
+        if dotenv_vars:
+            env_vars = {**dotenv_vars, **env_vars}
+
+        for field in settings.__fields__.values():
+            env_val: Optional[str] = None
+            for env_name in field.field_info.extra['env_names']:
+                env_val = env_vars.get(env_name)
+                if env_val is not None:
+                    break
+
+            is_complex, allow_parse_failure = self.field_is_complex(field)
+            if is_complex:
+                if env_val is None:
+                    # field is complex but no value found so far, try explode_env_vars
+                    env_val_built = self.explode_env_vars(field, env_vars)
+                    if env_val_built:
+                        d[field.alias] = env_val_built
+                else:
+                    # field is complex and there's a value, decode that as JSON, then add explode_env_vars
+                    try:
+                        env_val = settings.__config__.parse_env_var(field.name, env_val)
+                    except ValueError as e:
+                        if not allow_parse_failure:
+                            raise SettingsError(f'error parsing env var "{env_name}"') from e
+
+                    if isinstance(env_val, dict):
+                        d[field.alias] = deep_update(env_val, self.explode_env_vars(field, env_vars))
+                    else:
+                        d[field.alias] = env_val
+            elif env_val is not None:
+                # simplest case, field is not complex, we only need to add the value if it was found
+                d[field.alias] = env_val
+
+        return d
+
+    def _read_env_files(self, case_sensitive: bool) -> Dict[str, Optional[str]]:
+        env_files = self.env_file
+        if env_files is None:
+            return {}
+
+        if isinstance(env_files, (str, os.PathLike)):
+            env_files = [env_files]
+
+        dotenv_vars = {}
+        for env_file in env_files:
+            env_path = Path(env_file).expanduser()
+            if env_path.is_file():
+                dotenv_vars.update(
+                    read_env_file(env_path, encoding=self.env_file_encoding, case_sensitive=case_sensitive)
+                )
+
+        return dotenv_vars
+
+    def field_is_complex(self, field: ModelField) -> Tuple[bool, bool]:
+        """
+        Find out if a field is complex, and if so whether JSON errors should be ignored
+        """
+        if lenient_issubclass(field.annotation, JsonWrapper):
+            return False, False
+
+        if field.is_complex():
+            allow_parse_failure = False
+        elif is_union(get_origin(field.type_)) and field.sub_fields and any(f.is_complex() for f in field.sub_fields):
+            allow_parse_failure = True
+        else:
+            return False, False
+
+        return True, allow_parse_failure
+
+    def explode_env_vars(self, field: ModelField, env_vars: Mapping[str, Optional[str]]) -> Dict[str, Any]:
+        """
+        Process env_vars and extract the values of keys containing env_nested_delimiter into nested dictionaries.
+
+        This is applied to a single field, hence filtering by env_var prefix.
+        """
+        prefixes = [f'{env_name}{self.env_nested_delimiter}' for env_name in field.field_info.extra['env_names']]
+        result: Dict[str, Any] = {}
+        for env_name, env_val in env_vars.items():
+            if not any(env_name.startswith(prefix) for prefix in prefixes):
+                continue
+            # we remove the prefix before splitting in case the prefix has characters in common with the delimiter
+            env_name_without_prefix = env_name[self.env_prefix_len :]
+            _, *keys, last_key = env_name_without_prefix.split(self.env_nested_delimiter)
+            env_var = result
+            for key in keys:
+                env_var = env_var.setdefault(key, {})
+            env_var[last_key] = env_val
+
+        return result
+
+    def __repr__(self) -> str:
+        return (
+            f'EnvSettingsSource(env_file={self.env_file!r}, env_file_encoding={self.env_file_encoding!r}, '
+            f'env_nested_delimiter={self.env_nested_delimiter!r})'
+        )
+
+
+class SecretsSettingsSource:
+    __slots__ = ('secrets_dir',)
+
+    def __init__(self, secrets_dir: Optional[StrPath]):
+        self.secrets_dir: Optional[StrPath] = secrets_dir
+
+    def __call__(self, settings: BaseSettings) -> Dict[str, Any]:
+        """
+        Build fields from "secrets" files.
+        """
+        secrets: Dict[str, Optional[str]] = {}
+
+        if self.secrets_dir is None:
+            return secrets
+
+        secrets_path = Path(self.secrets_dir).expanduser()
+
+        if not secrets_path.exists():
+            warnings.warn(f'directory "{secrets_path}" does not exist')
+            return secrets
+
+        if not secrets_path.is_dir():
+            raise SettingsError(f'secrets_dir must reference a directory, not a {path_type(secrets_path)}')
+
+        for field in settings.__fields__.values():
+            for env_name in field.field_info.extra['env_names']:
+                path = find_case_path(secrets_path, env_name, settings.__config__.case_sensitive)
+                if not path:
+                    # path does not exist, we currently don't return a warning for this
+                    continue
+
+                if path.is_file():
+                    secret_value = path.read_text().strip()
+                    if field.is_complex():
+                        try:
+                            secret_value = settings.__config__.parse_env_var(field.name, secret_value)
+                        except ValueError as e:
+                            raise SettingsError(f'error parsing env var "{env_name}"') from e
+
+                    secrets[field.alias] = secret_value
+                else:
+                    warnings.warn(
+                        f'attempted to load secret file "{path}" but found a {path_type(path)} instead.',
+                        stacklevel=4,
+                    )
+        return secrets
+
+    def __repr__(self) -> str:
+        return f'SecretsSettingsSource(secrets_dir={self.secrets_dir!r})'
+
+
+def read_env_file(
+    file_path: StrPath, *, encoding: str = None, case_sensitive: bool = False
+) -> Dict[str, Optional[str]]:
+    try:
+        from dotenv import dotenv_values
+    except ImportError as e:
+        raise ImportError('python-dotenv is not installed, run `pip install pydantic[dotenv]`') from e
+
+    file_vars: Dict[str, Optional[str]] = dotenv_values(file_path, encoding=encoding or 'utf8')
+    if not case_sensitive:
+        return {k.lower(): v for k, v in file_vars.items()}
     else:
-        assert method == 'dump'
-        raw = type_adapter.dump_json(dumped)  # Use it
-        assert json.loads(raw.decode())['x'] == 1  # Sanity check
-        assert generate_schema_calls.count < 2, 'Should not build duplicates'
-
-    assert not isinstance(type_adapter.core_schema, _mock_val_ser.MockCoreSchema), (
-        'Should be initialized after the usage'
-    )
-    assert not isinstance(type_adapter.validator, _mock_val_ser.MockValSer), 'Should be initialized after the usage'
-    assert not isinstance(type_adapter.validator, _mock_val_ser.MockValSer), 'Should be initialized after the usage'
+        return file_vars
 
 
-def test_defer_build_raise_errors() -> None:
-    ta = TypeAdapter('MyInt', config=ConfigDict(defer_build=True))  # pyright: ignore[reportUndefinedVariable]
-    assert isinstance(ta.core_schema, _mock_val_ser.MockCoreSchema)
-
-    with pytest.raises(PydanticUndefinedAnnotation):
-        # `True` is the `raise_errors` default for the `rebuild` method, but we include here for clarity
-        ta.rebuild(raise_errors=True)
-
-    ta.rebuild(raise_errors=False)
-    assert isinstance(ta.core_schema, _mock_val_ser.MockCoreSchema)
-
-    MyInt = int  # noqa: F841
-
-    ta.rebuild(raise_errors=True)
-    assert not isinstance(ta.core_schema, _mock_val_ser.MockCoreSchema)
-
-
-@dataclass
-class SimpleDataclass:
-    x: int
-
-
-@pytest.mark.parametrize('type_,repr_', [(int, 'int'), (list[int], 'list[int]'), (SimpleDataclass, 'SimpleDataclass')])
-def test_ta_repr(type_: Any, repr_: str) -> None:
-    ta = TypeAdapter(type_)
-    assert repr(ta) == f'TypeAdapter({repr_})'
-
-
-def test_correct_frame_used_parametrized(create_module) -> None:
-    """https://github.com/pydantic/pydantic/issues/10892"""
-
-    @create_module
-    def module_1() -> None:
-        from pydantic import TypeAdapter
-
-        Any = int  # noqa: F841
-
-        # 'Any' should resolve to `int`, not `typing.Any`:
-        ta = TypeAdapter[int]('Any')  # noqa: F841
-
-    with pytest.raises(ValidationError):
-        module_1.ta.validate_python('a')
-
-
-def test_validate_python_with_incorrect_configuration():
-    ta = TypeAdapter(int)
-
-    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'validate-by-alias-and-name-false'):
-        ta.validate_python(1, by_alias=False, by_name=False)
-
-
-def test_validate_json_with_incorrect_configuration():
-    ta = TypeAdapter(int)
-
-    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'validate-by-alias-and-name-false'):
-        ta.validate_json(1, by_alias=False, by_name=False)
-
-
-def test_validate_strings_with_incorrect_configuration():
-    ta = TypeAdapter(int)
-
-    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'validate-by-alias-and-name-false'):
-        ta.validate_strings(1, by_alias=False, by_name=False)
+def find_case_path(dir_path: Path, file_name: str, case_sensitive: bool) -> Optional[Path]:
+    """
+    Find a file within path's directory matching filename, optionally ignoring case.
+    """
+    for f in dir_path.iterdir():
+        if f.name == file_name:
+            return f
+        elif not case_sensitive and f.name.lower() == file_name.lower():
+            return f
+    return None

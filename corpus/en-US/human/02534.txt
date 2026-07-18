@@ -1,0 +1,92 @@
+```json title="task-definition.json"
+{
+  "family": "deno-fargate",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "deno-fargate",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/deno-fargate:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The `executionRoleArn` refers to the `ecsTaskExecutionRole`, which lets ECS pull
+images from ECR and write logs to CloudWatch. If you have not used ECS before,
+create it once by following
+[the AWS guide](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html).
+
+Register the task definition:
+
+```shell
+aws ecs register-task-definition \
+  --cli-input-json file://task-definition.json \
+  --region $AWS_REGION
+```
+
+## Run it as a Fargate service
+
+Create a cluster to hold the service:
+
+```shell
+aws ecs create-cluster --cluster-name deno-cluster --region $AWS_REGION
+```
+
+Now create a service that keeps one copy of the task running. Fargate needs to
+know which subnets and security group to launch into, and `assignPublicIp` lets
+the task pull the image and be reachable without a NAT gateway. Replace the
+subnet and security group IDs with ones from your VPC, and make sure the
+security group allows inbound traffic on port `8000`:
+
+```shell
+aws ecs create-service \
+  --cluster deno-cluster \
+  --service-name deno-fargate \
+  --task-definition deno-fargate \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-abc123],securityGroups=[sg-abc123],assignPublicIp=ENABLED}" \
+  --region $AWS_REGION
+```
+
+Once the service reaches a steady state, find the task's public IP:
+
+```shell
+TASK_ARN=$(aws ecs list-tasks --cluster deno-cluster \
+  --service-name deno-fargate --query "taskArns[0]" --output text --region $AWS_REGION)
+
+ENI_ID=$(aws ecs describe-tasks --cluster deno-cluster --tasks $TASK_ARN \
+  --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" \
+  --output text --region $AWS_REGION)
+
+aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID \
+  --query "NetworkInterfaces[0].Association.PublicIp" --output text --region $AWS_REGION
+```
+
+Open `http://<public-ip>:8000` and you should see your Deno app responding from
+Fargate.
+
+## Production considerations
+
+For anything beyond a demo, put the service behind an
+[Application Load Balancer](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-load-balancing.html)
+instead of exposing the task's public IP directly. The load balancer gives you a
+stable DNS name, TLS termination, and health checks, and it lets ECS roll new
+deployments without downtime. You can also raise `desired-count` to run multiple
+tasks and enable
+[service auto scaling](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-auto-scaling.html)
+to adjust capacity based on load.
+
+🦕 Now you can deploy a Deno app to AWS ECS Fargate by containerizing it,
+pushing the image to Amazon ECR, and running it as a Fargate service.

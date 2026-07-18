@@ -1,174 +1,40 @@
-``` js
-onerror=alert;
-throw new Error(1);
-// Error: 1
-```
+In addition to the various COXX things mentioned above, there are other cross-origin related security issues that I want to mention in this article.
 
-Since `Label:` is valid code in JavaScript, you can directly place code after it, making it easy:
+Before we continue, I would like to remind everyone that this article is about "security issues of cross-origin", not just "security issues of CORS". The things protected by the CORS protocol and their content have been introduced before. What this article is going to talk about is actually somewhat deviating from the main title "CORS" complete guide, because this is not very related to the CORS protocol, but rather raises the level again and talks about "cross-origin" itself.
 
-``` js
-onerror=eval;
-throw new Error('alert(1)');
-```
+So when you read the following things, don't confuse them with CORS. Except for the first thing to be discussed later, the others are not very related to CORS.
 
-However, using `Error()` introduces parentheses, and Gareth Heyes' second discovery is that in Firefox, you can throw an error-like object to achieve the same effect:
+<!-- more -->
 
-``` js
-onerror=eval;
-throw {lineNumber:1,columnNumber:1,fileName:1,message:'alert\x281\x29'};
-```
+## CORS misconfiguration
 
-In summary, all of these efforts are to control the final error message produced by Firefox. As long as you can control it, you can construct valid code to pass to eval for execution.
+If you still remember, I mentioned earlier that if a cross-origin request wants to carry a cookie, `Access-Control-Allow-Origin` cannot be `*`, but must specify a single origin, otherwise the browser will not pass it.
 
-Recently, I saw Gareth Heyes [tweet](https://x.com/garethheyes/status/1961078705293246513) that Firefox is going to remove this feature: [Firefox removed support for throwing error-like objects](https://github.com/PortSwigger/xss-cheatsheet-data/issues/103), so he found a new method:
+But the reality is that we cannot have only one origin. We may have many origins, such as `buy.example.com`, `social.example.com`, `note.example.com`, all of which need to access `api.example.com`. At this time, we cannot hard-code the origin in the response header, but must adjust it dynamically.
+
+Let's talk about the worst way first, like this:
 
 ``` js
-throw onerror=eval,x=new Error,x.message='alert\x281\x29',x
+app.use((req, res, next) => {
+  res.headers['Access-Control-Allow-Credentials'] = 'true'
+  res.headers['Access-Control-Allow-Origin'] = req.headers['Origin']
+})
 ```
 
-It seems that if you want to create a new Error, you can do it without parentheses. After creating an Error object, you can set the message, and you can still control the error message.
+For convenience, the origin in the request header is directly mapped. By doing so, it actually means that any origin can pass the CORS check.
 
-## Other payloads
+What problems will this cause?
 
-There are other payloads mentioned by others in the original post.
+The problem is huge.
 
-The first one comes from [@terjanq](https://x.com/terjanq/status/1128692453047975936):
+Assuming that I make a phishing website today, the URL is `http://fake-example.com`, and I try to make the user click on this website, and the phishing website writes a script:
 
 ``` js
-throw/a/,Uncaught=1,g=alert,a=URL+0,onerror=eval,/1/g+a[12]+[1337,3331,117]+a[13]
-```
-
-I tried this payload, and it currently only works in Chrome. It can clearly be broken down into several parts:
-
-1. `/a/`
-2. `Uncaught=1`
-3. `g=alert`
-4. `a=URL+0`
-5. `onerror=eval`
-6. `throw /1/g+a[12]+[1337,3331,117]+a[13]`
-
-Because it is connected by commas, the part that gets thrown will be the last segment.
-
-Let's start with the last segment. What does `throw /1/g+a[12]+[1337,3331,117]+a[13]` do?
-
-First, `a` is `URL+0`, and `URL` is a global function. The function + 0 will become a string, so `a` is `"function URL() { [native code] }0"`, thus `a[12]` and `a[13]` are `(` and `)` respectively.
-
-The `/1/g` is a regexp, and when it becomes a string, it will be `"/1/g"`. As for the array `[1337,3331,117]`, when converted to a string, it will call `join`, resulting in `"1337,3331,117"`.
-
-Putting it all together, `/1/g+a[12]+[1337,3331,117]+a[13]` will be `/1/g(1337,3331,117)`.
-
-Combined with what was mentioned earlier, the error message thrown will be:
-
-```
-Uncaught /1/g(1337,3331,117)
-```
-
-Here, the `/` was previously treated as a regexp, but in the current code, it actually represents arithmetic division, i.e., `a / b / c`, where `a` is `Uncaught`, `b` is `1`, and `c` is `g(1337,3331,117)`.
-
-If `Uncaught` is not declared, it will throw an error, which is why `Uncaught=1` is needed. Then `g` will be treated as a function, so `g=alert`.
-
-What about the first line `/a/`? This is likely just to prevent a space between `throw` and the subsequent payload, and it doesn't serve any other purpose.
-
-The essence of this solution lies in making the error message become `Uncaught /1/g(1337,3331,117)` when thrown, which is a valid piece of code. As long as some prerequisites are fulfilled, it can successfully call the function `g`.
-
-The second one comes from [@cgvwzq](https://x.com/cgvwzq):
-
-``` js
-TypeError.prototype.name ='=/',0[onerror=eval]['/-alert(1)//']
-```
-
-This is actually divided into two statements. The first statement is: `TypeError.prototype.name ='=/'`, which forcibly changes the name of `TypeError` to `=/`.
-
-Without this line, the error message for `0[0]['test']` would be: `Uncaught TypeError: Cannot read properties of undefined (reading 'test')`.
-
-`0[0]` will be undefined, and `undefined['test']` will throw this TypeError.
-
-After we forcibly change the name:
-
-``` js
-TypeError.prototype.name ='hello!';
-0[0]['test'];
-// Uncaught hello!: Cannot read properties of undefined (reading 'test')
-```
-
-We can control the original part of `TypeError` to become any string.
-
-The other statement `0[onerror=eval]['/-alert(1)//']` simply places the assignment inside `[]`. After the assignment, it is equivalent to `0[eval]`, which will return undefined, thus throwing a TypeError.
-
-Let's look at it another way, with the following code:
-
-``` js
-TypeError.prototype.name ='{1}';
-0[eval]['{2}'];
-```
-
-The error message generated in Chrome would be:
-
-```
-Uncaught {1}: can't access property "{2}", 0[eval] is undefined
-```
-
-Now the problem becomes how to control the string above to make the error message a valid piece of code?
-
-In place of `{1}`, the author placed `=/`, resulting in `Uncaught=/`. This `/` actually means regexp, so the idea of this method is to make the string before `{2}` (`: can't access property "` ) become part of the regexp.
-
-Thus, the beginning of `{2}` is `/`, forming a regexp with the preceding part, and then using `-alert(1)` to execute the function. It can also be changed to `+alert(1)`, as it just needs to string the two operations together. After execution, the subsequent code is all commented out with `//`, so it can be ignored.
-
-However, if you actually run the above payload, you will find that Chrome returns the error message: `Invalid regular expression ... Unterminated group`. This is because there is a `(` in the error message, which may not have been there, causing the regexp syntax to be incorrect. You just need to add a `)` to fix it:
-
-``` js
-TypeError.prototype.name ='=/',0[onerror=eval][')/-alert(1)//']
-```
-
-The generated error message will be:
-
-``` js
-Uncaught =/: Cannot read properties of undefined (reading ')/-alert(1)//')
-```
-
-A simplified version would be:
-
-``` js
-Uncaught =/regexp/-alert(1)//...
-```
-
-By the way, this payload works fine on Chrome 139, but Firefox 142 will throw an error: `Uncaught SyntaxError: expected expression, got '='`.
-
-If you want to debug, just change `onerror=eval` to `onerror=console.log` to see what the generated error message looks like:
-
-```
-=/: can't access property ")//alert(1)//", 0[console.log] is undefined
-```
-
-It seems that in Firefox, there is nothing in front of the TypeError's name, so to make it work in Firefox, you can just add any character that can be a variable in front:
-
-```js
-TypeError.prototype.name ='a=/',0[onerror=eval]['/-alert(1)//']
-```
-
-If you really understand this approach, you can actually insert code at the TypeName part by following this idea, resulting in the same outcome, but not that cool (it works fine on Chrome):
-
-``` js
-TypeError.prototype.name ='=alert(1)//',0[onerror=eval][2]
-```
-
-As for how to construct a payload that works on both Chrome and Firefox, readers can practice on their own or refer to an example I created, which adds some variations:
-
-``` js
-TypeError.prototype.name ='+/[',[onerror=eval][window.Uncaught++][']/-alert\501\51<!--']
-```
-
-## Summary
-
-In fact, regardless of which payload it is, the core concept is the same: just turn the error message into valid JavaScript code and pass it to eval for execution.
-
-To understand the payload, you need to be somewhat familiar with JavaScript code, such as `0[onerror=eval]` or the use of commas; you should at least know what’s going on.
-
-Besides that, it’s about using your imagination, which is harder to practice and usually starts with observation and imitation.
-
-Finally, here are a few key points:
-
-1. Commas can chain multiple expressions, returning the last one.
-2. Replacing onerror with eval allows you to execute the error message as code.
-3. Errors thrown will become part of the error message.
-4. As long as you can turn the error message into valid code, you’ve succeeded.
+// 用 api 去拿使用者資料，並且帶上 cookie
+fetch('http://api.example.com/me', {
+  credentials: 'include'
+})
+  .then(res => res.text())
+  .then(res => {
+    // 成功拿到使用者資料，我可以傳送到我自己的 server
+    console.log(res)

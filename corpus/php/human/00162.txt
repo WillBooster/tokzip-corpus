@@ -10,90 +10,76 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Downloader;
+namespace Composer\Test\Util;
 
-use Composer\Package\PackageInterface;
-use React\Promise\PromiseInterface;
+use Composer\IO\BufferIO;
+use Composer\Util\HttpDownloader;
+use PHPUnit\Framework\TestCase;
 
-/**
- * Downloader interface.
- *
- * @author Konstantin Kudryashov <ever.zet@gmail.com>
- * @author Jordi Boggiano <j.boggiano@seld.be>
- */
-interface DownloaderInterface
+class HttpDownloaderTest extends TestCase
 {
     /**
-     * Returns installation source (either source or dist).
-     *
-     * @return string "source" or "dist"
+     * @return \PHPUnit\Framework\MockObject\MockObject&\Composer\Config
      */
-    public function getInstallationSource(): string;
+    private function getConfigMock()
+    {
+        $config = $this->getMockBuilder('Composer\Config')->getMock();
+        $config->expects($this->any())
+            ->method('get')
+            ->will($this->returnCallback(static function ($key) {
+                if ($key === 'github-domains' || $key === 'gitlab-domains') {
+                    return [];
+                }
+            }));
+
+        return $config;
+    }
 
     /**
-     * This should do any network-related tasks to prepare for an upcoming install/update
-     *
-     * @param  string $path download path
-     * @phpstan-return PromiseInterface<void|null|string>
+     * @group slow
      */
-    public function download(PackageInterface $package, string $path, ?PackageInterface $prevPackage = null): PromiseInterface;
+    public function testCaptureAuthenticationParamsFromUrl(): void
+    {
+        $io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $io->expects($this->once())
+            ->method('setAuthentication')
+            ->with($this->equalTo('github.com'), $this->equalTo('user'), $this->equalTo('pass'));
 
-    /**
-     * Do anything that needs to be done between all downloads have been completed and the actual operation is executed
-     *
-     * All packages get first downloaded, then all together prepared, then all together installed/updated/uninstalled. Therefore
-     * for error recovery it is important to avoid failing during install/update/uninstall as much as possible, and risky things or
-     * user prompts should happen in the prepare step rather. In case of failure, cleanup() will be called so that changes can
-     * be undone as much as possible.
-     *
-     * @param  string                $type        one of install/update/uninstall
-     * @param  PackageInterface      $package     package instance
-     * @param  string                $path        download path
-     * @param  PackageInterface      $prevPackage previous package instance in case of an update
-     * @phpstan-return PromiseInterface<void|null>
-     */
-    public function prepare(string $type, PackageInterface $package, string $path, ?PackageInterface $prevPackage = null): PromiseInterface;
+        $fs = new HttpDownloader($io, $this->getConfigMock());
+        try {
+            $fs->get('https://user:pass@github.com/composer/composer/404');
+        } catch (\Composer\Downloader\TransportException $e) {
+            self::assertNotEquals(200, $e->getCode());
+        }
+    }
 
-    /**
-     * Installs specific package into specific folder.
-     *
-     * @param  PackageInterface      $package package instance
-     * @param  string                $path    download path
-     * @phpstan-return PromiseInterface<void|null>
-     */
-    public function install(PackageInterface $package, string $path): PromiseInterface;
+    public function testOutputWarnings(): void
+    {
+        $io = new BufferIO();
+        HttpDownloader::outputWarnings($io, '$URL', []);
+        self::assertSame('', $io->getOutput());
+        HttpDownloader::outputWarnings($io, '$URL', [
+            'warning' => 'old warning msg',
+            'warning-versions' => '>=2.0',
+            'info' => 'old info msg',
+            'info-versions' => '>=2.0',
+            'warnings' => [
+                ['message' => 'should not appear', 'versions' => '<2.2'],
+                ['message' => 'visible warning', 'versions' => '>=2.2-dev'],
+            ],
+            'infos' => [
+                ['message' => 'should not appear', 'versions' => '<2.2'],
+                ['message' => 'visible info', 'versions' => '>=2.2-dev'],
+            ],
+        ]);
 
-    /**
-     * Updates specific package in specific folder from initial to target version.
-     *
-     * @param  PackageInterface      $initial initial package
-     * @param  PackageInterface      $target  updated package
-     * @param  string                $path    download path
-     * @phpstan-return PromiseInterface<void|null>
-     */
-    public function update(PackageInterface $initial, PackageInterface $target, string $path): PromiseInterface;
-
-    /**
-     * Removes specific package from specific folder.
-     *
-     * @param  PackageInterface      $package package instance
-     * @param  string                $path    download path
-     * @phpstan-return PromiseInterface<void|null>
-     */
-    public function remove(PackageInterface $package, string $path): PromiseInterface;
-
-    /**
-     * Do anything to cleanup changes applied in the prepare or install/update/uninstall steps
-     *
-     * Note that cleanup will be called for all packages, either after install/update/uninstall is complete,
-     * or if any package failed any operation. This is to give all installers a change to cleanup things
-     * they did previously, so you need to keep track of changes applied in the installer/downloader themselves.
-     *
-     * @param  string                $type        one of install/update/uninstall
-     * @param  PackageInterface      $package     package instance
-     * @param  string                $path        download path
-     * @param  PackageInterface      $prevPackage previous package instance in case of an update
-     * @phpstan-return PromiseInterface<void|null>
-     */
-    public function cleanup(string $type, PackageInterface $package, string $path, ?PackageInterface $prevPackage = null): PromiseInterface;
+        // the <info> tag are consumed by the OutputFormatter, but not <warning> as that is not a default output format
+        self::assertSame(
+            '<warning>Warning from $URL: old warning msg</warning>'.PHP_EOL.
+            'Info from $URL: old info msg'.PHP_EOL.
+            '<warning>Warning from $URL: visible warning</warning>'.PHP_EOL.
+            'Info from $URL: visible info'.PHP_EOL,
+            $io->getOutput()
+        );
+    }
 }

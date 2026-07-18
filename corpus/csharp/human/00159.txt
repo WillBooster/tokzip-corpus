@@ -1,51 +1,37 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
 using System.Threading;
+using NUnit.Framework.Constraints;
 using NUnit.Framework.Interfaces;
 using NUnit.Framework.Internal;
 using NUnit.Framework.Internal.Execution;
-using System.Collections.Generic;
-using System.IO;
-using System.Diagnostics;
-using System.Globalization;
-using System.Security;
-using NUnit.Framework.Internal.Abstractions;
-using NUnit.Framework.Internal.Extensions;
 
-#if NETFRAMEWORK
-using System.Windows.Forms;
-#endif
-
-namespace NUnit.Framework.Api
+namespace NUnit.Framework
 {
     /// <summary>
-    /// Implementation of ITestAssemblyRunner
+    /// Provide the context information of the current test.
+    /// This is an adapter for the internal ExecutionContext
+    /// class, hiding the internals from the user test.
     /// </summary>
-    public class NUnitTestAssemblyRunner : ITestAssemblyRunner
+    public class TestContext
     {
-        private static readonly Logger Log = InternalTrace.GetLogger("DefaultTestAssemblyRunner");
+        private readonly TestExecutionContext _testExecutionContext;
+        private TestAdapter? _test;
+        private ResultAdapter? _result;
 
-        private readonly ITestAssemblyBuilder _builder;
-        private readonly ManualResetEventSlim _runComplete = new();
-
-        // Saved Console.Out and Console.Error
-        private TextWriter? _savedOut;
-        private TextWriter? _savedErr;
-
-        // Event Pump
-        private EventPump? _pump;
-
-        #region Constructors
+        #region Constructor
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="NUnitTestAssemblyRunner"/> class.
+        /// Construct a TestContext for an ExecutionContext
         /// </summary>
-        /// <param name="builder">The builder.</param>
-        public NUnitTestAssemblyRunner(ITestAssemblyBuilder builder)
+        /// <param name="testExecutionContext">The ExecutionContext to adapt</param>
+        public TestContext(TestExecutionContext testExecutionContext)
         {
-            _builder = builder;
+            _testExecutionContext = testExecutionContext;
         }
 
         #endregion
@@ -53,391 +39,606 @@ namespace NUnit.Framework.Api
         #region Properties
 
         /// <summary>
-        /// Gets the default level of parallel execution (worker threads)
+        /// Get the current test context. This is created
+        /// as needed. The user may save the context for
+        /// use within a test, but it should not be used
+        /// outside the test for which it is created.
         /// </summary>
-        public static int DefaultLevelOfParallelism => Math.Max(Environment.ProcessorCount, 2);
+        public static TestContext CurrentContext => new(TestExecutionContext.CurrentContext);
 
         /// <summary>
-        /// The tree of tests that was loaded by the builder
+        /// Gets a TextWriter that will send output to the current test result.
         /// </summary>
-        public ITest? LoadedTest { get; private set; }
+        public static TextWriter Out => TestExecutionContext.CurrentContext.OutWriter;
 
         /// <summary>
-        /// The test result, if a run has completed
+        /// Gets a TextWriter that will send output directly to Console.Error
         /// </summary>
-        public ITestResult? Result => TopLevelWorkItem?.Result;
+        public static TextWriter Error = new EventListenerTextWriter("Error", Console.Error);
 
         /// <summary>
-        /// Indicates whether a test is loaded
+        /// Gets a TextWriter for use in displaying immediate progress messages
         /// </summary>
-        public bool IsTestLoaded => LoadedTest is not null;
+        public static readonly TextWriter Progress = new EventListenerTextWriter("Progress", Console.Error);
 
         /// <summary>
-        /// Indicates whether a test is running
+        /// TestParameters object holds parameters for the test run, if any are specified
         /// </summary>
-        public bool IsTestRunning => TopLevelWorkItem is not null && TopLevelWorkItem.State == WorkItemState.Running;
+        public static readonly TestParameters Parameters = new();
 
         /// <summary>
-        /// Indicates whether a test run is complete
+        /// Static DefaultWorkDirectory is now used as the source
+        /// of the public instance property WorkDirectory. This is
+        /// a bit odd but necessary to avoid breaking user tests.
         /// </summary>
-        public bool IsTestComplete => TopLevelWorkItem is not null && TopLevelWorkItem.State == WorkItemState.Complete;
+        internal static string? DefaultWorkDirectory;
 
         /// <summary>
-        /// Our settings, specified when loading the assembly
+        /// Get a representation of the current test.
         /// </summary>
-        private IDictionary<string, object> Settings { get; set; } = null!; /* Cheating */
+        public TestAdapter Test => _test ??= new(_testExecutionContext.CurrentTest);
 
         /// <summary>
-        /// The top level WorkItem created for the assembly as a whole
+        /// Gets a Representation of the TestResult for the current test.
         /// </summary>
-        private WorkItem? TopLevelWorkItem { get; set; }
+        public ResultAdapter Result => _result ??= new(_testExecutionContext.CurrentResult);
 
         /// <summary>
-        /// The TestExecutionContext for the top level WorkItem
+        /// Gets the unique name of the Worker that is executing this test.
         /// </summary>
-        private TestExecutionContext? Context { get; set; }
+        public string? WorkerId => _testExecutionContext.TestWorker?.Name;
+
+        /// <summary>
+        /// Gets the directory containing the current test assembly.
+        /// </summary>
+        public string TestDirectory
+        {
+            get
+            {
+                Assembly? assembly = _testExecutionContext?.CurrentTest?.TypeInfo?.Assembly;
+
+                if (assembly is not null)
+                    return AssemblyHelper.GetDirectoryName(assembly);
+
+                // Test is null, we may be loading tests rather than executing.
+                // Assume that calling assembly is the test assembly.
+                return AssemblyHelper.GetDirectoryName(Assembly.GetCallingAssembly());
+            }
+        }
+
+        /// <summary>
+        /// Gets the directory to be used for outputting files created
+        /// by this test run.
+        /// </summary>
+        public string WorkDirectory => DefaultWorkDirectory
+            ?? throw new InvalidOperationException("TestContext.WorkDirectory must not be accessed before DefaultTestAssemblyBuilder.Build runs.");
+
+        /// <summary>
+        /// Gets the random generator.
+        /// </summary>
+        /// <value>
+        /// The random generator.
+        /// </value>
+        public Randomizer Random => _testExecutionContext.RandomGenerator;
+
+        /// <summary>
+        /// Gets the number of assertions executed
+        /// up to this point in the test.
+        /// </summary>
+        public int AssertCount => _testExecutionContext.AssertCount;
+
+        /// <summary>
+        /// Get the number of times the current Test has been repeated
+        /// when using the <see cref="RetryAttribute"/> or <see cref="RepeatAttribute"/>.
+        /// </summary>
+        public int CurrentRepeatCount => _testExecutionContext.CurrentRepeatCount;
+
+        /// <summary>
+        /// Gets the <see cref="CancellationToken"/> for the test case.
+        /// </summary>
+        public CancellationToken CancellationToken => _testExecutionContext.CancellationToken;
 
         #endregion
 
-        #region Public Methods
+        #region Static Methods
 
-        /// <summary>
-        /// Loads the tests found in an Assembly
-        /// </summary>
-        /// <param name="assemblyNameOrPath">File name or path of the assembly to load</param>
-        /// <param name="settings">Dictionary of option settings for loading the assembly</param>
-        /// <returns>A Test Assembly containing all loaded tests</returns>
-        public ITest Load(string assemblyNameOrPath, IDictionary<string, object> settings)
+        /// <summary>Write the string representation of a boolean value to the current result</summary>
+        public static void Write(bool value)
         {
-            Settings = settings;
+            Out.Write(value);
+        }
 
-            if (settings.TryGetValue(FrameworkPackageSettings.RandomSeed, out var randomSeedValue))
-            {
-                Randomizer.InitialSeed = (int)randomSeedValue;
-            }
+        /// <summary>Write a char to the current result</summary>
+        public static void Write(char value)
+        {
+            Out.Write(value);
+        }
 
-            LoadedTest = WrapInNUnitCallContext(() => _builder.Build(assemblyNameOrPath, settings));
-            return LoadedTest;
+        /// <summary>Write a char array to the current result</summary>
+        public static void Write(char[]? value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write the string representation of a double to the current result</summary>
+        public static void Write(double value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write the string representation of an Int32 value to the current result</summary>
+        public static void Write(int value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write the string representation of an Int64 value to the current result</summary>
+        public static void Write(long value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write the string representation of a decimal value to the current result</summary>
+        public static void Write(decimal value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write the string representation of an object to the current result</summary>
+        public static void Write(object? value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write the string representation of a Single value to the current result</summary>
+        public static void Write(float value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write a string to the current result</summary>
+        public static void Write(string? value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write the string representation of a UInt32 value to the current result</summary>
+        [CLSCompliant(false)]
+        public static void Write(uint value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write the string representation of a UInt64 value to the current result</summary>
+        [CLSCompliant(false)]
+        public static void Write(ulong value)
+        {
+            Out.Write(value);
+        }
+
+        /// <summary>Write a formatted string to the current result</summary>
+        public static void Write(string format, object? arg1)
+        {
+            Out.Write(format, arg1);
+        }
+
+        /// <summary>Write a formatted string to the current result</summary>
+        public static void Write(string format, object? arg1, object? arg2)
+        {
+            Out.Write(format, arg1, arg2);
+        }
+
+        /// <summary>Write a formatted string to the current result</summary>
+        public static void Write(string format, object? arg1, object? arg2, object? arg3)
+        {
+            Out.Write(format, arg1, arg2, arg3);
+        }
+
+        /// <summary>Write a formatted string to the current result</summary>
+        public static void Write(string format, params object?[] args)
+        {
+            Out.Write(format, args);
+        }
+
+        /// <summary>Write a line terminator to the current result</summary>
+        public static void WriteLine()
+        {
+            Out.WriteLine();
+        }
+
+        /// <summary>Write the string representation of a boolean value to the current result followed by a line terminator</summary>
+        public static void WriteLine(bool value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write a char to the current result followed by a line terminator</summary>
+        public static void WriteLine(char value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write a char array to the current result followed by a line terminator</summary>
+        public static void WriteLine(char[]? value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write the string representation of a double to the current result followed by a line terminator</summary>
+        public static void WriteLine(double value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write the string representation of an Int32 value to the current result followed by a line terminator</summary>
+        public static void WriteLine(int value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write the string representation of an Int64 value to the current result followed by a line terminator</summary>
+        public static void WriteLine(long value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write the string representation of a decimal value to the current result followed by a line terminator</summary>
+        public static void WriteLine(decimal value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write the string representation of an object to the current result followed by a line terminator</summary>
+        public static void WriteLine(object? value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write the string representation of a Single value to the current result followed by a line terminator</summary>
+        public static void WriteLine(float value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write a string to the current result followed by a line terminator</summary>
+        public static void WriteLine(string? value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write the string representation of a UInt32 value to the current result followed by a line terminator</summary>
+        [CLSCompliant(false)]
+        public static void WriteLine(uint value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write the string representation of a UInt64 value to the current result followed by a line terminator</summary>
+        [CLSCompliant(false)]
+        public static void WriteLine(ulong value)
+        {
+            Out.WriteLine(value);
+        }
+
+        /// <summary>Write a formatted string to the current result followed by a line terminator</summary>
+        public static void WriteLine(string format, object? arg1)
+        {
+            Out.WriteLine(format, arg1);
+        }
+
+        /// <summary>Write a formatted string to the current result followed by a line terminator</summary>
+        public static void WriteLine(string format, object? arg1, object? arg2)
+        {
+            Out.WriteLine(format, arg1, arg2);
+        }
+
+        /// <summary>Write a formatted string to the current result followed by a line terminator</summary>
+        public static void WriteLine(string format, object? arg1, object? arg2, object? arg3)
+        {
+            Out.WriteLine(format, arg1, arg2, arg3);
+        }
+
+        /// <summary>Write a formatted string to the current result followed by a line terminator</summary>
+        public static void WriteLine(string format, params object?[] args)
+        {
+            Out.WriteLine(format, args);
         }
 
         /// <summary>
-        /// Loads the tests found in an Assembly
+        /// This method adds the a new ValueFormatterFactory to the
+        /// chain of responsibility used for formatting values in messages.
+        /// The scope of the change is the current TestContext.
         /// </summary>
-        /// <param name="assembly">The assembly to load</param>
-        /// <param name="settings">Dictionary of option settings for loading the assembly</param>
-        /// <returns>A Test Assembly containing all loaded tests</returns>
-        public ITest Load(Assembly assembly, IDictionary<string, object> settings)
+        /// <param name="formatterFactory">The factory delegate</param>
+        public static void AddFormatter(ValueFormatterFactory formatterFactory)
         {
-            Settings = settings;
-
-            if (settings.TryGetValue(FrameworkPackageSettings.RandomSeed, out var randomSeed))
-            {
-                Randomizer.InitialSeed = (int)randomSeed;
-            }
-
-            LoadedTest = WrapInNUnitCallContext(() => _builder.Build(assembly, settings));
-            return LoadedTest;
+            TestExecutionContext.CurrentContext.AddFormatter(formatterFactory);
         }
 
         /// <summary>
-        /// Count Test Cases using a filter
+        /// Attach a file to the current test result
         /// </summary>
-        /// <param name="filter">The filter to apply</param>
-        /// <returns>The number of test cases found</returns>
-        public int CountTestCases(ITestFilter filter)
+        /// <param name="filePath">Relative or absolute file path to attachment</param>
+        /// <param name="description">Optional description of attachment</param>
+        public static void AddTestAttachment(string filePath, string? description = null)
         {
-            if (LoadedTest is null)
-                throw new InvalidOperationException("Tests must be loaded before counting test cases.");
+            Guard.ArgumentNotNull(filePath, nameof(filePath));
+            Guard.ArgumentValid(filePath.IndexOfAny(Path.GetInvalidPathChars()) == -1,
+                $"Test attachment file path contains invalid path characters. {filePath}", nameof(filePath));
 
-            return CountTestCases(LoadedTest, filter);
+            if (!Path.IsPathRooted(filePath))
+                filePath = Path.Combine(TestContext.CurrentContext.WorkDirectory, filePath);
+
+            if (!File.Exists(filePath))
+                throw new FileNotFoundException("Test attachment file path could not be found.", filePath);
+
+            var result = TestExecutionContext.CurrentContext.CurrentResult;
+            result.AddTestAttachment(new TestAttachment(filePath, description));
         }
 
         /// <summary>
-        /// Explore the test cases using a filter
+        /// This method provides a simplified way to add a ValueFormatter
+        /// delegate to the chain of responsibility, creating the factory
+        /// delegate internally. It is useful when the Type of the object
+        /// is the only criterion for selection of the formatter, since
+        /// it can be used without getting involved with a compound function.
         /// </summary>
-        /// <param name="filter">The filter to apply</param>
-        /// <returns>Test Assembly with test cases that matches the filter</returns>
-        public ITest ExploreTests(ITestFilter filter)
+        /// <typeparam name="TSupported">The type supported by this formatter</typeparam>
+        /// <param name="formatter">The ValueFormatter delegate</param>
+        public static void AddFormatter<TSupported>(ValueFormatter formatter)
         {
-            if (LoadedTest is null)
-                throw new InvalidOperationException("Tests must be loaded before exploring them.");
-
-            if (filter == TestFilter.Empty)
-                return LoadedTest;
-
-            return new TestAssembly((TestAssembly)LoadedTest, filter);
-        }
-
-        /// <summary>
-        /// Run selected tests and return a test result. The test is run synchronously,
-        /// and the listener interface is notified as it progresses.
-        /// </summary>
-        /// <param name="listener">Interface to receive EventListener notifications.</param>
-        /// <param name="filter">A test filter used to select tests to be run</param>
-        /// <returns>The test results from the run</returns>
-        public ITestResult Run(ITestListener listener, ITestFilter filter)
-        {
-            RunAsync(listener, filter);
-            WaitForCompletion(Timeout.Infinite);
-            return Result!;
-        }
-
-        /// <summary>
-        /// Run selected tests asynchronously, notifying the listener interface as it progresses.
-        /// </summary>
-        /// <param name="listener">Interface to receive EventListener notifications.</param>
-        /// <param name="filter">A test filter used to select tests to be run</param>
-        /// <remarks>
-        /// RunAsync is a template method, calling various abstract and
-        /// virtual methods to be overridden by derived classes.
-        /// </remarks>
-        public void RunAsync(ITestListener listener, ITestFilter filter)
-        {
-            Log.Info("Running tests");
-            if (LoadedTest is null)
-                throw new InvalidOperationException("Tests must be loaded before running them.");
-
-            _runComplete.Reset();
-
-            var context = CreateTestExecutionContext(LoadedTest, listener);
-
-            TopLevelWorkItem = WorkItemBuilder.CreateWorkItem(LoadedTest, filter, new DebuggerProxy(), true);
-            if (TopLevelWorkItem is null)
-                throw new InvalidOperationException("Loaded test didn't result in a WorkItem");
-
-            TopLevelWorkItem.InitializeContext(context);
-            TopLevelWorkItem.Completed += OnRunCompleted;
-
-            // Needs to be set for StopRun
-            Context = context;
-
-            WrapInNUnitCallContext(() => StartRun(context, TopLevelWorkItem, listener));
-        }
-
-        /// <summary>
-        /// Wait for the ongoing run to complete.
-        /// </summary>
-        /// <param name="timeout">Time to wait in milliseconds</param>
-        /// <returns>True if the run completed, otherwise false</returns>
-        public bool WaitForCompletion(int timeout)
-        {
-            return _runComplete.Wait(timeout);
-        }
-
-        /// <summary>
-        /// Signal any test run that is in process to stop. Return without error if no test is running.
-        /// </summary>
-        /// <param name="force">If true, kill any tests that are currently running</param>
-        public void StopRun(bool force)
-        {
-            if (IsTestRunning && Context is not null)
-            {
-                Context.ExecutionStatus = force
-                    ? TestExecutionStatus.AbortRequested
-                    : TestExecutionStatus.StopRequested;
-
-                Context.Dispatcher.CancelRun(force);
-            }
+            AddFormatter(next => val => (val is TSupported) ? formatter(val) : next(val));
         }
 
         #endregion
 
-        #region Helper Methods
+        #region Nested TestAdapter Class
 
         /// <summary>
-        /// Initiate the test run.
+        /// TestAdapter adapts a Test for consumption by
+        /// the user test code.
         /// </summary>
-        private void StartRun(TestExecutionContext context, WorkItem topLevelWorkItem, ITestListener listener)
+        public class TestAdapter
         {
-            // Save Console.Out and Error for later restoration
-            _savedOut = Console.Out;
-            _savedErr = Console.Error;
+            private readonly Test _test;
 
-            Console.SetOut(new TextCapture(Console.Out));
-            Console.SetError(new EventListenerTextWriter("Error", Console.Error));
+            #region Constructor
 
-            // Queue and pump events, unless settings have SynchronousEvents == false
-            if (!Settings.TryGetValue(FrameworkPackageSettings.SynchronousEvents, out var synchronousEvents) ||
-                !(bool)synchronousEvents)
+            /// <summary>
+            /// Construct a TestAdapter for a Test
+            /// </summary>
+            /// <param name="test">The Test to be adapted</param>
+            public TestAdapter(Test test)
             {
-                QueuingEventListener queue = new QueuingEventListener();
-                context.Listener = queue;
-
-                _pump = new EventPump(listener, queue.Events);
-                _pump.Start();
+                _test = test;
             }
 
-            if (!Debugger.IsAttached &&
-                Settings.TryGetValue(FrameworkPackageSettings.DebugTests, out var debugTests) &&
-                (bool)debugTests)
+            #endregion
+
+            #region Properties
+
+            /// <summary>
+            /// Gets the unique Id of a test
+            /// </summary>
+            public string ID => _test.Id;
+
+            /// <summary>
+            /// The name of the test, which may or may not be
+            /// the same as the method name.
+            /// </summary>
+            public string Name => _test.Name;
+
+            /// <summary>
+            /// Get the Namespace of the test.
+            /// </summary>
+            public string? Namespace => _test.TypeInfo?.Namespace;
+
+            /// <summary>
+            /// Get the display name of the test.
+            /// </summary>
+            public string? DisplayName => _test.TypeInfo?.GetDisplayName();
+
+            /// <summary>
+            /// The name of the method representing the test.
+            /// </summary>
+            public string? MethodName => (_test as TestMethod)?.Method.Name;
+
+            /// <summary>
+            /// The method representing the test.
+            /// </summary>
+            public IMethodInfo? Method => (_test as TestMethod)?.Method;
+
+            /// <summary>
+            /// Gets the underlying Type.
+            /// </summary>
+            public Type? Type => _test.TypeInfo?.Type;
+
+            /// <summary>
+            /// The FullName of the test
+            /// </summary>
+            public string FullName => _test.FullName;
+
+            /// <summary>
+            /// The ClassName of the test
+            /// </summary>
+            public string? ClassName => _test.ClassName;
+
+            /// <summary>
+            /// A shallow copy of the properties of the test.
+            /// </summary>
+            public PropertyBagAdapter Properties => new(_test.Properties);
+
+            /// <summary>
+            /// The arguments to use in creating the test or empty array if none are required.
+            /// </summary>
+            public object?[] Arguments => _test.Arguments;
+
+            /// <summary>
+            /// The expected result if there is one for the test
+            /// </summary>
+            public object? ExpectedResult
             {
-                try
+                get { return (_test as TestMethod)?.ExpectedResult; }
+            }
+
+            #endregion
+        }
+
+        #endregion
+
+        #region Nested ResultAdapter Class
+
+        /// <summary>
+        /// ResultAdapter adapts a TestResult for consumption by
+        /// the user test code.
+        /// </summary>
+        public class ResultAdapter
+        {
+            private readonly TestResult _result;
+
+            #region Constructor
+
+            /// <summary>
+            /// Construct a ResultAdapter for a TestResult
+            /// </summary>
+            /// <param name="result">The TestResult to be adapted</param>
+            public ResultAdapter(TestResult result)
+            {
+                _result = result;
+            }
+
+            #endregion
+
+            #region Properties
+
+            /// <summary>
+            /// Gets a ResultState representing the outcome of the test
+            /// up to this point in its execution.
+            /// </summary>
+            public ResultState Outcome => _result.ResultState;
+
+            /// <summary>
+            /// Gets a list of the assertion results generated
+            /// up to this point in the test.
+            /// </summary>
+            public IEnumerable<AssertionResult> Assertions => _result.AssertionResults;
+
+            /// <summary>
+            /// Gets the message associated with a test
+            /// failure or with not running the test
+            /// </summary>
+            public string Message => _result.Message;
+
+            /// <summary>
+            /// Gets any stack trace associated with an
+            /// error or failure.
+            /// </summary>
+            public virtual string? StackTrace => _result.StackTrace;
+
+            /// <summary>
+            /// Gets the number of test cases that failed
+            /// when running the test and all its children.
+            /// </summary>
+            public int FailCount => _result.FailCount;
+
+            /// <summary>
+            /// Gets the number of test cases that had warnings
+            /// when running the test and all its children.
+            /// </summary>
+            public int WarningCount => _result.WarningCount;
+
+            /// <summary>
+            /// Gets the number of test cases that passed
+            /// when running the test and all its children.
+            /// </summary>
+            public int PassCount => _result.PassCount;
+
+            /// <summary>
+            /// Gets the number of test cases that were skipped
+            /// when running the test and all its children.
+            /// </summary>
+            public int SkipCount => _result.SkipCount;
+
+            /// <summary>
+            /// Gets the number of test cases that were inconclusive
+            /// when running the test and all its children.
+            /// </summary>
+            public int InconclusiveCount => _result.InconclusiveCount;
+
+            #endregion
+        }
+
+        #endregion
+
+        #region Nested PropertyBagAdapter Class
+
+        /// <summary>
+        /// <see cref="PropertyBagAdapter"/> adapts an <see cref="IPropertyBag"/>
+        /// for consumption by the user.
+        /// </summary>
+        public class PropertyBagAdapter
+        {
+            private readonly IPropertyBag _source;
+
+            /// <summary>
+            /// Construct a <see cref="PropertyBagAdapter"/> from a source
+            /// <see cref="IPropertyBag"/>.
+            /// </summary>
+            public PropertyBagAdapter(IPropertyBag source)
+            {
+                _source = source;
+            }
+
+            /// <summary>
+            /// Get the first property with the given <paramref name="key"/>, if it can be found, otherwise
+            /// returns null.
+            /// </summary>
+            public object? Get(string key)
+            {
+                return _source.Get(key);
+            }
+
+            /// <summary>
+            /// Indicates whether <paramref name="key"/> is found in this
+            /// <see cref="PropertyBagAdapter"/>.
+            /// </summary>
+            public bool ContainsKey(string key)
+            {
+                return _source.ContainsKey(key);
+            }
+
+            /// <summary>
+            /// Returns a collection of properties
+            /// with the given <paramref name="key"/>.
+            /// </summary>
+            public IEnumerable<object> this[string key]
+            {
+                get
                 {
-                    Debugger.Launch();
-                }
-                catch (SecurityException)
-                {
-                    topLevelWorkItem.MarkNotRunnable("System.Security.Permissions.UIPermission must be granted in order to launch the debugger.");
-                    return;
-                }
-                //System.Diagnostics.Debugger.Launch() not implemented on mono
-                catch (NotImplementedException)
-                {
-                    topLevelWorkItem.MarkNotRunnable("This platform does not support launching the debugger.");
-                    return;
+                    if (_source.TryGet(key, out var values))
+                    {
+                        foreach (var item in values)
+                        {
+                            yield return item;
+                        }
+                    }
                 }
             }
 
-#if NETFRAMEWORK
-            if (Settings.TryGetValue(FrameworkPackageSettings.PauseBeforeRun, out var pauseBeforeRun) &&
-                (bool)pauseBeforeRun)
+            /// <summary>
+            /// Returns the count of elements with the given <paramref name="key"/>.
+            /// </summary>
+            public int Count(string key)
             {
-                PauseBeforeRun();
-            }
-#endif
-
-            context.Dispatcher.Start(topLevelWorkItem);
-        }
-
-        /// <summary>
-        /// Create the initial TestExecutionContext used to run tests
-        /// </summary>
-        /// <param name="loadedTest">The test loaded.</param>
-        /// <param name="listener">The ITestListener specified in the RunAsync call</param>
-        private TestExecutionContext CreateTestExecutionContext(ITest loadedTest, ITestListener listener)
-        {
-            var context = new TestExecutionContext();
-
-            // Apply package settings to the context
-            if (Settings.TryGetValue(FrameworkPackageSettings.DefaultTimeout, out var timeout))
-                context.TestCaseTimeout = (int)timeout;
-            if (Settings.TryGetValue(FrameworkPackageSettings.DefaultCulture, out var culture))
-                context.CurrentCulture = new CultureInfo((string)culture, false);
-            if (Settings.TryGetValue(FrameworkPackageSettings.DefaultUICulture, out var uiCulture))
-                context.CurrentUICulture = new CultureInfo((string)uiCulture, false);
-            if (Settings.TryGetValue(FrameworkPackageSettings.StopOnError, out var stopOnError))
-                context.StopOnError = (bool)stopOnError;
-
-            // Apply attributes to the context
-
-            // Set the listener - overriding runners may replace this
-            context.Listener = listener;
-
-            int levelOfParallelism = GetLevelOfParallelism(loadedTest);
-
-            if (Settings.TryGetValue(FrameworkPackageSettings.RunOnMainThread, out var runOnMainThread) &&
-                (bool)runOnMainThread)
-            {
-                context.Dispatcher = new MainThreadWorkItemDispatcher();
-            }
-            else if (levelOfParallelism > 0)
-            {
-                context.Dispatcher = new ParallelWorkItemDispatcher(levelOfParallelism);
-            }
-            else
-            {
-                context.Dispatcher = new SimpleWorkItemDispatcher();
+                return _source.TryGet(key, out var values) ? values.Count : 0;
             }
 
-            return context;
+            /// <summary>
+            /// Returns a collection of the property keys.
+            /// </summary>
+            public ICollection<string> Keys => _source.Keys;
         }
 
-        /// <summary>
-        /// Handle the Completed event for the top level work item
-        /// </summary>
-        private void OnRunCompleted(object? sender, EventArgs e)
-        {
-            if (_pump is not null)
-                _pump.Dispose();
-
-            if (_savedOut is not null)
-                Console.SetOut(_savedOut);
-
-            if (_savedErr is not null)
-                Console.SetError(_savedErr);
-
-            _runComplete.Set();
-        }
-
-        private static int CountTestCases(ITest test, ITestFilter filter)
-        {
-            if (!test.IsSuite)
-                return filter.Pass(test) ? 1 : 0;
-
-            // Use for-loop to avoid allocating the enumerator
-            int count = 0;
-            var tests = test.Tests;
-            for (var i = 0; i < tests.Count; i++)
-            {
-                count += CountTestCases(tests[i], filter);
-            }
-
-            return count;
-        }
-
-        private int GetLevelOfParallelism(ITest loadedTest)
-        {
-            return Settings.TryGetValue(FrameworkPackageSettings.NumberOfTestWorkers, out var numberOfTestWorkers)
-                ? (int)numberOfTestWorkers
-                : loadedTest.Properties.TryGet(PropertyNames.LevelOfParallelism, NUnitTestAssemblyRunner.DefaultLevelOfParallelism);
-        }
-
-#if NETFRAMEWORK
-        private static void PauseBeforeRun()
-        {
-            using var process = Process.GetCurrentProcess();
-
-            MessageBox.Show(
-                $"Pausing as requested. If you would like to attach a debugger, the process name and ID are {process.ProcessName}.exe and {process.Id}." + Environment.NewLine
-                + Environment.NewLine
-                + "Click OK when you are ready to continue.",
-                $"{process.ProcessName} – paused",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-        }
-#endif
-#if NETFRAMEWORK
-        /// <summary>
-        /// Executes the action within an <see cref="NUnitCallContext" />
-        /// which ensures the <see cref="System.Runtime.Remoting.Messaging.CallContext"/> is cleaned up
-        /// suitably at the end of the test run. This method only has an effect running
-        /// the full .NET Framework.
-        /// </summary>
-#else
-        /// <summary>
-        /// This method is a no-op in .NET Standard builds.
-        /// </summary>
-#endif
-        protected void WrapInNUnitCallContext(Action action)
-        {
-#if NETFRAMEWORK
-            using (new NUnitCallContext())
-                action();
-#else
-            action();
-#endif
-        }
-#if NETFRAMEWORK
-        /// <summary>
-        /// Executes the function within an <see cref="NUnitCallContext" />
-        /// which ensures the <see cref="System.Runtime.Remoting.Messaging.CallContext"/> is cleaned up
-        /// suitably at the end of the test run. This method only has an effect running
-        /// the full .NET Framework.
-        /// </summary>
-#else
-        /// <summary>
-        /// This method is a no-op in .NET Standard builds.
-        /// </summary>
-#endif
-        protected T WrapInNUnitCallContext<T>(Func<T> function)
-        {
-#if NETFRAMEWORK
-            using (new NUnitCallContext())
-                return function();
-#else
-            return function();
-#endif
-        }
+        #endregion
     }
-    #endregion
 }

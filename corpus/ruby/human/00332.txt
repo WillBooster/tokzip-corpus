@@ -1,32 +1,60 @@
 # frozen_string_literal: true
 
-require "abstract_unit"
-require "capybara/dsl"
-require "action_dispatch/system_testing/server"
+require "delegate"
 
-class ServerTest < ActiveSupport::TestCase
-  setup do
-    @old_capybara_server = Capybara.server
-  end
+module ActiveSupport
+  # This is a class for wrapping syntax errors.  The purpose of this class
+  # is to enhance the backtraces on SyntaxError exceptions to include the
+  # source location of the syntax error.  That way we can display the error
+  # source on error pages in development.
+  class SyntaxErrorProxy < DelegateClass(SyntaxError) # :nodoc:
+    def backtrace
+      parse_message_for_trace + super
+    end
 
-  test "port is always included" do
-    ActionDispatch::SystemTesting::Server.new.run
-    assert Capybara.always_include_port, "expected Capybara.always_include_port to be true"
-  end
+    class BacktraceLocation < Struct.new(:path, :lineno, :to_s) # :nodoc:
+      def spot(_)
+      end
 
-  test "server is changed from `default` to `puma`" do
-    Capybara.server = :default
-    ActionDispatch::SystemTesting::Server.new.run
-    assert_not_equal Capybara.server, Capybara.servers[:default]
-  end
+      def label
+      end
+    end
 
-  test "server is not changed to `puma` when is different than default" do
-    Capybara.server = :webrick
-    ActionDispatch::SystemTesting::Server.new.run
-    assert_equal Capybara.server, Capybara.servers[:webrick]
-  end
+    class BacktraceLocationProxy < DelegateClass(Thread::Backtrace::Location) # :nodoc:
+      def initialize(loc, ex)
+        super(loc)
+        @ex = ex
+      end
 
-  teardown do
-    Capybara.server = @old_capybara_server
+      def spot(_)
+        super(@ex.__getobj__)
+      end
+    end
+
+    def backtrace_locations
+      return nil if super.nil?
+
+      parse_message_for_trace.map { |trace|
+        file, line = trace.match(/^(.+?):(\d+).*$/, &:captures) || trace
+        BacktraceLocation.new(file, line.to_i, trace)
+        # We have to wrap these backtrace locations because we need the
+        # spot information to come from the originating exception, not the
+        # proxy object that's generating these
+      } + super.map { |loc| BacktraceLocationProxy.new(loc, self) }
+    end
+
+    private
+      def parse_message_for_trace
+        if __getobj__.to_s.start_with?("(eval")
+          # If the exception is coming from a call to eval, we need to keep
+          # the path of the file in which eval was called to ensure we can
+          # return the right source fragment to show the location of the
+          # error
+          location = __getobj__.backtrace_locations[0]
+          ["#{location.path}:#{location.lineno}: #{__getobj__}"]
+        else
+          __getobj__.to_s.split("\n")
+        end
+      end
   end
 end

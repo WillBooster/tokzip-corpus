@@ -1,154 +1,174 @@
-### Build command
+</Listing>
 
-Command to compile/bundle your application (e.g., `next build`,
-`deno task build`). Leave empty if your application doesn't require building.
+As with many types, we create a `Mutex<T>` using the associated function `new`.
+To access the data inside the mutex, we use the `lock` method to acquire the
+lock. This call will block the current thread so that it can’t do any work
+until it’s our turn to have the lock.
 
-### Runtime configuration
+The call to `lock` would fail if another thread holding the lock panicked. In
+that case, no one would ever be able to get the lock, so we’ve chosen to
+`unwrap` and have this thread panic if we’re in that situation.
 
-For most frameworks there are no options to configure here, as Deno Deploy will
-figure out the ideal runtime configuration for the app based on the framework
-preset. When a framework is not configured, you can choose here whether the app
-is a `Dynamic` app that needs to execute code server side for every request,
-such as an API server, server-side rendered application, etc., or a `Static` app
-that consists only of a set of static files that need to be hosted.
+After we’ve acquired the lock, we can treat the return value, named `num` in
+this case, as a mutable reference to the data inside. The type system ensures
+that we acquire a lock before using the value in `m`. The type of `m` is
+`Mutex<i32>`, not `i32`, so we _must_ call `lock` to be able to use the `i32`
+value. We can’t forget; the type system won’t let us access the inner `i32`
+otherwise.
 
-### Dynamic Entrypoint
+The call to `lock` returns a type called `MutexGuard`, wrapped in a
+`LockResult` that we handled with the call to `unwrap`. The `MutexGuard` type
+implements `Deref` to point at our inner data; the type also has a `Drop`
+implementation that releases the lock automatically when a `MutexGuard` goes
+out of scope, which happens at the end of the inner scope. As a result, we
+don’t risk forgetting to release the lock and blocking the mutex from being
+used by other threads because the lock release happens automatically.
 
-The JavaScript or TypeScript file that should be executed to start the
-application. This is the file path that you would pass locally to `deno
-run` or
-`node` to start the app. The path has to be relative to the working directory.
+After dropping the lock, we can print the mutex value and see that we were able
+to change the inner `i32` to `6`.
 
-### Dynamic arguments
+<!-- Old headings. Do not remove or links may break. -->
 
-Additional command line arguments to pass to the app on startup, after the
-entrypoint. These are arguments that are passed to the application not to Deno
-itself.
+<a id="sharing-a-mutext-between-multiple-threads"></a>
 
-### Static Directory
+#### Shared Access to `Mutex<T>`
 
-The directory in the working directory that contains the static files to be
-served. For example,`dist`,`_site`, or`.output`.
+Now let’s try to share a value between multiple threads using `Mutex<T>`. We’ll
+spin up 10 threads and have them each increment a counter value by 1, so the
+counter goes from 0 to 10. The example in Listing 16-13 will have a compiler
+error, and we’ll use that error to learn more about using `Mutex<T>` and how
+Rust helps us use it correctly.
 
-### Single Page App mode
+<Listing number="16-13" file-name="src/main.rs" caption="Ten threads, each incrementing a counter guarded by a `Mutex<T>`">
 
-Whether the application is a single page app that should have the root
-`index.html` served for any paths that do not exist as files in the static
-directory, instead of a 404 page.
+```rust,ignore,does_not_compile
+{{#rustdoc_include ../listings/ch16-fearless-concurrency/listing-16-13/src/main.rs}}
+```
 
-Closing the drawer saves the settings.
+</Listing>
 
-### Environment variables
+We create a `counter` variable to hold an `i32` inside a `Mutex<T>`, as we did
+in Listing 16-12. Next, we create 10 threads by iterating over a range of
+numbers. We use `thread::spawn` and give all the threads the same closure: one
+that moves the counter into the thread, acquires a lock on the `Mutex<T>` by
+calling the `lock` method, and then adds 1 to the value in the mutex. When a
+thread finishes running its closure, `num` will go out of scope and release the
+lock so that another thread can acquire it.
 
-To add environment variables:
+In the main thread, we collect all the join handles. Then, as we did in Listing
+16-2, we call `join` on each handle to make sure all the threads finish. At
+that point, the main thread will acquire the lock and print the result of this
+program.
 
-1. Click `Add/Edit environment variables`
-2. Click `+ Add variable` in the drawer
-3. Enter the name and value
-4. Choose whether it's a plain text variable or secret
-5. Select the contexts where it should be available:
-   - **Production**: For requests to production domains
-   - **Development**: For requests to preview/branch domains
-6. Click `Save` to apply your changes
+We hinted that this example wouldn’t compile. Now let’s find out why!
 
-![Screenshot of the Deploy env variables config screen](./images/env_var.png)
+```console
+{{#include ../listings/ch16-fearless-concurrency/listing-16-13/output.txt}}
+```
 
-You can re-open the drawer to edit / remove environment variables you have
-added. You can also edit the app name on this page, and select which region(s)
-the application should be served from.
+The error message states that the `counter` value was moved in the previous
+iteration of the loop. Rust is telling us that we can’t move the ownership of
+lock `counter` into multiple threads. Let’s fix the compiler error with the
+multiple-ownership method we discussed in Chapter 15.
 
-## Build and deploy your app
+#### Multiple Ownership with Multiple Threads
 
-1. Click `Create App` to create the application and start the first build
-2. Watch the build progress through the live logs:
+In Chapter 15, we gave a value to multiple owners by using the smart pointer
+`Rc<T>` to create a reference-counted value. Let’s do the same here and see
+what happens. We’ll wrap the `Mutex<T>` in `Rc<T>` in Listing 16-14 and clone
+the `Rc<T>` before moving ownership to the thread.
 
-![Screenshot of app build logs](./images/build_logs.png)
+<Listing number="16-14" file-name="src/main.rs" caption="Attempting to use `Rc<T>` to allow multiple threads to own the `Mutex<T>`">
 
-On the build page you can see live streaming build logs split into multiple
-sections:
+```rust,ignore,does_not_compile
+{{#rustdoc_include ../listings/ch16-fearless-concurrency/listing-16-14/src/main.rs}}
+```
 
-- **Prepare:** cloning the GitHub repository and restoring build cache
-- **Install:** executing the install command, and any framework specific
-  pre-install setup
-- **Build:** executing the build command, any framework specific pre- and
-  post-build setup, and preparing the build artifact for deployment
-- **Warm up:** sending a request to the preview URL of the deployment to ensure
-  it starts up correctly. The logs shown in the Warm up section are Runtime
-  logs, not build logs.
-- **Route:** Deno Deploy is rolling out the new version of this build into all
-  global regions.
+</Listing>
 
-In the top left of this build is a button to cancel the build. For failed
-builds, there is also a button to restart the build.
+Once again, we compile and get... different errors! The compiler is teaching us
+a lot:
 
-For completed builds, the top right shows the preview URL. Further down all
-timelines that this build is deployed to are shown, such as `Production`, or
-`Git Branch` timelines.
+```console
+{{#include ../listings/ch16-fearless-concurrency/listing-16-14/output.txt}}
+```
 
-You can also see how the build was triggered on this page. This can either be
-`manual action`, for builds triggered through the UI, or `GitHub repo` for
-builds triggered through the GitHub integration.
+Wow, that error message is very wordy! Here’s the important part to focus on:
+`` `Rc<Mutex<i32>>` cannot be sent between threads safely ``. The compiler is
+also telling us the reason why: `` the trait `Send` is not implemented for
+`Rc<Mutex<i32>>` ``. We’ll talk about `Send` in the next section: It’s one of
+the traits that ensures that the types we use with threads are meant for use in
+concurrent situations.
 
-You can view the application through either the preview URL, or any of the other
-URLs shown in the timelines list.
+Unfortunately, `Rc<T>` is not safe to share across threads. When `Rc<T>`
+manages the reference count, it adds to the count for each call to `clone` and
+subtracts from the count when each clone is dropped. But it doesn’t use any
+concurrency primitives to make sure that changes to the count can’t be
+interrupted by another thread. This could lead to wrong counts—subtle bugs that
+could in turn lead to memory leaks or a value being dropped before we’re done
+with it. What we need is a type that is exactly like `Rc<T>`, but that makes
+changes to the reference count in a thread-safe way.
 
-## Monitor your application
+#### Atomic Reference Counting with `Arc<T>`
 
-After deploying, you can view telemetry about your application in the form of
-the logs and traces available in our observability panels. You can visit these
-pages by clicking the respective buttons in the left sidebar.
+Fortunately, `Arc<T>` _is_ a type like `Rc<T>` that is safe to use in
+concurrent situations. The _a_ stands for _atomic_, meaning it’s an _atomically
+reference-counted_ type. Atomics are an additional kind of concurrency
+primitive that we won’t cover in detail here: See the standard library
+documentation for [`std::sync::atomic`][atomic]<!-- ignore --> for more
+details. At this point, you just need to know that atomics work like primitive
+types but are safe to share across threads.
 
-### Logs
+You might then wonder why all primitive types aren’t atomic and why standard
+library types aren’t implemented to use `Arc<T>` by default. The reason is that
+thread safety comes with a performance penalty that you only want to pay when
+you really need to. If you’re just performing operations on values within a
+single thread, your code can run faster if it doesn’t have to enforce the
+guarantees atomics provide.
 
-View application logs with filtering options for context, revision, and text
-content:
+Let’s return to our example: `Arc<T>` and `Rc<T>` have the same API, so we fix
+our program by changing the `use` line, the call to `new`, and the call to
+`clone`. The code in Listing 16-15 will finally compile and run.
 
-![Screenshot of the Logs page](./images/logs.png)
+<Listing number="16-15" file-name="src/main.rs" caption="Using an `Arc<T>` to wrap the `Mutex<T>` to be able to share ownership across multiple threads">
 
-The logs page shows all recent logs in the project. By default logs from all
-contexts (production and development) are shown, but using the filter button and
-search bar at the top, the shown logs can be restricted. For example, to filter
-to only production logs, add `context:production` to the search bar. To only
-show logs from a certain revision, use `revision:<id>` etc.
+```rust
+{{#rustdoc_include ../listings/ch16-fearless-concurrency/listing-16-15/src/main.rs}}
+```
 
-You can also use full text search in the search bar. The full text search will
-filter down the log entries to only those containing the text written,
-case-insensitively.
+</Listing>
 
-By default logs from the last hour are shown. The time picker in the top right
-can be used to adjust the time frame that logs are shown for. The time zone of
-the timestamps shown is the time zone set in the time picker.
+This code will print the following:
 
-The "view trace" button on the right of a log line shows up if a log line is
-correlated with a trace. This happens when a log line occurs within an active
-trace. Clicking this button will open the respective trace as an overlay.
+<!-- Not extracting output because changes to this output aren't significant;
+the changes are likely to be due to the threads running differently rather than
+changes in the compiler -->
 
-### Traces
+```text
+Result: 10
+```
 
-View request traces with detailed timing information:
+We did it! We counted from 0 to 10, which may not seem very impressive, but it
+did teach us a lot about `Mutex<T>` and thread safety. You could also use this
+program’s structure to do more complicated operations than just incrementing a
+counter. Using this strategy, you can divide a calculation into independent
+parts, split those parts across threads, and then use a `Mutex<T>` to have each
+thread update the final result with its part.
 
-![Screenshot of the Traces page](./images/traces.png)
+Note that if you are doing simple numerical operations, there are types simpler
+than `Mutex<T>` types provided by the [`std::sync::atomic` module of the
+standard library][atomic]<!-- ignore -->. These types provide safe, concurrent,
+atomic access to primitive types. We chose to use `Mutex<T>` with a primitive
+type for this example so that we could concentrate on how `Mutex<T>` works.
 
-The traces page shows all recent traces in the project. By default traces from
-all contexts (production and development) are shown, but using the filter button
-and search bar at the top, the shown traces can be restricted. For example, to
-filter to only production traces, add `context:production` to the search bar. To
-only show traces from a certain revision, use `revision:<id>` etc.
+<!-- Old headings. Do not remove or links may break. -->
 
-All traces that contain an incoming HTTP request are shown in the list. The text
-shown for each trace is the path of the request, and the duration of the trace
-in milliseconds.
+<a id="similarities-between-refcelltrct-and-mutextarct"></a>
 
-Clicking on a trace will open the trace view, which shows the full trace
-including all spans and logs that are part of the trace.
+### Comparing `RefCell<T>`/`Rc<T>` and `Mutex<T>`/`Arc<T>`
 
-![Screenshot of the Trace view](./images/trace.png)
-
-For each span in the trace you can see the duration of the span, the name of the
-span, the start and end time, and the recorded attributes. By clicking on a span
-in the timeline, the details of that span will be shown in the summary panel at
-the bottom.
-
-The logs that are emitted as part of a given span are shown in the logs tab at
-the bottom. Changing the selected span will update which logs are shown in this
-panel.
+You might have noticed that `counter` is immutable but that we could get a
+mutable reference to the value inside it; this means `Mutex<T>` provides
+interior mutability, as the `Cell` family does. In the same way we used
+`RefCell<T>` in Chapter 15 to allow us to mutate contents inside an `Rc<T>`, we
+use `Mutex<T>` to mutate contents inside an `Arc<T>`.

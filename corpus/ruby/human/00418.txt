@@ -1,171 +1,196 @@
 # frozen_string_literal: true
 
-gem "aws-sdk-s3", "~> 1.48"
+require "abstract_unit"
 
-require "aws-sdk-s3"
-require "active_support/core_ext/numeric/bytes"
+module ActionController
+  class Base
+    include ActionController::Testing
+  end
+end
 
-module ActiveStorage
-  # = Active Storage \S3 \Service
-  #
-  # Wraps the Amazon Simple Storage Service (S3) as an Active Storage service.
-  # See ActiveStorage::Service for the generic API documentation that applies to all services.
-  class Service::S3Service < Service
-    attr_reader :client, :bucket
-    attr_reader :multipart_upload_threshold, :upload_options
+class InfoControllerTest < ActionController::TestCase
+  tests Rails::InfoController
+  Rails.application.config.secret_key_base = "b3c631c314c0bbca50c1b2843150fe33"
 
-    def initialize(bucket:, upload: {}, public: false, **options)
-      @client = Aws::S3::Resource.new(**options)
-      @bucket = @client.bucket(bucket)
-
-      @multipart_upload_threshold = upload.delete(:multipart_threshold) || 100.megabytes
-      @public = public
-
-      @upload_options = upload
-      @upload_options[:acl] = "public-read" if public?
+  def setup
+    Rails.application.routes.draw do
+      namespace :test do
+        get :nested_route, to: "test#show"
+      end
+      get "/rails/info/properties" => "rails/info#properties"
+      get "/rails/info/routes" => "rails/info#routes"
+      post "/rails/:test/properties" => "rails/info#properties"
+      put "/rails/:test/named_properties" => "rails/info#properties", as: "named_rails_info_properties"
     end
+    @routes = Rails.application.routes
 
-    def upload(key, io, checksum: nil, filename: nil, content_type: nil, disposition: nil, custom_metadata: {}, **)
-      instrument :upload, key: key, checksum: checksum do
-        content_disposition = content_disposition_with(filename: filename, type: disposition) if disposition && filename
+    Rails::InfoController.include(@routes.url_helpers)
 
-        if io.size < multipart_upload_threshold
-          upload_with_single_part key, io, checksum: checksum, content_type: content_type, content_disposition: content_disposition, custom_metadata: custom_metadata
-        else
-          upload_with_multipart key, io, content_type: content_type, content_disposition: content_disposition, custom_metadata: custom_metadata
-        end
-      end
-    end
+    @request.env["REMOTE_ADDR"] = "127.0.0.1"
+  end
 
-    def download(key, &block)
-      if block_given?
-        instrument :streaming_download, key: key do
-          stream(key, &block)
-        end
-      else
-        instrument :download, key: key do
-          object_for(key).get.body.string.force_encoding(Encoding::BINARY)
-        rescue Aws::S3::Errors::NoSuchKey
-          raise ActiveStorage::FileNotFoundError
-        end
-      end
-    end
+  def exact_results
+    JSON(response.body)["exact"]
+  end
 
-    def download_chunk(key, range)
-      instrument :download_chunk, key: key, range: range do
-        object_for(key).get(range: "bytes=#{range.begin}-#{range.exclude_end? ? range.end - 1 : range.end}").body.string.force_encoding(Encoding::BINARY)
-      rescue Aws::S3::Errors::NoSuchKey
-        raise ActiveStorage::FileNotFoundError
-      end
-    end
+  def fuzzy_results
+    JSON(response.body)["fuzzy"]
+  end
 
-    def delete(key)
-      instrument :delete, key: key do
-        object_for(key).delete
-      end
-    end
+  test "info controller does not allow remote requests" do
+    @request.env["REMOTE_ADDR"] = "example.org"
+    get :properties
+    assert_response :forbidden
+  end
 
-    def delete_prefixed(prefix)
-      instrument :delete_prefixed, prefix: prefix do
-        bucket.objects(prefix: prefix).batch_delete!
-      end
-    end
+  test "info controller renders an error message when request was forbidden" do
+    @request.env["REMOTE_ADDR"] = "example.org"
+    get :properties
+    assert_select "p"
+  end
 
-    def exist?(key)
-      instrument :exist, key: key do |payload|
-        answer = object_for(key).exists?
-        payload[:exist] = answer
-        answer
-      end
-    end
+  test "info controller allows requests when all requests are considered local" do
+    get :properties
+    assert_response :success
+  end
 
-    def url_for_direct_upload(key, expires_in:, content_type:, content_length:, checksum:, custom_metadata: {})
-      instrument :url, key: key do |payload|
-        generated_url = object_for(key).presigned_url :put, expires_in: expires_in.to_i,
-          content_type: content_type, content_length: content_length, content_md5: checksum,
-          metadata: custom_metadata, whitelist_headers: ["content-length"], **upload_options
+  test "info controller allows local requests" do
+    get :properties
+    assert_response :success
+  end
 
-        payload[:url] = generated_url
+  test "info controller renders a table with properties" do
+    get :properties
+    assert_select "table"
+  end
 
-        generated_url
-      end
-    end
+  test "info controller renders with routes" do
+    get :routes
+    assert_response :success
+  end
 
-    def headers_for_direct_upload(key, content_type:, checksum:, filename: nil, disposition: nil, custom_metadata: {}, **)
-      content_disposition = content_disposition_with(type: disposition, filename: filename) if filename
+  test "info controller search returns exact matches for route names" do
+    get :routes, params: { query: "rails_info_" }
+    assert exact_results.size == 0, "should not match incomplete route names"
 
-      { "Content-Type" => content_type, "Content-MD5" => checksum, "Content-Disposition" => content_disposition, **custom_metadata_headers(custom_metadata) }
-    end
+    get :routes, params: { query: "" }
+    assert exact_results.size == 0, "should not match unnamed routes"
 
-    def compose(source_keys, destination_key, filename: nil, content_type: nil, disposition: nil, custom_metadata: {})
-      content_disposition = content_disposition_with(type: disposition, filename: filename) if disposition && filename
+    get :routes, params: { query: "rails_info_properties" }
+    assert exact_results.size == 1, "should match complete route names"
+    assert exact_results.include? "/rails/info/properties(.:format)"
 
-      object_for(destination_key).upload_stream(
-        content_type: content_type,
-        content_disposition: content_disposition,
-        part_size: MINIMUM_UPLOAD_PART_SIZE,
-        metadata: custom_metadata,
-        **upload_options
-      ) do |out|
-        source_keys.each do |source_key|
-          stream(source_key) do |chunk|
-            IO.copy_stream(StringIO.new(chunk), out)
-          end
-        end
-      end
-    end
+    get :routes, params: { query: "rails_info_properties_path" }
+    assert exact_results.size == 1, "should match complete route paths"
+    assert exact_results.include? "/rails/info/properties(.:format)"
 
-    private
-      def private_url(key, expires_in:, filename:, disposition:, content_type:, **client_opts)
-        object_for(key).presigned_url :get, expires_in: expires_in.to_i,
-          response_content_disposition: content_disposition_with(type: disposition, filename: filename),
-          response_content_type: content_type, **client_opts
-      end
+    get :routes, params: { query: "rails_info_properties_url" }
+    assert exact_results.size == 1, "should match complete route urls"
+    assert exact_results.include? "/rails/info/properties(.:format)"
+  end
 
-      def public_url(key, **client_opts)
-        object_for(key).public_url(**client_opts)
-      end
+  test "info controller search returns exact matches for route paths" do
+    get :routes, params: { query: "rails/info/route" }
+    assert exact_results.size == 0, "should not match incomplete route paths"
 
+    get :routes, params: { query: "/rails/info/routes" }
+    assert exact_results.size == 1, "should match complete route paths prefixed with /"
+    assert exact_results.include? "/rails/info/routes(.:format)"
 
-      MAXIMUM_UPLOAD_PARTS_COUNT = 10000
-      MINIMUM_UPLOAD_PART_SIZE   = 5.megabytes
+    get :routes, params: { query: "rails/info/routes" }
+    assert exact_results.size == 1, "should match complete route paths NOT prefixed with /"
+    assert exact_results.include? "/rails/info/routes(.:format)"
 
-      def upload_with_single_part(key, io, checksum: nil, content_type: nil, content_disposition: nil, custom_metadata: {})
-        object_for(key).put(body: io, content_md5: checksum, content_type: content_type, content_disposition: content_disposition, metadata: custom_metadata, **upload_options)
-      rescue Aws::S3::Errors::BadDigest
-        raise ActiveStorage::IntegrityError
-      end
+    get :routes, params: { query: "rails/info/routes.html" }
+    assert exact_results.size == 1, "should match complete route paths with optional parts"
+    assert exact_results.include? "/rails/info/routes(.:format)"
 
-      def upload_with_multipart(key, io, content_type: nil, content_disposition: nil, custom_metadata: {})
-        part_size = [ io.size.fdiv(MAXIMUM_UPLOAD_PARTS_COUNT).ceil, MINIMUM_UPLOAD_PART_SIZE ].max
+    get :routes, params: { query: "test/nested_route" }
+    assert exact_results.size == 1, "should match complete route paths that are nested in a namespace"
+    assert exact_results.include? "/test/nested_route(.:format)"
+  end
 
-        object_for(key).upload_stream(content_type: content_type, content_disposition: content_disposition, part_size: part_size, metadata: custom_metadata, **upload_options) do |out|
-          IO.copy_stream(io, out)
-        end
-      end
+  test "info controller search returns case-sensitive exact matches for HTTP Verb methods" do
+    get :routes, params: { query: "GE" }
+    assert exact_results.size == 0, "should not match incomplete HTTP Verb methods"
 
+    get :routes, params: { query: "get" }
+    assert exact_results.size == 0, "should not case-insensitive match HTTP Verb methods"
 
-      def object_for(key)
-        bucket.object(key)
-      end
+    get :routes, params: { query: "GET" }
+    assert exact_results.size == 3, "should match complete HTTP Verb methods"
+    assert exact_results.include? "/test/nested_route(.:format)"
+    assert exact_results.include? "/rails/info/properties(.:format)"
+    assert exact_results.include? "/rails/info/routes(.:format)"
+  end
 
-      # Reads the object for the given key in chunks, yielding each to the block.
-      def stream(key)
-        object = object_for(key)
+  test "info controller search returns exact matches for route Controller#Action(s)" do
+    get :routes, params: { query: "rails/info#propertie" }
+    assert exact_results.size == 0, "should not match incomplete route Controller#Action(s)"
 
-        chunk_size = 5.megabytes
-        offset = 0
+    get :routes, params: { query: "rails/info#properties" }
+    assert exact_results.size == 3, "should match complete route Controller#Action(s)"
+    assert exact_results.include? "/rails/info/properties(.:format)"
+    assert exact_results.include? "/rails/:test/properties(.:format)"
+    assert exact_results.include? "/rails/:test/named_properties(.:format)"
+  end
 
-        raise ActiveStorage::FileNotFoundError unless object.exists?
+  test "info controller returns fuzzy matches for route names" do
+    get :routes, params: { query: "" }
+    assert exact_results.size == 0, "should not match unnamed routes"
 
-        while offset < object.content_length
-          yield object.get(range: "bytes=#{offset}-#{offset + chunk_size - 1}").body.string.force_encoding(Encoding::BINARY)
-          offset += chunk_size
-        end
-      end
+    get :routes, params: { query: "rails_info" }
+    assert fuzzy_results.size == 3, "should match incomplete route names"
+    assert fuzzy_results.include? "/rails/info/properties(.:format)"
+    assert fuzzy_results.include? "/rails/info/routes(.:format)"
+    assert fuzzy_results.include? "/rails/:test/named_properties(.:format)"
 
-      def custom_metadata_headers(metadata)
-        metadata.transform_keys { |key| "x-amz-meta-#{key}" }
-      end
+    get :routes, params: { query: "/rails/info/routes" }
+    assert fuzzy_results.size == 1, "should match complete route names"
+    assert fuzzy_results.include? "/rails/info/routes(.:format)"
+
+    get :routes, params: { query: "named_rails_info_properties_path" }
+    assert fuzzy_results.size == 1, "should match complete route paths"
+    assert fuzzy_results.include? "/rails/:test/named_properties(.:format)"
+
+    get :routes, params: { query: "named_rails_info_properties_url" }
+    assert fuzzy_results.size == 1, "should match complete route urls"
+    assert fuzzy_results.include? "/rails/:test/named_properties(.:format)"
+  end
+
+  test "info controller returns fuzzy matches for route paths" do
+    get :routes, params: { query: "rails/:test" }
+    assert fuzzy_results.size == 2, "should match incomplete routes"
+    assert fuzzy_results.include? "/rails/:test/properties(.:format)"
+    assert fuzzy_results.include? "/rails/:test/named_properties(.:format)"
+
+    get :routes, params: { query: "/rails/info/routes" }
+    assert fuzzy_results.size == 1, "should match complete routes"
+    assert fuzzy_results.include? "/rails/info/routes(.:format)"
+
+    get :routes, params: { query: "rails/info/routes.html" }
+    assert fuzzy_results.size == 0, "should match optional parts of route literally"
+  end
+
+  # Intentionally ignoring fuzzy match of HTTP Verb methods. There's not much value to 'GE' returning 'GET' results.
+
+  test "info controller search returns fuzzy matches for route Controller#Action(s)" do
+    get :routes, params: { query: "rails/info#propertie" }
+    assert fuzzy_results.size == 3, "should match incomplete routes"
+    assert fuzzy_results.include? "/rails/info/properties(.:format)"
+    assert fuzzy_results.include? "/rails/:test/properties(.:format)"
+    assert fuzzy_results.include? "/rails/:test/named_properties(.:format)"
+
+    get :routes, params: { query: "rails/info#properties" }
+    assert fuzzy_results.size == 3, "should match complete route Controller#Action(s)"
+    assert fuzzy_results.include? "/rails/info/properties(.:format)"
+    assert fuzzy_results.include? "/rails/:test/properties(.:format)"
+    assert fuzzy_results.include? "/rails/:test/named_properties(.:format)"
+  end
+
+  test "internal routes do not have a default params[:internal] value" do
+    get :properties
+    assert_response :success
+    assert_nil @controller.params[:internal]
   end
 end

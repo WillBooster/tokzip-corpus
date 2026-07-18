@@ -2,232 +2,175 @@
 
 using System;
 using System.Threading;
-using NUnit.Framework.Interfaces;
-using NUnit.TestData;
-using NUnit.Framework.Tests.TestUtilities;
-using F = NUnit.TestData.AwaitableReturnTypeFixture;
 
-namespace NUnit.Framework.Tests
+namespace NUnit.Framework.Internal.Execution
 {
-    [TestFixture(nameof(F.ReturnsTask))]
-    [TestFixture(nameof(F.ReturnsCustomTask))]
-    [TestFixture(nameof(F.ReturnsCustomAwaitable))]
-    [TestFixture(nameof(F.ReturnsCustomAwaitableWithImplicitOnCompleted))]
-    [TestFixture(nameof(F.ReturnsCustomAwaitableWithImplicitUnsafeOnCompleted))]
-    public class AwaitableReturnTypeTests
+    /// <summary>
+    /// A TestWorker pulls work items from a queue
+    /// and executes them.
+    /// </summary>
+    public class TestWorker
     {
-        private readonly string _methodName;
+        private static readonly Logger Log = InternalTrace.GetLogger("TestWorker");
 
-        public AwaitableReturnTypeTests(string methodName)
+        private Thread? _workerThread;
+
+        private int _workItemCount = 0;
+
+        private bool _running;
+
+        #region Events
+
+        /// <summary>
+        /// Event handler for TestWorker events
+        /// </summary>
+        /// <param name="worker">The TestWorker sending the event</param>
+        /// <param name="work">The WorkItem that caused the event</param>
+        public delegate void TestWorkerEventHandler(TestWorker worker, WorkItem work);
+
+        /// <summary>
+        /// Event signaled immediately before executing a WorkItem
+        /// </summary>
+        public event TestWorkerEventHandler? Busy;
+
+        /// <summary>
+        /// Event signaled immediately after executing a WorkItem
+        /// </summary>
+        public event TestWorkerEventHandler? Idle;
+
+        #endregion
+
+        #region Constructor
+
+        /// <summary>
+        /// Construct a new TestWorker.
+        /// </summary>
+        /// <param name="queue">The queue from which to pull work items</param>
+        /// <param name="name">The name of this worker</param>
+        public TestWorker(WorkItemQueue queue, string name)
         {
-            _methodName = methodName;
+            Guard.ArgumentNotNull(queue, nameof(queue));
+
+            WorkQueue = queue;
+            Name = name;
         }
 
-        protected ITestResult RunCurrentTestMethod(AsyncWorkload workload)
+        #endregion
+
+        #region Properties
+
+        /// <summary>
+        /// The WorkItemQueue from which this worker pulls WorkItems
+        /// </summary>
+        public WorkItemQueue WorkQueue { get; }
+
+        /// <summary>
+        /// The name of this worker - also used for the thread
+        /// </summary>
+        public string Name { get; }
+
+        /// <summary>
+        /// Indicates whether the worker thread is running
+        /// </summary>
+        public bool IsAlive => _workerThread?.IsAlive is true;
+
+        #endregion
+
+        /// <summary>
+        /// Our ThreadProc, which pulls and runs tests in a loop
+        /// </summary>
+        private WorkItem? _currentWorkItem;
+
+        private void TestWorkerThreadProc()
         {
-            var test = TestBuilder.MakeTestFromMethod(typeof(F), _methodName);
+            _running = true;
 
-            return TestBuilder.RunTest(test, new F(workload));
-        }
-
-        [Test]
-        public void GetResultIsCalledSynchronouslyIfIsCompleteIsFalse()
-        {
-            var wasCalled = false;
-
-            RunCurrentTestMethod(new AsyncWorkload(
-                isCompleted: true,
-                onCompleted: continuation => Assert.Fail("OnCompleted should not be called when IsCompleted is true."),
-                getResult: () =>
-                    {
-                        wasCalled = true;
-                        return 42;
-                    }))
-            .AssertPassed();
-
-            Assert.That(wasCalled);
-        }
-
-        [Test]
-        public void GetResultIsCalledSynchronouslyWhenContinued()
-        {
-            var wasCalled = false;
-
-            RunCurrentTestMethod(new AsyncWorkload(
-                isCompleted: false,
-                onCompleted: continuation => continuation.Invoke(),
-                getResult: () =>
-                    {
-                        wasCalled = true;
-                        return 42;
-                    }))
-            .AssertPassed();
-
-            Assert.That(wasCalled);
-        }
-
-        [Test]
-        public void GetResultIsNotCalledUntilContinued()
-        {
-            using (var continuationIsAvailable = new ManualResetEventSlim())
-            using (var getResultWasCalled = new ManualResetEventSlim())
+            try
             {
-                var continuation = default(Action);
-
-                ThreadPool.QueueUserWorkItem(state =>
+                while (_running)
                 {
-                    RunCurrentTestMethod(new AsyncWorkload(
-                        isCompleted: false,
-                        onCompleted: action =>
-                        {
-                            continuation = action;
-                            continuationIsAvailable.Set();
-                        },
-                        getResult: () =>
-                        {
-                            getResultWasCalled.Set();
-                            return 42;
-                        }));
-                });
+                    _currentWorkItem = WorkQueue.Dequeue();
+                    if (_currentWorkItem is null)
+                        break;
 
-                continuationIsAvailable.Wait();
+                    Log.Info("{0} executing {1}", Thread.CurrentThread.Name!, _currentWorkItem.Name);
 
-                if (getResultWasCalled.IsSet)
-                    Assert.Fail("GetResult was called before the continuation passed to OnCompleted was invoked.");
+                    _currentWorkItem.TestWorker = this;
 
-                continuation!.Invoke();
+                    // During this Busy call, the queue state may be saved.
+                    // This gives us a new set of queues, which are initially
+                    // empty. The intention is that only children of the current
+                    // executing item should make use of the new set of queues.
+                    // TODO: If we had a separate NonParallelTestWorker, it
+                    // could simply create the isolated queue without any
+                    // worrying about competing workers.
+                    Busy?.Invoke(this, _currentWorkItem);
 
-                if (!getResultWasCalled.Wait(10_000))
-                    Assert.Fail("GetResult was not called after the continuation passed to OnCompleted was invoked.");
+                    // Because we execute the current item AFTER the queue state
+                    // is saved, its children end up in the new queue set.
+                    _currentWorkItem.Execute();
+
+                    // This call may result in the queues being restored. There
+                    // is a potential race condition here. We should not restore
+                    // the queues unless all child items have finished.
+                    Idle?.Invoke(this, _currentWorkItem);
+
+                    ++_workItemCount;
+                }
+            }
+            finally
+            {
+                Log.Info("{0} stopping - {1} WorkItems processed.", Name, _workItemCount);
             }
         }
 
-        [Test]
-        public void ExceptionThrownBeforeReturningAwaitableShouldBeHandled()
+        /// <summary>
+        /// Create thread and start processing work items.
+        /// </summary>
+        public void Start()
         {
-            var getAwaiterWasCalled = false;
-            var isCompletedWasCalled = false;
-            var onCompletedWasCalled = false;
-            var getResultWasCalled = false;
+            _workerThread = new Thread(new ThreadStart(TestWorkerThreadProc))
+            {
+                Name = Name
+            };
 
-            var result = RunCurrentTestMethod(new AsyncWorkload(
-                beforeReturningAwaitable: () => { throw new OddlyNamedException("Failure message"); },
-                beforeReturningAwaiter: () => getAwaiterWasCalled = true,
-                isCompleted: () => isCompletedWasCalled = true,
-                onCompleted: continuation => onCompletedWasCalled = true,
-                getResult: () => getResultWasCalled = true));
-
-            Assert.That(result.ResultState.Status, Is.EqualTo(TestStatus.Failed));
-            Assert.That(result.Message, Contains.Substring("OddlyNamedException"));
-            Assert.That(result.Message, Contains.Substring("Failure message"));
-
-            Assert.That(getAwaiterWasCalled, Is.False);
-            Assert.That(isCompletedWasCalled, Is.False);
-            Assert.That(onCompletedWasCalled, Is.False);
-            Assert.That(getResultWasCalled, Is.False);
-        }
-
-        [Test]
-        public void ExceptionThrownInGetAwaiterShouldBeHandled()
-        {
-            var isCompletedWasCalled = false;
-            var onCompletedWasCalled = false;
-            var getResultWasCalled = false;
-
-            var result = RunCurrentTestMethod(new AsyncWorkload(
-                beforeReturningAwaitable: null,
-                beforeReturningAwaiter: () => { throw new OddlyNamedException("Failure message"); },
-                isCompleted: () => isCompletedWasCalled = true,
-                onCompleted: continuation => onCompletedWasCalled = true,
-                getResult: () => getResultWasCalled = true));
-
-            Assert.That(result.ResultState.Status, Is.EqualTo(TestStatus.Failed));
-            Assert.That(result.Message, Contains.Substring("OddlyNamedException"));
-            Assert.That(result.Message, Contains.Substring("Failure message"));
-
-            Assert.That(isCompletedWasCalled, Is.False);
-            Assert.That(onCompletedWasCalled, Is.False);
-            Assert.That(getResultWasCalled, Is.False);
-        }
-
-        [Test]
-        public void ExceptionThrownInIsCompletedShouldBeHandled()
-        {
-            var onCompletedWasCalled = false;
-            var getResultWasCalled = false;
-
-            var result = RunCurrentTestMethod(new AsyncWorkload(
-                isCompleted: () => { throw new OddlyNamedException("Failure message"); },
-                onCompleted: continuation => onCompletedWasCalled = true,
-                getResult: () => getResultWasCalled = true));
-
-            Assert.That(result.ResultState.Status, Is.EqualTo(TestStatus.Failed));
-            Assert.That(result.Message, Contains.Substring("OddlyNamedException"));
-            Assert.That(result.Message, Contains.Substring("Failure message"));
-
-            Assert.That(onCompletedWasCalled, Is.False);
-            Assert.That(getResultWasCalled, Is.False);
-        }
-
-        [Test]
-        public void ExceptionThrownInOnCompletedShouldBeHandled()
-        {
-            var getResultWasCalled = false;
-
-            var result = RunCurrentTestMethod(new AsyncWorkload(
-                isCompleted: false,
-                onCompleted: continuation => { throw new OddlyNamedException("Failure message"); },
-                getResult: () => getResultWasCalled = true));
-
-            Assert.That(result.ResultState.Status, Is.EqualTo(TestStatus.Failed));
-            Assert.That(result.Message, Contains.Substring("OddlyNamedException"));
-            Assert.That(result.Message, Contains.Substring("Failure message"));
-
-            Assert.That(getResultWasCalled, Is.False);
-        }
-
-        [Test]
-        public void ExceptionThrownInGetResultShouldBeHandled()
-        {
-            var result = RunCurrentTestMethod(new AsyncWorkload(
-                isCompleted: false,
-                onCompleted: continuation => continuation.Invoke(),
-                getResult: () => { throw new OddlyNamedException("Failure message"); }));
-
-            Assert.That(result.ResultState.Status, Is.EqualTo(TestStatus.Failed));
-            Assert.That(result.Message, Contains.Substring("OddlyNamedException"));
-            Assert.That(result.Message, Contains.Substring("Failure message"));
-        }
-
-        private sealed class OddlyNamedException : Exception
-        {
-            public OddlyNamedException(string message) : base(message)
+#if NET6_0_OR_GREATER
+            if (OperatingSystem.IsWindows())
+                _workerThread.SetApartmentState(WorkQueue.TargetApartment);
+#else
+            try
+            {
+                _workerThread.SetApartmentState(WorkQueue.TargetApartment);
+            }
+            catch (PlatformNotSupportedException)
             {
             }
+#endif
+
+            Log.Info("{0} starting on thread [{1}]", Name, _workerThread.ManagedThreadId);
+            _workerThread.Start();
         }
 
-        [Test]
-        public void OperationCanceledExceptionThrownInGetResultShouldBeReportedAsSuch()
+        private readonly object _cancelLock = new();
+
+        /// <summary>
+        /// Stop the thread, either immediately or after finishing the current WorkItem
+        /// </summary>
+        /// <param name="force">true if the thread should be aborted, false if it should allow the currently running test to complete</param>
+        public void Cancel(bool force)
         {
-            var result = RunCurrentTestMethod(new AsyncWorkload(
-                isCompleted: false,
-                onCompleted: continuation => continuation.Invoke(),
-                getResult: () => { throw new OperationCanceledException(); }));
+            if (force)
+                _running = false;
 
-            Assert.That(result.ResultState.Status, Is.EqualTo(TestStatus.Failed));
-            Assert.That(result.Message, Contains.Substring("OperationCanceledException"));
-        }
-
-        [Test]
-        public void TaskCanceledExceptionThrownInGetResultShouldBeReportedAsSuch()
-        {
-            var result = RunCurrentTestMethod(new AsyncWorkload(
-                isCompleted: false,
-                onCompleted: continuation => continuation.Invoke(),
-                getResult: () => { throw new System.Threading.Tasks.TaskCanceledException(); }));
-
-            Assert.That(result.ResultState.Status, Is.EqualTo(TestStatus.Failed));
-            Assert.That(result.Message, Contains.Substring("TaskCanceledException"));
+            lock (_cancelLock)
+            {
+                if (_workerThread is not null && _currentWorkItem is not null)
+                {
+                    _currentWorkItem.Cancel(force);
+                    if (force)
+                        _currentWorkItem = null;
+                }
+            }
         }
     }
 }

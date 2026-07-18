@@ -1,249 +1,192 @@
-﻿namespace AutoMapper.UnitTests;
-public class When_mapping_with_context_state
-{
-    public class Source
-    {
-        public int Value { get; set; }
-    }
-    public class Dest
-    {
-        public int Value { get; set; }
-    }
-    public class ContextResolver : IMemberValueResolver<Source, Dest, int, int>
-    {
-        public int Resolve(Source src, Dest d, int source, int dest, ResolutionContext context) => source + (int)context.State;
-    }
-    [Fact]
-    public void Should_use_value_passed_in()
-    {
-        var config = new MapperConfiguration(cfg =>
-        {
-            cfg.CreateMap<Source, Dest>()
-                .ForMember(d => d.Value, opt => opt.MapFrom<ContextResolver, int>(src => src.Value));
-        });
-        var dest = config.CreateMapper().Map<Source, Dest>(new Source { Value = 5 }, opt => { opt.State = 10; });
-        dest.Value.ShouldBe(15);
-    }
-}
-public class Context_try_get_items : AutoMapperSpecBase
-{
-    protected override MapperConfiguration CreateConfiguration() => new(c => c.CreateMap<int, int>().ConvertUsing((s, _, c) => 
-        c.TryGetItems(out var items) ? (int)items["override"] : s));
-    [Fact]
-    public void Should_not_throw()
-    {
-        Map<int>(42).ShouldBe(42);
-        Mapper.Map<int>(42, o=>o.Items["override"] = 43).ShouldBe(43);
-    }
-}
-public class When_mapping_with_contextual_values
-{
-    public class Source
-    {
-        public int Value { get; set; }
-    }
+using AutoMapper.Features;
+using AutoMapper.Internal.Mappers;
+using AutoMapper.QueryableExtensions.Impl;
+namespace AutoMapper;
 
-    public class Dest
-    {
-        public int Value { get; set; }
-    }
+using Validator = Action<ValidationContext>;
+public interface IMapperConfigurationExpression : IProfileExpression
+{
+    /// <summary>
+    /// Add an existing profile
+    /// </summary>
+    /// <param name="profile">Profile to add</param>
+    void AddProfile(Profile profile);
 
-    public class ContextResolver : IMemberValueResolver<Source, Dest, int, int>
+    /// <summary>
+    /// Add an existing profile type. Profile will be instantiated and added to the configuration.
+    /// </summary>
+    /// <typeparam name="TProfile">Profile type</typeparam>
+    void AddProfile<TProfile>() where TProfile : Profile, new();
+
+    /// <summary>
+    /// Add an existing profile type. Profile will be instantiated and added to the configuration.
+    /// </summary>
+    /// <param name="profileType">Profile type</param>
+    void AddProfile(Type profileType);
+
+    /// <summary>
+    /// Add profiles contained in an IEnumerable
+    /// </summary>
+    /// <param name="enumerableOfProfiles">IEnumerable of Profile</param>
+    void AddProfiles(IEnumerable<Profile> enumerableOfProfiles);
+
+    /// <summary>
+    /// Add mapping definitions contained in assemblies.
+    /// Looks for <see cref="Profile" /> definitions and classes decorated with <see cref="AutoMapAttribute" />
+    /// </summary>
+    /// <param name="assembliesToScan">Assemblies containing mapping definitions</param>
+    void AddMaps(IEnumerable<Assembly> assembliesToScan);
+
+    /// <summary>
+    /// Add mapping definitions contained in assemblies.
+    /// Looks for <see cref="Profile" /> definitions and classes decorated with <see cref="AutoMapAttribute" />
+    /// </summary>
+    /// <param name="assembliesToScan">Assemblies containing mapping definitions</param>
+    void AddMaps(params Assembly[] assembliesToScan);
+
+    /// <summary>
+    /// Add mapping definitions contained in assemblies.
+    /// Looks for <see cref="Profile" /> definitions and classes decorated with <see cref="AutoMapAttribute" />
+    /// </summary>
+    /// <param name="assemblyNamesToScan">Assembly names to load and scan containing mapping definitions</param>
+    void AddMaps(IEnumerable<string> assemblyNamesToScan);
+
+    /// <summary>
+    /// Add mapping definitions contained in assemblies.
+    /// Looks for <see cref="Profile" /> definitions and classes decorated with <see cref="AutoMapAttribute" />
+    /// </summary>
+    /// <param name="assemblyNamesToScan">Assembly names to load and scan containing mapping definitions</param>
+    void AddMaps(params string[] assemblyNamesToScan);
+
+    /// <summary>
+    /// Add mapping definitions contained in assemblies.
+    /// Looks for <see cref="Profile" /> definitions and classes decorated with <see cref="AutoMapAttribute" />
+    /// </summary>
+    /// <param name="typesFromAssembliesContainingMappingDefinitions">Types from assemblies containing mapping definitions</param>
+    void AddMaps(IEnumerable<Type> typesFromAssembliesContainingMappingDefinitions);
+
+    /// <summary>
+    /// Add mapping definitions contained in assemblies.
+    /// Looks for <see cref="Profile" /> definitions and classes decorated with <see cref="AutoMapAttribute" />
+    /// </summary>
+    /// <param name="typesFromAssembliesContainingMappingDefinitions">Types from assemblies containing mapping definitions</param>
+    void AddMaps(params Type[] typesFromAssembliesContainingMappingDefinitions);
+
+    /// <summary>
+    /// Supply a factory method callback for creating resolvers and type converters
+    /// </summary>
+    /// <param name="constructor">Factory method</param>
+    void ConstructServicesUsing(Func<Type, object> constructor);
+
+    /// <summary>
+    /// Create a named profile with the supplied configuration
+    /// </summary>
+    /// <param name="profileName">Profile name, must be unique</param>
+    /// <param name="config">Profile configuration</param>
+    void CreateProfile(string profileName, Action<IProfileExpression> config);
+}
+public sealed class MapperConfigurationExpression : Profile, IGlobalConfigurationExpression
+{
+    private readonly List<Profile> _profiles = new();
+    private readonly List<Validator> _validators = new();
+    private readonly List<IObjectMapper> _mappers;
+    private Func<Type, object> _serviceCtor = Activator.CreateInstance;
+    private List<IProjectionMapper> _projectionMappers;
+
+    public MapperConfigurationExpression() : base() => _mappers = MapperRegistry.Mappers();
+
+    /// <summary>
+    /// Add an action to be called when validating the configuration.
+    /// </summary>
+    /// <param name="validator">the validation callback</param>
+    void IGlobalConfigurationExpression.Validator(Validator validator) => 
+        _validators.Add(validator ?? throw new ArgumentNullException(nameof(validator)));
+    /// <summary>
+    /// How many levels deep should AutoMapper try to inline the execution plan for child classes.
+    /// See <a href="https://automapper.readthedocs.io/en/latest/Understanding-your-mapping.html">the docs</a> for details.
+    /// </summary>
+    int IGlobalConfigurationExpression.MaxExecutionPlanDepth { get; set; } = 1;
+
+    List<Validator> IGlobalConfigurationExpression.Validators => _validators;
+
+    List<IProjectionMapper> IGlobalConfigurationExpression.ProjectionMappers => _projectionMappers ??= ProjectionBuilder.DefaultProjectionMappers();
+
+    /// <summary>
+    /// How many levels deep should recursive queries be expanded.
+    /// Must be zero for EF6. Can be greater than zero for EF Core.
+    /// </summary>
+    int IGlobalConfigurationExpression.RecursiveQueriesMaxDepth { get; set; }
+
+    IReadOnlyCollection<IProfileConfiguration> IGlobalConfigurationExpression.Profiles => _profiles;
+    Func<Type, object> IGlobalConfigurationExpression.ServiceCtor => _serviceCtor;
+
+    public void CreateProfile(string profileName, Action<IProfileExpression> config)
+        => AddProfile(new Profile(profileName, config));
+
+    List<IObjectMapper> IGlobalConfigurationExpression.Mappers => _mappers;
+
+    Features<IGlobalFeature> IGlobalConfigurationExpression.Features { get; } = new Features<IGlobalFeature>();
+
+    public void AddProfile(Profile profile) => _profiles.Add(profile);
+
+    public void AddProfile<TProfile>() where TProfile : Profile, new() => AddProfile(new TProfile());
+
+    public void AddProfile(Type profileType) => AddProfile((Profile)Activator.CreateInstance(profileType));
+
+    public void AddProfiles(IEnumerable<Profile> enumerableOfProfiles)
     {
-        public int Resolve(Source src, Dest d, int source, int dest, ResolutionContext context)
+        foreach (var profile in enumerableOfProfiles)
         {
-            return source + (int)context.Items["Item"];
+            AddProfile(profile);
         }
     }
 
-    [Fact]
-    public void Should_use_value_passed_in()
+    public void AddMaps(IEnumerable<Assembly> assembliesToScan)
+        => AddMapsCore(assembliesToScan);
+
+    public void AddMaps(params Assembly[] assembliesToScan)
+        => AddMapsCore(assembliesToScan);
+
+    public void AddMaps(IEnumerable<string> assemblyNamesToScan)
+        => AddMapsCore(assemblyNamesToScan.Select(Assembly.Load));
+
+    public void AddMaps(params string[] assemblyNamesToScan)
+        => AddMaps((IEnumerable<string>)assemblyNamesToScan);
+
+    public void AddMaps(IEnumerable<Type> typesFromAssembliesContainingMappingDefinitions)
+        => AddMapsCore(typesFromAssembliesContainingMappingDefinitions.Select(t => t.GetTypeInfo().Assembly));
+
+    public void AddMaps(params Type[] typesFromAssembliesContainingMappingDefinitions)
+        => AddMaps((IEnumerable<Type>)typesFromAssembliesContainingMappingDefinitions);
+
+    private void AddMapsCore(IEnumerable<Assembly> assembliesToScan)
     {
-        var config = new MapperConfiguration(cfg =>
+        var autoMapAttributeProfile = new Profile(nameof(AutoMapAttribute));
+        foreach (var type in assembliesToScan.Where(a => !a.IsDynamic && a != typeof(Profile).Assembly).SelectMany(a => a.GetTypes()))
         {
-            cfg.CreateMap<Source, Dest>()
-                .ForMember(d => d.Value, opt => opt.MapFrom<ContextResolver, int>(src => src.Value));
-        });
-
-        var dest = config.CreateMapper().Map<Source, Dest>(new Source { Value = 5 }, opt => { opt.Items["Item"] = 10; });
-
-        dest.Value.ShouldBe(15);
-    }
-}
-
-public class When_mapping_with_contextual_values_wrong_overload : AutoMapperSpecBase
-{
-    public class Source
-    {
-        public int Value { get; set; }
-    }
-
-    public class Dest
-    {
-        public int Value { get; set; }
-    }
-
-    protected override MapperConfiguration CreateConfiguration() => new(cfg =>
-    {
-        cfg.CreateMap<Source, Dest>()
-            .ForMember(d => d.Value, opt => opt.MapFrom((src, d, member, ctxt) => { ctxt.Items["Item"] = 2; return -1; }));
-    });
-
-    [Fact]
-    public void Should_report_error()
-    {
-        new Action(() => Mapper.Map<Source, Dest>(new Source { Value = 5 })).ShouldThrowException<AutoMapperMappingException>(ex =>
-        {
-            var inner = ex.InnerException;
-            inner.ShouldBeOfType<InvalidOperationException>();
-            inner.Message.ShouldBe("Context.Items are only available when using a Map overload that takes Action<IMappingOperationOptions>! Consider using Context.TryGetItems instead.");
-        });
-    }
-}
-
-public class When_mapping_with_contextual_values_shortcut
-{
-    public class Source
-    {
-        public int Value { get; set; }
-    }
-
-    public class Dest
-    {
-        public int Value { get; set; }
-    }
-
-    [Fact]
-    public void Should_use_value_passed_in()
-    {
-        var config = new MapperConfiguration(cfg =>
-        {
-            cfg.CreateMap<Source, Dest>()
-                .ForMember(d => d.Value, opt => opt.MapFrom((src, d, member, ctxt) => (int)ctxt.Items["Item"] + 5));
-        });
-
-        var dest = config.CreateMapper().Map<Source, Dest>(new Source { Value = 5 }, opt => opt.Items["Item"] = 10);
-
-        dest.Value.ShouldBe(15);
-    }
-}
-
-public class When_mapping_with_contextual_values_in_resolve_func
-{
-    public class Source
-    {
-        public int Value1 { get; set; }
-    }
-
-    public class Dest
-    {
-        public int Value1 { get; set; }
-    }
-
-    [Fact]
-    public void Should_use_value_passed_in()
-    {
-        var config = new MapperConfiguration(cfg =>
-        {
-            cfg.CreateMap<Source, Dest>()
-                .ForMember(d => d.Value1, opt => opt.MapFrom((source, d, dMember, context) => (int)context.Items["Item"] + source.Value1));
-        });
-
-        var dest = config.CreateMapper().Map<Source, Dest>(new Source { Value1 = 5 }, opt => { opt.Items["Item"] = 10; });
-
-        dest.Value1.ShouldBe(15);
-    }
-}
-
-public class When_mapping_nested_context_items : AutoMapperSpecBase
-{
-    public class Door { }
-
-    public class FromGarage
-    {
-        public List<FromCar> FromCars { get; set; }
-    }
-
-    public class ToGarage
-    {
-        public List<ToCar> ToCars { get; set; }
-    }
-
-    public class FromCar
-    {
-        public int Id { get; set; }
-        public string Name { get; set; }
-        public Door Door { get; set; }
-    }
-
-    public class ToCar
-    {
-        public int Id { get; set; }
-        public string Name { get; set; }
-        public Door Door { get; set; }
-    }
-
-    protected override MapperConfiguration CreateConfiguration() => new(cfg =>
-    {
-        cfg.CreateMap<FromGarage, ToGarage>()
-            .ForMember(dest => dest.ToCars, opts => opts.MapFrom((src, dest, destVal, ctx) =>
+            if (typeof(Profile).IsAssignableFrom(type) && !type.IsAbstract && !type.ContainsGenericParameters)
             {
-                var toCars = new List<ToCar>();
-
-                ToCar toCar;
-                foreach (var fromCar in src.FromCars)
-                {
-                    toCar = ctx.Mapper.Map<ToCar>(fromCar);
-                    if (toCar == null)
-                        continue;
-
-                    toCars.Add(toCar);
-                }
-
-                return toCars;
-            }));
-
-        cfg.CreateMap<FromCar, ToCar>()
-            .ConvertUsing((src, dest, ctx) =>
-            {
-                ToCar toCar = null;
-                FromCar fromCar = src;
-
-                if (fromCar.Name != null)
-                {
-                    toCar = new ToCar
-                    {
-                        Id = fromCar.Id,
-                        Name = fromCar.Name,
-                        Door = (Door) ctx.Items["Door"]
-                    };
-                }
-
-                return toCar;
-            });
-    });
-
-    [Fact]
-    public void Should_flow_context_items_to_nested_mappings()
-    {
-        var door = new Door();
-        var fromGarage = new FromGarage
-        {
-            FromCars = new List<FromCar>
-            {
-                new FromCar {Door = door, Id = 2, Name = "Volvo"},
-                new FromCar {Door = door, Id = 3, Name = "Hyundai"},
+                AddProfile(type);
             }
-        };
 
-        var toGarage = Mapper.Map<ToGarage>(fromGarage, opts =>
-        {
-            opts.Items.Add("Door", door);
-        });
+            foreach (var autoMapAttribute in type.GetCustomAttributes<AutoMapAttribute>())
+            {
+                var mappingExpression = (MappingExpression) autoMapAttributeProfile.CreateMap(autoMapAttribute.SourceType, type);
+            
+                foreach (var memberInfo in type.GetMembers(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    foreach (var memberConfigurationProvider in memberInfo.GetCustomAttributes().OfType<IMemberConfigurationProvider>())
+                    {
+                        mappingExpression.ForMember(memberInfo, cfg => memberConfigurationProvider.ApplyConfiguration(cfg));
+                    }
+                }
 
-        foreach (var d in toGarage.ToCars.Select(c => c.Door))
-        {
-            d.ShouldBeSameAs(door);
+                autoMapAttribute.ApplyConfiguration(mappingExpression);
+            }
         }
+
+        AddProfile(autoMapAttributeProfile);
     }
+
+    public void ConstructServicesUsing(Func<Type, object> constructor) => _serviceCtor = constructor;
 }

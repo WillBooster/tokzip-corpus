@@ -1,391 +1,849 @@
-"""
-Register Hypothesis strategies for Pydantic custom types.
+import platform
+import weakref
+from collections import deque
+from collections.abc import Callable
+from typing import Any
 
-This enables fully-automatic generation of test data for most Pydantic classes.
+import pytest
 
-Note that this module has *no* runtime impact on Pydantic itself; instead it
-is registered as a setuptools entry point and Hypothesis will import it if
-Pydantic is installed.  See also:
+from pydantic_core import (
+    ArgsKwargs,
+    PydanticUseDefault,
+    SchemaError,
+    SchemaValidator,
+    Some,
+    ValidationError,
+    core_schema,
+)
 
-https://hypothesis.readthedocs.io/en/latest/strategies.html#registering-strategies-via-setuptools-entry-points
-https://hypothesis.readthedocs.io/en/latest/data.html#hypothesis.strategies.register_type_strategy
-https://hypothesis.readthedocs.io/en/latest/strategies.html#interaction-with-pytest-cov
-https://docs.pydantic.dev/usage/types/#pydantic-types
+from ..conftest import PyAndJson, assert_gc
 
-Note that because our motivation is to *improve user experience*, the strategies
-are always sound (never generate invalid data) but sacrifice completeness for
-maintainability (ie may be unable to generate some tricky but valid data).
 
-Finally, this module makes liberal use of `# type: ignore[<code>]` pragmas.
-This is because Hypothesis annotates `register_type_strategy()` with
-`(T, SearchStrategy[T])`, but in most cases we register e.g. `ConstrainedInt`
-to generate instances of the builtin `int` type which match the constraints.
-"""
+def test_typed_dict_default():
+    v = SchemaValidator(
+        core_schema.typed_dict_schema(
+            fields={
+                'x': core_schema.typed_dict_field(schema=core_schema.str_schema()),
+                'y': core_schema.typed_dict_field(
+                    schema=core_schema.with_default_schema(schema=core_schema.str_schema(), default='[default]')
+                ),
+            }
+        )
+    )
+    assert v.validate_python({'x': 'x', 'y': 'y'}) == {'x': 'x', 'y': 'y'}
+    assert v.validate_python({'x': 'x'}) == {'x': 'x', 'y': '[default]'}
 
-import contextlib
-import datetime
-import ipaddress
-import json
-import math
-from fractions import Fraction
-from typing import Callable, Dict, Type, Union, cast, overload
 
-import hypothesis.strategies as st
+def test_typed_dict_omit():
+    v = SchemaValidator(
+        core_schema.typed_dict_schema(
+            fields={
+                'x': core_schema.typed_dict_field(schema=core_schema.str_schema()),
+                'y': core_schema.typed_dict_field(
+                    schema=core_schema.with_default_schema(schema=core_schema.str_schema(), on_error='omit'),
+                    required=False,
+                ),
+            }
+        )
+    )
+    assert v.validate_python({'x': 'x', 'y': 'y'}) == {'x': 'x', 'y': 'y'}
+    assert v.validate_python({'x': 'x'}) == {'x': 'x'}
+    assert v.validate_python({'x': 'x', 'y': 42}) == {'x': 'x'}
 
-import pydantic
-import pydantic.color
-import pydantic.types
-from pydantic.v1.utils import lenient_issubclass
 
-# FilePath and DirectoryPath are explicitly unsupported, as we'd have to create
-# them on-disk, and that's unsafe in general without being told *where* to do so.
-#
-# URLs are unsupported because it's easy for users to define their own strategy for
-# "normal" URLs, and hard for us to define a general strategy which includes "weird"
-# URLs but doesn't also have unpredictable performance problems.
-#
-# conlist() and conset() are unsupported for now, because the workarounds for
-# Cython and Hypothesis to handle parametrized generic types are incompatible.
-# We are rethinking Hypothesis compatibility in Pydantic v2.
+def test_arguments():
+    v = SchemaValidator(
+        core_schema.arguments_schema(
+            arguments=[
+                {
+                    'name': 'a',
+                    'mode': 'positional_or_keyword',
+                    'schema': core_schema.with_default_schema(
+                        schema=core_schema.int_schema(), default_factory=lambda: 1
+                    ),
+                }
+            ]
+        )
+    )
+    assert v.validate_python({'a': 2}) == ((), {'a': 2})
+    assert v.validate_python(ArgsKwargs((2,))) == ((2,), {})
+    assert v.validate_python(ArgsKwargs((2,), {})) == ((2,), {})
+    assert v.validate_python(()) == ((), {'a': 1})
 
-# Emails
-try:
-    import email_validator
-except ImportError:  # pragma: no cover
-    pass
-else:
 
-    def is_valid_email(s: str) -> bool:
-        # Hypothesis' st.emails() occasionally generates emails like 0@A0--0.ac
-        # that are invalid according to email-validator, so we filter those out.
-        try:
-            email_validator.validate_email(s, check_deliverability=False)
-            return True
-        except email_validator.EmailNotValidError:  # pragma: no cover
-            return False
+def test_arguments_omit():
+    with pytest.raises(SchemaError, match="Parameter 'a': omit_on_error cannot be used with arguments"):
+        SchemaValidator(
+            schema=core_schema.arguments_schema(
+                arguments=[
+                    {
+                        'name': 'a',
+                        'mode': 'positional_or_keyword',
+                        'schema': core_schema.with_default_schema(
+                            schema=core_schema.int_schema(), default=1, on_error='omit'
+                        ),
+                    }
+                ]
+            )
+        )
 
-    # Note that these strategies deliberately stay away from any tricky Unicode
-    # or other encoding issues; we're just trying to generate *something* valid.
-    st.register_type_strategy(pydantic.EmailStr, st.emails().filter(is_valid_email))  # type: ignore[arg-type]
-    st.register_type_strategy(
-        pydantic.NameEmail,
-        st.builds(
-            '{} <{}>'.format,  # type: ignore[arg-type]
-            st.from_regex('[A-Za-z0-9_]+( [A-Za-z0-9_]+){0,5}', fullmatch=True),
-            st.emails().filter(is_valid_email),
+
+@pytest.mark.parametrize(
+    'input_value,expected', [([1, 2, 3], [1, 2, 3]), ([1, '2', 3], [1, 2, 3]), ([1, 'wrong', 3], [1, 3])]
+)
+def test_list_json(py_and_json: PyAndJson, input_value, expected):
+    v = py_and_json(
+        {'type': 'list', 'items_schema': {'type': 'default', 'schema': {'type': 'int'}, 'on_error': 'omit'}}
+    )
+    assert v.validate_test(input_value) == expected
+
+
+@pytest.mark.parametrize(
+    'input_value,expected',
+    [
+        ([1, '2', 3], [1, 2, 3]),
+        ([1, 'wrong', 3], [1, 3]),
+        ((1, '2', 3), [1, 2, 3]),
+        ((1, 'wrong', 3), [1, 3]),
+        (deque([1, '2', 3]), [1, 2, 3]),
+        (deque([1, 'wrong', 3]), [1, 3]),
+    ],
+)
+def test_list(input_value, expected):
+    v = SchemaValidator(
+        core_schema.list_schema(
+            items_schema=core_schema.with_default_schema(schema=core_schema.int_schema(), on_error='omit')
+        )
+    )
+    assert v.validate_python(input_value) == expected
+
+
+@pytest.mark.parametrize(
+    'input_value,expected',
+    [
+        ({1, '2', 3}, {1, 2, 3}),
+        ([1, '2', 3], {1, 2, 3}),
+        ([1, 'wrong', 3], {1, 3}),
+        (deque([1, '2', 3]), {1, 2, 3}),
+        (deque([1, 'wrong', 3]), {1, 3}),
+    ],
+)
+def test_set(input_value, expected):
+    v = SchemaValidator(
+        core_schema.set_schema(
+            items_schema=core_schema.with_default_schema(schema=core_schema.int_schema(), on_error='omit')
+        )
+    )
+    assert v.validate_python(input_value) == expected
+
+
+def test_dict_values(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'dict',
+            'keys_schema': {'type': 'str'},
+            'values_schema': {'type': 'default', 'schema': {'type': 'int'}, 'on_error': 'omit'},
+        }
+    )
+    assert v.validate_test({'a': 1, 'b': '2'}) == {'a': 1, 'b': 2}
+    assert v.validate_test({'a': 1, 'b': 'wrong'}) == {'a': 1}
+    assert v.validate_test({'a': 1, 'b': 'wrong', 'c': '3'}) == {'a': 1, 'c': 3}
+
+
+def test_dict_keys():
+    v = SchemaValidator(
+        core_schema.dict_schema(
+            keys_schema=core_schema.with_default_schema(schema=core_schema.int_schema(), on_error='omit'),
+            values_schema=core_schema.str_schema(),
+        )
+    )
+    assert v.validate_python({1: 'a', '2': 'b'}) == {1: 'a', 2: 'b'}
+    assert v.validate_python({1: 'a', 'wrong': 'b'}) == {1: 'a'}
+    assert v.validate_python({1: 'a', 'wrong': 'b', 3: 'c'}) == {1: 'a', 3: 'c'}
+
+
+def test_tuple_variable(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'tuple',
+            'items_schema': [{'type': 'default', 'schema': {'type': 'int'}, 'on_error': 'omit'}],
+            'variadic_item_index': 0,
+        }
+    )
+    assert v.validate_python((1, 2, 3)) == (1, 2, 3)
+    assert v.validate_python([1, '2', 3]) == (1, 2, 3)
+    assert v.validate_python([1, 'wrong', 3]) == (1, 3)
+
+
+def test_tuple_positional():
+    v = SchemaValidator(
+        core_schema.tuple_schema(
+            items_schema=[
+                core_schema.int_schema(),
+                core_schema.with_default_schema(schema=core_schema.int_schema(), default=42),
+            ]
+        )
+    )
+    assert v.validate_python((1, '2')) == (1, 2)
+    assert v.validate_python([1, '2']) == (1, 2)
+    assert v.validate_json('[1, "2"]') == (1, 2)
+    assert v.validate_python((1,)) == (1, 42)
+
+
+def test_tuple_positional_omit():
+    v = SchemaValidator(
+        core_schema.tuple_schema(
+            items_schema=[
+                core_schema.int_schema(),
+                core_schema.int_schema(),
+                core_schema.with_default_schema(schema=core_schema.int_schema(), on_error='omit'),
+            ],
+            variadic_item_index=2,
+        )
+    )
+    assert v.validate_python((1, '2')) == (1, 2)
+    assert v.validate_python((1, '2', 3, '4')) == (1, 2, 3, 4)
+    assert v.validate_python((1, '2', 'wrong', '4')) == (1, 2, 4)
+    assert v.validate_python((1, '2', 3, 'x4')) == (1, 2, 3)
+    assert v.validate_json('[1, "2", 3, "x4"]') == (1, 2, 3)
+
+
+def test_on_error_default():
+    v = SchemaValidator(core_schema.with_default_schema(schema=core_schema.int_schema(), default=2, on_error='default'))
+    assert v.validate_python(42) == 42
+    assert v.validate_python('42') == 42
+    assert v.validate_python('wrong') == 2
+
+
+def test_factory_runtime_error():
+    def broken():
+        raise RuntimeError('this is broken')
+
+    v = SchemaValidator(
+        core_schema.with_default_schema(schema=core_schema.int_schema(), on_error='default', default_factory=broken)
+    )
+    assert v.validate_python(42) == 42
+    assert v.validate_python('42') == 42
+    with pytest.raises(RuntimeError, match='this is broken'):
+        v.validate_python('wrong')
+
+
+def test_factory_missing_arg():
+    def broken(x):
+        return 7
+
+    v = SchemaValidator(
+        core_schema.with_default_schema(
+            schema=core_schema.int_schema(),
+            on_error='default',
+            default_factory=broken,
+            default_factory_takes_data=False,
+        )
+    )
+    assert v.validate_python(42) == 42
+    assert v.validate_python('42') == 42
+    with pytest.raises(TypeError, match=r"broken\(\) missing 1 required positional argument: 'x'"):
+        v.validate_python('wrong')
+
+
+def test_typed_dict_error():
+    v = SchemaValidator(
+        core_schema.typed_dict_schema(
+            fields={
+                'x': core_schema.typed_dict_field(schema=core_schema.str_schema()),
+                'y': core_schema.typed_dict_field(
+                    schema=core_schema.with_default_schema(
+                        schema=core_schema.str_schema(), default_factory=lambda y: y * 2
+                    )
+                ),
+            }
+        )
+    )
+    assert v.validate_python({'x': 'x', 'y': 'y'}) == {'x': 'x', 'y': 'y'}
+    with pytest.raises(TypeError, match=r"<lambda>\(\) missing 1 required positional argument: 'y'"):
+        v.validate_python({'x': 'x'})
+
+
+def test_on_error_default_not_int():
+    v = SchemaValidator(
+        core_schema.with_default_schema(schema=core_schema.int_schema(), default=[1, 2, 3], on_error='default')
+    )
+    assert v.validate_python(42) == 42
+    assert v.validate_python('42') == 42
+    assert v.validate_python('wrong') == [1, 2, 3]
+
+
+def test_on_error_default_factory():
+    v = SchemaValidator(
+        core_schema.with_default_schema(schema=core_schema.int_schema(), default_factory=lambda: 17, on_error='default')
+    )
+    assert v.validate_python(42) == 42
+    assert v.validate_python('42') == 42
+    assert v.validate_python('wrong') == 17
+
+
+def test_on_error_omit():
+    v = SchemaValidator(core_schema.with_default_schema(schema=core_schema.int_schema(), on_error='omit'))
+    assert v.validate_python(42) == 42
+    with pytest.raises(SchemaError, match='Uncaught Omit error, please check your usage of `default` validators.'):
+        v.validate_python('wrong')
+
+
+def test_on_error_wrong():
+    with pytest.raises(SchemaError, match="'on_error = default' requires a `default` or `default_factory`"):
+        SchemaValidator(core_schema.with_default_schema(schema=core_schema.int_schema(), on_error='default'))
+
+
+def test_build_default_and_default_factory():
+    with pytest.raises(SchemaError, match="'default' and 'default_factory' cannot be used together"):
+        SchemaValidator(
+            schema=core_schema.with_default_schema(
+                schema=core_schema.int_schema(), default_factory=lambda: 1, default=2
+            )
+        )
+
+
+def test_model_class():
+    class MyModel:
+        __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
+        field_a: str
+        field_b: int
+
+    v = SchemaValidator(
+        core_schema.model_schema(
+            cls=MyModel,
+            schema=core_schema.with_default_schema(
+                schema=core_schema.model_fields_schema(
+                    fields={
+                        'field_a': core_schema.model_field(schema=core_schema.str_schema()),
+                        'field_b': core_schema.model_field(schema=core_schema.int_schema()),
+                    }
+                ),
+                default=({'field_a': '[default-a]', 'field_b': '[default-b]'}, None, set()),
+                on_error='default',
+            ),
+        )
+    )
+    m = v.validate_python({'field_a': 'test', 'field_b': 12})
+    assert isinstance(m, MyModel)
+    assert m.field_a == 'test'
+    assert m.field_b == 12
+    assert m.__pydantic_fields_set__ == {'field_a', 'field_b'}
+    m = v.validate_python({'field_a': 'test', 'field_b': 'wrong'})
+    assert isinstance(m, MyModel)
+    assert m.field_a == '[default-a]'
+    assert m.field_b == '[default-b]'
+    assert m.__pydantic_fields_set__ == set()
+
+
+@pytest.mark.parametrize('config_validate_default', [True, False, None])
+@pytest.mark.parametrize('schema_validate_default', [True, False, None])
+@pytest.mark.parametrize(
+    'inner_schema',
+    [
+        core_schema.no_info_after_validator_function(lambda x: x * 2, core_schema.int_schema()),
+        core_schema.no_info_before_validator_function(lambda x: str(int(x) * 2), core_schema.int_schema()),
+        core_schema.no_info_wrap_validator_function(lambda x, h: h(str(int(x) * 2)), core_schema.int_schema()),
+        core_schema.no_info_wrap_validator_function(lambda x, h: h(x) * 2, core_schema.int_schema()),
+    ],
+    ids=['after', 'before', 'wrap-before', 'wrap-after'],
+)
+def test_validate_default(
+    config_validate_default: bool | None,
+    schema_validate_default: bool | None,
+    inner_schema: core_schema.CoreSchema,
+):
+    if config_validate_default is not None:
+        config = core_schema.CoreConfig(validate_default=config_validate_default)
+    else:
+        config = None
+    v = SchemaValidator(
+        core_schema.typed_dict_schema(
+            {
+                'x': core_schema.typed_dict_field(
+                    core_schema.with_default_schema(
+                        inner_schema, default='42', validate_default=schema_validate_default
+                    )
+                )
+            },
+            config=config,
+        )
+    )
+    assert v.validate_python({'x': '2'}) == {'x': 4}
+    expected = (
+        84
+        if (config_validate_default is True and schema_validate_default is not False or schema_validate_default is True)
+        else '42'
+    )
+    assert v.validate_python({}) == {'x': expected}
+
+
+def test_validate_default_factory():
+    v = SchemaValidator(
+        core_schema.tuple_positional_schema(
+            [core_schema.with_default_schema(core_schema.int_schema(), default_factory=lambda: '42')]
         ),
+        config=dict(validate_default=True),
     )
+    assert v.validate_python(('2',)) == (2,)
+    assert v.validate_python(()) == (42,)
 
-# PyObject - dotted names, in this case taken from the math module.
-st.register_type_strategy(
-    pydantic.PyObject,  # type: ignore[arg-type]
-    st.sampled_from(
-        [cast(pydantic.PyObject, f'math.{name}') for name in sorted(vars(math)) if not name.startswith('_')]
-    ),
-)
 
-# CSS3 Colors; as name, hex, rgb(a) tuples or strings, or hsl strings
-_color_regexes = (
-    '|'.join(
-        (
-            pydantic.color.r_hex_short,
-            pydantic.color.r_hex_long,
-            pydantic.color.r_rgb,
-            pydantic.color.r_rgba,
-            pydantic.color.r_hsl,
-            pydantic.color.r_hsla,
+def test_validate_default_error_tuple():
+    v = SchemaValidator(
+        core_schema.tuple_positional_schema(
+            [core_schema.with_default_schema(core_schema.int_schema(), default='wrong', validate_default=True)]
         )
     )
-    # Use more precise regex patterns to avoid value-out-of-range errors
-    .replace(pydantic.color._r_sl, r'(?:(\d\d?(?:\.\d+)?|100(?:\.0+)?)%)')
-    .replace(pydantic.color._r_alpha, r'(?:(0(?:\.\d+)?|1(?:\.0+)?|\.\d+|\d{1,2}%))')
-    .replace(pydantic.color._r_255, r'(?:((?:\d|\d\d|[01]\d\d|2[0-4]\d|25[0-4])(?:\.\d+)?|255(?:\.0+)?))')
+    assert v.validate_python(('2',)) == (2,)
+    with pytest.raises(ValidationError, match='Input should be a valid integer,') as exc_info:
+        v.validate_python(())
+
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'int_parsing',
+            'loc': (0,),
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'input': 'wrong',
+        }
+    ]
+
+
+def test_validate_default_error_typed_dict():
+    v = SchemaValidator(
+        core_schema.typed_dict_schema(
+            {
+                'x': core_schema.typed_dict_field(
+                    core_schema.with_default_schema(core_schema.int_schema(), default='xx', validate_default=True)
+                )
+            }
+        )
+    )
+    assert v.validate_python({'x': '2'}) == {'x': 2}
+    with pytest.raises(ValidationError, match='Input should be a valid integer,') as exc_info:
+        v.validate_python({})
+
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'int_parsing',
+            'loc': ('x',),
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'input': 'xx',
+        }
+    ]
+
+
+def test_deepcopy_mutable_defaults():
+    stored_empty_list = []
+    stored_empty_dict = {}
+
+    class Model:
+        int_list_with_default: list[int] = stored_empty_list
+        str_dict_with_default: dict[str, str] = stored_empty_dict
+
+    v = SchemaValidator(
+        core_schema.model_schema(
+            cls=Model,
+            schema=core_schema.model_fields_schema(
+                fields={
+                    'int_list_with_default': core_schema.model_field(
+                        schema=core_schema.with_default_schema(
+                            schema=core_schema.list_schema(items_schema=core_schema.int_schema()),
+                            default=stored_empty_list,
+                        )
+                    ),
+                    'str_dict_with_default': core_schema.model_field(
+                        schema=core_schema.with_default_schema(
+                            schema=core_schema.dict_schema(
+                                keys_schema=core_schema.str_schema(), values_schema=core_schema.str_schema()
+                            ),
+                            default=stored_empty_dict,
+                        )
+                    ),
+                }
+            ),
+        )
+    )
+
+    m1 = v.validate_python({})
+
+    assert m1.int_list_with_default == []
+    assert m1.str_dict_with_default == {}
+
+    assert m1.int_list_with_default is not stored_empty_list
+    assert m1.str_dict_with_default is not stored_empty_dict
+
+    m1.int_list_with_default.append(1)
+    m1.str_dict_with_default['a'] = 'abc'
+
+    m2 = v.validate_python({})
+
+    assert m2.int_list_with_default == []
+    assert m2.str_dict_with_default == {}
+
+    assert m2.int_list_with_default is not m1.int_list_with_default
+    assert m2.str_dict_with_default is not m1.str_dict_with_default
+
+
+def test_default_value() -> None:
+    s = core_schema.with_default_schema(core_schema.list_schema(core_schema.int_schema()), default=[1, 2, 3])
+
+    v = SchemaValidator(s)
+
+    r = v.get_default_value()
+    assert r is not None
+    assert r.value == [1, 2, 3]
+
+
+def test_default_value_validate_default() -> None:
+    s = core_schema.with_default_schema(core_schema.list_schema(core_schema.int_schema()), default=['1', '2', '3'])
+
+    v = SchemaValidator(s, config=core_schema.CoreConfig(validate_default=True))
+
+    r = v.get_default_value()
+    assert r is not None
+    assert r.value == [1, 2, 3]
+
+
+def test_default_value_validate_default_fail() -> None:
+    s = core_schema.with_default_schema(core_schema.list_schema(core_schema.int_schema()), default=['a'])
+
+    v = SchemaValidator(s, config=core_schema.CoreConfig(validate_default=True))
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.get_default_value()
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'int_parsing',
+            'loc': (0,),
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'input': 'a',
+        }
+    ]
+
+
+def test_default_value_validate_default_strict_pass() -> None:
+    s = core_schema.with_default_schema(core_schema.list_schema(core_schema.int_schema()), default=[1, 2, 3])
+
+    v = SchemaValidator(s, config=core_schema.CoreConfig(validate_default=True))
+
+    r = v.get_default_value(strict=True)
+    assert r is not None
+    assert r.value == [1, 2, 3]
+
+
+def test_default_value_validate_default_strict_fail() -> None:
+    s = core_schema.with_default_schema(core_schema.list_schema(core_schema.int_schema()), default=['1'])
+
+    v = SchemaValidator(s, config=core_schema.CoreConfig(validate_default=True))
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.get_default_value(strict=True)
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'int_type', 'loc': (0,), 'msg': 'Input should be a valid integer', 'input': '1'}
+    ]
+
+
+@pytest.mark.parametrize('validate_default', [True, False])
+def test_no_default_value(validate_default: bool) -> None:
+    s = core_schema.list_schema(core_schema.int_schema())
+    v = SchemaValidator(s, config=core_schema.CoreConfig(validate_default=validate_default))
+
+    assert v.get_default_value() is None
+
+
+@pytest.mark.parametrize('validate_default', [True, False])
+def test_some(validate_default: bool) -> None:
+    def get_default() -> Some[int] | None:
+        s = core_schema.with_default_schema(core_schema.int_schema(), default=42)
+        return SchemaValidator(s).get_default_value()
+
+    res = get_default()
+    assert res is not None
+    assert res.value == 42
+    assert repr(res) == 'Some(42)'
+
+
+def test_some_pattern_match() -> None:
+    def f(v: Some[Any] | None) -> str:
+        match v:
+            case Some(1):
+                return 'case1'
+            case Some(value=2):
+                return 'case2'
+            case Some(int(value)):
+                return f'case3: {value}'
+            case Some(value):
+                return f'case4: {type(value).__name__}({value})'
+            case None:
+                return 'case5'
+
+    res = f(SchemaValidator(core_schema.with_default_schema(core_schema.int_schema(), default=1)).get_default_value())
+    assert res == 'case1'
+
+    res = f(SchemaValidator(core_schema.with_default_schema(core_schema.int_schema(), default=2)).get_default_value())
+    assert res == 'case2'
+
+    res = f(SchemaValidator(core_schema.with_default_schema(core_schema.int_schema(), default=3)).get_default_value())
+    assert res == 'case3: 3'
+
+    res = f(
+        SchemaValidator(
+            schema=core_schema.with_default_schema(core_schema.int_schema(), default='4')
+        ).get_default_value()
+    )
+    assert res == 'case4: str(4)'
+
+    res = f(SchemaValidator(core_schema.int_schema()).get_default_value())
+    assert res == 'case5'
+
+
+def test_use_default_error() -> None:
+    def val_func(v: Any, handler: core_schema.ValidatorFunctionWrapHandler) -> Any:
+        if isinstance(v, str) and v == '':
+            raise PydanticUseDefault
+        return handler(v)
+
+    validator = SchemaValidator(
+        core_schema.with_default_schema(
+            core_schema.no_info_wrap_validator_function(val_func, core_schema.int_schema()), default=10
+        )
+    )
+
+    assert validator.validate_python('1') == 1
+    assert validator.validate_python('') == 10
+
+    # without a default value the error bubbles up
+    # the error message is the same as the error message produced by PydanticOmit
+    validator = SchemaValidator(
+        core_schema.with_default_schema(core_schema.no_info_wrap_validator_function(val_func, core_schema.int_schema()))
+    )
+    with pytest.raises(
+        SchemaError,
+        match='Uncaught `PydanticUseDefault` exception: the error was raised in a field validator and no default value is available for that field.',
+    ):
+        validator.validate_python('')
+
+    # same if there is no WithDefault validator
+    validator = SchemaValidator(core_schema.no_info_wrap_validator_function(val_func, core_schema.int_schema()))
+    with pytest.raises(
+        SchemaError,
+        match='Uncaught `PydanticUseDefault` exception: the error was raised in a field validator and no default value is available for that field.',
+    ):
+        validator.validate_python('')
+
+
+@pytest.mark.xfail(
+    condition=platform.python_implementation() == 'PyPy', reason='https://foss.heptapod.net/pypy/pypy/-/issues/3899'
 )
-st.register_type_strategy(
-    pydantic.color.Color,
-    st.one_of(
-        st.sampled_from(sorted(pydantic.color.COLORS_BY_NAME)),
-        st.tuples(
-            st.integers(0, 255),
-            st.integers(0, 255),
-            st.integers(0, 255),
-            st.none() | st.floats(0, 1) | st.floats(0, 100).map('{}%'.format),
+@pytest.mark.skipif(platform.python_implementation() == 'GraalVM', reason='Cannot reliably trigger GC on GraalPy')
+def test_leak_with_default():
+    def fn():
+        class Defaulted(int):
+            @classmethod
+            def _validator(cls, v, info):
+                return Defaulted(v)
+
+        schema = core_schema.with_info_plain_validator_function(Defaulted._validator)
+        schema = core_schema.with_default_schema(schema, default=Defaulted(0))
+
+        # If any of the Rust validators don't implement traversal properly,
+        # there will be an undetectable cycle created by this assignment
+        # which will keep Defaulted alive
+        Defaulted.__pydantic_validator__ = SchemaValidator(schema)
+
+        return Defaulted
+
+    klass = fn()
+    ref = weakref.ref(klass)
+    assert ref() is not None
+
+    del klass
+    assert_gc(lambda: ref() is None)
+
+
+validate_default_raises_examples = [
+    (
+        {},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'missing', 'loc': ('z',), 'msg': 'Field required', 'input': {}},
+        ],
+    ),
+    (
+        {'z': 'some str'},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': None},
+        ],
+    ),
+    (
+        {'x': None},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'missing', 'loc': ('z',), 'msg': 'Field required', 'input': {'x': None}},
+        ],
+    ),
+    (
+        {'x': None, 'z': 'some str'},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': None},
+        ],
+    ),
+    (
+        {'y': None},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'missing', 'loc': ('z',), 'msg': 'Field required', 'input': {'y': None}},
+        ],
+    ),
+    (
+        {'y': None, 'z': 'some str'},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': None},
+        ],
+    ),
+    (
+        {'x': None, 'y': None},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'missing', 'loc': ('z',), 'msg': 'Field required', 'input': {'x': None, 'y': None}},
+        ],
+    ),
+    (
+        {'x': None, 'y': None, 'z': 'some str'},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': None},
+        ],
+    ),
+    (
+        {'x': 1, 'y': None, 'z': 'some str'},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': 1},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': None},
+        ],
+    ),
+    (
+        {'x': None, 'y': 1, 'z': 'some str'},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': None},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': 1},
+        ],
+    ),
+    (
+        {'x': 1, 'y': 1, 'z': 'some str'},
+        [
+            {'type': 'assertion_error', 'loc': ('x',), 'msg': 'Assertion failed, ', 'input': 1},
+            {'type': 'assertion_error', 'loc': ('y',), 'msg': 'Assertion failed, ', 'input': 1},
+        ],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    'core_schema_constructor,field_constructor',
+    [
+        (core_schema.model_fields_schema, core_schema.model_field),
+        (core_schema.typed_dict_schema, core_schema.typed_dict_field),
+    ],
+)
+@pytest.mark.parametrize('input_value,expected', validate_default_raises_examples)
+def test_validate_default_raises(
+    core_schema_constructor: Callable[..., Any],
+    field_constructor: Callable[..., Any],
+    input_value: dict,
+    expected: Any,
+) -> None:
+    def _raise(ex: Exception) -> None:
+        raise ex()
+
+    inner_schema = core_schema.no_info_after_validator_function(
+        lambda x: _raise(AssertionError), core_schema.nullable_schema(core_schema.int_schema())
+    )
+
+    v = SchemaValidator(
+        core_schema_constructor(
+            {
+                'x': field_constructor(
+                    core_schema.with_default_schema(inner_schema, default=None, validate_default=True)
+                ),
+                'y': field_constructor(
+                    core_schema.with_default_schema(inner_schema, default=None, validate_default=True)
+                ),
+                'z': field_constructor(core_schema.str_schema()),
+            }
+        )
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python(input_value)
+        assert exc_info.value.errors(include_url=False, include_context=False) == expected
+
+
+@pytest.mark.parametrize('input_value,expected', validate_default_raises_examples)
+def test_validate_default_raises_dataclass(input_value: dict, expected: Any) -> None:
+    def _raise(ex: Exception) -> None:
+        raise ex()
+
+    inner_schema = core_schema.no_info_after_validator_function(
+        lambda x: _raise(AssertionError), core_schema.nullable_schema(core_schema.int_schema())
+    )
+
+    x = core_schema.dataclass_field(
+        name='x', schema=core_schema.with_default_schema(inner_schema, default=None, validate_default=True)
+    )
+    y = core_schema.dataclass_field(
+        name='y', schema=core_schema.with_default_schema(inner_schema, default=None, validate_default=True)
+    )
+    z = core_schema.dataclass_field(name='z', schema=core_schema.str_schema())
+
+    v = SchemaValidator(core_schema.dataclass_args_schema('XYZ', [x, y, z]))
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python(input_value)
+
+    assert exc_info.value.errors(include_url=False, include_context=False) == expected
+
+
+def test_default_validate_default_after_validator_field_name() -> None:
+    class Model:
+        pass
+
+    field_name: str | None = None
+
+    def val_func(value, info: core_schema.ValidationInfo):
+        nonlocal field_name
+        field_name = info.field_name
+        return value
+
+    schema = core_schema.model_schema(
+        cls=Model,
+        schema=core_schema.model_fields_schema(
+            fields={
+                'a': core_schema.model_field(
+                    schema=core_schema.with_default_schema(
+                        schema=core_schema.with_info_after_validator_function(
+                            val_func,
+                            schema=core_schema.str_schema(),
+                        ),
+                        default='default',
+                    )
+                )
+            }
         ),
-        st.from_regex(_color_regexes, fullmatch=True),
-    ),
-)
-
-
-# Card numbers, valid according to the Luhn algorithm
-
-
-def add_luhn_digit(card_number: str) -> str:
-    # See https://en.wikipedia.org/wiki/Luhn_algorithm
-    for digit in '0123456789':
-        with contextlib.suppress(Exception):
-            pydantic.PaymentCardNumber.validate_luhn_check_digit(card_number + digit)
-            return card_number + digit
-    raise AssertionError('Unreachable')  # pragma: no cover
-
-
-card_patterns = (
-    # Note that these patterns omit the Luhn check digit; that's added by the function above
-    '4[0-9]{14}',  # Visa
-    '5[12345][0-9]{13}',  # Mastercard
-    '3[47][0-9]{12}',  # American Express
-    '[0-26-9][0-9]{10,17}',  # other (incomplete to avoid overlap)
-)
-st.register_type_strategy(
-    pydantic.PaymentCardNumber,
-    st.from_regex('|'.join(card_patterns), fullmatch=True).map(add_luhn_digit),  # type: ignore[arg-type]
-)
-
-# UUIDs
-st.register_type_strategy(pydantic.UUID1, st.uuids(version=1))
-st.register_type_strategy(pydantic.UUID3, st.uuids(version=3))
-st.register_type_strategy(pydantic.UUID4, st.uuids(version=4))
-st.register_type_strategy(pydantic.UUID5, st.uuids(version=5))
-
-# Secrets
-st.register_type_strategy(pydantic.SecretBytes, st.binary().map(pydantic.SecretBytes))
-st.register_type_strategy(pydantic.SecretStr, st.text().map(pydantic.SecretStr))
-
-# IP addresses, networks, and interfaces
-st.register_type_strategy(pydantic.IPvAnyAddress, st.ip_addresses())  # type: ignore[arg-type]
-st.register_type_strategy(
-    pydantic.IPvAnyInterface,
-    st.from_type(ipaddress.IPv4Interface) | st.from_type(ipaddress.IPv6Interface),  # type: ignore[arg-type]
-)
-st.register_type_strategy(
-    pydantic.IPvAnyNetwork,
-    st.from_type(ipaddress.IPv4Network) | st.from_type(ipaddress.IPv6Network),  # type: ignore[arg-type]
-)
-
-# We hook into the con***() functions and the ConstrainedNumberMeta metaclass,
-# so here we only have to register subclasses for other constrained types which
-# don't go via those mechanisms.  Then there are the registration hooks below.
-st.register_type_strategy(pydantic.StrictBool, st.booleans())
-st.register_type_strategy(pydantic.StrictStr, st.text())
-
-
-# FutureDate, PastDate
-st.register_type_strategy(pydantic.FutureDate, st.dates(min_value=datetime.date.today() + datetime.timedelta(days=1)))
-st.register_type_strategy(pydantic.PastDate, st.dates(max_value=datetime.date.today() - datetime.timedelta(days=1)))
-
-
-# Constrained-type resolver functions
-#
-# For these ones, we actually want to inspect the type in order to work out a
-# satisfying strategy.  First up, the machinery for tracking resolver functions:
-
-RESOLVERS: Dict[type, Callable[[type], st.SearchStrategy]] = {}  # type: ignore[type-arg]
-
-
-@overload
-def _registered(typ: Type[pydantic.types.T]) -> Type[pydantic.types.T]:
-    pass
-
-
-@overload
-def _registered(typ: pydantic.types.ConstrainedNumberMeta) -> pydantic.types.ConstrainedNumberMeta:
-    pass
-
-
-def _registered(
-    typ: Union[Type[pydantic.types.T], pydantic.types.ConstrainedNumberMeta]
-) -> Union[Type[pydantic.types.T], pydantic.types.ConstrainedNumberMeta]:
-    # This function replaces the version in `pydantic.types`, in order to
-    # effect the registration of new constrained types so that Hypothesis
-    # can generate valid examples.
-    pydantic.types._DEFINED_TYPES.add(typ)
-    for supertype, resolver in RESOLVERS.items():
-        if issubclass(typ, supertype):
-            st.register_type_strategy(typ, resolver(typ))  # type: ignore
-            return typ
-    raise NotImplementedError(f'Unknown type {typ!r} has no resolver to register')  # pragma: no cover
-
-
-def resolves(
-    typ: Union[type, pydantic.types.ConstrainedNumberMeta]
-) -> Callable[[Callable[..., st.SearchStrategy]], Callable[..., st.SearchStrategy]]:  # type: ignore[type-arg]
-    def inner(f):  # type: ignore
-        assert f not in RESOLVERS
-        RESOLVERS[typ] = f
-        return f
-
-    return inner
-
-
-# Type-to-strategy resolver functions
-
-
-@resolves(pydantic.JsonWrapper)
-def resolve_json(cls):  # type: ignore[no-untyped-def]
-    try:
-        inner = st.none() if cls.inner_type is None else st.from_type(cls.inner_type)
-    except Exception:  # pragma: no cover
-        finite = st.floats(allow_infinity=False, allow_nan=False)
-        inner = st.recursive(
-            base=st.one_of(st.none(), st.booleans(), st.integers(), finite, st.text()),
-            extend=lambda x: st.lists(x) | st.dictionaries(st.text(), x),  # type: ignore
-        )
-    inner_type = getattr(cls, 'inner_type', None)
-    return st.builds(
-        cls.inner_type.json if lenient_issubclass(inner_type, pydantic.BaseModel) else json.dumps,
-        inner,
-        ensure_ascii=st.booleans(),
-        indent=st.none() | st.integers(0, 16),
-        sort_keys=st.booleans(),
+        config={'validate_default': True},
     )
 
+    val = SchemaValidator(schema)
+    val.validate_python({})
 
-@resolves(pydantic.ConstrainedBytes)
-def resolve_conbytes(cls):  # type: ignore[no-untyped-def]  # pragma: no cover
-    min_size = cls.min_length or 0
-    max_size = cls.max_length
-    if not cls.strip_whitespace:
-        return st.binary(min_size=min_size, max_size=max_size)
-    # Fun with regex to ensure we neither start nor end with whitespace
-    repeats = '{{{},{}}}'.format(
-        min_size - 2 if min_size > 2 else 0,
-        max_size - 2 if (max_size or 0) > 2 else '',
-    )
-    if min_size >= 2:
-        pattern = rf'\W.{repeats}\W'
-    elif min_size == 1:
-        pattern = rf'\W(.{repeats}\W)?'
-    else:
-        assert min_size == 0
-        pattern = rf'(\W(.{repeats}\W)?)?'
-    return st.from_regex(pattern.encode(), fullmatch=True)
-
-
-@resolves(pydantic.ConstrainedDecimal)
-def resolve_condecimal(cls):  # type: ignore[no-untyped-def]
-    min_value = cls.ge
-    max_value = cls.le
-    if cls.gt is not None:
-        assert min_value is None, 'Set `gt` or `ge`, but not both'
-        min_value = cls.gt
-    if cls.lt is not None:
-        assert max_value is None, 'Set `lt` or `le`, but not both'
-        max_value = cls.lt
-    s = st.decimals(min_value, max_value, allow_nan=False, places=cls.decimal_places)
-    if cls.lt is not None:
-        s = s.filter(lambda d: d < cls.lt)
-    if cls.gt is not None:
-        s = s.filter(lambda d: cls.gt < d)
-    return s
-
-
-@resolves(pydantic.ConstrainedFloat)
-def resolve_confloat(cls):  # type: ignore[no-untyped-def]
-    min_value = cls.ge
-    max_value = cls.le
-    exclude_min = False
-    exclude_max = False
-
-    if cls.gt is not None:
-        assert min_value is None, 'Set `gt` or `ge`, but not both'
-        min_value = cls.gt
-        exclude_min = True
-    if cls.lt is not None:
-        assert max_value is None, 'Set `lt` or `le`, but not both'
-        max_value = cls.lt
-        exclude_max = True
-
-    if cls.multiple_of is None:
-        return st.floats(min_value, max_value, exclude_min=exclude_min, exclude_max=exclude_max, allow_nan=False)
-
-    if min_value is not None:
-        min_value = math.ceil(min_value / cls.multiple_of)
-        if exclude_min:
-            min_value = min_value + 1
-    if max_value is not None:
-        assert max_value >= cls.multiple_of, 'Cannot build model with max value smaller than multiple of'
-        max_value = math.floor(max_value / cls.multiple_of)
-        if exclude_max:
-            max_value = max_value - 1
-
-    return st.integers(min_value, max_value).map(lambda x: x * cls.multiple_of)
-
-
-@resolves(pydantic.ConstrainedInt)
-def resolve_conint(cls):  # type: ignore[no-untyped-def]
-    min_value = cls.ge
-    max_value = cls.le
-    if cls.gt is not None:
-        assert min_value is None, 'Set `gt` or `ge`, but not both'
-        min_value = cls.gt + 1
-    if cls.lt is not None:
-        assert max_value is None, 'Set `lt` or `le`, but not both'
-        max_value = cls.lt - 1
-
-    if cls.multiple_of is None or cls.multiple_of == 1:
-        return st.integers(min_value, max_value)
-
-    # These adjustments and the .map handle integer-valued multiples, while the
-    # .filter handles trickier cases as for confloat.
-    if min_value is not None:
-        min_value = math.ceil(Fraction(min_value) / Fraction(cls.multiple_of))
-    if max_value is not None:
-        max_value = math.floor(Fraction(max_value) / Fraction(cls.multiple_of))
-    return st.integers(min_value, max_value).map(lambda x: x * cls.multiple_of)
-
-
-@resolves(pydantic.ConstrainedDate)
-def resolve_condate(cls):  # type: ignore[no-untyped-def]
-    if cls.ge is not None:
-        assert cls.gt is None, 'Set `gt` or `ge`, but not both'
-        min_value = cls.ge
-    elif cls.gt is not None:
-        min_value = cls.gt + datetime.timedelta(days=1)
-    else:
-        min_value = datetime.date.min
-    if cls.le is not None:
-        assert cls.lt is None, 'Set `lt` or `le`, but not both'
-        max_value = cls.le
-    elif cls.lt is not None:
-        max_value = cls.lt - datetime.timedelta(days=1)
-    else:
-        max_value = datetime.date.max
-    return st.dates(min_value, max_value)
-
-
-@resolves(pydantic.ConstrainedStr)
-def resolve_constr(cls):  # type: ignore[no-untyped-def]  # pragma: no cover
-    min_size = cls.min_length or 0
-    max_size = cls.max_length
-
-    if cls.regex is None and not cls.strip_whitespace:
-        return st.text(min_size=min_size, max_size=max_size)
-
-    if cls.regex is not None:
-        strategy = st.from_regex(cls.regex)
-        if cls.strip_whitespace:
-            strategy = strategy.filter(lambda s: s == s.strip())
-    elif cls.strip_whitespace:
-        repeats = '{{{},{}}}'.format(
-            min_size - 2 if min_size > 2 else 0,
-            max_size - 2 if (max_size or 0) > 2 else '',
-        )
-        if min_size >= 2:
-            strategy = st.from_regex(rf'\W.{repeats}\W')
-        elif min_size == 1:
-            strategy = st.from_regex(rf'\W(.{repeats}\W)?')
-        else:
-            assert min_size == 0
-            strategy = st.from_regex(rf'(\W(.{repeats}\W)?)?')
-
-    if min_size == 0 and max_size is None:
-        return strategy
-    elif max_size is None:
-        return strategy.filter(lambda s: min_size <= len(s))
-    return strategy.filter(lambda s: min_size <= len(s) <= max_size)
-
-
-# Finally, register all previously-defined types, and patch in our new function
-for typ in list(pydantic.types._DEFINED_TYPES):
-    _registered(typ)
-pydantic.types._registered = _registered
-st.register_type_strategy(pydantic.Json, resolve_json)
+    assert field_name == 'a'

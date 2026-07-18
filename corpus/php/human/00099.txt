@@ -10,753 +10,542 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\DependencyResolver;
+namespace Composer\Util;
 
-use Composer\Filter\PlatformRequirementFilter\IgnoreListPlatformRequirementFilter;
-use Composer\Filter\PlatformRequirementFilter\PlatformRequirementFilterFactory;
-use Composer\Filter\PlatformRequirementFilter\PlatformRequirementFilterInterface;
+use Composer\Config;
 use Composer\IO\IOInterface;
-use Composer\Package\BasePackage;
+use Composer\Downloader\TransportException;
+use Composer\Pcre\Preg;
+use Composer\Util\Http\Response;
+use Composer\Util\Http\CurlDownloader;
+use Composer\Composer;
+use Composer\Package\Version\VersionParser;
+use Composer\Semver\Constraint\Constraint;
+use Composer\Exception\IrrecoverableDownloadException;
+use React\Promise\Promise;
+use React\Promise\PromiseInterface;
 
 /**
- * @author Nils Adermann <naderman@naderman.de>
+ * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @phpstan-type Request array{url: non-empty-string, options: mixed[], copyTo: string|null}
+ * @phpstan-type Job array{id: int, status: int, request: Request, sync: bool, origin: string, resolve?: callable, reject?: callable, curl_id?: int, response?: Response, exception?: \Throwable}
  */
-class Solver
+class HttpDownloader
 {
-    private const BRANCH_LITERALS = 0;
-    private const BRANCH_LEVEL = 1;
-
-    /** @var PolicyInterface */
-    protected $policy;
-    /** @var Pool */
-    protected $pool;
-
-    /** @var RuleSet */
-    protected $rules;
-
-    /** @var RuleWatchGraph */
-    protected $watchGraph;
-    /** @var Decisions */
-    protected $decisions;
-    /** @var BasePackage[] */
-    protected $fixedMap;
-
-    /** @var int */
-    protected $propagateIndex;
-    /** @var mixed[] */
-    protected $branches = [];
-    /** @var Problem[] */
-    protected $problems = [];
-    /** @var array<Rule[]> */
-    protected $learnedPool = [];
-    /** @var array<string, int> */
-    protected $learnedWhy = [];
-
-    /** @var bool */
-    public $testFlagLearnedPositiveLiteral = false;
+    private const STATUS_QUEUED = 1;
+    private const STATUS_STARTED = 2;
+    private const STATUS_COMPLETED = 3;
+    private const STATUS_FAILED = 4;
+    private const STATUS_ABORTED = 5;
 
     /** @var IOInterface */
-    protected $io;
+    private $io;
+    /** @var Config */
+    private $config;
+    /** @var array<Job> */
+    private $jobs = [];
+    /** @var mixed[] */
+    private $options = [];
+    /** @var int */
+    private $runningJobs = 0;
+    /** @var int */
+    private $maxJobs = 12;
+    /** @var ?CurlDownloader */
+    private $curl;
+    /** @var ?RemoteFilesystem */
+    private $rfs;
+    /** @var int */
+    private $idGen = 0;
+    /** @var bool */
+    private $disabled;
+    /** @var bool */
+    private $allowAsync = false;
 
-    public function __construct(PolicyInterface $policy, Pool $pool, IOInterface $io)
+    /**
+     * @param IOInterface $io         The IO instance
+     * @param Config      $config     The config
+     * @param mixed[]     $options    The options
+     */
+    public function __construct(IOInterface $io, Config $config, array $options = [], bool $disableTls = false)
     {
         $this->io = $io;
-        $this->policy = $policy;
-        $this->pool = $pool;
-    }
 
-    public function getRuleSetSize(): int
-    {
-        return \count($this->rules);
-    }
+        $this->disabled = (bool) Platform::getEnv('COMPOSER_DISABLE_NETWORK');
 
-    public function getPool(): Pool
-    {
-        return $this->pool;
-    }
-
-    // aka solver_makeruledecisions
-
-    private function makeAssertionRuleDecisions(): void
-    {
-        $decisionStart = \count($this->decisions) - 1;
-
-        $rulesCount = \count($this->rules);
-        for ($ruleIndex = 0; $ruleIndex < $rulesCount; $ruleIndex++) {
-            $rule = $this->rules->ruleById[$ruleIndex];
-
-            if (!$rule->isAssertion() || $rule->isDisabled()) {
-                continue;
-            }
-
-            $literals = $rule->getLiterals();
-            $literal = $literals[0];
-
-            if (!$this->decisions->decided($literal)) {
-                $this->decisions->decide($literal, 1, $rule);
-                continue;
-            }
-
-            if ($this->decisions->satisfy($literal)) {
-                continue;
-            }
-
-            // found a conflict
-            if (RuleSet::TYPE_LEARNED === $rule->getType()) {
-                $rule->disable();
-                continue;
-            }
-
-            $conflict = $this->decisions->decisionRule($literal);
-
-            if ($conflict && RuleSet::TYPE_PACKAGE === $conflict->getType()) {
-                $problem = new Problem();
-
-                $problem->addRule($rule);
-                $problem->addRule($conflict);
-                $rule->disable();
-                $this->problems[] = $problem;
-                continue;
-            }
-
-            // conflict with another root require/fixed package
-            $problem = new Problem();
-            $problem->addRule($rule);
-            $problem->addRule($conflict);
-
-            // push all of our rules (can only be root require/fixed package rules)
-            // asserting this literal on the problem stack
-            foreach ($this->rules->getIteratorFor(RuleSet::TYPE_REQUEST) as $assertRule) {
-                if ($assertRule->isDisabled() || !$assertRule->isAssertion()) {
-                    continue;
-                }
-
-                $assertRuleLiterals = $assertRule->getLiterals();
-                $assertRuleLiteral = $assertRuleLiterals[0];
-
-                if (abs($literal) !== abs($assertRuleLiteral)) {
-                    continue;
-                }
-                $problem->addRule($assertRule);
-                $assertRule->disable();
-            }
-            $this->problems[] = $problem;
-
-            $this->decisions->resetToOffset($decisionStart);
-            $ruleIndex = -1;
-        }
-    }
-
-    protected function setupFixedMap(Request $request): void
-    {
-        $this->fixedMap = [];
-        foreach ($request->getFixedPackages() as $package) {
-            $this->fixedMap[$package->id] = $package;
-        }
-    }
-
-    protected function checkForRootRequireProblems(Request $request, PlatformRequirementFilterInterface $platformRequirementFilter): void
-    {
-        foreach ($request->getRequires() as $packageName => $constraint) {
-            if ($platformRequirementFilter->isIgnored($packageName)) {
-                continue;
-            } elseif ($platformRequirementFilter instanceof IgnoreListPlatformRequirementFilter) {
-                $constraint = $platformRequirementFilter->filterConstraint($packageName, $constraint);
-            }
-
-            if (!$this->pool->whatProvides($packageName, $constraint)) {
-                $problem = new Problem();
-                $problem->addRule(new GenericRule([], Rule::RULE_ROOT_REQUIRE, ['packageName' => $packageName, 'constraint' => $constraint]));
-                $this->problems[] = $problem;
-            }
-        }
-    }
-
-    public function solve(Request $request, ?PlatformRequirementFilterInterface $platformRequirementFilter = null): LockTransaction
-    {
-        $platformRequirementFilter = $platformRequirementFilter ?: PlatformRequirementFilterFactory::ignoreNothing();
-
-        $this->setupFixedMap($request);
-
-        $this->io->writeError('Generating rules', true, IOInterface::DEBUG);
-        $ruleSetGenerator = new RuleSetGenerator($this->policy, $this->pool);
-        $this->rules = $ruleSetGenerator->getRulesFor($request, $platformRequirementFilter);
-        unset($ruleSetGenerator);
-        $this->checkForRootRequireProblems($request, $platformRequirementFilter);
-        $this->decisions = new Decisions($this->pool);
-        $this->watchGraph = new RuleWatchGraph;
-
-        foreach ($this->rules as $rule) {
-            $this->watchGraph->insert(new RuleWatchNode($rule));
+        // Setup TLS options
+        // The cafile option can be set via config.json
+        if ($disableTls === false) {
+            $this->options = StreamContextFactory::getTlsDefaults($options, $io);
         }
 
-        /* make decisions based on root require/fix assertions */
-        $this->makeAssertionRuleDecisions();
+        // handle the other externally set options normally.
+        $this->options = array_replace_recursive($this->options, $options);
+        $this->config = $config;
 
-        $this->io->writeError('Resolving dependencies through SAT', true, IOInterface::DEBUG);
-        $before = microtime(true);
-        $this->runSat();
-        $this->io->writeError('', true, IOInterface::DEBUG);
-        $this->io->writeError(sprintf('Dependency resolution completed in %.3f seconds', microtime(true) - $before), true, IOInterface::VERBOSE);
-
-        if ($this->problems) {
-            throw new SolverProblemsException($this->problems, $this->learnedPool);
+        if (self::isCurlEnabled()) {
+            $this->curl = new CurlDownloader($io, $config, $options, $disableTls);
         }
 
-        return new LockTransaction($this->pool, $request->getPresentMap(), $request->getFixedPackagesMap(), $this->decisions);
+        $this->rfs = new RemoteFilesystem($io, $config, $options, $disableTls);
+
+        if (is_numeric($maxJobs = Platform::getEnv('COMPOSER_MAX_PARALLEL_HTTP'))) {
+            $this->maxJobs = max(1, min(50, (int) $maxJobs));
+        }
     }
 
     /**
-     * Makes a decision and propagates it to all rules.
+     * Download a file synchronously
      *
-     * Evaluates each term affected by the decision (linked through watches)
-     * If we find unit rules we make new decisions based on them
-     *
-     * @return Rule|null A rule on conflict, otherwise null.
+     * @param  string             $url     URL to download
+     * @param  mixed[]            $options Stream context options e.g. https://www.php.net/manual/en/context.http.php
+     *                                     although not all options are supported when using the default curl downloader
+     * @throws TransportException
+     * @return Response
      */
-    protected function propagate(int $level): ?Rule
+    public function get(string $url, array $options = [])
     {
-        while ($this->decisions->validOffset($this->propagateIndex)) {
-            $decision = $this->decisions->atOffset($this->propagateIndex);
+        if ('' === $url) {
+            throw new \InvalidArgumentException('$url must not be an empty string');
+        }
+        [$job, $promise] = $this->addJob(['url' => $url, 'options' => $options, 'copyTo' => null], true);
+        $promise->then(null, function (\Throwable $e) {
+            // suppress error as it is rethrown to the caller by getResponse() a few lines below
+        });
+        $this->wait($job['id']);
 
-            $conflict = $this->watchGraph->propagateLiteral(
-                $decision[Decisions::DECISION_LITERAL],
-                $level,
-                $this->decisions
-            );
+        $response = $this->getResponse($job['id']);
 
-            $this->propagateIndex++;
+        return $response;
+    }
 
-            if ($conflict) {
-                return $conflict;
+    /**
+     * Create an async download operation
+     *
+     * @param  string             $url     URL to download
+     * @param  mixed[]            $options Stream context options e.g. https://www.php.net/manual/en/context.http.php
+     *                                     although not all options are supported when using the default curl downloader
+     * @throws TransportException
+     * @return PromiseInterface
+     * @phpstan-return PromiseInterface<Http\Response>
+     */
+    public function add(string $url, array $options = [])
+    {
+        if ('' === $url) {
+            throw new \InvalidArgumentException('$url must not be an empty string');
+        }
+        [, $promise] = $this->addJob(['url' => $url, 'options' => $options, 'copyTo' => null]);
+
+        return $promise;
+    }
+
+    /**
+     * Copy a file synchronously
+     *
+     * @param  string             $url     URL to download
+     * @param  string             $to      Path to copy to
+     * @param  mixed[]            $options Stream context options e.g. https://www.php.net/manual/en/context.http.php
+     *                                     although not all options are supported when using the default curl downloader
+     * @throws TransportException
+     * @return Response
+     */
+    public function copy(string $url, string $to, array $options = [])
+    {
+        if ('' === $url) {
+            throw new \InvalidArgumentException('$url must not be an empty string');
+        }
+        [$job] = $this->addJob(['url' => $url, 'options' => $options, 'copyTo' => $to], true);
+        $this->wait($job['id']);
+
+        return $this->getResponse($job['id']);
+    }
+
+    /**
+     * Create an async copy operation
+     *
+     * @param  string             $url     URL to download
+     * @param  string             $to      Path to copy to
+     * @param  mixed[]            $options Stream context options e.g. https://www.php.net/manual/en/context.http.php
+     *                                     although not all options are supported when using the default curl downloader
+     * @throws TransportException
+     * @return PromiseInterface
+     * @phpstan-return PromiseInterface<Http\Response>
+     */
+    public function addCopy(string $url, string $to, array $options = [])
+    {
+        if ('' === $url) {
+            throw new \InvalidArgumentException('$url must not be an empty string');
+        }
+        [, $promise] = $this->addJob(['url' => $url, 'options' => $options, 'copyTo' => $to]);
+
+        return $promise;
+    }
+
+    /**
+     * Retrieve the options set in the constructor
+     *
+     * @return mixed[] Options
+     */
+    public function getOptions()
+    {
+        return $this->options;
+    }
+
+    /**
+     * Merges new options
+     *
+     * @param  mixed[] $options
+     * @return void
+     */
+    public function setOptions(array $options)
+    {
+        $this->options = array_replace_recursive($this->options, $options);
+    }
+
+    /**
+     * @phpstan-param Request $request
+     * @return array{Job, PromiseInterface}
+     * @phpstan-return array{Job, PromiseInterface<Http\Response>}
+     */
+    private function addJob(array $request, bool $sync = false): array
+    {
+        $request['options'] = array_replace_recursive($this->options, $request['options']);
+
+        /** @var Job */
+        $job = [
+            'id' => $this->idGen++,
+            'status' => self::STATUS_QUEUED,
+            'request' => $request,
+            'sync' => $sync,
+            'origin' => Url::getOrigin($this->config, $request['url']),
+        ];
+
+        if (!$sync && !$this->allowAsync) {
+            throw new \LogicException('You must use the HttpDownloader instance which is part of a Composer\Loop instance to be able to run async http requests');
+        }
+
+        // capture username/password from URL if there is one
+        if (Preg::isMatchStrictGroups('{^https?://([^:/]+):([^@/]+)@([^/]+)}i', $request['url'], $match)) {
+            $this->io->setAuthentication($job['origin'], rawurldecode($match[1]), rawurldecode($match[2]));
+        }
+
+        $rfs = $this->rfs;
+
+        if ($this->canUseCurl($job)) {
+            $resolver = static function ($resolve, $reject) use (&$job): void {
+                $job['status'] = HttpDownloader::STATUS_QUEUED;
+                $job['resolve'] = $resolve;
+                $job['reject'] = $reject;
+            };
+        } else {
+            $resolver = static function ($resolve, $reject) use (&$job, $rfs): void {
+                // start job
+                $url = $job['request']['url'];
+                $options = $job['request']['options'];
+
+                $job['status'] = HttpDownloader::STATUS_STARTED;
+
+                if ($job['request']['copyTo']) {
+                    $rfs->copy($job['origin'], $url, $job['request']['copyTo'], false /* TODO progress */, $options);
+
+                    $headers = $rfs->getLastHeaders();
+                    $response = new Http\Response($job['request'], $rfs->findStatusCode($headers), $headers, $job['request']['copyTo'].'~');
+
+                    $resolve($response);
+                } else {
+                    $body = $rfs->getContents($job['origin'], $url, false /* TODO progress */, $options);
+                    $headers = $rfs->getLastHeaders();
+                    $response = new Http\Response($job['request'], $rfs->findStatusCode($headers), $headers, $body);
+
+                    $resolve($response);
+                }
+            };
+        }
+
+        $curl = $this->curl;
+
+        $canceler = static function () use (&$job, $curl): void {
+            if ($job['status'] === HttpDownloader::STATUS_QUEUED) {
+                $job['status'] = HttpDownloader::STATUS_ABORTED;
             }
+            if ($job['status'] !== HttpDownloader::STATUS_STARTED) {
+                return;
+            }
+            $job['status'] = HttpDownloader::STATUS_ABORTED;
+            if (isset($job['curl_id'])) {
+                $curl->abortRequest($job['curl_id']);
+            }
+            throw new IrrecoverableDownloadException('Download of ' . Url::sanitize($job['request']['url']) . ' canceled');
+        };
+
+        $promise = new Promise($resolver, $canceler);
+        $promise = $promise->then(function ($response) use (&$job) {
+            $job['status'] = HttpDownloader::STATUS_COMPLETED;
+            $job['response'] = $response;
+
+            $this->markJobDone();
+
+            return $response;
+        }, function ($e) use (&$job): void {
+            $job['status'] = HttpDownloader::STATUS_FAILED;
+            $job['exception'] = $e;
+
+            $this->markJobDone();
+
+            throw $e;
+        });
+        $this->jobs[$job['id']] = &$job;
+
+        if ($this->runningJobs < $this->maxJobs) {
+            $this->startJob($job['id']);
+        }
+
+        return [$job, $promise];
+    }
+
+    private function startJob(int $id): void
+    {
+        $job = &$this->jobs[$id];
+        if ($job['status'] !== self::STATUS_QUEUED) {
+            return;
+        }
+
+        // start job
+        $job['status'] = self::STATUS_STARTED;
+        $this->runningJobs++;
+
+        assert(isset($job['resolve']));
+        assert(isset($job['reject']));
+
+        $resolve = $job['resolve'];
+        $reject = $job['reject'];
+        $url = $job['request']['url'];
+        $options = $job['request']['options'];
+        $origin = $job['origin'];
+
+        if ($this->disabled) {
+            if (isset($job['request']['options']['http']['header']) && false !== stripos(implode('', $job['request']['options']['http']['header']), 'if-modified-since')) {
+                $resolve(new Response(['url' => $url], 304, [], ''));
+            } else {
+                $e = new TransportException('Network disabled, request canceled: '.Url::sanitize($url), 499);
+                $e->setStatusCode(499);
+                $reject($e);
+            }
+
+            return;
+        }
+
+        try {
+            if ($job['request']['copyTo']) {
+                $job['curl_id'] = $this->curl->download($resolve, $reject, $origin, $url, $options, $job['request']['copyTo']);
+            } else {
+                $job['curl_id'] = $this->curl->download($resolve, $reject, $origin, $url, $options);
+            }
+        } catch (\Exception $exception) {
+            $reject($exception);
+        }
+    }
+
+    private function markJobDone(): void
+    {
+        $this->runningJobs--;
+    }
+
+    /**
+     * Wait for current async download jobs to complete
+     *
+     * @param int|null $index For internal use only, the job id
+     *
+     * @return void
+     */
+    public function wait(?int $index = null)
+    {
+        do {
+            $jobCount = $this->countActiveJobs($index);
+        } while ($jobCount);
+    }
+
+    /**
+     * @internal
+     */
+    public function enableAsync(): void
+    {
+        $this->allowAsync = true;
+    }
+
+    /**
+     * @internal
+     *
+     * @param  int|null $index For internal use only, the job id
+     * @return int      number of active (queued or started) jobs
+     */
+    public function countActiveJobs(?int $index = null): int
+    {
+        if ($this->runningJobs < $this->maxJobs) {
+            foreach ($this->jobs as $job) {
+                if ($job['status'] === self::STATUS_QUEUED && $this->runningJobs < $this->maxJobs) {
+                    $this->startJob($job['id']);
+                }
+            }
+        }
+
+        if ($this->curl) {
+            $this->curl->tick();
+        }
+
+        if (null !== $index) {
+            return $this->jobs[$index]['status'] < self::STATUS_COMPLETED ? 1 : 0;
+        }
+
+        $active = 0;
+        foreach ($this->jobs as $job) {
+            if ($job['status'] < self::STATUS_COMPLETED) {
+                $active++;
+            } elseif (!$job['sync']) {
+                unset($this->jobs[$job['id']]);
+            }
+        }
+
+        return $active;
+    }
+
+    /**
+     * @param  int $index Job id
+     */
+    private function getResponse(int $index): Response
+    {
+        if (!isset($this->jobs[$index])) {
+            throw new \LogicException('Invalid request id');
+        }
+
+        if ($this->jobs[$index]['status'] === self::STATUS_FAILED) {
+            assert(isset($this->jobs[$index]['exception']));
+            throw $this->jobs[$index]['exception'];
+        }
+
+        if (!isset($this->jobs[$index]['response'])) {
+            throw new \LogicException('Response not available yet, call wait() first');
+        }
+
+        $resp = $this->jobs[$index]['response'];
+
+        unset($this->jobs[$index]);
+
+        return $resp;
+    }
+
+    /**
+     * @internal
+     *
+     * @param  array{warning?: string, info?: string, warning-versions?: string, info-versions?: string, warnings?: array<array{versions: string, message: string}>, infos?: array<array{versions: string, message: string}>} $data
+     */
+    public static function outputWarnings(IOInterface $io, string $url, $data): void
+    {
+        $cleanMessage = static function ($msg) use ($io) {
+            if (!$io->isDecorated()) {
+                $msg = Preg::replace('{'.chr(27).'\\[[;\d]*m}u', '', $msg);
+            }
+
+            return $msg;
+        };
+
+        // legacy warning/info keys
+        foreach (['warning', 'info'] as $type) {
+            if (empty($data[$type])) {
+                continue;
+            }
+
+            if (!empty($data[$type . '-versions'])) {
+                $versionParser = new VersionParser();
+                $constraint = $versionParser->parseConstraints($data[$type . '-versions']);
+                $composer = new Constraint('==', $versionParser->normalize(Composer::getVersion()));
+                if (!$constraint->matches($composer)) {
+                    continue;
+                }
+            }
+
+            $io->writeError('<'.$type.'>'.ucfirst($type).' from '.Url::sanitize($url).': '.$cleanMessage($data[$type]).'</'.$type.'>');
+        }
+
+        // modern Composer 2.2+ format with support for multiple warning/info messages
+        foreach (['warnings', 'infos'] as $key) {
+            if (empty($data[$key])) {
+                continue;
+            }
+
+            $versionParser = new VersionParser();
+            foreach ($data[$key] as $spec) {
+                $type = substr($key, 0, -1);
+                $constraint = $versionParser->parseConstraints($spec['versions']);
+                $composer = new Constraint('==', $versionParser->normalize(Composer::getVersion()));
+                if (!$constraint->matches($composer)) {
+                    continue;
+                }
+
+                $io->writeError('<'.$type.'>'.ucfirst($type).' from '.Url::sanitize($url).': '.$cleanMessage($spec['message']).'</'.$type.'>');
+            }
+        }
+    }
+
+    /**
+     * @internal
+     *
+     * @return ?string[]
+     */
+    public static function getExceptionHints(\Throwable $e): ?array
+    {
+        if (!$e instanceof TransportException) {
+            return null;
+        }
+
+        if (
+            false !== strpos($e->getMessage(), 'Resolving timed out')
+            || false !== strpos($e->getMessage(), 'Could not resolve host')
+        ) {
+            Silencer::suppress();
+            $testConnectivity = file_get_contents('https://8.8.8.8', false, stream_context_create([
+                'ssl' => ['verify_peer' => false],
+                'http' => ['follow_location' => false, 'ignore_errors' => true],
+            ]));
+            Silencer::restore();
+            if (false !== $testConnectivity) {
+                return [
+                    '<error>The following exception probably indicates you have misconfigured DNS resolver(s)</error>',
+                ];
+            }
+
+            return [
+                '<error>The following exception probably indicates you are offline or have misconfigured DNS resolver(s)</error>',
+            ];
         }
 
         return null;
     }
 
     /**
-     * Reverts a decision at the given level.
+     * @param  Job  $job
      */
-    private function revert(int $level): void
+    private function canUseCurl(array $job): bool
     {
-        while (!$this->decisions->isEmpty()) {
-            $literal = $this->decisions->lastLiteral();
-
-            if ($this->decisions->undecided($literal)) {
-                break;
-            }
-
-            $decisionLevel = $this->decisions->decisionLevel($literal);
-
-            if ($decisionLevel <= $level) {
-                break;
-            }
-
-            $this->decisions->revertLast();
-            $this->propagateIndex = \count($this->decisions);
+        if (!$this->curl) {
+            return false;
         }
 
-        while (!empty($this->branches) && $this->branches[\count($this->branches) - 1][self::BRANCH_LEVEL] >= $level) {
-            array_pop($this->branches);
+        if (!Preg::isMatch('{^https?://}i', $job['request']['url'])) {
+            return false;
         }
+
+        if (!empty($job['request']['options']['ssl']['allow_self_signed'])) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
-     * setpropagatelearn
-     *
-     * add free decision (a positive literal) to decision queue
-     * increase level and propagate decision
-     * return if no conflict.
-     *
-     * in conflict case, analyze conflict rule, add resulting
-     * rule to learnt rule set, make decision from learnt
-     * rule (always unit) and re-propagate.
-     *
-     * returns the new solver level or 0 if unsolvable
-     *
-     * @param  string|int $literal
+     * @internal
      */
-    private function setPropagateLearn(int $level, $literal, Rule $rule): int
+    public static function isCurlEnabled(): bool
     {
-        $level++;
-
-        $this->decisions->decide($literal, $level, $rule);
-
-        while (true) {
-            $rule = $this->propagate($level);
-
-            if (null === $rule) {
-                break;
-            }
-
-            if ($level === 1) {
-                return $this->analyzeUnsolvable($rule);
-            }
-
-            // conflict
-            [$learnLiteral, $newLevel, $newRule, $why] = $this->analyze($level, $rule);
-
-            if ($newLevel <= 0 || $newLevel >= $level) {
-                throw new SolverBugException(
-                    "Trying to revert to invalid level ".$newLevel." from level ".$level."."
-                );
-            }
-
-            $level = $newLevel;
-
-            $this->revert($level);
-
-            $this->rules->add($newRule, RuleSet::TYPE_LEARNED);
-
-            $this->learnedWhy[spl_object_hash($newRule)] = $why;
-
-            $ruleNode = new RuleWatchNode($newRule);
-            $ruleNode->watch2OnHighest($this->decisions);
-            $this->watchGraph->insert($ruleNode);
-
-            $this->decisions->decide($learnLiteral, $level, $newRule);
-        }
-
-        return $level;
-    }
-
-    /**
-     * @param  int[] $decisionQueue
-     */
-    private function selectAndInstall(int $level, array $decisionQueue, Rule $rule): int
-    {
-        // choose best package to install from decisionQueue
-        $literals = $this->policy->selectPreferredPackages($this->pool, $decisionQueue, $rule->getRequiredPackage());
-
-        $selectedLiteral = array_shift($literals);
-
-        // if there are multiple candidates, then branch
-        if (\count($literals)) {
-            $this->branches[] = [$literals, $level];
-        }
-
-        return $this->setPropagateLearn($level, $selectedLiteral, $rule);
-    }
-
-    /**
-     * @return array{int, int, GenericRule, int}
-     */
-    protected function analyze(int $level, Rule $rule): array
-    {
-        $analyzedRule = $rule;
-        $ruleLevel = 1;
-        $num = 0;
-        $l1num = 0;
-        $seen = [];
-        $learnedLiterals = [null];
-
-        $decisionId = \count($this->decisions);
-
-        $this->learnedPool[] = [];
-
-        while (true) {
-            $this->learnedPool[\count($this->learnedPool) - 1][] = $rule;
-
-            foreach ($rule->getLiterals() as $literal) {
-                // multiconflictrule is really a bunch of rules in one, so some may not have finished propagating yet
-                if ($rule instanceof MultiConflictRule && !$this->decisions->decided($literal)) {
-                    continue;
-                }
-
-                // skip the one true literal
-                if ($this->decisions->satisfy($literal)) {
-                    continue;
-                }
-
-                if (isset($seen[abs($literal)])) {
-                    continue;
-                }
-                $seen[abs($literal)] = true;
-
-                $l = $this->decisions->decisionLevel($literal);
-
-                if (1 === $l) {
-                    $l1num++;
-                } elseif ($level === $l) {
-                    $num++;
-                } else {
-                    // not level1 or conflict level, add to new rule
-                    $learnedLiterals[] = $literal;
-
-                    if ($l > $ruleLevel) {
-                        $ruleLevel = $l;
-                    }
-                }
-            }
-            unset($literal);
-
-            $l1retry = true;
-            while ($l1retry) {
-                $l1retry = false;
-
-                if (0 === $num && 0 === --$l1num) {
-                    // all level 1 literals done
-                    break 2;
-                }
-
-                while (true) {
-                    if ($decisionId <= 0) {
-                        throw new SolverBugException(
-                            "Reached invalid decision id $decisionId while looking through $rule for a literal present in the analyzed rule $analyzedRule."
-                        );
-                    }
-
-                    $decisionId--;
-
-                    $decision = $this->decisions->atOffset($decisionId);
-                    $literal = $decision[Decisions::DECISION_LITERAL];
-
-                    if (isset($seen[abs($literal)])) {
-                        break;
-                    }
-                }
-
-                unset($seen[abs($literal)]);
-
-                if (0 !== $num && 0 === --$num) {
-                    if ($literal < 0) {
-                        $this->testFlagLearnedPositiveLiteral = true;
-                    }
-                    $learnedLiterals[0] = -$literal;
-
-                    if (!$l1num) {
-                        break 2;
-                    }
-
-                    foreach ($learnedLiterals as $i => $learnedLiteral) {
-                        if ($i !== 0) {
-                            unset($seen[abs($learnedLiteral)]);
-                        }
-                    }
-                    // only level 1 marks left
-                    $l1num++;
-                    $l1retry = true;
-                } else {
-                    $decision = $this->decisions->atOffset($decisionId);
-                    $rule = $decision[Decisions::DECISION_REASON];
-
-                    if ($rule instanceof MultiConflictRule) {
-                        // there is only ever exactly one positive decision in a multiconflict rule
-                        foreach ($rule->getLiterals() as $literal) {
-                            if (!isset($seen[abs($literal)]) && $this->decisions->satisfy(-$literal)) {
-                                $this->learnedPool[\count($this->learnedPool) - 1][] = $rule;
-                                $l = $this->decisions->decisionLevel($literal);
-                                if (1 === $l) {
-                                    $l1num++;
-                                } elseif ($level === $l) {
-                                    $num++;
-                                } else {
-                                    // not level1 or conflict level, add to new rule
-                                    $learnedLiterals[] = $literal;
-
-                                    if ($l > $ruleLevel) {
-                                        $ruleLevel = $l;
-                                    }
-                                }
-                                $seen[abs($literal)] = true;
-                                break;
-                            }
-                        }
-
-                        $l1retry = true;
-                    }
-                }
-            }
-
-            $decision = $this->decisions->atOffset($decisionId);
-            $rule = $decision[Decisions::DECISION_REASON];
-        }
-
-        $why = \count($this->learnedPool) - 1;
-
-        if (null === $learnedLiterals[0]) {
-            throw new SolverBugException(
-                "Did not find a learnable literal in analyzed rule $analyzedRule."
-            );
-        }
-
-        $newRule = new GenericRule($learnedLiterals, Rule::RULE_LEARNED, $why);
-
-        return [$learnedLiterals[0], $ruleLevel, $newRule, $why];
-    }
-
-    /**
-     * @param array<string, true> $ruleSeen
-     */
-    private function analyzeUnsolvableRule(Problem $problem, Rule $conflictRule, array &$ruleSeen): void
-    {
-        $why = spl_object_hash($conflictRule);
-        $ruleSeen[$why] = true;
-
-        if ($conflictRule->getType() === RuleSet::TYPE_LEARNED) {
-            $learnedWhy = $this->learnedWhy[$why];
-            $problemRules = $this->learnedPool[$learnedWhy];
-
-            foreach ($problemRules as $problemRule) {
-                if (!isset($ruleSeen[spl_object_hash($problemRule)])) {
-                    $this->analyzeUnsolvableRule($problem, $problemRule, $ruleSeen);
-                }
-            }
-
-            return;
-        }
-
-        if ($conflictRule->getType() === RuleSet::TYPE_PACKAGE) {
-            // package rules cannot be part of a problem
-            return;
-        }
-
-        $problem->nextSection();
-        $problem->addRule($conflictRule);
-    }
-
-    private function analyzeUnsolvable(Rule $conflictRule): int
-    {
-        $problem = new Problem();
-        $problem->addRule($conflictRule);
-
-        $ruleSeen = [];
-
-        $this->analyzeUnsolvableRule($problem, $conflictRule, $ruleSeen);
-
-        $this->problems[] = $problem;
-
-        $seen = [];
-        $literals = $conflictRule->getLiterals();
-
-        foreach ($literals as $literal) {
-            // skip the one true literal
-            if ($this->decisions->satisfy($literal)) {
-                continue;
-            }
-            $seen[abs($literal)] = true;
-        }
-
-        foreach ($this->decisions as $decision) {
-            $literal = $decision[Decisions::DECISION_LITERAL];
-
-            // skip literals that are not in this rule
-            if (!isset($seen[abs($literal)])) {
-                continue;
-            }
-
-            $why = $decision[Decisions::DECISION_REASON];
-
-            $problem->addRule($why);
-            $this->analyzeUnsolvableRule($problem, $why, $ruleSeen);
-
-            $literals = $why->getLiterals();
-
-            foreach ($literals as $literal) {
-                // skip the one true literal
-                if ($this->decisions->satisfy($literal)) {
-                    continue;
-                }
-                $seen[abs($literal)] = true;
-            }
-        }
-
-        return 0;
-    }
-
-    private function runSat(): void
-    {
-        $this->propagateIndex = 0;
-
-        /*
-         * here's the main loop:
-         * 1) propagate new decisions (only needed once)
-         * 2) fulfill root requires/fixed packages
-         * 3) fulfill all unresolved rules
-         * 4) minimalize solution if we had choices
-         * if we encounter a problem, we rewind to a safe level and restart
-         * with step 1
-         */
-
-        $level = 1;
-        $systemLevel = $level + 1;
-
-        while (true) {
-            if (1 === $level) {
-                $conflictRule = $this->propagate($level);
-                if (null !== $conflictRule) {
-                    if ($this->analyzeUnsolvable($conflictRule)) {
-                        continue;
-                    }
-
-                    return;
-                }
-            }
-
-            // handle root require/fixed package rules
-            if ($level < $systemLevel) {
-                $iterator = $this->rules->getIteratorFor(RuleSet::TYPE_REQUEST);
-                foreach ($iterator as $rule) {
-                    if ($rule->isEnabled()) {
-                        $decisionQueue = [];
-                        $noneSatisfied = true;
-
-                        foreach ($rule->getLiterals() as $literal) {
-                            if ($this->decisions->satisfy($literal)) {
-                                $noneSatisfied = false;
-                                break;
-                            }
-                            if ($literal > 0 && $this->decisions->undecided($literal)) {
-                                $decisionQueue[] = $literal;
-                            }
-                        }
-
-                        if ($noneSatisfied && \count($decisionQueue)) {
-                            // if any of the options in the decision queue are fixed, only use those
-                            $prunedQueue = [];
-                            foreach ($decisionQueue as $literal) {
-                                if (isset($this->fixedMap[abs($literal)])) {
-                                    $prunedQueue[] = $literal;
-                                }
-                            }
-                            if (!empty($prunedQueue)) {
-                                $decisionQueue = $prunedQueue;
-                            }
-                        }
-
-                        if ($noneSatisfied && \count($decisionQueue)) {
-                            $oLevel = $level;
-                            $level = $this->selectAndInstall($level, $decisionQueue, $rule);
-
-                            if (0 === $level) {
-                                return;
-                            }
-                            if ($level <= $oLevel) {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                $systemLevel = $level + 1;
-
-                // root requires/fixed packages left
-                $iterator->next();
-                if ($iterator->valid()) {
-                    continue;
-                }
-            }
-
-            if ($level < $systemLevel) {
-                $systemLevel = $level;
-            }
-
-            $rulesCount = \count($this->rules);
-            $pass = 1;
-
-            $this->io->writeError('Looking at all rules.', true, IOInterface::DEBUG);
-            for ($i = 0, $n = 0; $n < $rulesCount; $i++, $n++) {
-                if ($i === $rulesCount) {
-                    if (1 === $pass) {
-                        $this->io->writeError("Something's changed, looking at all rules again (pass #$pass)", false, IOInterface::DEBUG);
-                    } else {
-                        $this->io->overwriteError("Something's changed, looking at all rules again (pass #$pass)", false, null, IOInterface::DEBUG);
-                    }
-
-                    $i = 0;
-                    $pass++;
-                }
-
-                $rule = $this->rules->ruleById[$i];
-                $literals = $rule->getLiterals();
-
-                if ($rule->isDisabled()) {
-                    continue;
-                }
-
-                $decisionQueue = [];
-
-                // make sure that
-                // * all negative literals are installed
-                // * no positive literal is installed
-                // i.e. the rule is not fulfilled and we
-                // just need to decide on the positive literals
-                //
-                foreach ($literals as $literal) {
-                    if ($literal <= 0) {
-                        if (!$this->decisions->decidedInstall($literal)) {
-                            continue 2; // next rule
-                        }
-                    } else {
-                        if ($this->decisions->decidedInstall($literal)) {
-                            continue 2; // next rule
-                        }
-                        if ($this->decisions->undecided($literal)) {
-                            $decisionQueue[] = $literal;
-                        }
-                    }
-                }
-
-                // need to have at least 2 item to pick from
-                if (\count($decisionQueue) < 2) {
-                    continue;
-                }
-
-                $level = $this->selectAndInstall($level, $decisionQueue, $rule);
-
-                if (0 === $level) {
-                    return;
-                }
-
-                // something changed, so look at all rules again
-                $rulesCount = \count($this->rules);
-                $n = -1;
-            }
-
-            if ($level < $systemLevel) {
-                continue;
-            }
-
-            // minimization step
-            if (\count($this->branches)) {
-                $lastLiteral = null;
-                $lastLevel = null;
-                $lastBranchIndex = 0;
-                $lastBranchOffset = 0;
-
-                for ($i = \count($this->branches) - 1; $i >= 0; $i--) {
-                    [$literals, $l] = $this->branches[$i];
-
-                    foreach ($literals as $offset => $literal) {
-                        if ($literal && $literal > 0 && $this->decisions->decisionLevel($literal) > $l + 1) {
-                            $lastLiteral = $literal;
-                            $lastBranchIndex = $i;
-                            $lastBranchOffset = $offset;
-                            $lastLevel = $l;
-                        }
-                    }
-                }
-
-                if ($lastLiteral) {
-                    unset($this->branches[$lastBranchIndex][self::BRANCH_LITERALS][$lastBranchOffset]);
-
-                    $level = $lastLevel;
-                    $this->revert($level);
-
-                    $why = $this->decisions->lastReason();
-
-                    $level = $this->setPropagateLearn($level, $lastLiteral, $why);
-
-                    if ($level === 0) {
-                        return;
-                    }
-
-                    continue;
-                }
-            }
-
-            break;
-        }
+        return \extension_loaded('curl') && \function_exists('curl_multi_exec') && \function_exists('curl_multi_init');
     }
 }

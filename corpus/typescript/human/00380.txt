@@ -1,574 +1,749 @@
-// Copyright (c) Microsoft. All rights reserved. Licensed under the Apache License, Version 2.0. 
-// See LICENSE.txt in the project root for complete license information.
+import {
+    CharacterCodes,
+    combinePaths,
+    createQueue,
+    Debug,
+    directorySeparator,
+    DirectoryWatcherCallback,
+    FileWatcher,
+    getDirectoryPath,
+    getRootLength,
+    LanguageServiceMode,
+    MapLike,
+    noop,
+    noopFileWatcher,
+    normalizePath,
+    normalizeSlashes,
+    perfLogger,
+    startTracing,
+    stripQuotes,
+    sys,
+    toFileNameLowerCase,
+    tracing,
+    validateLocaleAndSetLanguage,
+    versionMajorMinor,
+    WatchOptions,
+} from "../typescript/typescript.js";
+import * as ts from "../typescript/typescript.js";
+import {
+    getLogLevel,
+    StartInput,
+    StartSessionOptions,
+} from "./common.js";
 
-///<reference path='typescript.ts' />
+interface LogOptions {
+    file?: string;
+    detailLevel?: ts.server.LogLevel;
+    traceToConsole?: boolean;
+    logToFile?: boolean;
+}
 
-module TypeScript {
-    export function lastOf(items: any[]): any {
-        return (items === null || items.length === 0) ? null : items[items.length - 1];
+interface NodeChildProcess {
+    send(message: any, sendHandle?: any): void;
+    on(message: "message" | "exit", f: (m: any) => void): void;
+    kill(): void;
+    pid: number;
+}
+
+interface ReadLineOptions {
+    input: NodeJS.ReadableStream;
+    output?: NodeJS.WritableStream;
+    terminal?: boolean;
+    historySize?: number;
+}
+
+interface NodeSocket {
+    write(data: string, encoding: string): boolean;
+}
+
+function parseLoggingEnvironmentString(logEnvStr: string | undefined): LogOptions {
+    if (!logEnvStr) {
+        return {};
     }
-
-    export function max(a: number, b: number): number {
-        return a >= b ? a : b;
-    }
-
-    export function min(a: number, b: number): number {
-        return a <= b ? a : b;
-    }
-
-    //
-    // Helper class representing a path from a root ast node to a (grand)child ast node.
-    // This is helpful as our tree don't have parents.
-    //
-    export class AstPath {
-        public asts: TypeScript.AST[] = [];
-        public top: number = -1;
-
-        static reverseIndexOf(items: any[], index: number): any {
-            return (items === null || items.length <= index) ? null : items[items.length - index - 1];
-        }
-
-        public clone(): AstPath {
-            var clone = new AstPath();
-            clone.asts = this.asts.map((value) => { return value; });
-            clone.top = this.top;
-            return clone;
-        }
-
-        public pop(): TypeScript.AST {
-            var head = this.ast();
-            this.up();
-
-            while (this.asts.length > this.count()) {
-                this.asts.pop();
+    const logEnv: LogOptions = { logToFile: true };
+    const args = logEnvStr.split(" ");
+    const len = args.length - 1;
+    for (let i = 0; i < len; i += 2) {
+        const option = args[i];
+        const { value, extraPartCounter } = getEntireValue(i + 1);
+        i += extraPartCounter;
+        if (option && value) {
+            switch (option) {
+                case "-file":
+                    logEnv.file = value;
+                    break;
+                case "-level":
+                    const level = getLogLevel(value);
+                    logEnv.detailLevel = level !== undefined ? level : ts.server.LogLevel.normal;
+                    break;
+                case "-traceToConsole":
+                    logEnv.traceToConsole = value.toLowerCase() === "true";
+                    break;
+                case "-logToFile":
+                    logEnv.logToFile = value.toLowerCase() === "true";
+                    break;
             }
-            return head;
         }
+    }
+    return logEnv;
 
-        public push(ast: TypeScript.AST) {
-            while (this.asts.length > this.count()) {
-                this.asts.pop();
+    function getEntireValue(initialIndex: number) {
+        let pathStart = args[initialIndex];
+        let extraPartCounter = 0;
+        if (
+            pathStart.charCodeAt(0) === CharacterCodes.doubleQuote &&
+            pathStart.charCodeAt(pathStart.length - 1) !== CharacterCodes.doubleQuote
+        ) {
+            for (let i = initialIndex + 1; i < args.length; i++) {
+                pathStart += " ";
+                pathStart += args[i];
+                extraPartCounter++;
+                if (pathStart.charCodeAt(pathStart.length - 1) === CharacterCodes.doubleQuote) break;
             }
-            this.top = this.asts.length;
-            this.asts.push(ast);
         }
+        return { value: stripQuotes(pathStart), extraPartCounter };
+    }
+}
 
-        public up() {
-            if (this.top <= -1)
-                throw new Error("Invalid call to 'up'");
-            this.top--;
+function parseServerMode(): LanguageServiceMode | string | undefined {
+    const mode = ts.server.findArgument("--serverMode");
+    if (!mode) return undefined;
+
+    switch (mode.toLowerCase()) {
+        case "semantic":
+            return LanguageServiceMode.Semantic;
+        case "partialsemantic":
+            return LanguageServiceMode.PartialSemantic;
+        case "syntactic":
+            return LanguageServiceMode.Syntactic;
+        default:
+            return mode;
+    }
+}
+
+/** @internal */
+export function initializeNodeSystem(): StartInput {
+    const sys = Debug.checkDefined(ts.sys) as ts.server.ServerHost;
+    const childProcess: {
+        execFileSync(file: string, args: string[], options: { stdio: "ignore"; env: MapLike<string>; }): string | Buffer;
+    } = require("child_process");
+
+    interface Stats {
+        isFile(): boolean;
+        isDirectory(): boolean;
+        isBlockDevice(): boolean;
+        isCharacterDevice(): boolean;
+        isSymbolicLink(): boolean;
+        isFIFO(): boolean;
+        isSocket(): boolean;
+        dev: number;
+        ino: number;
+        mode: number;
+        nlink: number;
+        uid: number;
+        gid: number;
+        rdev: number;
+        size: number;
+        blksize: number;
+        blocks: number;
+        atime: Date;
+        mtime: Date;
+        ctime: Date;
+        birthtime: Date;
+    }
+
+    const fs: {
+        openSync(path: string, options: string): number;
+        close(fd: number, callback: (err: NodeJS.ErrnoException) => void): void;
+        writeSync(fd: number, buffer: Buffer, offset: number, length: number, position?: number): number;
+        statSync(path: string): Stats;
+        stat(path: string, callback?: (err: NodeJS.ErrnoException, stats: Stats) => any): void;
+    } = require("fs");
+
+    class Logger implements Logger {
+        private seq = 0;
+        private inGroup = false;
+        private firstInGroup = true;
+        private fd = -1;
+        constructor(
+            private readonly logFilename: string,
+            private readonly traceToConsole: boolean,
+            private readonly level: ts.server.LogLevel,
+        ) {
+            if (this.logFilename) {
+                try {
+                    this.fd = fs.openSync(this.logFilename, "w");
+                }
+                catch (_) {
+                    // swallow the error and keep logging disabled if file cannot be opened
+                }
+            }
         }
-
-        public down() {
-            if (this.top == this.ast.length - 1)
-                throw new Error("Invalid call to 'down'");
-            this.top++;
+        static padStringRight(str: string, padding: string) {
+            return (str + padding).slice(0, padding.length);
         }
-
-        public nodeType(): TypeScript.NodeType {
-            if (this.ast() == null)
-                return TypeScript.NodeType.None;
-            return this.ast().nodeType;
+        close() {
+            if (this.fd >= 0) {
+                fs.close(this.fd, noop);
+            }
         }
-
-        public ast() {
-            return <TypeScript.AST>AstPath.reverseIndexOf(this.asts, this.asts.length - (this.top + 1));
+        getLogFileName(): string | undefined {
+            return this.logFilename;
         }
-
-        public parent() {
-            return <TypeScript.AST>AstPath.reverseIndexOf(this.asts, this.asts.length - this.top);
+        perftrc(s: string) {
+            this.msg(s, ts.server.Msg.Perf);
         }
-
-        public count() {
-            return this.top + 1;
+        info(s: string) {
+            this.msg(s, ts.server.Msg.Info);
         }
-
-        public get(index: number): TypeScript.AST {
-            return this.asts[index];
+        err(s: string) {
+            this.msg(s, ts.server.Msg.Err);
         }
-
-        public isNameOfClass(): boolean {
-            if (this.ast() === null || this.parent() === null)
-                return false;
-
-            return (this.ast().nodeType === TypeScript.NodeType.Name) &&
-                (this.parent().nodeType === TypeScript.NodeType.ClassDeclaration) &&
-                ((<TypeScript.InterfaceDeclaration>this.parent()).name === this.ast());
+        startGroup() {
+            this.inGroup = true;
+            this.firstInGroup = true;
         }
-
-        public isNameOfInterface(): boolean {
-            if (this.ast() === null || this.parent() === null)
-                return false;
-
-            return (this.ast().nodeType === TypeScript.NodeType.Name) &&
-                (this.parent().nodeType === TypeScript.NodeType.InterfaceDeclaration) &&
-                ((<TypeScript.InterfaceDeclaration>this.parent()).name === this.ast());
+        endGroup() {
+            this.inGroup = false;
         }
-
-        public isNameOfArgument(): boolean {
-            if (this.ast() === null || this.parent() === null)
-                return false;
-
-            return (this.ast().nodeType === TypeScript.NodeType.Name) &&
-                (this.parent().nodeType === TypeScript.NodeType.ArgDecl) &&
-                ((<TypeScript.ArgDecl>this.parent()).id === this.ast());
+        loggingEnabled() {
+            return !!this.logFilename || this.traceToConsole;
         }
-
-        public isNameOfVariable(): boolean {
-            if (this.ast() === null || this.parent() === null)
-                return false;
-
-            return (this.ast().nodeType === TypeScript.NodeType.Name) &&
-                (this.parent().nodeType === TypeScript.NodeType.VarDecl) &&
-                ((<TypeScript.VarDecl>this.parent()).id === this.ast());
+        hasLevel(level: ts.server.LogLevel) {
+            return this.loggingEnabled() && this.level >= level;
         }
+        msg(s: string, type: ts.server.Msg = ts.server.Msg.Err) {
+            switch (type) {
+                case ts.server.Msg.Info:
+                    perfLogger?.logInfoEvent(s);
+                    break;
+                case ts.server.Msg.Perf:
+                    perfLogger?.logPerfEvent(s);
+                    break;
+                default: // Msg.Err
+                    perfLogger?.logErrEvent(s);
+                    break;
+            }
 
-        public isNameOfModule(): boolean {
-            if (this.ast() === null || this.parent() === null)
-                return false;
+            if (!this.canWrite()) return;
 
-            return (this.ast().nodeType === TypeScript.NodeType.Name) &&
-                (this.parent().nodeType === TypeScript.NodeType.ModuleDeclaration) &&
-                ((<TypeScript.ModuleDeclaration>this.parent()).name === this.ast());
+            s = `[${ts.server.nowString()}] ${s}\n`;
+            if (!this.inGroup || this.firstInGroup) {
+                const prefix = Logger.padStringRight(type + " " + this.seq.toString(), "          ");
+                s = prefix + s;
+            }
+            this.write(s, type);
+            if (!this.inGroup) {
+                this.seq++;
+            }
         }
-
-        public isNameOfFunction(): boolean {
-            if (this.ast() === null || this.parent() === null)
-                return false;
-
-            return (this.ast().nodeType === TypeScript.NodeType.Name) &&
-                (this.parent().nodeType === TypeScript.NodeType.FuncDecl) &&
-                ((<TypeScript.FuncDecl>this.parent()).name === this.ast());
+        protected canWrite() {
+            return this.fd >= 0 || this.traceToConsole;
         }
-
-        public isChildOfScript(): boolean {
-            var ast = lastOf(this.asts);
-            return this.count() >= 3 &&
-                this.asts[this.top] === ast &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.Script;
-        }
-
-        public isChildOfModule(): boolean {
-            var ast = lastOf(this.asts);
-            return this.count() >= 3 &&
-                this.asts[this.top] === ast &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.ModuleDeclaration;
-        }
-
-        public isChildOfClass(): boolean {
-            var ast = lastOf(this.asts);
-            return this.count() >= 3 &&
-                this.asts[this.top] === ast &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.ClassDeclaration;
-        }
-
-        public isArgumentOfClassConstructor(): boolean {
-            var ast = lastOf(this.asts);
-            return this.count() >= 5 &&
-                this.asts[this.top] === ast &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.FuncDecl &&
-                this.asts[this.top - 3].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 4].nodeType === TypeScript.NodeType.ClassDeclaration &&
-                ((<TypeScript.FuncDecl>this.asts[this.top - 2]).isConstructor) &&
-                ((<TypeScript.FuncDecl>this.asts[this.top - 2]).arguments === this.asts[this.top - 1]) &&
-                ((<TypeScript.ClassDeclaration>this.asts[this.top - 4]).constructorDecl === this.asts[this.top - 2]);
-        }
-
-        public isChildOfInterface(): boolean {
-            var ast = lastOf(this.asts);
-            return this.count() >= 3 &&
-                this.asts[this.top] === ast &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.InterfaceDeclaration;
-        }
-
-        public isTopLevelImplicitModule() {
-            return this.count() >= 1 &&
-                this.asts[this.top].nodeType === TypeScript.NodeType.ModuleDeclaration &&
-                TypeScript.hasFlag((<TypeScript.ModuleDeclaration>this.asts[this.top]).modFlags, TypeScript.ModuleFlags.IsWholeFile);
-        }
-
-        public isBodyOfTopLevelImplicitModule() {
-            return this.count() >= 2 &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.ModuleDeclaration &&
-                 (<TypeScript.ModuleDeclaration>this.asts[this.top - 1]).members == this.asts[this.top - 0] &&
-                TypeScript.hasFlag((<TypeScript.ModuleDeclaration>this.asts[this.top - 1]).modFlags, TypeScript.ModuleFlags.IsWholeFile);
-        }
-
-        public isBodyOfScript(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Script &&
-                 (<TypeScript.Script>this.asts[this.top - 1]).bod == this.asts[this.top - 0];
-        }
-
-        public isBodyOfSwitch(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Switch &&
-                 (<TypeScript.SwitchStatement>this.asts[this.top - 1]).caseList == this.asts[this.top - 0];
-        }
-
-        public isBodyOfModule(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.ModuleDeclaration &&
-                 (<TypeScript.ModuleDeclaration>this.asts[this.top - 1]).members == this.asts[this.top - 0];
-        }
-
-        public isBodyOfClass(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.ClassDeclaration &&
-                 (<TypeScript.ClassDeclaration>this.asts[this.top - 1]).members == this.asts[this.top - 0];
-        }
-
-        public isBodyOfFunction(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.FuncDecl &&
-                 (<TypeScript.FuncDecl>this.asts[this.top - 1]).bod == this.asts[this.top - 0];
-        }
-
-        public isBodyOfInterface(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.InterfaceDeclaration &&
-                 (<TypeScript.InterfaceDeclaration>this.asts[this.top - 1]).members == this.asts[this.top - 0];
-        }
-
-        public isBodyOfBlock(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Block &&
-                (<TypeScript.Block>this.asts[this.top - 1]).statements == this.asts[this.top - 0];
-        }
-
-        public isBodyOfFor(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.For &&
-                (<TypeScript.ForStatement>this.asts[this.top - 1]).body == this.asts[this.top - 0];
-        }
-
-        public isBodyOfCase(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Case &&
-                (<TypeScript.CaseStatement>this.asts[this.top - 1]).body == this.asts[this.top - 0];
-        }
-
-        public isBodyOfTry(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Try &&
-                (<TypeScript.Try>this.asts[this.top - 1]).body == this.asts[this.top - 0];
-        }
-
-        public isBodyOfCatch(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Catch &&
-                (<TypeScript.Catch>this.asts[this.top - 1]).body == this.asts[this.top - 0];
-        }
-
-        public isBodyOfDoWhile(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.DoWhile &&
-                (<TypeScript.DoWhileStatement>this.asts[this.top - 1]).body == this.asts[this.top - 0];
-        }
-
-        public isBodyOfWhile(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.While &&
-                (<TypeScript.WhileStatement>this.asts[this.top - 1]).body == this.asts[this.top - 0];
-        }
-
-        public isBodyOfForIn(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.ForIn &&
-                (<TypeScript.ForInStatement>this.asts[this.top - 1]).body == this.asts[this.top - 0];
-        }
-
-        public isBodyOfWith(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.With &&
-                (<TypeScript.WithStatement>this.asts[this.top - 1]).body == this.asts[this.top - 0];
-        }
-
-        public isBodyOfFinally(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Finally &&
-                (<TypeScript.Finally>this.asts[this.top - 1]).body == this.asts[this.top - 0];
-        }
-
-        public isCaseOfSwitch(): boolean {
-            return this.count() >= 3 &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.Switch &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List &&
-                (<TypeScript.SwitchStatement>this.asts[this.top - 2]).caseList == this.asts[this.top - 1];
-        }
-
-        public isDefaultCaseOfSwitch(): boolean {
-            return this.count() >= 3 &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.Switch &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List &&
-                (<TypeScript.SwitchStatement>this.asts[this.top - 2]).caseList == this.asts[this.top - 1] &&
-                (<TypeScript.SwitchStatement>this.asts[this.top - 2]).defaultCase == this.asts[this.top - 0];
-        }
-
-        public isListOfObjectLit(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.ObjectLit &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.List &&
-                (<TypeScript.UnaryExpression>this.asts[this.top - 1]).operand == this.asts[this.top - 0];
-        }
-
-        public isBodyOfObjectLit(): boolean {
-            return this.isListOfObjectLit();
-        }
-
-        public isEmptyListOfObjectLit(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.ObjectLit &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.List &&
-                (<TypeScript.UnaryExpression>this.asts[this.top - 1]).operand == this.asts[this.top - 0] &&
-                (<TypeScript.ASTList>this.asts[this.top - 0]).members.length == 0;
-        }
-
-        public isMemberOfObjectLit(): boolean {
-            return this.count() >= 3 &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.ObjectLit &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.Member &&
-                (<TypeScript.UnaryExpression>this.asts[this.top - 2]).operand == this.asts[this.top - 1];
-        }
-
-        public isNameOfMemberOfObjectLit(): boolean {
-            return this.count() >= 4 &&
-                this.asts[this.top - 3].nodeType === TypeScript.NodeType.ObjectLit &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Member &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.Name &&
-                (<TypeScript.UnaryExpression>this.asts[this.top - 3]).operand == this.asts[this.top - 2];
-        }
-
-        public isListOfArrayLit(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.ArrayLit &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.List &&
-                (<TypeScript.UnaryExpression>this.asts[this.top - 1]).operand == this.asts[this.top - 0];
-        }
-
-        public isTargetOfMember(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Member &&
-                (<TypeScript.BinaryExpression>this.asts[this.top - 1]).operand1 === this.asts[this.top - 0];
-        }
-
-        public isMemberOfMember(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Member &&
-                (<TypeScript.BinaryExpression>this.asts[this.top - 1]).operand2 === this.asts[this.top - 0];
-        }
-
-        public isItemOfList(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List;
-            //(<Tools.ASTList>this.asts[this.top - 1]).operand2 === this.asts[this.top - 0];
-        }
-
-        public isThenOfIf(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.If &&
-                (<TypeScript.IfStatement>this.asts[this.top - 1]).thenBod == this.asts[this.top - 0];
-        }
-
-        public isElseOfIf(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.If &&
-                (<TypeScript.IfStatement>this.asts[this.top - 1]).elseBod == this.asts[this.top - 0];
-        }
-
-        public isBodyOfDefaultCase(): boolean {
-            return this.isBodyOfCase();
-        }
-
-        public isSingleStatementList(): boolean {
-            return this.count() >= 1 &&
-                this.asts[this.top].nodeType === TypeScript.NodeType.List &&
-                (<TypeScript.ASTList>this.asts[this.top]).members.length === 1;
-        }
-
-        public isArgumentListOfFunction(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.FuncDecl &&
-                (<TypeScript.FuncDecl>this.asts[this.top - 1]).arguments === this.asts[this.top - 0];
-        }
-
-        public isArgumentOfFunction(): boolean {
-            return this.count() >= 3 &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 2].nodeType === TypeScript.NodeType.FuncDecl &&
-                (<TypeScript.FuncDecl>this.asts[this.top - 2]).arguments === this.asts[this.top - 1];
-        }
-
-        public isArgumentListOfCall(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.Call &&
-                (<TypeScript.CallExpression>this.asts[this.top - 1]).arguments === this.asts[this.top - 0];
-        }
-
-        public isArgumentListOfNew(): boolean {
-            return this.count() >= 2 &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.List &&
-                this.asts[this.top - 1].nodeType === TypeScript.NodeType.New &&
-                (<TypeScript.CallExpression>this.asts[this.top - 1]).arguments === this.asts[this.top - 0];
-        }
-
-        public isSynthesizedBlock(): boolean {
-            return this.count() >= 1 &&
-                this.asts[this.top - 0].nodeType === TypeScript.NodeType.Block &&
-                (<TypeScript.Block>this.asts[this.top - 0]).isStatementBlock === false;
+        protected write(s: string, _type: ts.server.Msg) {
+            if (this.fd >= 0) {
+                const buf = Buffer.from(s);
+                // eslint-disable-next-line no-restricted-syntax
+                fs.writeSync(this.fd, buf, 0, buf.length, /*position*/ null!); // TODO: GH#18217
+            }
+            if (this.traceToConsole) {
+                console.warn(s);
+            }
         }
     }
 
-    export function isValidAstNode(ast: TypeScript.ASTSpan): boolean {
-        if (ast === null)
-            return false;
+    const libDirectory = getDirectoryPath(normalizePath(sys.getExecutingFilePath()));
 
-        if (ast.minChar === -1 || ast.limChar === -1)
-            return false;
+    const useWatchGuard = process.platform === "win32";
+    const originalWatchDirectory: ts.server.ServerHost["watchDirectory"] = sys.watchDirectory.bind(sys);
+    const logger = createLogger();
 
-        return true;
-    }
+    // enable deprecation logging
+    Debug.loggingHost = {
+        log(level, s) {
+            switch (level) {
+                case ts.LogLevel.Error:
+                case ts.LogLevel.Warning:
+                    return logger.msg(s, ts.server.Msg.Err);
+                case ts.LogLevel.Info:
+                case ts.LogLevel.Verbose:
+                    return logger.msg(s, ts.server.Msg.Info);
+            }
+        },
+    };
 
-    export class AstPathContext {
-        public path = new TypeScript.AstPath();
-    }
+    const pending = createQueue<Buffer>();
+    let canWrite = true;
 
-    export enum GetAstPathOptions {
-        Default = 0,
-        EdgeInclusive = 1,
-        //We need this options dealing with an AST coming from an incomplete AST. For example:
-        //     class foo { // r
-        // If we ask for the AST at the position after the "r" character, we won't see we are 
-        // inside a comment, because the "class" AST node has a limChar corresponding to the position of 
-        // the "{" character, meaning we don't traverse the tree down to the stmt list of the class, meaning
-        // we don't find the "precomment" attached to the errorneous empty stmt.
-        //TODO: It would be nice to be able to get rid of this.
-        DontPruneSearchBasedOnPosition = 1 << 1,
-    }
-
-    ///
-    /// Return the stack of AST nodes containing "position"
-    ///
-    export function getAstPathToPosition(script: TypeScript.AST, pos: number, options = GetAstPathOptions.Default): TypeScript.AstPath {
-        var lookInComments = (comments: TypeScript.Comment[]) => {
-            if (comments && comments.length > 0) {
-                for (var i = 0; i < comments.length; i++) {
-                    var minChar = comments[i].minChar;
-                    var limChar = comments[i].limChar;
-                    if (!comments[i].isBlockComment) {
-                        limChar++; // For single line comments, include 1 more character (for the newline)
+    if (useWatchGuard) {
+        const currentDrive = extractWatchDirectoryCacheKey(sys.resolvePath(sys.getCurrentDirectory()), /*currentDriveKey*/ undefined);
+        const statusCache = new Map<string, boolean>();
+        sys.watchDirectory = (path, callback, recursive, options) => {
+            const cacheKey = extractWatchDirectoryCacheKey(path, currentDrive);
+            let status = cacheKey && statusCache.get(cacheKey);
+            if (status === undefined) {
+                if (logger.hasLevel(ts.server.LogLevel.verbose)) {
+                    logger.info(`${cacheKey} for path ${path} not found in cache...`);
+                }
+                try {
+                    const args = [combinePaths(libDirectory, "watchGuard.js"), path];
+                    if (logger.hasLevel(ts.server.LogLevel.verbose)) {
+                        logger.info(`Starting ${process.execPath} with args:${ts.server.stringifyIndented(args)}`);
                     }
-                    if (pos >= minChar && pos < limChar) {
-                        ctx.path.push(comments[i]);
+                    childProcess.execFileSync(process.execPath, args, { stdio: "ignore", env: { ELECTRON_RUN_AS_NODE: "1" } });
+                    status = true;
+                    if (logger.hasLevel(ts.server.LogLevel.verbose)) {
+                        logger.info(`WatchGuard for path ${path} returned: OK`);
                     }
                 }
-            }
-        }
-
-        var pre = function (cur: TypeScript.AST, parent: TypeScript.AST, walker: IAstWalker) {
-            if (isValidAstNode(cur)) {
-
-                // Add "cur" to the stack if it contains our position
-                // For "identifier" nodes, we need a special case: A position equal to "limChar" is
-                // valid, since the position corresponds to a caret position (in between characters)
-                // For example:
-                //  bar
-                //  0123
-                // If "position == 3", the caret is at the "right" of the "r" character, which should be considered valid
-                var inclusive =
-                    hasFlag(options, GetAstPathOptions.EdgeInclusive) ||
-                    cur.nodeType === TypeScript.NodeType.Name ||
-                    pos === script.limChar; // Special "EOF" case
-
-                var minChar = cur.minChar;
-                var limChar = cur.limChar + (inclusive ? 1 : 0)
-                if (pos >= minChar && pos < limChar) {
-
-                    // TODO: Since AST is sometimes not correct wrt to position, only add "cur" if it's better
-                    //       than top of the stack.
-                    var previous = ctx.path.ast();
-                    if (previous == null || (cur.minChar >= previous.minChar && cur.limChar <= previous.limChar)) {
-                        ctx.path.push(cur);
-                    }
-                    else {
-                        //logger.log("TODO: Ignoring node because minChar, limChar not better than previous node in stack");
+                catch (e) {
+                    status = false;
+                    if (logger.hasLevel(ts.server.LogLevel.verbose)) {
+                        logger.info(`WatchGuard for path ${path} returned: ${e.message}`);
                     }
                 }
-
-                // The AST walker skips comments, but we might be in one, so check the pre/post comments for this node manually
-                if (pos < limChar) {
-                    lookInComments(cur.preComments);
-                }
-                if (pos >= minChar) {
-                    lookInComments(cur.postComments);
-                }
-
-                if (!hasFlag(options, GetAstPathOptions.DontPruneSearchBasedOnPosition)) {
-                    // Don't go further down the tree if pos is outside of [minChar, limChar]
-                    walker.options.goChildren = (minChar <= pos && pos <= limChar);
+                if (cacheKey) {
+                    statusCache.set(cacheKey, status);
                 }
             }
-            return cur;
-        }
-
-        var ctx = new AstPathContext();
-        TypeScript.getAstWalkerFactory().walk(script, pre, null, null, ctx);
-        return ctx.path;
+            else if (logger.hasLevel(ts.server.LogLevel.verbose)) {
+                logger.info(`watchDirectory for ${path} uses cached drive information.`);
+            }
+            if (status) {
+                // this drive is safe to use - call real 'watchDirectory'
+                return watchDirectorySwallowingException(path, callback, recursive, options);
+            }
+            else {
+                // this drive is unsafe - return no-op watcher
+                return noopFileWatcher;
+            }
+        };
+    }
+    else {
+        sys.watchDirectory = watchDirectorySwallowingException;
     }
 
-    //
-    // Find a source text offset that is safe for lexing tokens at the given position.
-    // This is used when "position" might be inside a comment or string, etc.
-    //
-    export function getTokenizationOffset(script: TypeScript.Script, position: number): number {
-        var bestOffset = 0;
-        var pre = (cur: TypeScript.AST, parent: TypeScript.AST, walker: TypeScript.IAstWalker): TypeScript.AST => {
-            if (TypeScript.isValidAstNode(cur)) {
-                // Did we find a closer offset?
-                if (cur.minChar <= position) {
-                    bestOffset = max(bestOffset, cur.minChar);
-                }
+    // Override sys.write because fs.writeSync is not reliable on Node 4
+    sys.write = (s: string) => writeMessage(Buffer.from(s, "utf8"));
 
-                // Stop the walk if this node is not related to "minChar"
-                if (cur.minChar > position || cur.limChar < bestOffset) {
-                    walker.options.goChildren = false;
+    /* eslint-disable no-restricted-globals */
+    sys.setTimeout = setTimeout;
+    sys.clearTimeout = clearTimeout;
+    sys.setImmediate = setImmediate;
+    sys.clearImmediate = clearImmediate;
+    /* eslint-enable no-restricted-globals */
+
+    if (typeof global !== "undefined" && global.gc) {
+        sys.gc = () => global.gc?.();
+    }
+
+    let cancellationToken: ts.server.ServerCancellationToken;
+    try {
+        const factory = require("./cancellationToken");
+        cancellationToken = factory(sys.args);
+    }
+    catch (e) {
+        cancellationToken = ts.server.nullCancellationToken;
+    }
+
+    const localeStr = ts.server.findArgument("--locale");
+    if (localeStr) {
+        validateLocaleAndSetLanguage(localeStr, sys);
+    }
+
+    const modeOrUnknown = parseServerMode();
+    let serverMode: LanguageServiceMode | undefined;
+    let unknownServerMode: string | undefined;
+    if (modeOrUnknown !== undefined) {
+        if (typeof modeOrUnknown === "number") serverMode = modeOrUnknown;
+        else unknownServerMode = modeOrUnknown;
+    }
+    return {
+        args: process.argv,
+        logger,
+        cancellationToken,
+        serverMode,
+        unknownServerMode,
+        startSession: startNodeSession,
+    };
+
+    // TSS_LOG "{ level: "normal | verbose | terse", file?: string}"
+    function createLogger() {
+        const cmdLineLogFileName = ts.server.findArgument("--logFile");
+        const cmdLineVerbosity = getLogLevel(ts.server.findArgument("--logVerbosity"));
+        const envLogOptions = parseLoggingEnvironmentString(process.env.TSS_LOG);
+
+        const unsubstitutedLogFileName = cmdLineLogFileName
+            ? stripQuotes(cmdLineLogFileName)
+            : envLogOptions.logToFile
+            ? envLogOptions.file || (libDirectory + "/.log" + process.pid.toString())
+            : undefined;
+
+        const substitutedLogFileName = unsubstitutedLogFileName
+            ? unsubstitutedLogFileName.replace("PID", process.pid.toString())
+            : undefined;
+
+        const logVerbosity = cmdLineVerbosity || envLogOptions.detailLevel;
+        return new Logger(substitutedLogFileName!, envLogOptions.traceToConsole!, logVerbosity!); // TODO: GH#18217
+    }
+
+    function writeMessage(buf: Buffer) {
+        if (!canWrite) {
+            pending.enqueue(buf);
+        }
+        else {
+            canWrite = false;
+            process.stdout.write(buf, setCanWriteFlagAndWriteMessageIfNecessary);
+        }
+    }
+
+    function setCanWriteFlagAndWriteMessageIfNecessary() {
+        canWrite = true;
+        if (!pending.isEmpty()) {
+            writeMessage(pending.dequeue());
+        }
+    }
+
+    function extractWatchDirectoryCacheKey(path: string, currentDriveKey: string | undefined) {
+        path = normalizeSlashes(path);
+        if (isUNCPath(path)) {
+            // UNC path: extract server name
+            // //server/location
+            //         ^ <- from 0 to this position
+            const firstSlash = path.indexOf(directorySeparator, 2);
+            return firstSlash !== -1 ? toFileNameLowerCase(path.substring(0, firstSlash)) : path;
+        }
+        const rootLength = getRootLength(path);
+        if (rootLength === 0) {
+            // relative path - assume file is on the current drive
+            return currentDriveKey;
+        }
+        if (path.charCodeAt(1) === CharacterCodes.colon && path.charCodeAt(2) === CharacterCodes.slash) {
+            // rooted path that starts with c:/... - extract drive letter
+            return toFileNameLowerCase(path.charAt(0));
+        }
+        if (path.charCodeAt(0) === CharacterCodes.slash && path.charCodeAt(1) !== CharacterCodes.slash) {
+            // rooted path that starts with slash - /somename - use key for current drive
+            return currentDriveKey;
+        }
+        // do not cache any other cases
+        return undefined;
+    }
+
+    function isUNCPath(s: string): boolean {
+        return s.length > 2 && s.charCodeAt(0) === CharacterCodes.slash && s.charCodeAt(1) === CharacterCodes.slash;
+    }
+
+    // This is the function that catches the exceptions when watching directory, and yet lets project service continue to function
+    // Eg. on linux the number of watches are limited and one could easily exhaust watches and the exception ENOSPC is thrown when creating watcher at that point
+    function watchDirectorySwallowingException(path: string, callback: DirectoryWatcherCallback, recursive?: boolean, options?: WatchOptions): FileWatcher {
+        try {
+            return originalWatchDirectory(path, callback, recursive, options);
+        }
+        catch (e) {
+            logger.info(`Exception when creating directory watcher: ${e.message}`);
+            return noopFileWatcher;
+        }
+    }
+}
+
+function parseEventPort(eventPortStr: string | undefined) {
+    const eventPort = eventPortStr === undefined ? undefined : parseInt(eventPortStr);
+    return eventPort !== undefined && !isNaN(eventPort) ? eventPort : undefined;
+}
+function startNodeSession(options: StartSessionOptions, logger: ts.server.Logger, cancellationToken: ts.server.ServerCancellationToken) {
+    const childProcess: {
+        fork(modulePath: string, args: string[], options?: { execArgv: string[]; env?: MapLike<string>; }): NodeChildProcess;
+    } = require("child_process");
+
+    const os: {
+        homedir?(): string;
+        tmpdir(): string;
+    } = require("os");
+
+    const net: {
+        connect(options: { port: number; }, onConnect?: () => void): NodeSocket;
+    } = require("net");
+
+    const readline: {
+        createInterface(options: ReadLineOptions): NodeJS.EventEmitter;
+    } = require("readline");
+
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        terminal: false,
+    });
+
+    class NodeTypingsInstallerAdapter extends ts.server.TypingsInstallerAdapter {
+        protected override installer!: NodeChildProcess;
+        // This number is essentially arbitrary.  Processing more than one typings request
+        // at a time makes sense, but having too many in the pipe results in a hang
+        // (see https://github.com/nodejs/node/issues/7657).
+        // It would be preferable to base our limit on the amount of space left in the
+        // buffer, but we have yet to find a way to retrieve that value.
+        private static readonly maxActiveRequestCount = 10;
+
+        constructor(
+            telemetryEnabled: boolean,
+            logger: ts.server.Logger,
+            host: ts.server.ServerHost,
+            globalTypingsCacheLocation: string,
+            readonly typingSafeListLocation: string,
+            readonly typesMapLocation: string,
+            private readonly npmLocation: string | undefined,
+            private readonly validateDefaultNpmLocation: boolean,
+            event: ts.server.Event,
+        ) {
+            super(
+                telemetryEnabled,
+                logger,
+                host,
+                globalTypingsCacheLocation,
+                event,
+                NodeTypingsInstallerAdapter.maxActiveRequestCount,
+            );
+        }
+
+        createInstallerProcess() {
+            if (this.logger.hasLevel(ts.server.LogLevel.requestTime)) {
+                this.logger.info("Binding...");
+            }
+
+            const args: string[] = [ts.server.Arguments.GlobalCacheLocation, this.globalTypingsCacheLocation];
+            if (this.telemetryEnabled) {
+                args.push(ts.server.Arguments.EnableTelemetry);
+            }
+            if (this.logger.loggingEnabled() && this.logger.getLogFileName()) {
+                args.push(ts.server.Arguments.LogFile, combinePaths(getDirectoryPath(normalizeSlashes(this.logger.getLogFileName()!)), `ti-${process.pid}.log`));
+            }
+            if (this.typingSafeListLocation) {
+                args.push(ts.server.Arguments.TypingSafeListLocation, this.typingSafeListLocation);
+            }
+            if (this.typesMapLocation) {
+                args.push(ts.server.Arguments.TypesMapLocation, this.typesMapLocation);
+            }
+            if (this.npmLocation) {
+                args.push(ts.server.Arguments.NpmLocation, this.npmLocation);
+            }
+            if (this.validateDefaultNpmLocation) {
+                args.push(ts.server.Arguments.ValidateDefaultNpmLocation);
+            }
+
+            const execArgv: string[] = [];
+            for (const arg of process.execArgv) {
+                const match = /^--((?:debug|inspect)(?:-brk)?)(?:=(\d+))?$/.exec(arg);
+                if (match) {
+                    // if port is specified - use port + 1
+                    // otherwise pick a default port depending on if 'debug' or 'inspect' and use its value + 1
+                    const currentPort = match[2] !== undefined
+                        ? +match[2]
+                        : match[1].charAt(0) === "d" ? 5858 : 9229;
+                    execArgv.push(`--${match[1]}=${currentPort + 1}`);
+                    break;
                 }
             }
 
-            return cur;
-        }
+            const typingsInstaller = combinePaths(getDirectoryPath(sys.getExecutingFilePath()), "typingsInstaller.js");
+            this.installer = childProcess.fork(typingsInstaller, args, { execArgv });
+            this.installer.on("message", m => this.handleMessage(m));
 
-        TypeScript.getAstWalkerFactory().walk(script, pre);
-        return bestOffset;
+            // We have to schedule this event to the next tick
+            // cause this fn will be called during
+            // new IOSession => super(which is Session) => new ProjectService => NodeTypingsInstaller.attach
+            // and if "event" is referencing "this" before super class is initialized, it will be a ReferenceError in ES6 class.
+            this.host.setImmediate(() => this.event({ pid: this.installer.pid }, "typingsInstallerPid"));
+
+            process.on("exit", () => {
+                this.installer.kill();
+            });
+            return this.installer;
+        }
     }
 
-    ///
-    /// Simple function to Walk an AST using a simple callback function.
-    ///
-    export function walkAST(ast: TypeScript.AST, callback: (path: AstPath, walker: TypeScript.IAstWalker) => void ): void {
-        var pre = function (cur: TypeScript.AST, parent: TypeScript.AST, walker: TypeScript.IAstWalker) {
-            var path: TypeScript.AstPath = walker.state;
-            path.push(cur);
-            callback(path, walker);
-            return cur;
-        }
-        var post = function (cur: TypeScript.AST, parent: TypeScript.AST, walker: TypeScript.IAstWalker) {
-            var path: TypeScript.AstPath = walker.state;
-            path.pop();
-            return cur;
+    class IOSession extends ts.server.Session {
+        private eventPort: number | undefined;
+        private eventSocket: NodeSocket | undefined;
+        private socketEventQueue: { body: any; eventName: string; }[] | undefined;
+        /** No longer needed if syntax target is es6 or above. Any access to "this" before initialized will be a runtime error. */
+        private constructed: boolean | undefined;
+
+        constructor() {
+            const event = (body: object, eventName: string) => {
+                this.event(body, eventName);
+            };
+
+            const host = sys as ts.server.ServerHost;
+
+            const typingsInstaller = disableAutomaticTypingAcquisition
+                ? undefined
+                : new NodeTypingsInstallerAdapter(telemetryEnabled, logger, host, getGlobalTypingsCacheLocation(), typingSafeListLocation, typesMapLocation, npmLocation, validateDefaultNpmLocation, event);
+
+            super({
+                host,
+                cancellationToken,
+                ...options,
+                typingsInstaller,
+                byteLength: Buffer.byteLength,
+                hrtime: process.hrtime,
+                logger,
+                canUseEvents: true,
+                typesMapLocation,
+            });
+
+            this.eventPort = eventPort;
+            if (this.canUseEvents && this.eventPort) {
+                const s = net.connect({ port: this.eventPort }, () => {
+                    this.eventSocket = s;
+                    if (this.socketEventQueue) {
+                        // flush queue.
+                        for (const event of this.socketEventQueue) {
+                            this.writeToEventSocket(event.body, event.eventName);
+                        }
+                        this.socketEventQueue = undefined;
+                    }
+                });
+            }
+
+            this.constructed = true;
         }
 
-        var path = new AstPath();
-        TypeScript.getAstWalkerFactory().walk(ast, pre, post, null, path);
+        override event<T extends object>(body: T, eventName: string): void {
+            Debug.assert(!!this.constructed, "Should only call `IOSession.prototype.event` on an initialized IOSession");
+
+            if (this.canUseEvents && this.eventPort) {
+                if (!this.eventSocket) {
+                    if (this.logger.hasLevel(ts.server.LogLevel.verbose)) {
+                        this.logger.info(`eventPort: event "${eventName}" queued, but socket not yet initialized`);
+                    }
+                    (this.socketEventQueue || (this.socketEventQueue = [])).push({ body, eventName });
+                    return;
+                }
+                else {
+                    Debug.assert(this.socketEventQueue === undefined);
+                    this.writeToEventSocket(body, eventName);
+                }
+            }
+            else {
+                super.event(body, eventName);
+            }
+        }
+
+        private writeToEventSocket(body: object, eventName: string): void {
+            this.eventSocket!.write(ts.server.formatMessage(ts.server.toEvent(eventName, body), this.logger, this.byteLength, this.host.newLine), "utf8");
+        }
+
+        override exit() {
+            this.logger.info("Exiting...");
+            this.projectService.closeLog();
+            tracing?.stopTracing();
+            process.exit(0);
+        }
+
+        listen() {
+            rl.on("line", (input: string) => {
+                const message = input.trim();
+                this.onMessage(message);
+            });
+
+            rl.on("close", () => {
+                this.exit();
+            });
+        }
+    }
+
+    class IpcIOSession extends IOSession {
+        protected override writeMessage(msg: ts.server.protocol.Message): void {
+            const verboseLogging = logger.hasLevel(ts.server.LogLevel.verbose);
+            if (verboseLogging) {
+                const json = JSON.stringify(msg);
+                logger.info(`${msg.type}:${ts.server.indent(json)}`);
+            }
+
+            process.send!(msg);
+        }
+
+        protected override parseMessage(message: any): ts.server.protocol.Request {
+            return message as ts.server.protocol.Request;
+        }
+
+        protected override toStringMessage(message: any) {
+            return JSON.stringify(message, undefined, 2);
+        }
+
+        public override listen() {
+            process.on("message", (e: any) => {
+                this.onMessage(e);
+            });
+
+            process.on("disconnect", () => {
+                this.exit();
+            });
+        }
+    }
+
+    const eventPort: number | undefined = parseEventPort(ts.server.findArgument("--eventPort"));
+    const typingSafeListLocation = ts.server.findArgument(ts.server.Arguments.TypingSafeListLocation)!; // TODO: GH#18217
+    const typesMapLocation = ts.server.findArgument(ts.server.Arguments.TypesMapLocation) || combinePaths(getDirectoryPath(sys.getExecutingFilePath()), "typesMap.json");
+    const npmLocation = ts.server.findArgument(ts.server.Arguments.NpmLocation);
+    const validateDefaultNpmLocation = ts.server.hasArgument(ts.server.Arguments.ValidateDefaultNpmLocation);
+    const disableAutomaticTypingAcquisition = ts.server.hasArgument("--disableAutomaticTypingAcquisition");
+    const useNodeIpc = ts.server.hasArgument("--useNodeIpc");
+    const telemetryEnabled = ts.server.hasArgument(ts.server.Arguments.EnableTelemetry);
+    const commandLineTraceDir = ts.server.findArgument("--traceDirectory");
+    const traceDir = commandLineTraceDir
+        ? stripQuotes(commandLineTraceDir)
+        : process.env.TSS_TRACE;
+    if (traceDir) {
+        startTracing("server", traceDir);
+    }
+
+    const ioSession = useNodeIpc ? new IpcIOSession() : new IOSession();
+    process.on("uncaughtException", err => {
+        ioSession.logError(err, "unknown");
+    });
+    // See https://github.com/Microsoft/TypeScript/issues/11348
+    (process as any).noAsar = true;
+    // Start listening
+    ioSession.listen();
+
+    function getGlobalTypingsCacheLocation() {
+        switch (process.platform) {
+            case "win32": {
+                const basePath = process.env.LOCALAPPDATA ||
+                    process.env.APPDATA ||
+                    (os.homedir && os.homedir()) ||
+                    process.env.USERPROFILE ||
+                    (process.env.HOMEDRIVE && process.env.HOMEPATH && normalizeSlashes(process.env.HOMEDRIVE + process.env.HOMEPATH)) ||
+                    os.tmpdir();
+                return combinePaths(combinePaths(normalizeSlashes(basePath), "Microsoft/TypeScript"), versionMajorMinor);
+            }
+            case "openbsd":
+            case "freebsd":
+            case "netbsd":
+            case "darwin":
+            case "linux":
+            case "android": {
+                const cacheLocation = getNonWindowsCacheLocation(process.platform === "darwin");
+                return combinePaths(combinePaths(cacheLocation, "typescript"), versionMajorMinor);
+            }
+            default:
+                return Debug.fail(`unsupported platform '${process.platform}'`);
+        }
+    }
+
+    function getNonWindowsCacheLocation(platformIsDarwin: boolean) {
+        if (process.env.XDG_CACHE_HOME) {
+            return process.env.XDG_CACHE_HOME;
+        }
+        const usersDir = platformIsDarwin ? "Users" : "home";
+        const homePath = (os.homedir && os.homedir()) ||
+            process.env.HOME ||
+            ((process.env.LOGNAME || process.env.USER) && `/${usersDir}/${process.env.LOGNAME || process.env.USER}`) ||
+            os.tmpdir();
+        const cacheFolder = platformIsDarwin
+            ? "Library/Caches"
+            : ".cache";
+        return combinePaths(normalizeSlashes(homePath), cacheFolder);
     }
 }

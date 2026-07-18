@@ -1,123 +1,142 @@
-from typing import ClassVar, Literal
+import datetime
+import warnings
+from collections import deque
+from collections.abc import Callable
+from decimal import Decimal
+from enum import Enum
+from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
+from pathlib import Path
+from re import Pattern
+from types import GeneratorType
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
-from typing_extensions import TypedDict
+from typing_extensions import deprecated
 
-import pydantic
+from .._internal._import_utils import import_cached_base_model
+from ..color import Color
+from ..networks import NameEmail
+from ..types import SecretBytes, SecretStr
+from ..warnings import PydanticDeprecatedSince20
 
+if not TYPE_CHECKING:
+    # See PyCharm issues https://youtrack.jetbrains.com/issue/PY-21915
+    # and https://youtrack.jetbrains.com/issue/PY-51428
+    DeprecationWarning = PydanticDeprecatedSince20
 
-def test_field_serializer_in_nested_union_called_only_twice():
-    class MyModel(pydantic.BaseModel):
-        a: int
-        b: int
-
-        field_a_serializer_calls: ClassVar[int] = 0
-
-        @pydantic.field_serializer('a')
-        def serialize_my_field(self, value: int) -> str:
-            self.__class__.field_a_serializer_calls += 1
-            return str(value)
-
-    class Container(TypedDict):
-        u: MyModel | int
-
-    class Container2(TypedDict):
-        u: Container | int
-
-    # forcibly construct model with a False value
-    value = MyModel.model_construct(a=1, b=False)
-    assert value.b is False
-
-    ta = pydantic.TypeAdapter(Container2 | int)
-    ta.dump_json(Container2(u=Container(u=value)), warnings=False)
-
-    # Historical implementations of pydantic would call the field serializer many times
-    # as nested unions were individually attempted with each of strict and lax checking.
-    #
-    # 2 comes from:
-    # - one attempt in strict mode, which fails because of `b=False` as a subclass
-    # - one attempt in lax mode, which succeeds
-    assert MyModel.field_a_serializer_calls == 2
+__all__ = 'pydantic_encoder', 'custom_pydantic_encoder', 'timedelta_isoformat'
 
 
-def test_field_serializer_in_nested_tagged_union_called_only_twice():
-    class MyModel(pydantic.BaseModel):
-        type_: Literal['a'] = 'a'
-
-        a: int
-        b: int
-
-        field_a_serializer_calls: ClassVar[int] = 0
-
-        @pydantic.field_serializer('a')
-        def serialize_my_field(self, value: int) -> str:
-            self.__class__.field_a_serializer_calls += 1
-            return str(value)
-
-    class ModelB(pydantic.BaseModel):
-        type_: Literal['b'] = 'b'
-
-    class Container(pydantic.BaseModel):
-        type_: Literal['a'] = 'a'
-        u: MyModel | ModelB = pydantic.Field(..., discriminator='type_')
-
-    class Container2(pydantic.BaseModel):
-        u: Container | ModelB = pydantic.Field(..., discriminator='type_')
-
-    # forcibly construct model with a False value
-    value = MyModel.model_construct(a=1, b=False)
-    assert value.b is False
-
-    ta = pydantic.TypeAdapter(Container2 | int)
-    ta.dump_json(Container2(u=Container(u=value)), warnings=False)
-
-    # Historical implementations of pydantic would call the field serializer many times
-    # as nested unions were individually attempted with each of strict and lax checking,
-    # and the discriminators also incurred an extra attempt at each check level too.
-    assert MyModel.field_a_serializer_calls == 2
+def isoformat(o: datetime.date | datetime.time) -> str:
+    return o.isoformat()
 
 
-def test_exclude_unset_in_nested_union():
-    class Cat(pydantic.BaseModel):
-        type: Literal['cat']
-        color: str | None = None  # field with default
+def decimal_encoder(dec_value: Decimal) -> int | float:
+    """Encodes a Decimal as int of there's no exponent, otherwise float.
 
-    class Dog(pydantic.BaseModel):
-        type: Literal['dog']
+    This is useful when we use ConstrainedDecimal to represent Numeric(x,0)
+    where a integer (but not int typed) is used. Encoding this as a float
+    results in failed round-tripping between encode and parse.
+    Our Id type is a prime example of this.
 
-    class Zoo(pydantic.BaseModel):
-        animals: list[Cat | Dog]
+    >>> decimal_encoder(Decimal("1.0"))
+    1.0
 
-    cat = Cat(type='cat')
-    zoo = Zoo(animals=[cat])
-
-    assert zoo.model_dump() == {'animals': [{'type': 'cat', 'color': None}]}
-    assert cat.model_dump(exclude_unset=True) == {'type': 'cat'}
-    assert zoo.model_dump(exclude_unset=True) == {'animals': [{'type': 'cat'}]}
-
-
-def test_list_union_omit():
-    OmitList = list[pydantic.OnErrorOmit[int] | pydantic.OnErrorOmit[bool]]
-    ta = pydantic.TypeAdapter(OmitList)
-    assert ta.validate_python([1, 'True', 'foo', '2', False, 'bar']) == [1, True, 2, False]
+    >>> decimal_encoder(Decimal("1"))
+    1
+    """
+    exponent = dec_value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent >= 0:
+        return int(dec_value)
+    else:
+        return float(dec_value)
 
 
-def test_list_union_omit_one_member():
-    OmitList = list[pydantic.OnErrorOmit[int] | bool]
-    ta = pydantic.TypeAdapter(OmitList)
-    assert ta.validate_python([1, 'True', 'foo', '2', False, 'bar']) == [1, True, 2, False]
+ENCODERS_BY_TYPE: dict[type[Any], Callable[[Any], Any]] = {
+    bytes: lambda o: o.decode(),
+    Color: str,
+    datetime.date: isoformat,
+    datetime.datetime: isoformat,
+    datetime.time: isoformat,
+    datetime.timedelta: lambda td: td.total_seconds(),
+    Decimal: decimal_encoder,
+    Enum: lambda o: o.value,
+    frozenset: list,
+    deque: list,
+    GeneratorType: list,
+    IPv4Address: str,
+    IPv4Interface: str,
+    IPv4Network: str,
+    IPv6Address: str,
+    IPv6Interface: str,
+    IPv6Network: str,
+    NameEmail: str,
+    Path: str,
+    Pattern: lambda o: o.pattern,
+    SecretBytes: str,
+    SecretStr: str,
+    set: list,
+    UUID: str,
+}
 
 
-def test_typed_dict_union_omit():
-    class TD(TypedDict):
-        # arguably this should fail on schema build since `x` is a
-        # required field, and setting the type to `OnErrorOmit`
-        # effectively makes it optional.
-        x: pydantic.OnErrorOmit[int] | pydantic.OnErrorOmit[bool]
+@deprecated(
+    '`pydantic_encoder` is deprecated, use `pydantic_core.to_jsonable_python` instead.',
+    category=None,
+)
+def pydantic_encoder(obj: Any) -> Any:
+    warnings.warn(
+        '`pydantic_encoder` is deprecated, use `pydantic_core.to_jsonable_python` instead.',
+        category=PydanticDeprecatedSince20,
+        stacklevel=2,
+    )
+    from dataclasses import asdict, is_dataclass
 
-    ta = pydantic.TypeAdapter(TD)
-    assert ta.validate_python({'x': 1}) == {'x': 1}
-    assert ta.validate_python({'x': 'True'}) == {'x': True}
+    BaseModel = import_cached_base_model()
 
-    # test to document the behaviour that if all options in the union fail,
-    # the field is omitted, even if it is required in the TypedDict.
-    assert ta.validate_python({'x': 'foo'}) == {}
+    if isinstance(obj, BaseModel):
+        return obj.model_dump()
+    elif is_dataclass(obj):
+        return asdict(obj)  # type: ignore
+
+    # Check the class type and its superclasses for a matching encoder
+    for base in obj.__class__.__mro__[:-1]:
+        try:
+            encoder = ENCODERS_BY_TYPE[base]
+        except KeyError:
+            continue
+        return encoder(obj)
+    else:  # We have exited the for loop without finding a suitable encoder
+        raise TypeError(f"Object of type '{obj.__class__.__name__}' is not JSON serializable")
+
+
+# TODO: Add a suggested migration path once there is a way to use custom encoders
+@deprecated(
+    '`custom_pydantic_encoder` is deprecated, use `BaseModel.model_dump` instead.',
+    category=None,
+)
+def custom_pydantic_encoder(type_encoders: dict[Any, Callable[[type[Any]], Any]], obj: Any) -> Any:
+    warnings.warn(
+        '`custom_pydantic_encoder` is deprecated, use `BaseModel.model_dump` instead.',
+        category=PydanticDeprecatedSince20,
+        stacklevel=2,
+    )
+    # Check the class type and its superclasses for a matching encoder
+    for base in obj.__class__.__mro__[:-1]:
+        try:
+            encoder = type_encoders[base]
+        except KeyError:
+            continue
+
+        return encoder(obj)
+    else:  # We have exited the for loop without finding a suitable encoder
+        return pydantic_encoder(obj)
+
+
+@deprecated('`timedelta_isoformat` is deprecated.', category=None)
+def timedelta_isoformat(td: datetime.timedelta) -> str:
+    """ISO 8601 encoding for Python timedelta object."""
+    warnings.warn('`timedelta_isoformat` is deprecated.', category=PydanticDeprecatedSince20, stacklevel=2)
+    minutes, seconds = divmod(td.seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f'{"-" if td.days < 0 else ""}P{abs(td.days)}DT{hours:d}H{minutes:d}M{seconds:d}.{td.microseconds:06d}S'

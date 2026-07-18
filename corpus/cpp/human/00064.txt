@@ -1,246 +1,129 @@
 //     __ _____ _____ _____
-//  __|  |   __|     |   | |  JSON for Modern C++ (supporting code)
+//  __|  |   __|     |   | |  JSON for Modern C++
 // |  |  |__   |  |  | | | |  version 3.11.3
 // |_____|_____|_____|_|___|  https://github.com/nlohmann/json
 //
-// Copyright (c) 2013-2022 Niels Lohmann <http://nlohmann.me>.
 // SPDX-FileCopyrightText: 2013-2023 Niels Lohmann <https://nlohmann.me>
 // SPDX-License-Identifier: MIT
 
-#include "doctest_compatibility.h"
+#pragma once
 
-#ifdef JSON_DIAGNOSTICS
-    #undef JSON_DIAGNOSTICS
-#endif
+#include <cstdint> // uint8_t
+#include <cstddef> // size_t
+#include <functional> // hash
 
-#define JSON_DIAGNOSTICS 1
+#include <nlohmann/detail/abi_macros.hpp>
+#include <nlohmann/detail/value_t.hpp>
 
-#include <nlohmann/json.hpp>
-using nlohmann::json;
-
-TEST_CASE("Better diagnostics")
+NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace detail
 {
-    SECTION("empty JSON Pointer")
-    {
-        json const j = 1;
-        std::string s;
-        CHECK_THROWS_WITH_AS(s = j.get<std::string>(), "[json.exception.type_error.302] type must be string, but is number", json::type_error);
-    }
 
-    SECTION("invalid type")
-    {
-        json j;
-        j["a"]["b"]["c"] = 1;
-        std::string s;
-        CHECK_THROWS_WITH_AS(s = j["a"]["b"]["c"].get<std::string>(), "[json.exception.type_error.302] (/a/b/c) type must be string, but is number", json::type_error);
-    }
+// boost::hash_combine
+inline std::size_t combine(std::size_t seed, std::size_t h) noexcept
+{
+    seed ^= h + 0x9e3779b9 + (seed << 6U) + (seed >> 2U);
+    return seed;
+}
 
-    SECTION("missing key")
-    {
-        json j;
-        j["object"]["object"] = true;
-        CHECK_THROWS_WITH_AS(j["object"].at("not_found"), "[json.exception.out_of_range.403] (/object) key 'not_found' not found", json::out_of_range);
-    }
+/*!
+@brief hash a JSON value
 
-    SECTION("array index out of range")
-    {
-        json j;
-        j["array"][4] = true;
-        CHECK_THROWS_WITH_AS(j["array"].at(5), "[json.exception.out_of_range.401] (/array) array index 5 is out of range", json::out_of_range);
-    }
+The hash function tries to rely on std::hash where possible. Furthermore, the
+type of the JSON value is taken into account to have different hash values for
+null, 0, 0U, and false, etc.
 
-    SECTION("array index at wrong type")
-    {
-        json j;
-        j["array"][4] = true;
-        CHECK_THROWS_WITH_AS(j["array"][4][5], "[json.exception.type_error.305] (/array/4) cannot use operator[] with a numeric argument with boolean", json::type_error);
-    }
+@tparam BasicJsonType basic_json specialization
+@param j JSON value to hash
+@return hash value of j
+*/
+template<typename BasicJsonType>
+std::size_t hash(const BasicJsonType& j)
+{
+    using string_t = typename BasicJsonType::string_t;
+    using number_integer_t = typename BasicJsonType::number_integer_t;
+    using number_unsigned_t = typename BasicJsonType::number_unsigned_t;
+    using number_float_t = typename BasicJsonType::number_float_t;
 
-    SECTION("wrong iterator")
+    const auto type = static_cast<std::size_t>(j.type());
+    switch (j.type())
     {
-        json j;
-        j["array"] = json::array();
-        CHECK_THROWS_WITH_AS(j["array"].erase(j.begin()), "[json.exception.invalid_iterator.202] (/array) iterator does not fit current value", json::invalid_iterator);
-    }
+        case BasicJsonType::value_t::null:
+        case BasicJsonType::value_t::discarded:
+        {
+            return combine(type, 0);
+        }
 
-    SECTION("JSON Pointer escaping")
-    {
-        json j;
-        j["a/b"]["m~n"] = 1;
-        std::string s;
-        CHECK_THROWS_WITH_AS(s = j["a/b"]["m~n"].get<std::string>(), "[json.exception.type_error.302] (/a~1b/m~0n) type must be string, but is number", json::type_error);
-    }
+        case BasicJsonType::value_t::object:
+        {
+            auto seed = combine(type, j.size());
+            for (const auto& element : j.items())
+            {
+                const auto h = std::hash<string_t> {}(element.key());
+                seed = combine(seed, h);
+                seed = combine(seed, hash(element.value()));
+            }
+            return seed;
+        }
 
-    SECTION("Parse error")
-    {
-        json _;
-        CHECK_THROWS_WITH_AS(_ = json::parse(""), "[json.exception.parse_error.101] parse error at line 1, column 1: attempting to parse an empty input; check that your input string or stream contains the expected JSON", json::parse_error);
-    }
+        case BasicJsonType::value_t::array:
+        {
+            auto seed = combine(type, j.size());
+            for (const auto& element : j)
+            {
+                seed = combine(seed, hash(element));
+            }
+            return seed;
+        }
 
-    SECTION("Wrong type in update()")
-    {
-        json j = {{"foo", "bar"}};
-        json k = {{"bla", 1}};
+        case BasicJsonType::value_t::string:
+        {
+            const auto h = std::hash<string_t> {}(j.template get_ref<const string_t&>());
+            return combine(type, h);
+        }
 
-        CHECK_THROWS_WITH_AS(j.update(k["bla"].begin(), k["bla"].end()), "[json.exception.type_error.312] (/bla) cannot use update() with number", json::type_error);
-        CHECK_THROWS_WITH_AS(j.update(k["bla"]), "[json.exception.type_error.312] (/bla) cannot use update() with number", json::type_error);
+        case BasicJsonType::value_t::boolean:
+        {
+            const auto h = std::hash<bool> {}(j.template get<bool>());
+            return combine(type, h);
+        }
+
+        case BasicJsonType::value_t::number_integer:
+        {
+            const auto h = std::hash<number_integer_t> {}(j.template get<number_integer_t>());
+            return combine(type, h);
+        }
+
+        case BasicJsonType::value_t::number_unsigned:
+        {
+            const auto h = std::hash<number_unsigned_t> {}(j.template get<number_unsigned_t>());
+            return combine(type, h);
+        }
+
+        case BasicJsonType::value_t::number_float:
+        {
+            const auto h = std::hash<number_float_t> {}(j.template get<number_float_t>());
+            return combine(type, h);
+        }
+
+        case BasicJsonType::value_t::binary:
+        {
+            auto seed = combine(type, j.get_binary().size());
+            const auto h = std::hash<bool> {}(j.get_binary().has_subtype());
+            seed = combine(seed, h);
+            seed = combine(seed, static_cast<std::size_t>(j.get_binary().subtype()));
+            for (const auto byte : j.get_binary())
+            {
+                seed = combine(seed, std::hash<std::uint8_t> {}(byte));
+            }
+            return seed;
+        }
+
+        default:                   // LCOV_EXCL_LINE
+            JSON_ASSERT(false); // NOLINT(cert-dcl03-c,hicpp-static-assert,misc-static-assert) LCOV_EXCL_LINE
+            return 0;              // LCOV_EXCL_LINE
     }
 }
 
-TEST_CASE("Regression tests for extended diagnostics")
-{
-    SECTION("Regression test for https://github.com/nlohmann/json/pull/2562#pullrequestreview-574858448")
-    {
-        CHECK_THROWS_WITH_AS(json({"0", "0"})[1].get<int>(), "[json.exception.type_error.302] (/1) type must be number, but is string", json::type_error);
-        CHECK_THROWS_WITH_AS(json({"0", "1"})[1].get<int>(), "[json.exception.type_error.302] (/1) type must be number, but is string", json::type_error);
-    }
-
-    SECTION("Regression test for https://github.com/nlohmann/json/pull/2562/files/380a613f2b5d32425021129cd1f371ddcfd54ddf#r563259793")
-    {
-        json j;
-        j["/foo"] = {1, 2, 3};
-        CHECK_THROWS_WITH_AS(j.unflatten(), "[json.exception.type_error.315] (/~1foo) values in object must be primitive", json::type_error);
-    }
-
-    SECTION("Regression test for issue #2838 - Assertion failure when inserting into arrays with JSON_DIAGNOSTICS set")
-    {
-        // void push_back(basic_json&& val)
-        {
-            json j_arr = json::array();
-            j_arr.push_back(json::object());
-            j_arr.push_back(json::object());
-            j_arr.push_back(json::object());
-            j_arr.push_back(json::object());
-            json j_obj = json::object();
-            j_obj["key"] = j_arr;
-        }
-
-        // void push_back(const basic_json& val)
-        {
-            json j_arr = json::array();
-            auto object = json::object();
-            j_arr.push_back(object);
-            j_arr.push_back(object);
-            j_arr.push_back(object);
-            j_arr.push_back(object);
-            json j_obj = json::object();
-            j_obj["key"] = j_arr;
-        }
-
-        // reference emplace_back(Args&& ... args)
-        {
-            json j_arr = json::array();
-            j_arr.emplace_back(json::object());
-            j_arr.emplace_back(json::object());
-            j_arr.emplace_back(json::object());
-            j_arr.emplace_back(json::object());
-            json j_obj = json::object();
-            j_obj["key"] = j_arr;
-        }
-
-        // iterator insert(const_iterator pos, const basic_json& val)
-        {
-            json j_arr = json::array();
-            j_arr.insert(j_arr.begin(), json::object());
-            j_arr.insert(j_arr.begin(), json::object());
-            j_arr.insert(j_arr.begin(), json::object());
-            j_arr.insert(j_arr.begin(), json::object());
-            json j_obj = json::object();
-            j_obj["key"] = j_arr;
-        }
-
-        // iterator insert(const_iterator pos, size_type cnt, const basic_json& val)
-        {
-            json j_arr = json::array();
-            j_arr.insert(j_arr.begin(), 2, json::object());
-            json j_obj = json::object();
-            j_obj["key"] = j_arr;
-        }
-
-        // iterator insert(const_iterator pos, const_iterator first, const_iterator last)
-        {
-            json j_arr = json::array();
-            json j_objects = {json::object(), json::object()};
-            j_arr.insert(j_arr.begin(), j_objects.begin(), j_objects.end());
-            json j_obj = json::object();
-            j_obj["key"] = j_arr;
-        }
-    }
-
-    SECTION("Regression test for issue #2962 - JSON_DIAGNOSTICS assertion for ordered_json")
-    {
-        nlohmann::ordered_json j;
-        nlohmann::ordered_json j2;
-        const std::string value;
-        j["first"] = value;
-        j["second"] = value;
-        j2["something"] = j;
-    }
-
-    SECTION("Regression test for issue #3007 - Parent pointers properly set when using update()")
-    {
-        // void update(const_reference j)
-        {
-            json j = json::object();
-
-            {
-                json j2 = json::object();
-                j2["one"] = 1;
-
-                j.update(j2);
-            }
-
-            // Must call operator[] on const element, otherwise m_parent gets updated.
-            auto const& constJ = j;
-            CHECK_THROWS_WITH_AS(constJ["one"].at(0), "[json.exception.type_error.304] (/one) cannot use at() with number", json::type_error);
-        }
-
-        // void update(const_iterator first, const_iterator last)
-        {
-            json j = json::object();
-
-            {
-                json j2 = json::object();
-                j2["one"] = 1;
-
-                j.update(j2.begin(), j2.end());
-            }
-
-            // Must call operator[] on const element, otherwise m_parent gets updated.
-            auto const& constJ = j;
-            CHECK_THROWS_WITH_AS(constJ["one"].at(0), "[json.exception.type_error.304] (/one) cannot use at() with number", json::type_error);
-        }
-
-        // Code from #3007 triggering unwanted assertion without fix to update().
-        {
-            json root = json::array();
-            json lower = json::object();
-
-            {
-                json lowest = json::object();
-                lowest["one"] = 1;
-
-                lower.update(lowest);
-            }
-
-            root.push_back(lower);
-        }
-    }
-
-    SECTION("Regression test for issue #3032 - Yet another assertion failure when inserting into arrays with JSON_DIAGNOSTICS set")
-    {
-        // reference operator[](size_type idx)
-        {
-            json j_arr = json::array();
-            j_arr[0] = 0;
-            j_arr[1] = 1;
-            j_arr[2] = 2;
-            j_arr[3] = 3;
-            j_arr[4] = 4;
-            j_arr[5] = 5;
-            j_arr[6] = 6;
-            j_arr[7] = 7;
-            json const j_arr_copy = j_arr;
-        }
-    }
-}
+}  // namespace detail
+NLOHMANN_JSON_NAMESPACE_END

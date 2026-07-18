@@ -1,18 +1,249 @@
----
-last_modified: 2026-02-09
-title: "Configure sandbox memory"
-description: "Learn how to configure the memory allocated to a sandbox"
-url: /examples/sandbox_memory/
-layout: sandbox-example.tsx
----
+Three differences trip up Node.js developers most often:
 
-You can customize the amount of memory allocated to your sandbox using the
-memoryMb option. This allows you to allocate more resources for memory-intensive
-workloads or reduce memory for lighter tasks.
+**Imports use real file extensions.** In Deno you write
+`import { greet } from "./greet.ts"`, using the actual extension of the file on
+disk. Under `tsc` you would instead write `./greet.js` to import a file named
+`greet.ts`, or opt into
+[`allowImportingTsExtensions`](https://www.typescriptlang.org/tsconfig/#allowImportingTsExtensions),
+which `tsc` only permits together with `noEmit`. Deno needs neither workaround,
+since it never emits. See [Modules](/runtime/fundamentals/modules/) for how
+resolution works, including npm packages.
 
-```ts
-import { Sandbox } from "@deno/sandbox";
+**Deno runs the full TypeScript language.** Node's built-in type stripping only
+handles syntax it can erase. Features that generate runtime code (enums,
+namespaces with runtime values, and parameter properties) require Node's
+experimental `--experimental-transform-types` flag, which is still present as of
+Node 24. Deno runs all of them with no flag.
 
-// Create a sandbox with 1GB of memory
-await using sandbox = await Sandbox.create({ memory: 1024 });
+**Most of your `tsconfig.json` configures output files Deno never writes.**
+Options like `target`, `module`, `outDir`, `esModuleInterop`, and `sourceMap`
+shape emitted JavaScript, which Deno keeps in its internal cache rather than
+writing to disk. Deno warns about these ignored options, and the
+[migration table](/runtime/reference/ts_config_migration/#migrating-compileroptions-from-nodejs)
+in the configuration reference says what to do with each one. For most, the
+answer is "delete it".
+
+If you are moving a whole project over, the
+[Migrating from Node.js](/runtime/migrate/) guide covers the rest (dependencies,
+`package.json`, npm scripts).
+
+## Type checking
+
+Deno type-checks in
+[strict mode](https://www.typescriptlang.org/tsconfig/#strict) by default. It
+also turns on `noImplicitOverride`, which `tsc` leaves off even under `strict`.
+The
+[compiler options table](/runtime/reference/ts_config_migration/#ts-compiler-options)
+lists every default.
+
+Check your code without running it using
+[`deno check`](/runtime/reference/cli/check/):
+
+```sh
+# Check the whole project
+deno check
+
+# Check a specific file or directory
+deno check main.ts
+deno check src/
+
+# Also type-check remote modules and npm dependencies
+deno check --all main.ts
+
+# Type-check JavaScript files too, without adding @ts-check to each one
+deno check --check-js main.js
+```
+
+`deno check` exits non-zero on errors, so it works as-is in CI. The `--check-js`
+flag shown above is covered in
+[type checking JavaScript](#type-checking-javascript) below. `deno check` can
+also check code blocks in JSDoc comments and markdown files; see
+[documentation tests](/runtime/test/doc_tests/).
+
+To type-check before execution, add `--check` to `deno run`:
+
+```sh
+deno run --check main.ts
+
+# Include remote modules and npm packages in the check
+deno run --check=all main.ts
+```
+
+With this flag, a type error stops the process before any code runs. You can
+resolve the error, suppress it with a `// @ts-expect-error` or `// @ts-ignore`
+comment, or drop the flag.
+
+`deno test` and `deno bench` type-check by default. Pass `--no-check` to skip
+it:
+
+```sh
+deno test --no-check
+```
+
+### Faster type checking with the native compiler (tsgo)
+
+TypeScript's [native compiler](https://devblogs.microsoft.com/typescript/),
+written in Go and often around 10 times faster than the JavaScript `tsc`, is
+integrated into Deno behind an unstable flag. Unlike running the standalone
+`tsgo` binary, Deno's integration understands Deno's module resolution and
+types, so `jsr:` and `npm:` specifiers and the `Deno` global all resolve as
+usual.
+
+Enable it for a single command with the `DENO_UNSTABLE_TSGO` environment
+variable or the `--unstable-tsgo` flag:
+
+```sh
+DENO_UNSTABLE_TSGO=1 deno check main.ts
+deno check --unstable-tsgo main.ts
+```
+
+Or turn it on for a whole project in `deno.json`:
+
+```json title="deno.json"
+{
+  "unstable": ["tsgo"]
+}
+```
+
+:::caution
+
+This is an unstable, preview feature. The native compiler is not yet
+feature-complete, so some programs that type-check with the default compiler may
+report different results. Don't rely on it for CI or release builds yet, and
+please [report issues](https://github.com/denoland/deno/issues).
+
+:::
+
+## Configuring TypeScript compiler options
+
+Deno's defaults are strict and modern, so most projects need no configuration at
+all. When you do want to change the checker's behavior, set the options under
+`compilerOptions`, either in [`deno.json`](/runtime/fundamentals/configuration/)
+or in a `tsconfig.json` (see [using an existing tsconfig.json](#tsconfig)). For
+a Deno-first project, keeping them in `deno.json` means one config file instead
+of two:
+
+```json title="deno.json"
+{
+  "compilerOptions": {
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true
+  }
+}
+```
+
+The
+[full list of supported options and their defaults](/runtime/reference/ts_config_migration/#ts-compiler-options)
+is in the configuration reference. For JSX settings (React, Preact, and
+friends), see the [JSX reference](/runtime/reference/jsx/).
+
+### Using an existing tsconfig.json {#tsconfig}
+
+You do not have to translate your configuration to try Deno. Each workspace
+directory containing a `deno.json` or `package.json` is probed for a
+`tsconfig.json`; if one exists, Deno automatically uses it for type checking and
+the language server, no flags needed. Since Deno 2.1, `jsconfig.json` is also
+auto-detected when a `package.json` is present, which is useful for
+JavaScript-only projects.
+
+For example, an existing Node.js project with this `tsconfig.json`:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "strict": true,
+    "jsx": "react-jsx",
+    "lib": ["dom", "esnext"],
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*"]
+}
+```
+
+will be picked up automatically by `deno check` and the Deno language server. If
+a `deno.json` with its own `compilerOptions` is added later, those take
+precedence. Emit-related options are ignored (with a warning), since Deno does
+not write output files.
+
+For Deno-first projects, prefer `compilerOptions` in `deno.json` over a separate
+`tsconfig.json`. See
+[Configuring TypeScript](/runtime/reference/ts_config_migration/) for supported
+fields, precedence rules, and project-reference behavior.
+
+## Type checking JavaScript
+
+Deno runs JavaScript and TypeScript side by side, but only type-checks
+TypeScript files by default. There are three ways to opt a JavaScript file in:
+add a `// @ts-check` pragma at the top of the file, enable
+`compilerOptions.checkJs` for the whole project, or pass `--check-js` on the
+command line (`deno check --check-js main.js`) for a one-off check without
+touching any configuration.
+
+With the file in scope, the checker flags the same errors it would in
+TypeScript:
+
+```js title="main.js"
+// @ts-check
+
+let x = "hello";
+x = 42; // Type 'number' is not assignable to type 'string'.
+```
+
+The pragma checks a single file; `checkJs` turns it on project-wide:
+
+```json title="deno.json"
+{
+  "compilerOptions": {
+    "checkJs": true
+  }
+}
+```
+
+JavaScript files can't contain TypeScript syntax like type annotations, but you
+can provide the same information in
+[JSDoc comments](https://www.typescriptlang.org/docs/handbook/jsdoc-supported-types.html),
+which the type checker reads:
+
+```js title="main.js"
+// @ts-check
+
+/**
+ * @param {number} a
+ * @param {number} b
+ * @returns {number}
+ */
+function add(a, b) {
+  return a + b;
+}
+```
+
+## Providing declaration files
+
+When importing an untyped JavaScript module from TypeScript, the checker assumes
+everything it exports is `any`. To fix that, supply a `.d.ts` declaration file
+(unless the JavaScript is already annotated with JSDoc).
+
+One important difference from `tsc`: `tsc` automatically picks up a `.d.ts` file
+sitting next to a `.js` file with the same basename. **Deno does not.** You must
+say where the declaration file is, either in the JavaScript source or at the
+import site.
+
+### Providing types in the source
+
+Prefer declaring types in the `.js` file itself with `@ts-self-types`, so every
+importer gets them for free:
+
+```js title="add.js"
+// @ts-self-types="./add.d.ts"
+
+export function add(a, b) {
+  return a + b;
+}
+```
+
+```ts title="add.d.ts"
+export function add(a: number, b: number): number;
 ```

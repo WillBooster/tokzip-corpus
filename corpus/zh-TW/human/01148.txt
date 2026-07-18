@@ -1,100 +1,106 @@
-Basically, some parameters are taken from the query string and passed to wasm to generate a password. When I was solving this problem, I found a few places that needed to be bypassed.
+So after writing a cookie to the root domain `abc.com` from the subdomain `a.b.abc.com`, when the browser sends a request to `abc.com`, it will bring the cookie you wrote.
 
-The first one is `if (!(passwordLength = passwordLength.match(/^\d+$/gm))) {`, which limits the password length to only numbers.
+## What is a Cookie Bomb?
 
-When I saw this, I noticed that the `m` flag was unnecessary because it matches with line breaks, so `123\nabc` can also pass. But later, I got stuck because the value was taken from the input, and the input filters out `\n`, so I couldn't use `\n`.
+Suppose my attack target is `example.com`. If I can find any subdomain or page on the website that allows me to write cookies, I can freely write the cookies I want.
 
-I got stuck here.
+For example, suppose there is a page `https://example.com/log?uid=abc`. After visiting this page, `uid=abc` will be written to the cookie. Then, I only need to change the URL to `?uid=xxxxxxxxxx`, and I can write `xxxxxxxxxx` to the cookie.
 
-The second point where something needs to be done is the wasm part. I tried to decompile it, but I couldn't understand what it was doing.
+Let's take another example. Suppose there is a blog website, and each user has a unique subdomain, for example, mine would be `huliblog.example.com`. The blog can customize its own JS, so I can use JS to write the cookie I want on `huliblog.example.com` for `example.com`.
 
-My initial guess was to use passwordLength to modify the JSON passed in, and then fix the seed to a certain number, which would generate a feasible payload (later I found out that it wasn't like that).
+Okay, what can I do after writing any cookie?
 
-But because I didn't know what wasm was doing, I continued to look down. The generated password will be filtered, and these characters cannot be used:
+Start writing a bunch of junk cookies.
 
-```
-["&", "`", "\"", "{", "}", "(", ")", "[", "]", "=", ",", "+"]
-```
+For example, `a1=o....*4000`, just write a bunch of meaningless content in it. Here, it is important to note that a cookie can write about 4kb of data, and we need at least two cookies, which means we need to write 8kb of data to achieve the attack.
 
-`<>` is not filtered, so tags can be added, but backticks and () are all filtered out, and too many characters are filtered out, so I didn't think of a way to bypass it.
+After you write these cookies, when you return to the main page `https://example.com`, according to the characteristics of the cookie, all these junk cookies will be sent to the server together, right? The next step is the moment of witnessing a miracle.
 
-That was the train of thought when I was solving the problem. I found three places where something needed to be done, but because none of them were bypassed, I couldn't solve it.
+The server did not display the page you usually see, but returned an error: `431 Request Header Fields Too Large`.
 
-Next, let's take a look at someone else's writeup and do a self-review in the process.
+![](/img/cookie-bomb/p1.png)
 
-## terjanq
+Among the many HTTP status codes, there are two codes related to the request being too large:
 
-Link: [How to solve an XSS challenge from Intigriti in under 60 minutes](https://terjanq.medium.com/how-to-solve-a-challenge-from-intigrity-in-under-60-minutes-6843ba9b9552)
+1. [413 Payload Too Large](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/413)
+2. [431 Request Header Fields Too Large](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/431)
 
-In addition to sharing the solution, this article also shares how he thought about it and solved it in under an hour, which is really impressive.
+Suppose there is a form, and you fill in a million words and send it to the server, you may receive a `413 Payload Too Large` response, just like the error message says, the payload is too large, and the server cannot handle it.
 
-His solution was to scan the code and find that there must be a problem with wasm, so he started testing how to bring it down. The testing method is to copy the code and test wasm by modifying the JSON payload.
+The header is the same. When you have too many cookies, the `Cookie` in the request header will be very large, so large that the server cannot handle it, and it will return a `431 Request Header Fields Too Large` (but according to actual tests, some servers may reply with different codes depending on the implementation, such as Microsoft's 400 bad request).
 
-Everyone knows this method, but the direction I can review myself is that I was too lazy at the time... I always assumed that this problem was about reversing wasm, so I didn't even try it. I had a preset position and the position was wrong, so I got stuck.
+Therefore, as long as we can stuff the user's cookie, we can make them see this error page and cannot access the service normally. This is a cookie bomb, a DoS attack caused by a large number of cookies. The principle behind it is that "when a browser visits a webpage, it will automatically bring the corresponding cookie together."
 
-Afterwards, I can actively try different methods and not be trapped in existing ideas.
+The term "Cookie Bomb" was first proposed by Egor Homakov on January 18, 2014, in [Cookie Bomb or let's break the Internet.](http://homakov.blogspot.com/2014/01/cookie-bomb-or-lets-break-internet.html), but similar attack methods appeared in 2009: [How to use Google Analytics to DoS a client from some website](http://sirdarckcat.blogspot.com/2009/04/how-to-use-google-analytics-to-dos.html)
 
-Then he briefly scanned wasm and found nothing hidden, and started asking himself what vulnerabilities only wasm has and not JS, and the answer was buffer overflow.
+## Attack Process
 
-Then he started testing and found that when the password length was very long, the payload would reflect the original password. After solving this part, he was sure that this part was feasible and started looking at other parts.
+As mentioned above, suppose we now find a URL `https://example.com/log?uid=abc` that allows us to set any cookie. The next thing to do is:
 
-For the part where regexp needs to be bypassed, he directly gave the characters that can be bypassed based on experience, which are /u2028 and /u2029.
+1. Change the URL to make the cookie very large and try to make it larger than 8kb (because it seems that more server restrictions are 8kb).
+2. Pass this URL to the attack target and try to get them to click on it.
+3. The target clicked on the URL and set a very large cookie on the browser.
+4. The target visited the website `https://example.com` and found that they could not see the content, only a white screen or an error message, and the attack was successful.
 
-The keywords can actually be found here: [Line terminators](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Lexical_grammar#line_terminators). The mistake I made at the time was giving up too early and kept thinking, "I know there may be other characters that can be line breaks, but I don't know what they are." I didn't google it.
+At this time, unless the user changes the browser or the cookie expires, or they clear the cookie themselves, they will always be in this state.
 
-After bypassing this part, he started to bypass the last restriction, which is a bunch of restricted characters. The technique used here is very cool, which is that `-` is not restricted, so you can use `unsafeCharacters.length--` many times to shorten the array, so there are fewer restricted characters!
+In summary, this attack can only attack specific users and must meet two prerequisites:
 
-However, in this way, the entire process needs to be triggered twice, the first time to shorten the restricted characters, and the second time to put the real payload on the screen. But once the alert appears, clicking close will refresh the webpage, and it is impossible to trigger it twice.
+1. Find a place where you can set any cookie.
+2. The target must click on the URL found in step one.
 
-The final solution given is: `document.body.lastElementChild.outerHTML--`, which destroys the newly added alert and turns it into NaN, preventing it from refreshing.
+For actual attack cases, please refer to:
 
-Complete code:
+1. [Overflow Trilogy](https://blog.innerht.ml/overflow-trilogy/)
+2. [#777984 Denial of Service with Cookie Bomb](https://hackerone.com/reports/777984)
+3. [#57356 DOM based cookie bomb](https://hackerone.com/reports/57356)
+4. [#847493 Cookie Bombing cause DOS - businesses.uber.com](https://hackerone.com/reports/847493)
+5. [#105363 [livechat.shopify.com] Cookie bomb at customer chats](https://hackerone.com/reports/105363)
 
-```
-1000\u2029<script>unsafeCharacters.length--;unsafeCharacters.length--;unsafeCharacters.length--;unsafeCharacters.length--;unsafeCharacters.length--;unsafeCharacters.length--;unsafeCharacters.length--;document.body.lastElementChild.outerHTML--;</script><script>alert()</script>
-```
+Before continuing to talk about the attack surface, let's first mention the defense methods.
 
-You need to click generate twice to trigger it.
+## Defense Methods
 
-In summary, here are the things learned:
+The first point is not to trust user input. For example, in the example mentioned above: `https://example.com/log?uid=abc`, `abc` should not be directly written into the cookie. Instead, a basic check, such as format or length, can be performed to avoid this type of attack.
 
-1. Try to break it down into paragraphs and try random things when you encounter something you don't understand. You might break it and find the problem.
-2. Don't assume anything. The solution may be completely different from what you think.
-3. Google is very useful.
-4. If you can't bypass the restriction, break it.
+Next, when I mentioned that cookies can be set from subdomains to root domains, many people should think of one thing: "What about shared subdomains?"
 
-## FHantke
+For example, GitHub Pages, each person's domain is `username.github.io`. Can't I use a cookie bomb to bomb all GitHub Pages? Just build a malicious HTML in my own subdomain, with JS code that sets cookies, and then send this page to anyone. After they click it, they won't be able to access any `*.github.io` resources because they will all be rejected by the server.
 
-Link: [Intigriti — XSS Challenge 0621](https://infosecwriteups.com/intigriti-xss-challenge-0621-cf76c28840c1)
+This hypothesis seems to be valid, but there is actually a premise that must be established first, which is: "Users can set cookies on `*.github.io` to `github.io`." If this premise is not established, the cookie bomb cannot be executed.
 
-Regarding the bypass of regexp, he wrote a simple program to fuzz it:
+In fact, there are many requirements for "not wanting the upper-level domain to be able to set cookies" like this. For example, if `a.com.tw` can set cookies to `.com.tw` or `.tw`, won't a lot of unrelated websites share cookies? This is obviously unreasonable.
 
-``` js
-for (i=0;i<10000; i++) {
-  let passwordLength = document.getElementById("password-length");
-  passwordLength.value = "2" + String.fromCharCode(i) + "4";  
-  var p = passwordLength.value.match(/^\d+$/gm);
-  if (p) console.log(i + " => " + p);
-}
-```
+Or the website of the Presidential Office, `https://www.president.gov.tw`, should not be affected by the website of the Ministry of Finance, `https://www.mof.gov.tw`, so `.gov.tw` should also be a domain that cannot set cookies.
 
-Yes, why didn't I think of this? Just write a code to help you guess how to bypass it. This trick is great and must be learned.
+When the browser decides whether it can set cookies for a certain domain, it refers to a list called the [public suffix list](https://publicsuffix.org/list/). The subdomains of domains that appear on this list cannot directly set cookies for that domain.
 
-Then he tried to find a payload that could break wasm. He found that if he passed a large passwordLength and a string to allowedNumbers, it would be reflected in the generated password.
+For example, the following domains are on this list:
 
-Finally, he used the trick: `<svg><script>alert(1)</script></svg>`. Although it will still become: `<svg><script>alert&#40;1&#41;</script></svg>`, because it is wrapped in svg, the svg parser will be used to parse it, and the parsing rules are different. The original text has a DOM diagram attached.
+1. com.tw
+2. gov.tw
+3. github.io
 
-This trick is also great. I remember seeing it somewhere before.
+So the example mentioned earlier is not valid because when I am on `userA.github.io`, I cannot set `github.io` cookies, so the cookie bomb attack cannot be executed.
 
-However, the final payload only works on Firefox, and I'm not sure why. The original text didn't mention it, and I'm too lazy to check it out for now XD
+Regarding the public suffix list, Heroku has a special article introducing some of its historical evolution: [Cookies and the Public Suffix List](https://devcenter.heroku.com/articles/cookies-and-herokuapp-com).
 
-By the way, after writing it, I found this writeup: [Intigriti's 0621 XSS challenge - by Physuru (@cffaedfe)](https://github.com/svennergr/writeups/blob/master/inti/0621/README.md), which also uses a lot of fuzzing to find valid payloads. This article is also worth referring to.
+## Expanding the Attack Surface
 
-## Summary
+There are two prerequisites for the two attacks mentioned above to be successful:
 
-Learned some useful tricks:
+1. Find a place where any cookie can be set.
+2. The target must click on the URL found in step one.
 
-1. Use `<svg><script></script></svg>` to bypass some character encoding restrictions.
-2. Use `arr.length--` to destroy arrays.
-3. Use fuzzing to find out what valid characters are. It's simple, violent, and effective.
-4. Don't dive into the implementation first. Try different combinations of payloads and extreme parameters.
+If you want to make the attack easier to succeed, you can think about these two prerequisites:
+
+1. Is it possible to find this place easily?
+2. Is it possible that the target will be infected without clicking on the link?
+
+First, let's talk about the second point. If cache poisoning can be used, it can be easily achieved. Cache poisoning means finding a way to make the cache server store the corrupted cache (such as the 431 status code). This way, not only you, but all other users will get the corrupted file due to the cache, and see the same error message.
+
+In this case, the target does not need to click on anything to be infected, and the attack target expands from one person to everyone.
+
+In fact, the second point has a proprietary term: CPDoS (Cache Poisoned Denial of Service). Because it uses the relationship of the cache, it is not necessary to set cookies. Other headers can also be used, not limited to cookie bombs.
+
+For more detailed related attack methods, please refer to: https://cpdos.org/

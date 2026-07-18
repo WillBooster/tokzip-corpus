@@ -1,170 +1,161 @@
 # frozen_string_literal: true
 
-require "openssl"
-require "zlib"
-require "active_support/core_ext/numeric"
+require "date"
+require "active_support/duration"
+require "active_support/core_ext/object/acts_like"
+require "active_support/core_ext/date/zones"
+require "active_support/core_ext/time/zones"
+require "active_support/core_ext/date_and_time/calculations"
 
-module ActiveRecord
-  module Encryption
-    # An encryptor exposes the encryption API that ActiveRecord::Encryption::EncryptedAttributeType
-    # uses for encrypting and decrypting attribute values.
+class Date
+  include DateAndTime::Calculations
+
+  class << self
+    attr_accessor :beginning_of_week_default
+
+    # Returns the week start (e.g. +:monday+) for the current request, if this has been set (via Date.beginning_of_week=).
+    # If <tt>Date.beginning_of_week</tt> has not been set for the current request, returns the week start specified in <tt>config.beginning_of_week</tt>.
+    # If no +config.beginning_of_week+ was specified, returns +:monday+.
+    def beginning_of_week
+      ::ActiveSupport::IsolatedExecutionState[:beginning_of_week] || beginning_of_week_default || :monday
+    end
+
+    # Sets <tt>Date.beginning_of_week</tt> to a week start (e.g. +:monday+) for current request/thread.
     #
-    # It interacts with a KeyProvider for getting the keys, and delegate to
-    # ActiveRecord::Encryption::Cipher the actual encryption algorithm.
-    class Encryptor
-      # === Options
-      #
-      # * <tt>:compress</tt> - Boolean indicating whether records should be compressed before encryption.
-      #   Defaults to +true+.
-      def initialize(compress: true)
-        @compress = compress
-      end
+    # This method accepts any of the following day symbols:
+    # +:monday+, +:tuesday+, +:wednesday+, +:thursday+, +:friday+, +:saturday+, +:sunday+
+    def beginning_of_week=(week_start)
+      ::ActiveSupport::IsolatedExecutionState[:beginning_of_week] = find_beginning_of_week!(week_start)
+    end
 
-      # Encrypts +clean_text+ and returns the encrypted result
-      #
-      # Internally, it will:
-      #
-      # 1. Create a new ActiveRecord::Encryption::Message
-      # 2. Compress and encrypt +clean_text+ as the message payload
-      # 3. Serialize it with +ActiveRecord::Encryption.message_serializer+ (+ActiveRecord::Encryption::SafeMarshal+
-      #    by default)
-      # 4. Encode the result with Base 64
-      #
-      # === Options
-      #
-      # [:key_provider]
-      #   Key provider to use for the encryption operation. It will default to
-      #   +ActiveRecord::Encryption.key_provider+ when not provided.
-      #
-      # [:cipher_options]
-      #   Cipher-specific options that will be passed to the Cipher configured in
-      #   +ActiveRecord::Encryption.cipher+
-      def encrypt(clear_text, key_provider: default_key_provider, cipher_options: {})
-        clear_text = force_encoding_if_needed(clear_text) if cipher_options[:deterministic]
+    # Returns week start day symbol (e.g. +:monday+), or raises an +ArgumentError+ for invalid day symbol.
+    def find_beginning_of_week!(week_start)
+      raise ArgumentError, "Invalid beginning of week: #{week_start}" unless ::Date::DAYS_INTO_WEEK.key?(week_start)
+      week_start
+    end
 
-        validate_payload_type(clear_text)
-        serialize_message build_encrypted_message(clear_text, key_provider: key_provider, cipher_options: cipher_options)
-      end
+    # Returns a new Date representing the date 1 day ago (i.e. yesterday's date).
+    def yesterday
+      ::Date.current.yesterday
+    end
 
-      # Decrypts an +encrypted_text+ and returns the result as clean text
-      #
-      # === Options
-      #
-      # [:key_provider]
-      #   Key provider to use for the encryption operation. It will default to
-      #   +ActiveRecord::Encryption.key_provider+ when not provided
-      #
-      # [:cipher_options]
-      #   Cipher-specific options that will be passed to the Cipher configured in
-      #   +ActiveRecord::Encryption.cipher+
-      def decrypt(encrypted_text, key_provider: default_key_provider, cipher_options: {})
-        message = deserialize_message(encrypted_text)
-        keys = key_provider.decryption_keys(message)
-        raise Errors::Decryption unless keys.present?
-        uncompress_if_needed(cipher.decrypt(message, key: keys.collect(&:secret), **cipher_options), message.headers.compressed)
-      rescue *(ENCODING_ERRORS + DECRYPT_ERRORS)
-        raise Errors::Decryption
-      end
+    # Returns a new Date representing the date 1 day after today (i.e. tomorrow's date).
+    def tomorrow
+      ::Date.current.tomorrow
+    end
 
-      # Returns whether the text is encrypted or not
-      def encrypted?(text)
-        deserialize_message(text)
-        true
-      rescue Errors::Encoding, *DECRYPT_ERRORS
-        false
-      end
-
-      def binary?
-        serializer.binary?
-      end
-
-      private
-        DECRYPT_ERRORS = [OpenSSL::Cipher::CipherError, Errors::EncryptedContentIntegrity, Errors::Decryption]
-        ENCODING_ERRORS = [EncodingError, Errors::Encoding]
-        THRESHOLD_TO_JUSTIFY_COMPRESSION = 140.bytes
-
-        def default_key_provider
-          ActiveRecord::Encryption.key_provider
-        end
-
-        def validate_payload_type(clear_text)
-          unless clear_text.is_a?(String)
-            raise ActiveRecord::Encryption::Errors::ForbiddenClass, "The encryptor can only encrypt string values (#{clear_text.class})"
-          end
-        end
-
-        def cipher
-          ActiveRecord::Encryption.cipher
-        end
-
-        def build_encrypted_message(clear_text, key_provider:, cipher_options:)
-          key = key_provider.encryption_key
-
-          clear_text, was_compressed = compress_if_worth_it(clear_text)
-          cipher.encrypt(clear_text, key: key.secret, **cipher_options).tap do |message|
-            message.headers.add(key.public_tags)
-            message.headers.compressed = true if was_compressed
-          end
-        end
-
-        def serialize_message(message)
-          serializer.dump(message)
-        end
-
-        def deserialize_message(message)
-          serializer.load message
-        rescue ArgumentError, TypeError, Errors::ForbiddenClass
-          raise Errors::Encoding
-        end
-
-        def serializer
-          ActiveRecord::Encryption.message_serializer
-        end
-
-        # Under certain threshold, ZIP compression is actually worse that not compressing
-        def compress_if_worth_it(string)
-          if compress? && string.bytesize > THRESHOLD_TO_JUSTIFY_COMPRESSION
-            [compress(string), true]
-          else
-            [string, false]
-          end
-        end
-
-        def compress?
-          @compress
-        end
-
-        def compress(data)
-          Zlib::Deflate.deflate(data).tap do |compressed_data|
-            compressed_data.force_encoding(data.encoding)
-          end
-        end
-
-        def uncompress_if_needed(data, compressed)
-          if compressed
-            uncompress(data)
-          else
-            data
-          end
-        end
-
-        def uncompress(data)
-          Zlib::Inflate.inflate(data).tap do |uncompressed_data|
-            uncompressed_data.force_encoding(data.encoding)
-          end
-        end
-
-        def force_encoding_if_needed(value)
-          if forced_encoding_for_deterministic_encryption && value && value.encoding != forced_encoding_for_deterministic_encryption
-            value.encode(forced_encoding_for_deterministic_encryption, invalid: :replace, undef: :replace)
-          else
-            value
-          end
-        end
-
-        def forced_encoding_for_deterministic_encryption
-          ActiveRecord::Encryption.config.forced_encoding_for_deterministic_encryption
-        end
+    # Returns Time.zone.today when <tt>Time.zone</tt> or <tt>config.time_zone</tt> are set, otherwise just returns Date.today.
+    def current
+      ::Time.zone ? ::Time.zone.today : ::Date.today
     end
   end
+
+  # Converts Date to a Time (or DateTime if necessary) with the time portion set to the beginning of the day (0:00)
+  # and then subtracts the specified number of seconds.
+  def ago(seconds)
+    in_time_zone.since(-seconds)
+  end
+
+  # Converts Date to a Time (or DateTime if necessary) with the time portion set to the beginning of the day (0:00)
+  # and then adds the specified number of seconds
+  def since(seconds)
+    in_time_zone.since(seconds)
+  end
+  alias :in :since
+
+  # Converts Date to a Time (or DateTime if necessary) with the time portion set to the beginning of the day (0:00)
+  def beginning_of_day
+    in_time_zone
+  end
+  alias :midnight :beginning_of_day
+  alias :at_midnight :beginning_of_day
+  alias :at_beginning_of_day :beginning_of_day
+
+  # Converts Date to a Time (or DateTime if necessary) with the time portion set to the middle of the day (12:00)
+  def middle_of_day
+    in_time_zone.middle_of_day
+  end
+  alias :midday :middle_of_day
+  alias :noon :middle_of_day
+  alias :at_midday :middle_of_day
+  alias :at_noon :middle_of_day
+  alias :at_middle_of_day :middle_of_day
+
+  # Converts Date to a Time (or DateTime if necessary) with the time portion set to the end of the day (23:59:59)
+  def end_of_day
+    in_time_zone.end_of_day
+  end
+  alias :at_end_of_day :end_of_day
+
+  def plus_with_duration(other) # :nodoc:
+    if ActiveSupport::Duration === other
+      other.since(self)
+    else
+      plus_without_duration(other)
+    end
+  end
+  alias_method :plus_without_duration, :+
+  alias_method :+, :plus_with_duration
+
+  def minus_with_duration(other) # :nodoc:
+    if ActiveSupport::Duration === other
+      plus_with_duration(-other)
+    else
+      minus_without_duration(other)
+    end
+  end
+  alias_method :minus_without_duration, :-
+  alias_method :-, :minus_with_duration
+
+  # Provides precise Date calculations for years, months, and days. The +options+ parameter takes a hash with
+  # any of these keys: <tt>:years</tt>, <tt>:months</tt>, <tt>:weeks</tt>, <tt>:days</tt>.
+  #
+  # The increments are applied in order of time units from largest to smallest.
+  # In other words, the date is incremented first by +:years+, then by
+  # +:months+, then by +:weeks+, then by +:days+. This order can affect the
+  # result around the end of a month. For example, incrementing first by months
+  # then by days:
+  #
+  #   Date.new(2004, 9, 30).advance(months: 1, days: 1)
+  #   # => Sun, 31 Oct 2004
+  #
+  # Whereas incrementing first by days then by months yields a different result:
+  #
+  #   Date.new(2004, 9, 30).advance(days: 1).advance(months: 1)
+  #   # => Mon, 01 Nov 2004
+  #
+  def advance(options)
+    d = self
+
+    d = d >> options[:years] * 12 if options[:years]
+    d = d >> options[:months] if options[:months]
+    d = d + options[:weeks] * 7 if options[:weeks]
+    d = d + options[:days] if options[:days]
+
+    d
+  end
+
+  # Returns a new Date where one or more of the elements have been changed according to the +options+ parameter.
+  # The +options+ parameter is a hash with a combination of these keys: <tt>:year</tt>, <tt>:month</tt>, <tt>:day</tt>.
+  #
+  #   Date.new(2007, 5, 12).change(day: 1)               # => Date.new(2007, 5, 1)
+  #   Date.new(2007, 5, 12).change(year: 2005, month: 1) # => Date.new(2005, 1, 12)
+  def change(options)
+    ::Date.new(
+      options.fetch(:year, year),
+      options.fetch(:month, month),
+      options.fetch(:day, day)
+    )
+  end
+
+  # Allow Date to be compared with Time by converting to DateTime and relying on the <=> from there.
+  def compare_with_coercion(other)
+    if other.is_a?(Time)
+      to_datetime <=> other
+    else
+      compare_without_coercion(other)
+    end
+  end
+  alias_method :compare_without_coercion, :<=>
+  alias_method :<=>, :compare_with_coercion
 end

@@ -1,152 +1,279 @@
 # frozen_string_literal: true
 
-module ActiveRecord
-  module ConnectionAdapters
-    module Mysql2
-      module DatabaseStatements
-        # Returns an ActiveRecord::Result instance.
-        def select_all(*, **) # :nodoc:
-          if ExplainRegistry.collect? && prepared_statements
-            unprepared_statement { super }
-          else
-            super
-          end
-        end
+require_relative "abstract_unit"
 
-        def internal_exec_query(sql, name = "SQL", binds = [], prepare: false, async: false, allow_retry: false) # :nodoc:
-          if without_prepared_statement?(binds)
-            execute_and_free(sql, name, async: async, allow_retry: allow_retry) do |result|
-              if result
-                build_result(columns: result.fields, rows: result.to_a)
-              else
-                build_result(columns: [], rows: [])
-              end
-            end
-          else
-            exec_stmt_and_free(sql, name, binds, cache_stmt: prepare, async: async) do |_, result|
-              if result
-                build_result(columns: result.fields, rows: result.to_a)
-              else
-                build_result(columns: [], rows: [])
-              end
-            end
-          end
-        end
+class ExecutorTest < ActiveSupport::TestCase
+  class DummyError < RuntimeError
+  end
 
-        def exec_delete(sql, name = nil, binds = []) # :nodoc:
-          if without_prepared_statement?(binds)
-            with_raw_connection do |conn|
-              @affected_rows_before_warnings = nil
-              execute_and_free(sql, name) { @affected_rows_before_warnings || conn.affected_rows }
-            end
-          else
-            exec_stmt_and_free(sql, name, binds) { |stmt| stmt.affected_rows }
-          end
-        end
-        alias :exec_update :exec_delete
+  class ErrorSubscriber
+    attr_reader :events
 
-        private
-          def sync_timezone_changes(raw_connection)
-            raw_connection.query_options[:database_timezone] = default_timezone
-          end
+    def initialize
+      @events = []
+    end
 
-          def execute_batch(statements, name = nil)
-            statements = statements.map { |sql| transform_query(sql) }
-            combine_multi_statements(statements).each do |statement|
-              with_raw_connection do |conn|
-                raw_execute(statement, name)
-              end
-            end
-          end
-
-          def last_inserted_id(result)
-            if supports_insert_returning?
-              super
-            else
-              @raw_connection&.last_id
-            end
-          end
-
-          def multi_statements_enabled?
-            flags = @config[:flags]
-
-            if flags.is_a?(Array)
-              flags.include?("MULTI_STATEMENTS")
-            else
-              flags.anybits?(::Mysql2::Client::MULTI_STATEMENTS)
-            end
-          end
-
-          def with_multi_statements
-            if multi_statements_enabled?
-              return yield
-            end
-
-            with_raw_connection do |conn|
-              conn.set_server_option(::Mysql2::Client::OPTION_MULTI_STATEMENTS_ON)
-
-              yield
-            ensure
-              conn.set_server_option(::Mysql2::Client::OPTION_MULTI_STATEMENTS_OFF)
-            end
-          end
-
-          def raw_execute(sql, name, async: false, allow_retry: false, materialize_transactions: true)
-            log(sql, name, async: async) do |notification_payload|
-              with_raw_connection(allow_retry: allow_retry, materialize_transactions: materialize_transactions) do |conn|
-                sync_timezone_changes(conn)
-                result = conn.query(sql)
-                conn.abandon_results!
-                verified!
-                handle_warnings(sql)
-                notification_payload[:row_count] = result&.size || 0
-                result
-              end
-            end
-          end
-
-          def exec_stmt_and_free(sql, name, binds, cache_stmt: false, async: false)
-            sql = transform_query(sql)
-            check_if_write_query(sql)
-
-            mark_transaction_written_if_write(sql)
-
-            type_casted_binds = type_casted_binds(binds)
-
-            log(sql, name, binds, type_casted_binds, async: async) do |notification_payload|
-              with_raw_connection do |conn|
-                sync_timezone_changes(conn)
-
-                if cache_stmt
-                  stmt = @statements[sql] ||= conn.prepare(sql)
-                else
-                  stmt = conn.prepare(sql)
-                end
-
-                begin
-                  result = ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
-                    stmt.execute(*type_casted_binds)
-                  end
-                  verified!
-                  result
-                rescue ::Mysql2::Error => e
-                  if cache_stmt
-                    @statements.delete(sql)
-                  else
-                    stmt.close
-                  end
-                  raise e
-                end
-
-                ret = yield stmt, result
-                notification_payload[:row_count] = result&.size || 0
-                result.free if result
-                stmt.close unless cache_stmt
-                ret
-              end
-            end
-          end
-      end
+    def report(error, handled:, severity:, source:, context:)
+      @events << [error, handled, severity, source, context]
     end
   end
+
+  def test_wrap_report_errors
+    subscriber = ErrorSubscriber.new
+    executor.error_reporter.subscribe(subscriber)
+    error = DummyError.new("Oops")
+    assert_raises DummyError do
+      executor.wrap do
+        raise error
+      end
+    end
+    assert_equal [error, false, :error, "application.active_support", {}], subscriber.events.last
+
+    error = DummyError.new("Oops")
+    assert_raises DummyError do
+      executor.wrap(source: "custom") do
+        raise error
+      end
+    end
+    assert_equal [error, false, :error, "custom", {}], subscriber.events.last
+  end
+
+  def test_wrap_invokes_callbacks
+    called = []
+    executor.to_run { called << :run }
+    executor.to_complete { called << :complete }
+
+    executor.wrap do
+      called << :body
+    end
+
+    assert_equal [:run, :body, :complete], called
+  end
+
+  def test_callbacks_share_state
+    result = false
+    executor.to_run { @foo = true }
+    executor.to_complete { result = @foo }
+
+    executor.wrap { }
+
+    assert result
+  end
+
+  def test_separated_calls_invoke_callbacks
+    called = []
+    executor.to_run { called << :run }
+    executor.to_complete { called << :complete }
+
+    state = executor.run!
+    called << :body
+    state.complete!
+
+    assert_equal [:run, :body, :complete], called
+  end
+
+  def test_exceptions_unwind
+    called = []
+    executor.to_run { called << :run_1 }
+    executor.to_run { raise DummyError }
+    executor.to_run { called << :run_2 }
+    executor.to_complete { called << :complete }
+
+    assert_raises(DummyError) do
+      executor.wrap { called << :body }
+    end
+
+    assert_equal [:run_1, :complete], called
+  end
+
+  def test_avoids_double_wrapping
+    called = []
+    executor.to_run { called << :run }
+    executor.to_complete { called << :complete }
+
+    executor.wrap do
+      called << :early
+      executor.wrap do
+        called << :body
+      end
+      called << :late
+    end
+
+    assert_equal [:run, :early, :body, :late, :complete], called
+  end
+
+  def test_hooks_carry_state
+    supplied_state = :none
+
+    hook = Class.new do
+      define_method(:run) do
+        :some_state
+      end
+
+      define_method(:complete) do |state|
+        supplied_state = state
+      end
+    end.new
+
+    executor.register_hook(hook)
+
+    executor.wrap { }
+
+    assert_equal :some_state, supplied_state
+  end
+
+  def test_nil_state_is_sufficient
+    supplied_state = :none
+
+    hook = Class.new do
+      define_method(:run) do
+        nil
+      end
+
+      define_method(:complete) do |state|
+        supplied_state = state
+      end
+    end.new
+
+    executor.register_hook(hook)
+
+    executor.wrap { }
+
+    assert_nil supplied_state
+  end
+
+  def test_exception_skips_uninvoked_hook
+    supplied_state = :none
+
+    hook = Class.new do
+      define_method(:run) do
+        :some_state
+      end
+
+      define_method(:complete) do |state|
+        supplied_state = state
+      end
+    end.new
+
+    executor.to_run do
+      raise DummyError
+    end
+    executor.register_hook(hook)
+
+    assert_raises(DummyError) do
+      executor.wrap { }
+    end
+
+    assert_equal :none, supplied_state
+  end
+
+  def test_exception_unwinds_invoked_hook
+    supplied_state = :none
+
+    hook = Class.new do
+      define_method(:run) do
+        :some_state
+      end
+
+      define_method(:complete) do |state|
+        supplied_state = state
+      end
+    end.new
+
+    executor.register_hook(hook)
+    executor.to_run do
+      raise DummyError
+    end
+
+    assert_raises(DummyError) do
+      executor.wrap { }
+    end
+
+    assert_equal :some_state, supplied_state
+  end
+
+  def test_hook_insertion_order
+    invoked = []
+    supplied_state = []
+
+    hook_class = Class.new do
+      attr_accessor :letter
+
+      define_method(:initialize) do |letter|
+        self.letter = letter
+      end
+
+      define_method(:run) do
+        invoked << :"run_#{letter}"
+        :"state_#{letter}"
+      end
+
+      define_method(:complete) do |state|
+        invoked << :"complete_#{letter}"
+        supplied_state << state
+      end
+    end
+
+    executor.register_hook(hook_class.new(:a))
+    executor.register_hook(hook_class.new(:b))
+    executor.register_hook(hook_class.new(:c), outer: true)
+    executor.register_hook(hook_class.new(:d))
+
+    executor.wrap { }
+
+    assert_equal [:run_c, :run_a, :run_b, :run_d, :complete_a, :complete_b, :complete_d, :complete_c], invoked
+    assert_equal [:state_a, :state_b, :state_d, :state_c], supplied_state
+  end
+
+  if RUBY_VERSION < "3.2"
+    def test_class_serial_is_unaffected
+      skip if !defined?(RubyVM) || !RubyVM.stat.has_key?(:class_serial)
+
+      hook = Class.new do
+        define_method(:run) do
+          nil
+        end
+
+        define_method(:complete) do |state|
+          nil
+        end
+      end.new
+
+      executor.register_hook(hook)
+
+      # Warm-up to trigger any pending autoloads
+      executor.wrap { }
+
+      before = RubyVM.stat(:class_serial)
+      executor.wrap { }
+      executor.wrap { }
+      executor.wrap { }
+      after = RubyVM.stat(:class_serial)
+
+      assert_equal before, after
+    end
+  end
+
+  def test_separate_classes_can_wrap
+    other_executor = Class.new(ActiveSupport::Executor)
+
+    called = []
+    executor.to_run { called << :run }
+    executor.to_complete { called << :complete }
+    other_executor.to_run { called << :other_run }
+    other_executor.to_complete { called << :other_complete }
+
+    executor.wrap do
+      other_executor.wrap do
+        called << :body
+      end
+    end
+
+    assert_equal [:run, :other_run, :body, :other_complete, :complete], called
+  end
+
+  private
+    def executor
+      @executor ||= Class.new(ActiveSupport::Executor)
+    end
 end

@@ -1,338 +1,160 @@
-`pydantic` is a great tool for validating data coming from various sources.
-In this section, we will look at how to validate data from different types of files.
+# Flattening
 
-!!! note
-    If you're using any of the below file formats to parse configuration / settings, you might want to
-    consider using the [`pydantic-settings`][pydantic_settings] library, which offers builtin
-    support for parsing this type of data.
+One of the common usages of object-object mapping is to take a complex object model and flatten it to a simpler model.  You can take a complex model such as:
 
-## JSON data
-
-`.json` files are a common way to store key / value data in a human-readable format.
-Here is an example of a `.json` file:
-
-```json
+```c#
+public class Order
 {
-    "name": "John Doe",
-    "age": 30,
-    "email": "john@example.com"
+	private readonly IList<OrderLineItem> _orderLineItems = new List<OrderLineItem>();
+
+	public Customer Customer { get; set; }
+
+	public OrderLineItem[] GetOrderLineItems()
+	{
+		return _orderLineItems.ToArray();
+	}
+
+	public void AddOrderLineItem(Product product, int quantity)
+	{
+		_orderLineItems.Add(new OrderLineItem(product, quantity));
+	}
+
+	public decimal GetTotal()
+	{
+		return _orderLineItems.Sum(li => li.GetTotal());
+	}
+}
+
+public class Product
+{
+	public decimal Price { get; set; }
+	public string Name { get; set; }
+}
+
+public class OrderLineItem
+{
+	public OrderLineItem(Product product, int quantity)
+	{
+		Product = product;
+		Quantity = quantity;
+	}
+
+	public Product Product { get; private set; }
+	public int Quantity { get; private set;}
+
+	public decimal GetTotal()
+	{
+		return Quantity*Product.Price;
+	}
+}
+
+public class Customer
+{
+	public string Name { get; set; }
 }
 ```
 
-To validate this data, we can use a `pydantic` model:
+We want to flatten this complex Order object into a simpler OrderDto that contains only the data needed for a certain scenario:
 
-```python {test="skip"}
-import pathlib
-
-from pydantic import BaseModel, EmailStr, PositiveInt
-
-
-class Person(BaseModel):
-    name: str
-    age: PositiveInt
-    email: EmailStr
-
-
-json_string = pathlib.Path('person.json').read_text()
-person = Person.model_validate_json(json_string)
-print(person)
-#> name='John Doe' age=30 email='john@example.com'
-```
-
-If the data in the file is not valid, `pydantic` will raise a [`ValidationError`][pydantic_core.ValidationError].
-Let's say we have the following `.json` file:
-
-```json
+```c#
+public class OrderDto
 {
-    "age": -30,
-    "email": "not-an-email-address"
+	public string CustomerName { get; set; }
+	public decimal Total { get; set; }
 }
 ```
 
-This data is flawed for three reasons:
+When you configure a source/destination type pair in AutoMapper, the configurator attempts to match properties and methods on the source type to properties on the destination type.  If for any property on the destination type a property, method, or a method prefixed with "Get" does not exist on the source type, AutoMapper splits the destination member name into individual words (by PascalCase conventions).
 
-1. It's missing the `name` field.
-2. The `age` field is negative.
-3. The `email` field is not a valid email address.
+```c#
+// Complex model
 
-When we try to validate this data, `pydantic` raises a [`ValidationError`][pydantic_core.ValidationError] with all of the
-above issues:
+var customer = new Customer
+	{
+		Name = "George Costanza"
+	};
+var order = new Order
+	{
+		Customer = customer
+	};
+var bosco = new Product
+	{
+		Name = "Bosco",
+		Price = 4.99m
+	};
+order.AddOrderLineItem(bosco, 15);
 
-```python {test="skip"}
-import pathlib
+// Configure AutoMapper
 
-from pydantic import BaseModel, EmailStr, PositiveInt, ValidationError
+var configuration = new MapperConfiguration(cfg => cfg.CreateMap<Order, OrderDto>());
 
+// Perform mapping
 
-class Person(BaseModel):
-    name: str
-    age: PositiveInt
-    email: EmailStr
+OrderDto dto = mapper.Map<Order, OrderDto>(order);
 
-
-json_string = pathlib.Path('person.json').read_text()
-try:
-    person = Person.model_validate_json(json_string)
-except ValidationError as err:
-    print(err)
-    """
-    3 validation errors for Person
-    name
-    Field required [type=missing, input_value={'age': -30, 'email': 'not-an-email-address'}, input_type=dict]
-        For further information visit https://errors.pydantic.dev/2/v/missing
-    age
-    Input should be greater than 0 [type=greater_than, input_value=-30, input_type=int]
-        For further information visit https://errors.pydantic.dev/2/v/greater_than
-    email
-    value is not a valid email address: An email address must have an @-sign. [type=value_error, input_value='not-an-email-address', input_type=str]
-    """
+dto.CustomerName.ShouldEqual("George Costanza");
+dto.Total.ShouldEqual(74.85m);
 ```
 
-Often, it's the case that you have an abundance of a certain type of data within a `.json` file.
-For example, you might have a list of people:
+We configured the type map in AutoMapper with the CreateMap method.  AutoMapper can only map type pairs it knows about, so we have explicitly register the source/destination type pair with CreateMap.  To perform the mapping, we use the Map method.
 
-```json
-[
-    {
-        "name": "John Doe",
-        "age": 30,
-        "email": "john@example.com"
-    },
-    {
-        "name": "Jane Doe",
-        "age": 25,
-        "email": "jane@example.com"
-    }
-]
+On the OrderDto type, the Total property matched to the GetTotal() method on Order.  The CustomerName property matched to the Customer.Name property on Order.  As long as we name our destination properties appropriately, we do not need to configure individual property matching.
+
+If you want to disable this behavior, you can use the `ExactMatchNamingConvention`:
+```
+cfg.DestinationMemberNamingConvention = new ExactMatchNamingConvention();
 ```
 
-In this case, you can validate the data against a `list[Person]` model:
+## IncludeMembers
 
-```python {test="skip"}
-import pathlib
+If you need more control when flattening, you can use IncludeMembers. You can map members of a child object to the destination object when you already have a map from the child type to the destination type (unlike the classic flattening that doesn't require a map for the child type).
 
-from pydantic import BaseModel, EmailStr, PositiveInt, TypeAdapter
+```c#
+class Source
+{
+    public string Name { get; set; }
+    public InnerSource InnerSource { get; set; }
+    public OtherInnerSource OtherInnerSource { get; set; }
+}
+class InnerSource
+{
+    public string Name { get; set; }
+    public string Description { get; set; }
+}
+class OtherInnerSource
+{
+    public string Name { get; set; }
+    public string Description { get; set; }
+    public string Title { get; set; }
+}
+class Destination
+{
+    public string Name { get; set; }
+    public string Description { get; set; }
+    public string Title { get; set; }
+}
 
+cfg.CreateMap<Source, Destination>().IncludeMembers(s=>s.InnerSource, s=>s.OtherInnerSource);
+cfg.CreateMap<InnerSource, Destination>(MemberList.None);
+cfg.CreateMap<OtherInnerSource, Destination>();
 
-class Person(BaseModel):
-    name: str
-    age: PositiveInt
-    email: EmailStr
-
-
-person_list_adapter = TypeAdapter(list[Person])  # (1)!
-
-json_string = pathlib.Path('people.json').read_text()
-people = person_list_adapter.validate_json(json_string)
-print(people)
-#> [Person(name='John Doe', age=30, email='john@example.com'), Person(name='Jane Doe', age=25, email='jane@example.com')]
+var source = new Source { Name = "name", InnerSource = new InnerSource{ Description = "description" }, 
+                          OtherInnerSource = new OtherInnerSource{ Title = "title" } };
+var destination = mapper.Map<Destination>(source);
+destination.Name.ShouldBe("name");
+destination.Description.ShouldBe("description");
+destination.Title.ShouldBe("title");
 ```
+So this allows you to reuse the configuration in the existing map for the child types `InnerSource` and `OtherInnerSource` when mapping the parent types `Source` and `Destination`. It works in a similar way to [mapping inheritance](Mapping-inheritance.html), but it uses composition, not inheritance.
 
-1. We use [`TypeAdapter`][pydantic.type_adapter.TypeAdapter] to validate a list of `Person` objects.
-[`TypeAdapter`][pydantic.type_adapter.TypeAdapter] is a Pydantic construct used to validate data against a single type.
+The order of the parameters in the `IncludeMembers` call is relevant. When mapping a destination member, the first match wins, starting with the source object itself and then with the included child objects in the order you specified. So in the example above, `Name` is mapped from the source object itself and `Description` from `InnerSource` because it's the first match.
 
-## JSON lines files
+Note that this matching is static, it happens at configuration time, not at `Map` time, so the runtime types of the child objects are not considered.
 
-Similar to validating a list of objects from a `.json` file, you can validate a list of objects from a `.jsonl` file.
-`.jsonl` files are a sequence of JSON objects separated by newlines.
-
-Consider the following `.jsonl` file:
-
-```json
-{"name": "John Doe", "age": 30, "email": "john@example.com"}
-{"name": "Jane Doe", "age": 25, "email": "jane@example.com"}
+IncludeMembers integrates with `ReverseMap`. An included member will be reversed to 
+```c#
+ForPath(destination => destination.IncludedMember, member => member.MapFrom(source => source))
 ```
+and the other way around. If that's not what you want, you can avoid `ReverseMap` (explicitly create the reverse map) or you can override the default settings (using `Ignore` or `IncludeMembers` without parameters respectively).
 
-We can validate this data with a similar approach to the one we used for `.json` files:
-
-```python {test="skip"}
-import pathlib
-
-from pydantic import BaseModel, EmailStr, PositiveInt
-
-
-class Person(BaseModel):
-    name: str
-    age: PositiveInt
-    email: EmailStr
-
-
-json_lines = pathlib.Path('people.jsonl').read_text().splitlines()
-people = [Person.model_validate_json(line) for line in json_lines]
-print(people)
-#> [Person(name='John Doe', age=30, email='john@example.com'), Person(name='Jane Doe', age=25, email='jane@example.com')]
-```
-
-## CSV files
-
-CSV is one of the most common file formats for storing tabular data.
-To validate data from a CSV file, you can use the `csv` module from the Python standard library to load
-the data and validate it against a Pydantic model.
-
-Consider the following CSV file:
-
-```csv
-name,age,email
-John Doe,30,john@example.com
-Jane Doe,25,jane@example.com
-```
-
-Here's how we validate that data:
-
-```python {test="skip"}
-import csv
-
-from pydantic import BaseModel, EmailStr, PositiveInt
-
-
-class Person(BaseModel):
-    name: str
-    age: PositiveInt
-    email: EmailStr
-
-
-with open('people.csv') as f:
-    reader = csv.DictReader(f)
-    people = [Person.model_validate(row) for row in reader]
-
-print(people)
-#> [Person(name='John Doe', age=30, email='john@example.com'), Person(name='Jane Doe', age=25, email='jane@example.com')]
-```
-
-## TOML files
-
-TOML files are often used for configuration due to their simplicity and readability.
-
-Consider the following TOML file:
-
-```toml
-name = "John Doe"
-age = 30
-email = "john@example.com"
-```
-
-Here's how we validate that data:
-
-```python {test="skip"}
-import tomllib
-
-from pydantic import BaseModel, EmailStr, PositiveInt
-
-
-class Person(BaseModel):
-    name: str
-    age: PositiveInt
-    email: EmailStr
-
-
-with open('person.toml', 'rb') as f:
-    data = tomllib.load(f)
-
-person = Person.model_validate(data)
-print(person)
-#> name='John Doe' age=30 email='john@example.com'
-```
-
-## YAML files
-
-YAML (YAML Ain't Markup Language) is a human-readable data serialization format that is often used for configuration files.
-
-Consider the following YAML file:
-
-```yaml
-name: John Doe
-age: 30
-email: john@example.com
-```
-
-Here's how we validate that data using [PyYAML](https://pypi.org/project/PyYAML/):
-
-```python {test="skip"}
-import yaml
-
-from pydantic import BaseModel, EmailStr, PositiveInt
-
-
-class Person(BaseModel):
-    name: str
-    age: PositiveInt
-    email: EmailStr
-
-
-with open('person.yaml') as f:
-    data = yaml.safe_load(f)
-
-person = Person.model_validate(data)
-print(person)
-#> name='John Doe' age=30 email='john@example.com'
-```
-
-## XML files
-
-XML (eXtensible Markup Language) is a markup language that defines a set of rules for encoding documents in a format that is both human-readable and machine-readable.
-
-Consider the following XML file:
-
-```xml
-<?xml version="1.0"?>
-<person>
-    <name>John Doe</name>
-    <age>30</age>
-    <email>john@example.com</email>
-</person>
-```
-
-Here's how we validate that data:
-
-```python {test="skip"}
-import xml.etree.ElementTree as ET
-
-from pydantic import BaseModel, EmailStr, PositiveInt
-
-
-class Person(BaseModel):
-    name: str
-    age: PositiveInt
-    email: EmailStr
-
-
-tree = ET.parse('person.xml').getroot()
-data = {child.tag: child.text for child in tree}
-person = Person.model_validate(data)
-print(person)
-#> name='John Doe' age=30 email='john@example.com'
-```
-
-## INI files
-
-INI files are a simple configuration file format that uses sections and key-value pairs. They are commonly used in Windows applications and older software.
-
-Consider the following INI file:
-
-```ini
-[PERSON]
-name = John Doe
-age = 30
-email = john@example.com
-```
-
-Here's how we validate that data:
-
-```python {test="skip"}
-import configparser
-
-from pydantic import BaseModel, EmailStr, PositiveInt
-
-
-class Person(BaseModel):
-    name: str
-    age: PositiveInt
-    email: EmailStr
-
-
-config = configparser.ConfigParser()
-config.read('person.ini')
-person = Person.model_validate(config['PERSON'])
-print(person)
-#> name='John Doe' age=30 email='john@example.com'
-```
+For details, check [the tests](https://github.com/AutoMapper/AutoMapper/blob/master/src/UnitTests/IMappingExpression/IncludeMembers.cs).

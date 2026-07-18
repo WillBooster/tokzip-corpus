@@ -1,224 +1,56 @@
-但有幾個屬性除外，可參考 HTML spec 中的 [7.2.3.1 CrossOriginProperties ( O )](https://html.spec.whatwg.org/multipage/browsers.html#crossoriginproperties-(-o-))：
+#Main Content
+After reading some tutorial articles, you think Redux is really great, so you start using Redux for your own product. But at this moment, you suddenly want to implement a feature: logging. You want to record every action and the changes to the store after executing the action. How to do it? Let's start with the simplest method!
 
-> If O is a Location object, then return « { [[Property]]: "href", [[NeedsGet]]: false, [[NeedsSet]]: true }, { [[Property]]: "replace" } ».
->
-> A JavaScript property name P is a cross-origin accessible window property name if it is "window", "self", "location", "close", "closed", "focus", "blur", "frames", "length", "top", "opener", "parent", "postMessage", or an array index property name.
+##First Attempt: Most Intuitive Method
+Assuming that the code for dispatching actions is originally written like this:
+```javascript
+store.dispatch(addTodo('Use Redux'));
+```
+We can directly change it to:
+```javascript
+let action = addTodo('Use Redux');
 
-有些是可以呼叫的函式，例如說 `focus`、`blur` 跟 `postMessage`，這些都可以跨 origin 呼叫，而 `postMessage` 也是跨 origin 的 window 間傳遞資訊的首要方式。
-
-其他大部分都是可讀的屬性，例如說 `closes`、`frames`、`length` 或是 `top`、`opener` 以及 `parent` 等等。
-
-而少數可寫的屬性是 `location.href`，只要你能存取到 window，就能用 `location.href = 'https://huli.tw'` 把網頁導到其他地方。
-
-順帶一提，有另外一種執行 JavaScript 的方式就是透過 location + javascript protocol，像是這樣：`location.href = 'javascript:alert(1)'`，這個我在[在做跳轉功能時應該注意的問題：Open Redirect](https://blog.huli.tw/2021/09/26/what-is-open-redirect/) 裡有提過。
-
-這時你可能會想說，那前面提過的 iframe src + data URI，是不是就可以透過這個方法繞過 null origin 的限制，針對 parent window 做 XSS 呢？像是這樣：
-
-``` html
-<iframe src="data:text/html,<script>top.location.href = 'javascript:alert(1)'</script>"></iframe>
+console.log('dispatching', action);
+store.dispatch(action);
+console.log('next state', store.getState());
 ```
 
-答案是不行，瀏覽器會噴這樣的錯誤給你：
-
-> Unsafe attempt to initiate navigation for frame with URL 'file://poc.html' from frame with URL 'data:text/html,&lt;script>top.location.href = 'javascript:alert(1)'</script>'. The frame attempting navigation must be same-origin with the target if navigating to a javascript: url
-
-如果你要跳到 javascript: 開頭的 url，那必須要 same-origin 才會讓你跳。
-
-## iframe 的 srcdoc
-
-除了常用的 src 屬性以外，還有另一個屬性叫做 srcdoc，裡面放的值就是 iframe 的內容，跟 src + data URI 其實有點類似：
-
-``` html
-<iframe
-  srcdoc="<h1>hello</h1><script>alert(top.document.body)</script>">
-</iframe>
+##Second Attempt: Wrap it in a Function
+But everyone knows that the first method cannot be done like this because there must be more than one place in the program that needs to do this. So what should we do next? Wrap it in a function.
+```javascript
+function dispatchAndLog(store, action) {
+  console.log('dispatching', action);
+  store.dispatch(action);
+  console.log('next state', store.getState());
+}
+dispatchAndLog(store, addTodo('Use Redux'));
 ```
+However, in this way, you need to import this function every time you need to dispatch, is there a better way?
 
-但是有個決定性的差異，那就是 iframe + srcdoc 所產生的 window，它的 origin 會繼承上層，跟 data URI 會變成 null origin 不同。也就是說，上面這段程式碼可以存取到上層的 DOM 元素，因為他們是 same origin。
-
-另外，srcdoc 並不受 CSP 的 `frame-src` 影響，就像 iframe 的 src 如果是 `javascript:` 的話，是受 `script-src` 管而不是 `frame-src` 管，細節可看這裡：[Test of CSP: iframe srcdoc='...' is not governed by frame-src](https://csplite.com/csp/test188/)
-
-還有，由於 srcdoc 是 HTML attribute 的關係，所以內容就跟之前提過的一樣，可以是 encode 過的結果，像這樣：
-
-``` html
-<iframe srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"></iframe>
+##Third Attempt: Monkeypatching
+What is `Monkeypatch`? You can Google it yourself. The idea is to replace something at runtime. Just like you can write in your chrome devtool:
+```javascript
+console.log = function(text){
+  alert(text);
+}
 ```
+All messages that were originally displayed in the console will now be displayed using alert. How can we use it here?
+```javascript
+//First, save the original because it will be used later
+let next = store.dispatch;
 
-所以如果 iframe srcdoc 的屬性可控，就算內容有先 escape 過也沒有用，還是會被解析回原本的符號來執行。
+//Override the current one
+store.dispatch = function dispatchAndLog(action) {
+  console.log('dispatching', action);
+  
+  //Execute
+  next(action);
+  console.log('next state', store.getState());
+  return;
+};
 
-## iframe 的 CSP
-
-iframe 上有一個 csp 的屬性，可以指定 iframe 所載入的 document 的 CSP 規則，不過並不是每個瀏覽器都支援，可參考 [MDN: HTMLIFrameElement.csp](https://developer.mozilla.org/en-US/docs/Web/API/HTMLIFrameElement/csp)：
-
-``` html
-<iframe csp="default-src 'self'; script-src 'none';"
-  srcdoc="<script>alert(1)</script>"></iframe>
+//The way to call it is the same as before
+store.dispatch(addTodo('Use Redux'));
 ```
-
-加了 csp 屬性後，iframe 的內容會被它所影響，舉例來說，直接打開 test.html 會跳 alert，但是用 csp 把 inline script 擋住，就會跳出違反 CSP 的錯誤訊息：
-
-``` html
-// test.html
-<script>alert(1)</script>
-
-// csp.html
-<iframe csp="default-src 'self'; script-src 'none';" src="test.html"></iframe>
-```
-
-> Refused to execute inline script because it violates the following Content Security Policy directive: "script-src 'none'". Either the 'unsafe-inline' keyword, a hash ('sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI='), or a nonce ('nonce-...') is required to enable inline execution.
-
-之前 Intigriti 有一次的 XSS 挑戰就是利用插入 CSP 的方式把 CSP 變嚴格，然後有些腳本就不會執行到，靠這樣來繞過一些限制。
-
-## iframe 的 sandbox
-
-前面有提過，當你利用 iframe 把其他網頁嵌入的時候，那個網頁可以用 `top.location = 'https://huli.tw'` 把上層頁面導到其他地方，而 iframe 有個叫做 sandbox 的屬性，可以限制 iframe 的各種行為，讓它不能做一些壞壞的事，基本的使用像是這樣：
-
-``` html
-<iframe srcdoc="<script>alert(1)</script>" sandbox></iframe>
-```
-
-> Blocked script execution in 'about:srcdoc' because the document's frame is sandboxed and the 'allow-scripts' permission is not set.
-
-一旦加上了 sandbox 這個屬性，就進入了沙箱模式，這個模式有沒有加主要的差別有兩個。
-
-第一個是，被載入的 iframe 的 origin 會變成 `null`。
-
-第二個是，一堆功能會被關閉，而這些功能可以被主動開啟，根據目前最新的 [spec](https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element) 所述，一共有 13 種 flag，每一個都代表一個功能：
-
-1. allow-downloads
-2. allow-forms
-3. allow-modals
-4. allow-orientation-lock
-5. allow-pointer-lock
-6. allow-popups
-7. allow-popups-to-escape-sandbox
-8. allow-presentation
-9. allow-same-origin
-10. allow-scripts
-11. allow-top-navigation
-12. allow-top-navigation-by-user-activation
-13. allow-top-navigation-to-custom-protocols
-
-這邊其實 flag 有點多而且有些只差一點點，我們先來看最重要的一個，就是 `allow-scripts`，這個 flag 十分好懂，沒有加上的話，預設是沒辦法執行 JavaScript 的，就像上面看到的錯誤那樣，加上這個 flag 以後才能執行 JavaScript，但可以使用的功能還是有限制。
-
-其他的 flag 我們可以分成幾類來看比較好懂。
-
-### 重新導向類型的 flag
-
-底下這三個都跟重新導向有關
-
-1. allow-top-navigation
-2. allow-top-navigation-by-user-activation
-3. allow-top-navigation-to-custom-protocols
-
-如果沒有加的話，預設是不能對上層重新導向的：
-
-``` html
-<iframe
-  srcdoc="<script>top.location='https://blog.huli.tw'</script>"
-  sandbox="allow-scripts">
-</iframe>
-```
-
-錯誤：
-
-> Unsafe attempt to initiate navigation for frame with URL 'file:///test.html' from frame with URL 'about:srcdoc'. The frame attempting navigation of the top-level window is sandboxed, but the flag of 'allow-top-navigation' or 'allow-top-navigation-by-user-activation' is not set.
-
-想要讓 iframe 可以對上層重新導向，只要加上 `allow-top-navigation` 即可，但如果你不想讓網頁在沒有互動的狀況下就自動重新導走，可以改用 `allow-top-navigation-by-user-activation` 這個 flag：
-
-``` html
-<iframe
-  srcdoc="<script>top.location='https://blog.huli.tw'</script>"
-  sandbox="allow-scripts allow-top-navigation-by-user-activation">
-</iframe>
-```
-
-錯誤：
-
-> The frame attempting navigation of the top-level window is sandboxed with the 'allow-top-navigation-by-user-activation' flag, but has no user activation (aka gesture). See https://www.chromestatus.com/feature/5629582019395584.
-
-用這個 flag 的話，使用者必須要有互動（例如說點個按鈕來觸發事件），才能把網頁重新導走。
-
-而 `allow-top-navigation-to-custom-protocols` 這個 flag 因為 Chrome 目前還沒支援，所以也沒辦法 demo，就先跳過吧。Chrome 102 支援的 flag 可以看這邊：[third_party/blink/renderer/core/html/html_iframe_element_sandbox.cc](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/102.0.4961.1/third_party/blink/renderer/core/html/html_iframe_element_sandbox.cc#17)
-
-### 功能類型的 flag
-
-1. allow-downloads
-2. allow-forms
-3. allow-orientation-lock
-4. allow-pointer-lock
-5. allow-presentation
-
-上面這五個都是跟功能有關的，從名字就大概可以看出來是在幹嘛。
-
-舉例來說，預設是不能送出表單的：
-
-``` html
-<iframe
-  srcdoc="<form><input name=a value=a><input type=submit></form>"
-  sandbox>
-</iframe>
-```
-
-錯誤：
-
-> Blocked form submission to '' because the form's frame is sandboxed and the 'allow-forms' permission is not set.
-
-要加上 `allow-forms` 這個 flag 之後才能送出表單。其他的 flag 也都類似，這邊就不多說了。
-
-
-### 彈出視窗相關的 flag
-
-1. allow-modals
-2. allow-popups
-3. allow-popups-to-escape-sandbox
-
-這邊 `allow-modals` 跟 `allow-popups` 名字很像，但定義其實差滿多的，底下幾種功能都是 `allow-modals` 會開啟的：
-
-1. window.alert
-2. window.confirm
-3. window.print
-4. window.prompt
-5. beforeunload event
-
-給個簡單的範例：`<iframe srcdoc="<script>alert(1)</script>" sandbox="allow-scripts">`，錯誤：
-
-> Ignored call to 'alert()'. The document is sandboxed, and the 'allow-modals' keyword is not set.
-
-而 `allow-popups` 則是與 `window.open` 跟 `target=_blank` 這些東西有關，預設情況下你是沒辦法開新視窗的：
-
-``` html
-<iframe
-  srcdoc="<script>window.open()</script>"
-  sandbox="allow-scripts">
-</iframe>
-```
-
-錯誤：
-
-> Blocked opening '' in a new window because the request was made in a sandboxed frame whose 'allow-popups' permission is not set.
-
-要把 `allow-popups` 加上去之後才能使用 `window.open`。
-
-而這邊還有一個神奇的特性，我覺得[舊版 spec](https://www.w3.org/TR/2010/WD-html5-20100624/the-iframe-element.html) 寫得比較清楚：
-
-> While the sandbox attribute is specified, the iframe element's nested browsing context must have the flags given in the following list set. In addition, any browsing contexts nested within an iframe, either directly or indirectly, must have all the flags set on them as were set on the iframe's Document's browsing context when the iframe's Document was created.
-
-[新版 spec](https://html.spec.whatwg.org/multipage/origin.html#sandboxing) 則直接把那段拿掉，要去另一個地方找，不過大意是一樣的，就是 sandbox iframe 裡面所開啟的 window，會繼承 sandbox 的屬性！
-
-這是什麼意思呢？
-
-舉例來說，如果我有一個 `iframe.html`，內容只有這樣：`<script>alert(1)</script>`，接著我在另一個頁面 `test.html` 這樣寫：
-
-``` html
-<iframe
-  srcdoc="<script>window.open('iframe.html')</script>"
-  sandbox="allow-scripts allow-popups">
-</iframe>
-```
-
-你會發現新開啟的 `iframe.html` 這個頁面沒辦法執行 `alert(1)`，因為它繼承了 sandbox，而 sandbox 並沒有加上 `allow-modals` 這個屬性。
-
-再舉個例子，我們可以在網路上隨便找一個用 JS 來 render 頁面內容的網頁，像這個計算機：`https://ahfarmer.github.io/calculator/`
-
-直接打開是沒問題的，但如果我們用一個 sandbox iframe 打開的話：
+In this way, the original code does not need to be modified at all. You just need to replace `store.dispatch` at the beginning of the program. It is easy and fun, but we soon encountered a new problem.
+>If I want an error reporting mechanism now, what should I do? When dispatching an error, I want to pass the error back to the server.

@@ -1,41 +1,61 @@
-This page builds on
-[lockfiles](/runtime/packages/#lockfile-and-reproducible-installs) and
-[vendoring](/runtime/packages/#vendoring-remote-modules) from the
-[dependency management guide](/runtime/packages/).
+Because OCC transactions are optimistic, they can fail on commit because the
+version constraints specified in the atomic operation were violated. This occurs
+when an agent updates a key used within the transaction between read and commit.
+When this happens, the agent performing the transaction must retry the
+transaction.
 
-## Core practices
+To illustrate how to use OCC transactions with Deno KV, this example shows how
+to implement a `transferFunds(from: string, to: string, amount: number)`
+function for an account ledger. The account ledger stores the balance for each
+account in the key-value store. The keys are prefixed by `"account"`, followed
+by the account identifier: `["account", "alice"]`. The value stored for each key
+is a number that represents the account balance.
 
-1. Pin versions deliberately
-   - For applications, prefer exact versions (for example
-     `jsr:@luca/cases@1.2.3`).
-   - For libraries, a caret range (`^1.2.3`) lets consumers get
-     backwards‑compatible fixes.
-   - Avoid unbounded (`*`) or overly broad ranges in production applications.
-2. Commit your `deno.lock` file.
-3. Enable a frozen lockfile in CI / production (`--frozen` or
-   `"lock": { "frozen": true }`) so new, unseen dependencies fail the build
-   instead of silently appearing.
-4. Vendor when you need hermetic/offline builds (`"vendor": true`) or when you
-   must patch third‑party code locally. Vendoring does not remove the need for a
-   lockfile—it complements it.
-5. Use `jsr:` and `npm:` specifiers with import map (`imports`) entries to
-   centralize version management.
-6. Periodically unfreeze and update consciously (for example on a weekly or
-   sprint cadence) instead of ad‑hoc updates during feature work.
-7. Set a [minimum dependency age](#minimum-dependency-age) so freshly published
-   versions can't slip into an install before the ecosystem has had time to spot
-   a compromised release.
-8. Turn on a [publishing-trust policy](#publishing-trust-policy) so a version
-   published with a weaker method than the one you already locked is rejected
-   instead of silently accepted.
+Here's a step-by-step example of implementing this `transferFunds` function:
 
-## Minimum dependency age
+```ts
+async function transferFunds(sender: string, receiver: string, amount: number) {
+  if (amount <= 0) throw new Error("Amount must be positive");
 
-Deno refuses to install package versions younger than a configured age. This is
-a cheap, broad defence against npm supply-chain attacks: malicious versions are
-usually detected and yanked within days, so delaying installs by a similar
-window catches the bulk of them.
+  // Construct the KV keys for the sender and receiver accounts.
+  const senderKey = ["account", sender];
+  const receiverKey = ["account", receiver];
 
-Since Deno 2.9 this is on by default with a 24-hour window, so versions
-published in the last day are skipped even with no configuration. The settings
-below change that window or turn it off (set the age to `0`).
+  // Retry the transaction until it succeeds.
+  let res = { ok: false };
+  while (!res.ok) {
+    // Read the current balance of both accounts.
+    const [senderRes, receiverRes] = await kv.getMany([senderKey, receiverKey]);
+    if (senderRes.value === null) {
+      throw new Error(`Account ${sender} not found`);
+    }
+    if (receiverRes.value === null) {
+      throw new Error(`Account ${receiver} not found`);
+    }
+
+    const senderBalance = senderRes.value;
+    const receiverBalance = receiverRes.value;
+
+    // Ensure the sender has a sufficient balance to complete the transfer.
+    if (senderBalance < amount) {
+      throw new Error(
+        `Insufficient funds to transfer ${amount} from ${sender}`,
+      );
+    }
+
+    // Perform the transfer.
+    const newSenderBalance = senderBalance - amount;
+    const newReceiverBalance = receiverBalance + amount;
+
+    // Attempt to commit the transaction. `res` returns an object with
+    // `ok: false` if the transaction fails to commit due to a check failure
+    // (i.e. the versionstamp for a key has changed)
+    res = await kv.atomic()
+      .check(senderRes) // Ensure the sender's balance hasn't changed.
+      .check(receiverRes) // Ensure the receiver's balance hasn't changed.
+      .set(senderKey, newSenderBalance) // Update the sender's balance.
+      .set(receiverKey, newReceiverBalance) // Update the receiver's balance.
+      .commit();
+  }
+}
+```

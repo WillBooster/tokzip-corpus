@@ -1,217 +1,405 @@
-import json
-import os
-import platform
-from pathlib import Path
+import re
+from collections.abc import Callable
+from enum import Enum
 from typing import Any
 
 import pytest
 
-from pydantic_core import SchemaSerializer, core_schema
+from pydantic_core import SchemaError, SchemaValidator, ValidationError, core_schema
+from pydantic_core import core_schema as cs
 
-from ..conftest import plain_repr
-
-on_pypy = platform.python_implementation() == 'PyPy'
-# pypy doesn't seem to maintain order of `__dict__`
-if on_pypy:
-    IsStrictDict = dict
-else:
-    pass
+from ..conftest import Err, PyAndJson, plain_repr
 
 
-class BaseModel:
-    __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
-
-    def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-
-class RootModel:
-    __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
-    root: str
-
-    def __init__(self, data):
-        self.root = data
-
-
-class RootSubModel(RootModel):
-    pass
-
-
-def test_model_root():
-    s = SchemaSerializer(core_schema.model_schema(RootModel, core_schema.int_schema(), root_model=True))
-    print(plain_repr(s))
-    # TODO: assert 'mode:RootModel' in plain_repr(s)
-    assert 'has_extra:false' in plain_repr(s)
-    assert s.to_python(RootModel(1)) == 1
-    assert s.to_python(RootSubModel(1)) == 1
-
-    j = s.to_json(RootModel(1))
-    if on_pypy:
-        assert json.loads(j) == 1
-    else:
-        assert j == b'1'
-
-    assert json.loads(s.to_json(RootSubModel(1))) == 1
-
-
-def test_function_plain_field_serializer_to_python():
-    class Model(RootModel):
-        def ser_root(self, v: Any, _) -> str:
-            assert self.root == 1_000
-            return f'{v:_}'
-
-    s = SchemaSerializer(
-        core_schema.model_schema(
-            Model,
-            core_schema.int_schema(
-                serialization=core_schema.plain_serializer_function_ser_schema(
-                    Model.ser_root, is_field_serializer=True, info_arg=True
-                )
+@pytest.mark.parametrize(
+    'kwarg_expected,input_value,expected',
+    [
+        ([1], 1, 1),
+        pytest.param(
+            [1],
+            2,
+            Err(
+                'Input should be 1 [type=literal_error, input_value=2, input_type=int]',
+                [
+                    {
+                        'type': 'literal_error',
+                        'loc': (),
+                        'msg': 'Input should be 1',
+                        'input': 2,
+                        'ctx': {'expected': '1'},
+                    }
+                ],
             ),
-            root_model=True,
-        )
-    )
-    assert s.to_python(Model(1000)) == '1_000'
-
-
-def test_function_wrap_field_serializer_to_python():
-    class Model(RootModel):
-        def ser_root(self, v: Any, serializer: core_schema.SerializerFunctionWrapHandler, _) -> str:
-            root = serializer(v)
-            assert self.root == 1_000
-            return f'{root:_}'
-
-    s = SchemaSerializer(
-        core_schema.model_schema(
-            Model,
-            core_schema.int_schema(
-                serialization=core_schema.wrap_serializer_function_ser_schema(
-                    Model.ser_root, is_field_serializer=True, info_arg=True, schema=core_schema.any_schema()
-                )
-            ),
-            root_model=True,
-        )
-    )
-    assert s.to_python(Model(1000)) == '1_000'
-
-
-def test_function_plain_field_serializer_to_json():
-    class Model(RootModel):
-        def ser_root(self, v: Any, _) -> str:
-            assert self.root == 1_000
-            return f'{v:_}'
-
-    s = SchemaSerializer(
-        core_schema.model_schema(
-            Model,
-            core_schema.int_schema(
-                serialization=core_schema.plain_serializer_function_ser_schema(
-                    Model.ser_root, is_field_serializer=True, info_arg=True
-                )
-            ),
-            root_model=True,
-        )
-    )
-    assert json.loads(s.to_json(Model(1000))) == '1_000'
-
-
-def test_function_wrap_field_serializer_to_json():
-    class Model(RootModel):
-        def ser_root(self, v: Any, serializer: core_schema.SerializerFunctionWrapHandler, _) -> str:
-            assert self.root == 1_000
-            root = serializer(v)
-            return f'{root:_}'
-
-    s = SchemaSerializer(
-        core_schema.model_schema(
-            Model,
-            core_schema.int_schema(
-                serialization=core_schema.wrap_serializer_function_ser_schema(
-                    Model.ser_root, is_field_serializer=True, info_arg=True, schema=core_schema.any_schema()
-                )
-            ),
-            root_model=True,
-        )
-    )
-    assert json.loads(s.to_json(Model(1000))) == '1_000'
-
-
-@pytest.mark.parametrize('order', ['BR', 'RB'])
-def test_root_model_dump_with_base_model(order):
-    class BModel(BaseModel):
-        value: str
-
-    b_schema = core_schema.model_schema(
-        BModel, core_schema.model_fields_schema({'value': core_schema.model_field(core_schema.str_schema())})
-    )
-
-    class RModel(RootModel):
-        root: int
-
-    r_schema = core_schema.model_schema(RModel, core_schema.int_schema(), root_model=True)
-
-    if order == 'BR':
-
-        class Model(RootModel):
-            root: list[BModel | RModel]
-
-        choices = [b_schema, r_schema]
-
-    elif order == 'RB':
-
-        class Model(RootModel):
-            root: list[RModel | BModel]
-
-        choices = [r_schema, b_schema]
-
-    s = SchemaSerializer(
-        core_schema.model_schema(
-            Model, core_schema.list_schema(core_schema.union_schema(choices=choices)), root_model=True
-        )
-    )
-
-    m = Model([RModel(1), RModel(2), BModel(value='abc')])
-
-    assert s.to_python(m) == [1, 2, {'value': 'abc'}]
-    assert s.to_json(m) == b'[1,2,{"value":"abc"}]'
-
-
-def test_not_root_model():
-    # https://github.com/pydantic/pydantic/issues/8963
-
-    class RootModel:
-        root: int
-
-    v = RootModel()
-    v.root = '123'
-
-    s = SchemaSerializer(
-        core_schema.model_schema(
-            RootModel,
-            core_schema.str_schema(),
-            root_model=True,
+            id='wrong-single-int',
         ),
-    )
-
-    assert s.to_python(v) == '123'
-    assert s.to_json(v) == b'"123"'
-
-    # Path is chosen because it has a .root property
-    # which could look like a root model in bad implementations
-
-    if os.name == 'nt':
-        path_value = Path('C:\\a\\b')
-        path_bytes = b'"C:\\\\a\\\\b"'  # fixme double escaping?
+        (['foo'], 'foo', 'foo'),
+        pytest.param(
+            ['foo'],
+            'bar',
+            Err(
+                "Input should be 'foo' [type=literal_error, input_value='bar', input_type=str]",
+                [
+                    {
+                        'type': 'literal_error',
+                        'loc': (),
+                        'msg': "Input should be 'foo'",
+                        'input': 'bar',
+                        'ctx': {'expected': "'foo'"},
+                    }
+                ],
+            ),
+            id='wrong-single-str',
+        ),
+        ([1, 2], 1, 1),
+        ([1, 2], 2, 2),
+        pytest.param(
+            [1, 2],
+            3,
+            Err('Input should be 1 or 2 [type=literal_error, input_value=3, input_type=int]'),
+            id='wrong-multiple-int',
+        ),
+        ([1, 2, 3, 4], 4, 4),
+        pytest.param(
+            [1, 2, 3, 4],
+            5,
+            Err(
+                'Input should be 1, 2, 3 or 4 [type=literal_error, input_value=5, input_type=int]',
+                [
+                    {
+                        'type': 'literal_error',
+                        'loc': (),
+                        'msg': 'Input should be 1, 2, 3 or 4',
+                        'input': 5,
+                        'ctx': {'expected': '1, 2, 3 or 4'},
+                    }
+                ],
+            ),
+            id='wrong-multiple-int-2',
+        ),
+        (['a', 'b'], 'a', 'a'),
+        pytest.param(
+            ['a', 'b'],
+            'c',
+            Err("Input should be 'a' or 'b' [type=literal_error, input_value='c', input_type=str]"),
+            id='wrong-multiple-str',
+        ),
+        ([1, '1'], 1, 1),
+        ([1, '1'], '1', '1'),
+        pytest.param(
+            [1, '1'],
+            '2',
+            Err(
+                "Input should be 1 or '1' [type=literal_error, input_value='2', input_type=str]",
+                [
+                    {
+                        'type': 'literal_error',
+                        'loc': (),
+                        'msg': "Input should be 1 or '1'",
+                        'input': '2',
+                        'ctx': {'expected': "1 or '1'"},
+                    }
+                ],
+            ),
+            id='wrong-str-int',
+        ),
+    ],
+)
+def test_literal_py_and_json(py_and_json: PyAndJson, kwarg_expected, input_value, expected):
+    v = py_and_json({'type': 'literal', 'expected': kwarg_expected})
+    if isinstance(expected, Err):
+        with pytest.raises(ValidationError, match=re.escape(expected.message)) as exc_info:
+            v.validate_test(input_value)
+        if expected.errors is not None:
+            # debug(exc_info.value.errors(include_url=False))
+            assert exc_info.value.errors(include_url=False) == expected.errors
     else:
-        path_value = Path('/a/b')
-        path_bytes = b'"/a/b"'
+        assert v.validate_test(input_value) == expected
 
-    with pytest.warns(UserWarning, match=r'PydanticSerializationUnexpectedValue\(Expected `RootModel`'):
-        assert s.to_python(path_value) == path_value
 
-    with pytest.warns(UserWarning, match=r'PydanticSerializationUnexpectedValue\(Expected `RootModel`'):
-        assert s.to_json(path_value) == path_bytes
+@pytest.mark.parametrize(
+    'kwarg_expected,input_value,expected',
+    [
+        ([1, b'whatever'], b'whatever', b'whatever'),
+        ([(1, 2), (3, 4)], (1, 2), (1, 2)),
+        ([(1, 2), (3, 4)], (3, 4), (3, 4)),
+        pytest.param(
+            [1, b'whatever'],
+            3,
+            Err("Input should be 1 or b'whatever' [type=literal_error, input_value=3, input_type=int]"),
+            id='wrong-general',
+        ),
+        ([b'bite'], b'bite', b'bite'),
+        pytest.param(
+            [b'bite'],
+            'spoon',
+            Err(
+                "Input should be b'bite' [type=literal_error, input_value='spoon', input_type=str]",
+                [
+                    {
+                        'type': 'literal_error',
+                        'loc': (),
+                        'msg': "Input should be 1 or '1'",
+                        'input': '2',
+                        'ctx': {'expected': "1 or '1'"},
+                    }
+                ],
+            ),
+            id='single-byte',
+        ),
+    ],
+)
+def test_literal_not_json(kwarg_expected, input_value, expected):
+    v = SchemaValidator(cs.literal_schema(expected=kwarg_expected))
+    if isinstance(expected, Err):
+        with pytest.raises(ValidationError, match=re.escape(expected.message)) as exc_info:
+            v.validate_python(input_value)
+            if expected.errors is not None:
+                # debug(exc_info.value.errors(include_url=False))
+                assert exc_info.value.errors(include_url=False) == expected.errors
+    else:
+        assert v.validate_python(input_value) == expected
 
-    assert s.to_python(path_value, warnings=False) == path_value
-    assert s.to_json(path_value, warnings=False) == path_bytes
+
+def test_build_error():
+    with pytest.raises(SchemaError, match='SchemaError: `expected` should have length > 0'):
+        SchemaValidator(cs.literal_schema(expected=[]))
+
+
+def test_literal_none():
+    v = SchemaValidator(core_schema.literal_schema([None]))
+    assert v.isinstance_python(None) is True
+    assert v.isinstance_python(0) is False
+    expected_repr_start = 'SchemaValidator(title="literal[None]"'
+    assert plain_repr(v)[: len(expected_repr_start)] == expected_repr_start
+
+
+def test_union():
+    v = SchemaValidator(core_schema.union_schema([core_schema.literal_schema(['a', 'b']), core_schema.int_schema()]))
+    assert v.validate_python('a') == 'a'
+    assert v.validate_python(4) == 4
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python('c')
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'literal_error',
+            'loc': ("literal['a','b']",),
+            'msg': "Input should be 'a' or 'b'",
+            'input': 'c',
+            'ctx': {'expected': "'a' or 'b'"},
+        },
+        {
+            'type': 'int_parsing',
+            'loc': ('int',),
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'input': 'c',
+        },
+    ]
+
+
+def test_enum_value():
+    class FooEnum(Enum):
+        foo = 'foo_value'
+        bar = 'bar_value'
+
+    v = SchemaValidator(core_schema.literal_schema([FooEnum.foo]))
+    assert v.validate_python(FooEnum.foo) == FooEnum.foo
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python('foo_value')
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'literal_error',
+            'loc': (),
+            'msg': "Input should be <FooEnum.foo: 'foo_value'>",
+            'input': 'foo_value',
+            'ctx': {'expected': "<FooEnum.foo: 'foo_value'>"},
+        }
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python('unknown')
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'literal_error',
+            'loc': (),
+            'msg': "Input should be <FooEnum.foo: 'foo_value'>",
+            'input': 'unknown',
+            'ctx': {'expected': "<FooEnum.foo: 'foo_value'>"},
+        }
+    ]
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_json('"foo_value"')
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'literal_error',
+            'loc': (),
+            'msg': "Input should be <FooEnum.foo: 'foo_value'>",
+            'input': 'foo_value',
+            'ctx': {'expected': "<FooEnum.foo: 'foo_value'>"},
+        }
+    ]
+
+
+def test_str_enum_values():
+    class Foo(str, Enum):
+        foo = 'foo_value'
+        bar = 'bar_value'
+
+    v = SchemaValidator(core_schema.literal_schema([Foo.foo]))
+
+    assert v.validate_python(Foo.foo) == Foo.foo
+    assert v.validate_python('foo_value') == Foo.foo
+    assert v.validate_json('"foo_value"') == Foo.foo
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python('unknown')
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'literal_error',
+            'loc': (),
+            'msg': "Input should be <Foo.foo: 'foo_value'>",
+            'input': 'unknown',
+            'ctx': {'expected': "<Foo.foo: 'foo_value'>"},
+        }
+    ]
+
+
+def test_int_enum_values():
+    class Foo(int, Enum):
+        foo = 2
+        bar = 3
+
+    v = SchemaValidator(core_schema.literal_schema([Foo.foo]))
+
+    assert v.validate_python(Foo.foo) == Foo.foo
+    assert v.validate_python(2) == Foo.foo
+    assert v.validate_json('2') == Foo.foo
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python(4)
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'literal_error',
+            'loc': (),
+            'msg': 'Input should be <Foo.foo: 2>',
+            'input': 4,
+            'ctx': {'expected': '<Foo.foo: 2>'},
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    'reverse, err',
+    [
+        (
+            lambda x: list(reversed(x)),
+            [
+                {
+                    'type': 'literal_error',
+                    'loc': (),
+                    'msg': 'Input should be <Foo.foo: 1> or 1',
+                    'input': 2,
+                    'ctx': {'expected': '<Foo.foo: 1> or 1'},
+                }
+            ],
+        ),
+        (
+            lambda x: x,
+            [
+                {
+                    'type': 'literal_error',
+                    'loc': (),
+                    'msg': 'Input should be 1 or <Foo.foo: 1>',
+                    'input': 2,
+                    'ctx': {'expected': '1 or <Foo.foo: 1>'},
+                }
+            ],
+        ),
+    ],
+)
+def test_mix_int_enum_with_int(reverse: Callable[[list[Any]], list[Any]], err: Any):
+    class Foo(int, Enum):
+        foo = 1
+
+    v = SchemaValidator(core_schema.literal_schema(reverse([1, Foo.foo])))
+
+    assert v.validate_python(Foo.foo) is Foo.foo
+    val = v.validate_python(1)
+    assert val == 1 and val is not Foo.foo
+    val = v.validate_json('1')
+    assert val == 1 and val is not Foo.foo
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python(2)
+    assert exc_info.value.errors(include_url=False) == err
+
+
+@pytest.mark.parametrize(
+    'reverse, err',
+    [
+        (
+            lambda x: list(reversed(x)),
+            [
+                {
+                    'type': 'literal_error',
+                    'loc': (),
+                    'msg': "Input should be <Foo.foo: 'foo_val'> or 'foo_val'",
+                    'input': 'bar_val',
+                    'ctx': {'expected': "<Foo.foo: 'foo_val'> or 'foo_val'"},
+                }
+            ],
+        ),
+        (
+            lambda x: x,
+            [
+                {
+                    'type': 'literal_error',
+                    'loc': (),
+                    'msg': "Input should be 'foo_val' or <Foo.foo: 'foo_val'>",
+                    'input': 'bar_val',
+                    'ctx': {'expected': "'foo_val' or <Foo.foo: 'foo_val'>"},
+                }
+            ],
+        ),
+    ],
+)
+def test_mix_str_enum_with_str(reverse: Callable[[list[Any]], list[Any]], err: Any):
+    class Foo(str, Enum):
+        foo = 'foo_val'
+
+    v = SchemaValidator(core_schema.literal_schema(reverse(['foo_val', Foo.foo])))
+
+    assert v.validate_python(Foo.foo) is Foo.foo
+    val = v.validate_python('foo_val')
+    assert val == 'foo_val' and val is not Foo.foo
+    val = v.validate_json('"foo_val"')
+    assert val == 'foo_val' and val is not Foo.foo
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python('bar_val')
+    assert exc_info.value.errors(include_url=False) == err
+
+
+def test_big_int():
+    big_int = 2**64 + 1
+    massive_int = 2**128 + 1
+    v = SchemaValidator(core_schema.literal_schema([big_int, massive_int]))
+    assert v.validate_python(big_int) == big_int
+    assert v.validate_python(massive_int) == massive_int
+    m = r'Input should be 18446744073709551617 or 340282366920938463463374607431768211457 \[type=literal_error'
+    with pytest.raises(ValidationError, match=m):
+        v.validate_python(37)
+
+
+def test_enum_for_str() -> None:
+    class S(str, Enum):
+        a = 'a'
+
+    val_enum = SchemaValidator(core_schema.literal_schema([S.a]))
+    val_str = SchemaValidator(core_schema.literal_schema(['a']))
+
+    for val in [val_enum, val_str]:
+        assert val.validate_python('a') == 'a'
+        assert val.validate_python(S.a) == 'a'

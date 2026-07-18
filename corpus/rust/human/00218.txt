@@ -1,59 +1,149 @@
-/// Completion support for Bash
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct Elvish;
+use clap::{arg, Arg, ArgAction, Command};
 
-impl crate::dynamic::Completer for Elvish {
-    fn file_name(&self, name: &str) -> String {
-        format!("{name}.elv")
-    }
-    fn write_registration(
-        &self,
-        _name: &str,
-        bin: &str,
-        completer: &str,
-        buf: &mut dyn std::io::Write,
-    ) -> Result<(), std::io::Error> {
-        let bin = shlex::try_quote(bin).unwrap_or(std::borrow::Cow::Borrowed(bin));
-        let completer =
-            shlex::try_quote(completer).unwrap_or(std::borrow::Cow::Borrowed(completer));
+use super::utils;
 
-        let script = r#"
-set edit:completion:arg-completer[BIN] = { |@words|
-    set E:_CLAP_IFS = "\n"
+#[test]
+fn single_short_arg_without_value() {
+    let cmd = Command::new("cmd").ignore_errors(true).arg(arg!(
+        -c --config [FILE] "Sets a custom config file"
+    ));
 
-    var index = (count $words)
-    set index = (- $index 1)
-    set E:_CLAP_COMPLETE_INDEX = (to-string $index)
+    let r = cmd.try_get_matches_from(vec!["cmd", "-c" /* missing: , "config file" */]);
 
-    put (COMPLETER complete --shell elvish -- $@words) | to-lines
+    assert!(r.is_ok(), "unexpected error: {r:?}");
+    let m = r.unwrap();
+    assert!(m.contains_id("config"));
 }
-"#
-        .replace("COMPLETER", &completer)
-        .replace("BIN", &bin);
 
-        writeln!(buf, "{script}")?;
-        Ok(())
-    }
-    fn write_complete(
-        &self,
-        cmd: &mut clap::Command,
-        args: Vec<std::ffi::OsString>,
-        current_dir: Option<&std::path::Path>,
-        buf: &mut dyn std::io::Write,
-    ) -> Result<(), std::io::Error> {
-        let index: usize = std::env::var("_CLAP_COMPLETE_INDEX")
-            .ok()
-            .and_then(|i| i.parse().ok())
-            .unwrap_or_default();
-        let ifs: Option<String> = std::env::var("_CLAP_IFS").ok().and_then(|i| i.parse().ok());
-        let completions = crate::dynamic::complete(cmd, args, index, current_dir)?;
+#[test]
+fn single_long_arg_without_value() {
+    let cmd = Command::new("cmd").ignore_errors(true).arg(arg!(
+        -c --config [FILE] "Sets a custom config file"
+    ));
 
-        for (i, candidate) in completions.iter().enumerate() {
-            if i != 0 {
-                write!(buf, "{}", ifs.as_deref().unwrap_or("\n"))?;
-            }
-            write!(buf, "{}", candidate.get_content().to_string_lossy())?;
-        }
-        Ok(())
-    }
+    let r = cmd.try_get_matches_from(vec!["cmd", "--config" /* missing: , "config file" */]);
+
+    assert!(r.is_ok(), "unexpected error: {r:?}");
+    let m = r.unwrap();
+    assert!(m.contains_id("config"));
+}
+
+#[test]
+fn multiple_args_and_final_arg_without_value() {
+    let cmd = Command::new("cmd")
+        .ignore_errors(true)
+        .arg(arg!(
+            -c --config [FILE] "Sets a custom config file"
+        ))
+        .arg(arg!(
+            -x --stuff [FILE] "Sets a custom stuff file"
+        ))
+        .arg(arg!(f: -f "Flag").action(ArgAction::SetTrue));
+
+    let r = cmd.try_get_matches_from(vec![
+        "cmd", "-c", "file", "-f", "-x", /* missing: , "some stuff" */
+    ]);
+
+    assert!(r.is_ok(), "unexpected error: {r:?}");
+    let m = r.unwrap();
+    assert_eq!(
+        m.get_one::<String>("config").map(|v| v.as_str()),
+        Some("file")
+    );
+    assert!(*m.get_one::<bool>("f").expect("defaulted by clap"));
+    assert_eq!(m.get_one::<String>("stuff").map(|v| v.as_str()), None);
+}
+
+#[test]
+fn multiple_args_and_intermittent_arg_without_value() {
+    let cmd = Command::new("cmd")
+        .ignore_errors(true)
+        .arg(arg!(
+            -c --config[FILE] "Sets a custom config file"
+        ))
+        .arg(arg!(
+            -x --stuff[FILE] "Sets a custom stuff file"
+        ))
+        .arg(arg!(f: -f "Flag").action(ArgAction::SetTrue));
+
+    let r = cmd.try_get_matches_from(vec![
+        "cmd", "-x", /* missing: ,"some stuff" */
+        "-c", "file", "-f",
+    ]);
+
+    assert!(r.is_ok(), "unexpected error: {r:?}");
+    let m = r.unwrap();
+    assert_eq!(
+        m.get_one::<String>("config").map(|v| v.as_str()),
+        Some("file")
+    );
+    assert!(*m.get_one::<bool>("f").expect("defaulted by clap"));
+    assert_eq!(m.get_one::<String>("stuff").map(|v| v.as_str()), None);
+}
+
+#[test]
+fn subcommand() {
+    let cmd = Command::new("test")
+        .ignore_errors(true)
+        .subcommand(
+            Command::new("some")
+                .arg(
+                    Arg::new("test")
+                        .short('t')
+                        .long("test")
+                        .action(ArgAction::Set)
+                        .help("testing testing"),
+                )
+                .arg(
+                    Arg::new("stuff")
+                        .short('x')
+                        .long("stuff")
+                        .action(ArgAction::Set)
+                        .help("stuf value"),
+                ),
+        )
+        .arg(Arg::new("other").long("other"));
+
+    let m = cmd
+        .try_get_matches_from(vec![
+            "myprog",
+            "some",
+            "--test", /* missing: ,"some val" */
+            "-x",
+            "some other val",
+        ])
+        .unwrap();
+
+    assert_eq!(m.subcommand_name().unwrap(), "some");
+    let sub_m = m.subcommand_matches("some").unwrap();
+    assert!(
+        sub_m.contains_id("test"),
+        "expected subcommand to be present due to partial parsing"
+    );
+    assert_eq!(sub_m.get_one::<String>("test").map(|v| v.as_str()), None);
+    assert_eq!(
+        sub_m.get_one::<String>("stuff").map(|v| v.as_str()),
+        Some("some other val")
+    );
+}
+
+#[test]
+fn help_command() {
+    static HELP: &str = "\
+Usage: test
+
+Options:
+  -h, --help  Print help
+";
+
+    let cmd = Command::new("test").ignore_errors(true);
+
+    utils::assert_output(cmd, "test --help", HELP, false);
+}
+
+#[test]
+fn version_command() {
+    let cmd = Command::new("test").ignore_errors(true).version("0.1");
+
+    utils::assert_output(cmd, "test --version", "test 0.1\n", false);
 }

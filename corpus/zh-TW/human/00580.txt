@@ -1,12 +1,151 @@
----
-title: GoogleCTF 2024 Writeups
-date: 2024-06-28 11:40:00
-catalog: true
-tags: [Security]
-categories: [Security]
-photos: /img/google-ctf-2024-writeup/cover-en.png
----
+一個非常簡單的程式，一執行就會透過 GitHub API 去 po 一個新的 Issue，標題就是今天的日期。
 
-For the past half year, I have been busy with other things and haven't had a chance to participate in a CTF. This time, I made time for GoogleCTF 2024 and solved all the web challenges with my teammates.
+有一點需要注意的是這邊有用到其他 npm 的 library，應該有方法是可以只傳 package.json 上去，Lambda 就幫你執行 `npm install` 把那些套件抓下來，但我懶得查了，我就直接把`node_modules`包進壓縮檔裡面丟上去。
 
-The challenges were interesting as always. I participated in three of them, while my teammates quickly solved the other two simpler ones before I could even take a look. Nevertheless, I will make a brief record of them. I really enjoy CTF challenges that are mostly client-side focused.
+我上一次用 Lambda 大概兩三年前，這個服務才剛推出沒多久，因為好奇所以隨意玩了一下，發現介面很陽春然後很多東西不知道怎麼設定。
+
+事隔多年，這次再看到它的介面真的嚇到我了，進步超級多！
+
+首先是觸發條件這個部分一目瞭然：
+
+![l1](https://user-images.githubusercontent.com/2755720/49351935-8e03d580-f6f0-11e8-9219-d2c45b499596.png)
+
+因為我是要每天固定執行，在 AWS 上你可以用 CloudWatch 來設定一個排程，要注意的是在 Lambda 上面這個排程的時間會以 UTC 為準，也就是 +0 的時區，所以你如果是寫說每天 00:00 跑，其實就代表說是在台灣的早上 08:00 跑。
+
+我這邊設定的表達式是：`5 0 ? * MON-FRI *`，在台灣時間平日早上 08:05 都會觸發 Lambda，執行 po issue 的 function。
+
+然後在 Lambda 的介面上如果你的程式碼沒有很大，可以直接編輯，有功能完整的編輯器（我一直覺得很眼熟，後來才想到應該是 Amazon 買了 Cloud9 的關係，以前上 CS50 都用 Cloud9 的 IDE，難怪這麼熟悉）：
+
+![l2](https://user-images.githubusercontent.com/2755720/49351938-90fec600-f6f0-11e8-9fa8-5686d09a9276.png)
+
+最後把環境變數 token 設定好之後就完成了，測試一下發現 Issue 有成功被建立，第一個任務就這樣輕鬆完成了，感謝 Lambda 的努力。
+
+## 2. 每個 Issue 下的留言要被同步到 Slack
+
+這是三個任務當中最簡單的，因為 Slack 本來的優勢就是可以跟很多現成的東西串接，只要在 Slack 上面安裝 GitHub App，就可以用指令來 subscribe 指定的 repo 跟事件。
+
+因為這個實在是太簡單，所以我就沒必要再多介紹了，直接給大家看成果：
+
+![github](https://user-images.githubusercontent.com/2755720/49351947-9c51f180-f6f0-11e8-894d-0b10d4b85b2d.png)
+
+## 3. 要串接 GitHub Webhook，同步把紀錄寫到試算表裡面
+
+這個任務我們一樣用 Lambda 搭配其他 AWS 的服務就可以輕鬆實作出來，流程是這樣的：
+
+1. 學生留言，觸發 GitHub Webhook
+2. GitHub Webhook 打到 AWS API Gateway
+3. 經由 API Gateway 觸發 Labmda function
+4. Lambda function 透過 Google Sheet API 寫入試算表
+
+我們先來把要丟給 webhook 的 API 給準備好，這邊利用 API Gateway 來觸發 Lambda，像是這樣：
+
+![api](https://user-images.githubusercontent.com/2755720/49351952-9eb44b80-f6f0-11e8-949a-81248d45316f.png)
+
+API Gateway 設定上也超級方便，你就設定要用什麼 HTTP method，他就會給你一個網址，假設我設定的是 GET，那你用 GET 打這個 API 它就會觸發 Lambda，用超短的時間就能做出一個 Webhook，比起自己架 Server 還要設定 domain 跟 https 方便得多。
+
+再來就是要串接 Google Sheet API 了，我稍微看了一下官方的 API 發現還是維持一慣的風格，就是文件很完整但是講得很複雜，沒辦法一眼就看出我到底要怎麼實作出我要的功能，後來就找了一套別人包裝過的：[Simple Google Spreadsheet Access (node.js)](https://github.com/theoephraim/node-google-spreadsheet)，用起來簡單很多。
+
+最麻煩的權限管理裡面也有教你怎麼實作，基本上就是去開一個`Service Account`，設定成對 Google Drive API 有權限，然後再去產生這個帳號的 token，用那一組 token 就行了。
+
+主程式要做的基本上就是先過濾資料，接著從 GitHub 丟過來的資料裡找到帳號，把帳號跟日期丟進我另外寫好的 function，最後回傳結果就結束了：
+
+``` js
+var updateSheet = require('./lib')
+  
+exports.handler = async (event, context, callback) => {
+    if (!event.body) return 'no body'
+    const body = JSON.parse(event.body) || {}
+    if (!body || body.action !== 'created') return response(callback)
+    const title = body.issue.title.split(' ')
+    if (!title.length) return response(callback)
+    const date = title[1]
+    const account = body.comment.user.login
+    console.log('log:', date, account)
+    try {
+        await updateSheet(date, account)
+        return callback(null, {
+            statusCode: 200,
+            body: date + account
+        })
+    } catch (err) {
+        console.log('error:', err)
+    }
+      
+    return response(callback)
+};
+  
+const response = (cb) => {
+    cb(null, {
+        statusCode: 200,
+        body: 'ok'
+    })
+}
+```
+
+`updateSheet` 這個 function 做的事也很簡單，就是根據日期還有帳號找到正確的位置，把那一格的值更改成 O 就好了，這邊附上部分程式碼供大家參考：
+
+``` js
+async function searchAccount(sheet, account) {
+  const firstRow = await getCells(sheet, {
+    'min-row': 1,
+    'max-row': 1
+  })
+  const length = firstRow.length
+  for(var i=0; i<length; i++) {
+    if (firstRow[i].value === account) {
+      return {
+        col: firstRow[i].col,
+        batchId: firstRow[i].batchId
+      }
+    }
+  }
+  return null
+}
+  
+async function setValue(sheet, row, col, value) {
+  const cells = await getCells(sheet, {
+    'min-row': row,
+    'max-row': row,
+    'min-col': col,
+    'max-col': col,
+    'return-empty': true
+  })
+  if (cells && cells[0]) {
+    cells[0].value = value
+    cells[0].save(function(err) {
+      if (err) {
+        console.log('err', err)
+      }
+    })
+  }
+}
+  
+async function updateSheet(date, account) {
+  try {
+    const sheet = await getSheet()
+    const accountPosition = await searchAccount(sheet, account)
+    const datePosition = await searchDate(sheet, date)
+    console.log('position:', accountPosition, datePosition)
+    if (!accountPosition || !datePosition) return
+    await setValue(sheet, datePosition.row, accountPosition.col, 'O')
+  } catch (err) {
+    console.log('err', err)
+  }  
+}
+```
+
+最後只要在 GitHub 那邊把 webhook 的網址設定好，一切就大功告成了！
+
+## 在 Lambda 上要如何 debug？
+
+雖然我上面寫的輕鬆寫意，但實際開發的時候我其實有碰到幾個小問題，第一個就是 debug 不像你在電腦上那樣可以直接看到結果，而且 webhook 通常又是比較難 debug 的一個。
+
+有關於這部分，其實 Lambda 都會把 log 送到 CloudWatch 去，所以就是自己在 app 裡面寫 log，再去看 CloudWatch 分析一下那些 log，如果是簡單的應用的話還滿容易的，再複雜一點的話應該就是 function 要切更細，不然 debug 起來應該滿麻煩的。
+
+另一個碰到的問題是 Google Sheet API 那邊速度比較慢，整個過程做完大概要 5 秒左右，預設的 timeout 好像是 3 秒左右，記得要自己把 timeout 加大不然會一直失敗。
+
+## 總結
+
+這次對於 AWS Lambda 的使用體驗滿不錯的，開發過程中沒碰到什麼太大的困難，可能跟我想實作的東西比較簡單也有關係，但這種簡單的東西我覺得超級適合走這種 Serverless 的方案，因為沒有 Server 真的超方便的，少了很多麻煩。
+
+以後如果還有類似簡單的小需求，我想我應該還是會走這種解決方案，直接用現成服務一個串一個，把東西全部串起來就結束了。也推薦大家如果要做一些小東西，不妨來試試看用這些現成的服務搞定，可以節省很多時間。

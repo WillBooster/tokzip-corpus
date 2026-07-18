@@ -1,104 +1,55 @@
-# AutoMapper.Extensions.EnumMapping
+---
+sidebar_position: 7
+---
 
-The built-in enum mapper is not configurable, it can only be replaced. Alternatively, AutoMapper supports convention based mapping of enum values in a separate package [AutoMapper.Extensions.EnumMapping](https://www.nuget.org/packages/AutoMapper.Extensions.EnumMapping/).
+# Cloud
 
-### Usage
+Tigerbeetle is [optimized for performance](../performance.md), exploiting "close to the metal"
+technologies such as **Direct I/O** and **io_uring**.
 
-For method `CreateMap` this library provide a `ConvertUsingEnumMapping` method. This method add all default mappings from source to destination enum values.
+This raises the question of whether or not these benefits are realised in a cloud environment where
+the kernel is available to the app but where the network and the storage is virtualised.
 
-If you want to change some mappings, then you can use `MapValue` method. This is a chainable method.
+## Direct I/O
 
-Default the enum values are mapped by value (explicitly: `MapByValue()`), but it is possible to map by name calling  `MapByName()`.
+Direct I/O eliminates memory copies between user space and the kernel within the OS, so whether the
+OS is virtualized or not beyond that, Direct I/O would still be of benefit, and perhaps even more so
+in a cloud environment by virtue of reducing memory pressure and freeing up the more limited
+per-core memory bandwidth, especially with noisy neighbors.
 
-```c#
-using AutoMapper.Extensions.EnumMapping;
+A quick example, tested with Ubuntu in a VM on a Mac, we still see a 7% relative throughput
+improvement for Direct I/O, regardless of whether Parallels is propagating O_DIRECT to the physical
+disk, it’s still saving the cost of the memcpy to Ubuntu’s page cache (and beyond that appears to
+also avoid polluting the CPU’s L1-3 cache by memcpy’ing through it - hard to be certain given all
+the various memcpy() implementations).
 
-public enum Source
-{
-    Default = 0,
-    First = 1,
-    Second = 2
-}
+At the same time, where cloud environments support locally attached high-performance block devices
+(NVMe SSD), running local storage (as opposed to something like EBS) would definitely be preferable
+if only from a performance point of view.
 
-public enum Destination
-{
-    Default = 0,
-    Second = 2
-}
+From a safety point of view, we haven’t yet tested whether any VMs would disregard O_DIRECT for an
+NVMe device, or interpolate their own block device caching layer and mark dirty pages as clean
+despite an EIO disk fault, but after a physical system reboot our hash-chaining and ongoing disk
+scrubbing would at least be able to detect any issues related to this.
 
-internal class YourProfile : Profile
-{
-    public YourProfile()
-    {
-        CreateMap<Source, Destination>()
-            .ConvertUsingEnumMapping(opt => opt
-		        // optional: .MapByValue() or MapByName(), without configuration MapByValue is used
-		        .MapValue(Source.First, Destination.Default)
-            )
-            .ReverseMap(); // to support Destination to Source mapping, including custom mappings of ConvertUsingEnumMapping
-    }
-}
-    ...
-```
+We are intentionally designing TigerBeetle to repair these local storage failures automatically on a
+fine-grained basis using cluster redundancy.
 
-### Default Convention
+## io_uring
 
-The package [AutoMapper.Extensions.EnumMapping](https://www.nuget.org/packages/AutoMapper.Extensions.EnumMapping/) will map all values from Source type to Destination type if both enum types have the same value (or by name or by value). All Source enum values which have no Target equivalent, will throw an exception if EnumMappingValidation is enabled.
+In a similar way, io_uring removes (or amortizes by orders of magnitude) the cost of syscalls
+between user space and the kernel, regardless of whether those are both within a virtualized
+environment or not. io_uring is being developed by Jens Axboe specifically to reduce the cost of
+large scale server fleets, which are typically cloud native, and there’s already been
+[work done](https://www.phoronix.com/scan.php?page=news_item&px=KVM-IO-uring-Passthrough-LF2020) to
+share the host’s io_uring queues with virtualized guests.
 
-### ReverseMap Convention
+Our testing is only getting started though, we’re still building out the system end to end, so it
+will be great to benchmark more performance numbers in various environments (and across cloud
+providers) and share these as we go.
 
-For method `ReverseMap` the same convention is used as for default mappings, but it also respects override enum value mappings if possible.
+Credit to @tdaly61 from the Mojaloop community for prompting us with some great questions about
+Tigerbeetle in the cloud.
 
-The following steps determines the reversed overrides:
-
-1) Create mappings for `Source` to `Destination` (default convention), including custom overrides.
-
-2) Create mappings for `Destination` to `Source` (default convention), without custom overrides (must be determined)
-
-3) The mappings from step 1 will be used to determine the overrides for the `ReverseMap`. 
-   Therefore the mappings are grouped by `Destination` value.
-    
-        3a) if there is a matching `Source` value for the `Destination` value, then that mapping is preferred and no override is needed
-
-    It is possible that a `Destination` value has multiple `Source` values specified by override mappings.
-    
-    We have to determine which `Source` value will be the new `Destination` for the current `Destination` value (which is the new `Source` value)
-
-    For every `Source` value per grouped `Destination` value:
-
-        3b) if the `Source` enum value does not exists in the `Destination` enum type, then that mapping cannot reversed
-    
-        3c) if there is a `Source` value which is not a `Destination` part of the mappings from step 1, then that mapping cannot reversed
-    
-        3d) if the `Source` value is not excluded by option b and c, the that `Source` value is the new `Destination` value.
-
-4) All overrides which are determined in step 3 will be applied to mappings from step 2.
-
-5) Finally, the custom mappings provided to method `ReverseMap` will be applied.
-
-### Testing
-
-[AutoMapper](https://www.nuget.org/packages/AutoMapper/) provides a nice tooling for validating typemaps. This package adds an extra `EnumMapperConfigurationExpressionExtensions.EnableEnumMappingValidation` extension method to extend the existing `AssertConfigurationIsValid()` method to validate also the enum mappings.
-
-To enable testing the enum mapping configuration:
-
-```c#
-
-public class MappingConfigurationsTests
-{
-    [Fact]
-    public void WhenProfilesAreConfigured_ItShouldNotThrowException()
-    {
-        // Arrange
-        var config = new MapperConfiguration(configuration =>
-        {
-            configuration.EnableEnumMappingValidation();
-
-            configuration.AddMaps(typeof(AssemblyInfo).GetTypeInfo().Assembly);
-        });
-		
-        // Assert
-        config.AssertConfigurationIsValid();
-    }
-}
-```
+You can read more about how we use io_uring in
+[A Programmer-Friendly I/O Abstraction Over io_uring and kqueue](https://tigerbeetle.com/blog/a-friendly-abstraction-over-iouring-and-kqueue).

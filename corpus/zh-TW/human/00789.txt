@@ -1,200 +1,141 @@
-Basically, you just need to run an executable on your phone with root privileges. If it is not the default root when you run the file, you can use `adb shell` to change it:
+However, strictly speaking, this is not actually a problem with `sendBeacon`, but rather a limitation that comes with fetch combined with keepalive. In fact, the underlying implementation of `navigator.sendBeacon` is fetch combined with keepalive.
 
-``` shell
-adb shell
+## The Specification of navigator.sendBeacon and a Short Story about Sentry
 
-# kill old process
-ps -e | grep frida-server
-kill -9 {your_process_id}
+In the specification section [3.2 Processing Model](https://w3c.github.io/beacon/#sec-processing-model), step six mentions the queue we just discussed:
 
-# run as root
-su
-/data/local/tmp/frida-server &
-```
+![Queue in the spec](/img/navigator-sendbeacon-64kib-and-source-code/p3.png)
 
-After running it, you can use `frida-ps -U` to confirm that it is running.
+If it is determined that the request cannot fit into the queue, `sendBeacon` will return false.
 
-The second method, which does not require root access, involves modifying the APK. You add a Frida so file to the APK and add a line of `System.loadLibrary()` at the entry point to use Frida. Details can be found in the wiki: https://github.com/sensepost/objection/wiki/Patching-Android-Applications
+This is actually the solution when the payload encounters a problem. After calling `sendBeacon`, check if the return value is false. If it is, proceed to handle it, deciding whether to fallback to a regular fetch or implement a retry mechanism.
 
-You don't need to execute the above process yourself; there are ready-made commands to help you. If you can't package it, you can use this command:
+The seventh step is what `sendBeacon` primarily does: it creates a keepalive request and sends it out:
 
-``` shell
-objection patchapk --source test.apk --skip-resources --ignore-nativelibs
-```
+![keepalive section](/img/navigator-sendbeacon-64kib-and-source-code/p4.png)
 
-If it still doesn't work, you can use the knowledge we learned earlier to modify it yourself. First, use `apktool d` to unpack the packaged APK, then modify the contents yourself. For example, sometimes there may be an alignment issue with the so file, so you can change `android:extractNativeLibs` in `AndroidManifest.xml` to true and then repack it.
+The payload limit for fetch + keepalive is 64 KiB, which is stated in the [spec](https://fetch.spec.whatwg.org/#http-network-or-cache-fetch):
 
-## Basic Usage of Frida
+![fetch spec](/img/navigator-sendbeacon-64kib-and-source-code/fetch-spec.png)
 
-First, let's talk about what Frida does. The most common use case is to write some code to hook functions. Hooking means that you can override the implementation of any function, observe input and output, and change the return value of the function.
+The error tracking service Sentry actually encountered this issue in the past. In 2018, it was discovered that Sentry had keepalive enabled by default when using fetch, causing some requests over 65536 bytes to fail to send. As a result, this flag was removed:
 
-These codes are written in JavaScript and injected into the app when it is launched. In my experience, after seeing more examples, it is quite easy to get started.
+![Sentry issue](/img/navigator-sendbeacon-64kib-and-source-code/p5.png)
 
-Instead of talking so much, let's try it out. The sample app used this time is the same as the first article, which is an app that checks whether the device is rooted after pressing a button: https://github.com/aszx87410/demo/raw/master/android/demoapp.apk
+Source: [When fetch is used keepalive is the default, and Chrome only allows a POST body <= 65536 bytes in that scenario #1464](https://github.com/getsentry/sentry-javascript/issues/1464), the removed PR: [ref: Remove keepalive:true as a default and document payload size #1496](https://github.com/getsentry/sentry-javascript/pull/1496)
 
-After opening this app, the default activity will be `com.cymetrics.demo/MainActivity`. Let's hook the onCreate method of this class.
+Two years later, in 2020, someone discovered the specifications and correct usage of keepalive: [Fetch KeepAlive #2547](https://github.com/getsentry/sentry-javascript/issues/2547), proposing to use keepalive under the payload allowance, and not to use it if exceeded, rather than not using it at all as was the case then.
 
-First, create a file named `script.js` with the following content:
+However, no action was taken at that time. It was another two years later, in 2022, when someone found that Chrome cancels all requests during navigation, causing some requests to fail to send, leading to the idea of using keepalive to solve this.
+
+Thus, in September 2022, it was added back with insightful comments:
+
+[feat(browser): Use fetch keepalive flag #5697](https://github.com/getsentry/sentry-javascript/issues/2547)
 
 ``` js
-function run() {
-  Java.perform(() => {
-    var MainActivity = Java.use('com.cymetrics.demo.MainActivity')
-    MainActivity.onCreate.implementation = function() {
-      console.log('MainActivity onCreate')
+// Outgoing requests are usually cancelled when navigating to a different page, causing a "TypeError: Failed to
+// fetch" error and sending a "network_error" client-outcome - in Chrome, the request status shows "(cancelled)".
+// The `keepalive` flag keeps outgoing requests alive, even when switching pages. We want this since we're
+// frequently sending events right before the user is switching pages (eg. whenfinishing navigation transactions).
+// Gotchas:
+// - `keepalive` isn't supported by Firefox
+// - As per spec (https://fetch.spec.whatwg.org/#http-network-or-cache-fetch), a request with `keepalive: true`
+//   and a content length of > 64 kibibytes returns a network error. We will therefore only activate the flag when
+//   we're below that limit.
+keepalive: request.body.length <= 65536,
+```
+
+Machine translation from Chinese:
+
+> When switching to a different page, unfinished requests are often canceled, leading to a "TypeError: Failed to fetch" error and a "network_error" message. In Chrome, the request status shows "(cancelled)".
+The keepalive flag allows unfinished requests to remain active during page transitions. Since we often send events before users switch pages, this functionality is necessary.
+> 
+> Important to note:
+>
+> 1. Firefox does not support keepalive.
+> 2. According to the specification, if a request is set with keepalive: true and the content length exceeds 64 KiB, a network error will be returned. Therefore, we will only enable this flag when the request content length is below that limit.
+
+But the story doesn't end here. As I mentioned earlier, this 65536 limit is not just for a single request, but there is a queue, so this approach is insufficient. Six months later, Sentry also noticed this issue and added logic to calculate the queue size, making the entire mechanism more robust: [fix(browser): Ensure keepalive flag is correctly set for parallel requests #7553](https://github.com/getsentry/sentry-javascript/pull/7553)
+
+![Issue screenshot](/img/navigator-sendbeacon-64kib-and-source-code/p6.png)
+
+If you want to implement something similar in the future, you can directly refer to the above Sentry PR.
+
+## Implementation of sendBeacon
+
+### Implementation of sendBeacon in Chromium
+
+Finally, let's take a look at the underlying implementation of sendBeacon, starting with Chromium. I will use the latest stable version 131.0.6778.205 at the time of writing this article as an example. The relevant code can be found at: [third_party/blink/renderer/modules/beacon/navigator_beacon.cc](https://source.chromium.org/chromium/chromium/src/+/refs/tags/131.0.6778.205:third_party/blink/renderer/modules/beacon/navigator_beacon.cc;l=93)
+
+I have extracted a small segment of the core code:
+
+``` c
+bool NavigatorBeacon::SendBeaconImpl(
+    ScriptState* script_state,
+    const String& url_string,
+    const V8UnionReadableStreamOrXMLHttpRequestBodyInit* data,
+    ExceptionState& exception_state) {
+  ExecutionContext* execution_context = ExecutionContext::From(script_state);
+  KURL url = execution_context->CompleteURL(url_string);
+  if (!CanSendBeacon(execution_context, url, exception_state)) {
+    return false;
+  }
+
+  bool allowed;
+  LocalFrame* frame = GetSupplementable()->DomWindow()->GetFrame();
+  if (data) {
+    switch (data->GetContentType()) {
+      // [...]
+      case V8UnionReadableStreamOrXMLHttpRequestBodyInit::ContentType::
+          kUSVString:
+        UseCounter::Count(execution_context,
+                          WebFeature::kSendBeaconWithUSVString);
+        allowed = PingLoader::SendBeacon(*script_state, frame, url,
+                                         data->GetAsUSVString());
+        break;
     }
-  })
-}
+  } else {
+    allowed = PingLoader::SendBeacon(*script_state, frame, url, String());
+  }
 
-setImmediate(run)
-```
+  if (!allowed) {
+    UseCounter::Count(execution_context, WebFeature::kSendBeaconQuotaExceeded);
+  }
 
-Then run the command:
-
-``` shell
-frida -U --no-pause -l script.js -f "com.cymetrics.demo"
-```
-
-If you don't have root, the startup method will be different. First, patch the app as mentioned above, then install it on your phone, and then enter the following command in the terminal:
-
-``` shell
-frida -U Gadget -l script.js
-```
-
-Then you should see a new log line on your terminal, which is `MainActivity onCreate`, and the app on your phone crashes. This is normal.
-
-Let's briefly talk about the basic structure of Frida scripts. The starting point is:
-
-``` js
-function run() {
-  Java.perform(() => {
-    // code
-  })
-}
-
-setImmediate(run)
-```
-
-Then it depends on what method you want to hook. In our previous code, we first use `Java.use` to get the class we want to hook, and then use `MainActivity.onCreate.implementation` to replace the original implementation with our own function.
-
-Why did the app crash after hooking? Because the function we implemented ourselves did nothing except log, which means that everything the original onCreate should have done was removed, so the crash is reasonable. To find out the root cause of the crash, you can use `adb logcat | grep AndroidRuntime`:
-
-``` shell
-android.util.SuperNotCalledException: Activity {com.cymetrics.demo/com.cymetrics.demo.MainActivity} did not call through to super.onCreate()
-```
-
-So what should we do? Just remember to call the original implementation at the end, like this:
-
-``` js
-function run() {
-  Java.perform(() => {
-    var MainActivity = Java.use('com.cymetrics.demo.MainActivity')
-    MainActivity.onCreate.implementation = function() {
-      console.log('MainActivity onCreate')
-      this.onCreate.call(this)
-    }
-  })
-}
-
-setImmediate(run)
-```
-
-`this` will be the original MainActivity, and `this.onCreate.call` can call the original implementation, with the first parameter of the call method being `this`, followed by the parameters.
-
-After executing the above script, another error will appear:
-
-``` shell
-Error: onCreate(): argument types do not match any of:
-  .overload('android.os.Bundle')
-```
-
-This is because onCreate should actually have parameters, but we did not receive any parameters when we overrode it, so an error occurred. To avoid this problem, I would recommend adding `.overload()` at the beginning when overriding the implementation, like this:
-
-``` js
-MainActivity.onCreate.overload().implementation = function() {
-
+  return allowed;
 }
 ```
 
-Frida will then show an error message again to tell you what the correct parameters should be, so you can follow it. Finally, it will look like this:
+The beginning of `CanSendBeacon` basically checks whether the URL is valid. If it is valid, it continues to check the content type of the payload to be sent, and the actual sending occurs in the `PingLoader::SendBeacon` method.
 
-``` js
-function run() {
-  Java.perform(() => {
-    var MainActivity = Java.use('com.cymetrics.demo.MainActivity')
-    MainActivity.onCreate.overload('android.os.Bundle').implementation = function(a) {
-      console.log('MainActivity onCreate')
-      this.onCreate.call(this, a)
-    }
-  })
-}
+In addition, you can see `UseCounter::Count` in the code, which is used by Chromium to track the usage frequency of certain features.
 
-setImmediate(run)
-```
+The implementation of `PingLoader::SendBeacon` can be found at [third_party/blink/renderer/core/loader/ping_loader.cc](https://source.chromium.org/chromium/chromium/src/+/refs/tags/131.0.6778.205:third_party/blink/renderer/core/loader/ping_loader.cc):
 
-In this way, you can know what the parameters are, and you can also pass in parameters when calling the original implementation, so there will be no errors.
+``` c
+bool SendBeaconCommon(const ScriptState& state,
+                      LocalFrame* frame,
+                      const KURL& url,
+                      const BeaconData& beacon) {
+  if (!frame->DomWindow()
+           ->GetContentSecurityPolicyForWorld(&state.World())
+           ->AllowConnectToSource(url, url, RedirectStatus::kNoRedirect)) {
+    // We're simulating a network failure here, so we return 'true'.
+    return true;
+  }
 
-Since we can insert code, we can do a lot of things, such as displaying a new message directly on the UI:
-
-``` js
-function run() {
-  Java.perform(() => {
-    var MainActivity = Java.use('com.cymetrics.demo.MainActivity')
-    MainActivity.onCreate.overload('android.os.Bundle').implementation = function(a) {
-      console.log('MainActivity onCreate')
-      // Toast should be run on the main thread(UI thread)
-      Java.scheduleOnMainThread(function() {
-        var Toast = Java.use("android.widget.Toast");
-        var currentApplication = Java.use('android.app.ActivityThread').currentApplication();
-        // We need context for displaying the Toast
-        var context = currentApplication.getApplicationContext();
-        Toast.makeText(
-          context,
-          // The type should be correct
-          Java.use("java.lang.String").$new("Hello!"),
-          Toast.LENGTH_SHORT.value
-        ).show();
-      });
-      this.onCreate.call(this, a)
-    }
-  })
-}
-
-setImmediate(run)
-```
-
-Code from: [makeToast.js](https://gist.github.com/myzhan/ab13068463cd7f77b7f06ae561ea853a).
-
-## Bypassing Root Detection with Frida
-
-In our previous article, we bypassed root detection by directly modifying the smali code and patching the function that performs the detection. With Frida, we don't need to modify the smali code anymore. We can directly hook the function that performs the detection and replace its implementation, like this:
-
-``` js
-function run() {
-  Java.perform(() => {
-    var RootBeer = Java.use('com.scottyab.rootbeer.RootBeer')    
-    RootBeer.isRooted.overload().implementation = function(){
-        console.log('bypass rootbeer')
-        return false
-    };
-  })
-}
-
-setImmediate(run)
-```
-
-Yes, it's that easy.
-
-You may ask, how do we know to hook this function? This part still requires static analysis. From static analysis, we know that this function is doing a check, so we use Frida to hook this function.
-
-For myself, I usually use two methods in combination. First, I disassemble and statically analyze the code, take a quick look at the code, and then use Frida to hook it to see if I can achieve what I want. If I can, I will go to the corresponding place in smali and then repack the app. This way, I can execute the process I want even on a phone without Frida.
-
-In fact, the basic use of Frida is like this. The rest depends on understanding of the code and Android development to determine which function to hook.
-
-## Other Frida Tips
-
-Below are some Frida tips that I found on the internet and have used in practice for your reference.
-
-### Print stack trace
-
-Suppose an app has a check mechanism that detects whether it has root, and the source code is obfuscated, making it difficult to trace. However, when checking, it will output check-related information using Log.d. At this time, we can hook Log.d and use `Log.getStackTraceString` to output the stack trace to know where this function is called:
+  ResourceRequest request(url);
+  request.SetHttpMethod(http_names::kPOST);
+  request.SetKeepalive(true);
+  request.SetRequestContext(mojom::blink::RequestContextType::BEACON);
+  beacon.Serialize(request);
+  FetchParameters params(std::move(request),
+                         ResourceLoaderOptions(&state.World()));
+  // The spec says:
+  //  - If mimeType is not null:
+  //   - If mimeType value is a CORS-safelisted request-header value for the
+  //     Content-Type header, set corsMode to "no-cors".
+  // As we don't support requests with non CORS-safelisted Content-Type, the
+  // mode should always be "no-cors".
+  params.MutableOptions().initiator_info.name =
+      fetch_initiator_type_names::kBeacon;

@@ -1,663 +1,661 @@
 # frozen_string_literal: true
 
-require "abstract_unit"
+require "active_record/database_configurations"
 
-class TagHelperTest < ActionView::TestCase
-  include RenderERBUtils
+module ActiveRecord
+  module Tasks # :nodoc:
+    class DatabaseNotSupported < StandardError; end # :nodoc:
 
-  tests ActionView::Helpers::TagHelper
+    # = Active Record \DatabaseTasks
+    #
+    # ActiveRecord::Tasks::DatabaseTasks is a utility class, which encapsulates
+    # logic behind common tasks used to manage database and migrations.
+    #
+    # The tasks defined here are used with \Rails commands provided by Active Record.
+    #
+    # In order to use DatabaseTasks, a few config values need to be set. All the needed
+    # config values are set by \Rails already, so it's necessary to do it only if you
+    # want to change the defaults or when you want to use Active Record outside of \Rails
+    # (in such case after configuring the database tasks, you can also use the rake tasks
+    # defined in Active Record).
+    #
+    # The possible config values are:
+    #
+    # * +env+: current environment (like Rails.env).
+    # * +database_configuration+: configuration of your databases (as in +config/database.yml+).
+    # * +db_dir+: your +db+ directory.
+    # * +fixtures_path+: a path to fixtures directory.
+    # * +migrations_paths+: a list of paths to directories with migrations.
+    # * +seed_loader+: an object which will load seeds, it needs to respond to the +load_seed+ method.
+    # * +root+: a path to the root of the application.
+    #
+    # Example usage of DatabaseTasks outside \Rails could look as such:
+    #
+    #   include ActiveRecord::Tasks
+    #   DatabaseTasks.database_configuration = YAML.load_file('my_database_config.yml')
+    #   DatabaseTasks.db_dir = 'db'
+    #   # other settings...
+    #
+    #   DatabaseTasks.create_current('production')
+    module DatabaseTasks
+      ##
+      # :singleton-method:
+      # Extra flags passed to database CLI tool (mysqldump/pg_dump) when calling db:schema:dump
+      # It can be used as a string/array (the typical case) or a hash (when you use multiple adapters)
+      # Example:
+      #   ActiveRecord::Tasks::DatabaseTasks.structure_dump_flags = {
+      #     mysql2: ['--no-defaults', '--skip-add-drop-table'],
+      #     postgres: '--no-tablespaces'
+      #   }
+      mattr_accessor :structure_dump_flags, instance_accessor: false
 
-  COMMON_DANGEROUS_CHARS = "&<>\"' %*+,/;=^|"
-  INVALID_TAG_CHARS = "> /"
+      ##
+      # :singleton-method:
+      # Extra flags passed to database CLI tool when calling db:schema:load
+      # It can be used as a string/array (the typical case) or a hash (when you use multiple adapters)
+      mattr_accessor :structure_load_flags, instance_accessor: false
 
-  def test_tag
-    assert_equal "<br />", tag("br")
-    assert_equal "<br clear=\"left\" />", tag(:br, clear: "left")
-    assert_equal "<br>", tag("br", nil, true)
-  end
+      extend self
 
-  def test_tag_builder
-    assert_equal "<span></span>", tag.span
-    assert_equal "<span class=\"bookmark\"></span>", tag.span(class: "bookmark")
-  end
+      attr_writer :db_dir, :migrations_paths, :fixtures_path, :root, :env, :seed_loader
+      attr_accessor :database_configuration
 
-  def test_tag_builder_void_tag
-    assert_equal "<br>", tag.br
-    assert_equal "<br class=\"some_class\">", tag.br(class: "some_class")
-  end
+      LOCAL_HOSTS = ["127.0.0.1", "localhost"]
 
-  def test_tag_builder_void_tag_with_forced_content
-    assert_deprecated(ActionView.deprecator) do
-      assert_equal "<br>some content</br>", tag.br("some content")
-    end
-  end
+      def check_protected_environments!(environment = env)
+        return if ENV["DISABLE_DATABASE_ENVIRONMENT_CHECK"]
 
-  def test_tag_builder_void_tag_with_empty_content
-    assert_deprecated(ActionView.deprecator) do
-      assert_equal "<br></br>", tag.br("")
-    end
-  end
-
-  def test_tag_builder_self_closing_tag
-    assert_equal "<svg><use href=\"#cool-icon\" /></svg>", tag.svg { tag.use("href" => "#cool-icon") }
-    assert_equal "<svg><circle cx=\"5\" cy=\"5\" r=\"5\" /></svg>", tag.svg { tag.circle(cx: "5", cy: "5", r: "5") }
-    assert_equal "<animateMotion dur=\"10s\" repeatCount=\"indefinite\" />", tag.animate_motion(dur: "10s", repeatCount: "indefinite")
-  end
-
-  def test_tag_builder_self_closing_tag_with_content
-    assert_equal "<svg><circle r=\"5\"><desc>A circle</desc></circle></svg>", tag.svg { tag.circle(r: "5") { tag.desc "A circle" } }
-  end
-
-  def test_tag_builder_defines_methods_to_build_html_elements
-    assert_respond_to tag, :div
-    assert_includes tag.public_methods, :div
-  end
-
-  def test_tag_builder_renders_unknown_html_elements
-    assert_respond_to tag, :turbo_frame
-
-    assert_equal "<turbo-frame id=\"rendered\">Rendered</turbo-frame>", tag.turbo_frame("Rendered", id: "rendered")
-  end
-
-  def test_tag_builder_is_singleton
-    assert_equal tag, tag
-  end
-
-  def test_tag_options
-    str = tag("p", "class" => "show", :class => "elsewhere")
-    assert_match(/class="show"/, str)
-    assert_match(/class="elsewhere"/, str)
-  end
-
-  def test_tag_options_with_array_of_numeric
-    str = tag(:input, value: [123, 456])
-
-    assert_equal("<input value=\"123 456\" />", str)
-  end
-
-  def test_tag_options_with_array_of_random_objects
-    klass = Class.new do
-      def to_s
-        "hello"
+        configs_for(env_name: environment).each do |db_config|
+          check_current_protected_environment!(db_config)
+        end
       end
-    end
 
-    str = tag(:input, value: [klass.new])
-
-    assert_equal("<input value=\"hello\" />", str)
-  end
-
-  def test_tag_options_rejects_nil_option
-    assert_equal "<p />", tag("p", ignored: nil)
-  end
-
-  def test_tag_builder_options_rejects_nil_option
-    assert_equal "<p></p>", tag.p(ignored: nil)
-  end
-
-  def test_tag_options_accepts_false_option
-    assert_equal "<p value=\"false\" />", tag("p", value: false)
-  end
-
-  def test_tag_builder_options_accepts_false_option
-    assert_equal "<p value=\"false\"></p>", tag.p(value: false)
-  end
-
-  def test_tag_options_accepts_blank_option
-    assert_equal "<p included=\"\" />", tag("p", included: "")
-  end
-
-  def test_tag_builder_options_accepts_blank_option
-    assert_equal "<p included=\"\"></p>", tag.p(included: "")
-  end
-
-  def test_tag_options_accepts_symbol_option_when_not_escaping
-    assert_equal "<p value=\"symbol\" />", tag("p", { value: :symbol }, false, false)
-  end
-
-  def test_tag_options_accepts_integer_option_when_not_escaping
-    assert_equal "<p value=\"42\" />", tag("p", { value: 42 }, false, false)
-  end
-
-  def test_tag_options_converts_boolean_option
-    assert_dom_equal '<p disabled="disabled" itemscope="itemscope" multiple="multiple" readonly="readonly" allowfullscreen="allowfullscreen" seamless="seamless" typemustmatch="typemustmatch" sortable="sortable" default="default" inert="inert" truespeed="truespeed" allowpaymentrequest="allowpaymentrequest" nomodule="nomodule" playsinline="playsinline" />',
-      tag("p", disabled: true, itemscope: true, multiple: true, readonly: true, allowfullscreen: true, seamless: true, typemustmatch: true, sortable: true, default: true, inert: true, truespeed: true, allowpaymentrequest: true, nomodule: true, playsinline: true)
-  end
-
-  def test_tag_builder_options_converts_boolean_option
-    assert_dom_equal '<p disabled="disabled" itemscope="itemscope" multiple="multiple" readonly="readonly" allowfullscreen="allowfullscreen" seamless="seamless" typemustmatch="typemustmatch" sortable="sortable" default="default" inert="inert" truespeed="truespeed" allowpaymentrequest="allowpaymentrequest" nomodule="nomodule" playsinline="playsinline" />',
-      tag.p(disabled: true, itemscope: true, multiple: true, readonly: true, allowfullscreen: true, seamless: true, typemustmatch: true, sortable: true, default: true, inert: true, truespeed: true, allowpaymentrequest: true, nomodule: true, playsinline: true)
-  end
-
-  def test_tag_builder_with_options_builds_p_elements
-    html = tag.with_options(id: "with-options") { |t| t.p("content") }
-
-    assert_dom_equal '<p id="with-options">content</p>', html
-  end
-
-  def test_tag_builder_do_not_modify_html_safe_options
-    html_safe_str = '"'.html_safe
-    assert_equal "<p value=\"&quot;\" />", tag("p", value: html_safe_str)
-    assert_equal '"', html_safe_str
-    assert_predicate html_safe_str, :html_safe?
-  end
-
-  def test_tag_with_dangerous_name
-    INVALID_TAG_CHARS.each_char do |char|
-      tag_name = "asdf-#{char}"
-      assert_raise(ArgumentError, "expected #{tag_name.inspect} to be invalid") do
-        tag(tag_name)
+      def register_task(pattern, task)
+        @tasks ||= {}
+        @tasks[pattern] = task
       end
-    end
-  end
 
-  def test_tag_builder_with_dangerous_name
-    INVALID_TAG_CHARS.each_char do |char|
-      tag_name = "asdf-#{char}".to_sym
-      assert_raise(ArgumentError, "expected #{tag_name.inspect} to be invalid") do
-        tag.public_send(tag_name)
+      register_task(/mysql/,        "ActiveRecord::Tasks::MySQLDatabaseTasks")
+      register_task(/trilogy/,      "ActiveRecord::Tasks::MySQLDatabaseTasks")
+      register_task(/postgresql/,   "ActiveRecord::Tasks::PostgreSQLDatabaseTasks")
+      register_task(/sqlite/,       "ActiveRecord::Tasks::SQLiteDatabaseTasks")
+
+      def db_dir
+        @db_dir ||= Rails.application.config.paths["db"].first
       end
-    end
-  end
 
-  def test_tag_with_dangerous_aria_attribute_name
-    escaped_dangerous_chars = "_" * COMMON_DANGEROUS_CHARS.size
-    assert_equal "<the-name aria-#{escaped_dangerous_chars}=\"the value\" />",
-                 tag("the-name", aria: { COMMON_DANGEROUS_CHARS => "the value" })
-
-    assert_equal "<the-name aria-#{COMMON_DANGEROUS_CHARS}=\"the value\" />",
-                 tag("the-name", { aria: { COMMON_DANGEROUS_CHARS => "the value" } }, false, false)
-  end
-
-  def test_tag_builder_with_dangerous_aria_attribute_name
-    escaped_dangerous_chars = "_" * COMMON_DANGEROUS_CHARS.size
-    assert_equal "<the-name aria-#{escaped_dangerous_chars}=\"the value\"></the-name>",
-                 tag.public_send(:"the-name", aria: { COMMON_DANGEROUS_CHARS => "the value" })
-
-    assert_equal "<the-name aria-#{COMMON_DANGEROUS_CHARS}=\"the value\"></the-name>",
-                 tag.public_send(:"the-name", aria: { COMMON_DANGEROUS_CHARS => "the value" }, escape: false)
-  end
-
-  def test_tag_with_dangerous_data_attribute_name
-    escaped_dangerous_chars = "_" * COMMON_DANGEROUS_CHARS.size
-    assert_equal "<the-name data-#{escaped_dangerous_chars}=\"the value\" />",
-                 tag("the-name", data: { COMMON_DANGEROUS_CHARS => "the value" })
-
-    assert_equal "<the-name data-#{COMMON_DANGEROUS_CHARS}=\"the value\" />",
-                 tag("the-name", { data: { COMMON_DANGEROUS_CHARS => "the value" } }, false, false)
-  end
-
-  def test_tag_builder_with_dangerous_data_attribute_name
-    escaped_dangerous_chars = "_" * COMMON_DANGEROUS_CHARS.size
-    assert_equal "<the-name data-#{escaped_dangerous_chars}=\"the value\"></the-name>",
-                 tag.public_send(:"the-name", data: { COMMON_DANGEROUS_CHARS => "the value" })
-
-    assert_equal "<the-name data-#{COMMON_DANGEROUS_CHARS}=\"the value\"></the-name>",
-                 tag.public_send(:"the-name", data: { COMMON_DANGEROUS_CHARS => "the value" }, escape: false)
-  end
-
-  def test_tag_with_dangerous_unknown_attribute_name
-    escaped_dangerous_chars = "_" * COMMON_DANGEROUS_CHARS.size
-    assert_equal "<the-name #{escaped_dangerous_chars}=\"the value\" />",
-                 tag("the-name", COMMON_DANGEROUS_CHARS => "the value")
-
-    assert_equal "<the-name #{COMMON_DANGEROUS_CHARS}=\"the value\" />",
-                 tag("the-name", { COMMON_DANGEROUS_CHARS => "the value" }, false, false)
-  end
-
-  def test_tag_builder_with_dangerous_unknown_attribute_name
-    escaped_dangerous_chars = "_" * COMMON_DANGEROUS_CHARS.size
-    assert_equal "<the-name #{escaped_dangerous_chars}=\"the value\"></the-name>",
-                 tag.public_send(:"the-name", COMMON_DANGEROUS_CHARS => "the value")
-
-    assert_equal "<the-name #{COMMON_DANGEROUS_CHARS}=\"the value\"></the-name>",
-                 tag.public_send(:"the-name", COMMON_DANGEROUS_CHARS => "the value", escape: false)
-  end
-
-  def test_content_tag
-    assert_equal "<a href=\"create\">Create</a>", content_tag("a", "Create", "href" => "create")
-    assert_predicate content_tag("a", "Create", "href" => "create"), :html_safe?
-    assert_equal content_tag("a", "Create", "href" => "create"),
-                 content_tag("a", "Create", href: "create")
-    assert_equal "<p>&lt;script&gt;evil_js&lt;/script&gt;</p>",
-                 content_tag(:p, "<script>evil_js</script>")
-    assert_equal "<p><script>evil_js</script></p>",
-                 content_tag(:p, "<script>evil_js</script>", nil, false)
-    assert_equal "<div @click=\"triggerNav()\">test</div>",
-                 content_tag(:div, "test", "@click": "triggerNav()")
-  end
-
-  def test_tag_builder_with_content
-    assert_equal "<div id=\"post_1\">Content</div>", tag.div("Content", id: "post_1")
-    assert_predicate tag.div("Content", id: "post_1"), :html_safe?
-    assert_equal tag.div("Content", id: "post_1"),
-                 tag.div("Content", "id": "post_1")
-    assert_equal "<p>&lt;script&gt;evil_js&lt;/script&gt;</p>",
-                 tag.p("<script>evil_js</script>")
-    assert_equal "<p><script>evil_js</script></p>",
-                 tag.p("<script>evil_js</script>", escape: false)
-    assert_equal '<input pattern="\w+">', tag.input(pattern: /\w+/)
-  end
-
-  def test_tag_builder_nested
-    assert_equal "<div>content</div>",
-                 tag.div { "content" }
-    assert_equal "<div id=\"header\"><span>hello</span></div>",
-                 tag.div(id: "header") { |tag| tag.span "hello" }
-    assert_equal "<div id=\"header\"><div class=\"world\"><span>hello</span></div></div>",
-                 tag.div(id: "header") { |tag| tag.div(class: "world") { tag.span "hello" } }
-  end
-
-  def test_content_tag_with_block_in_erb
-    buffer = render_erb("<%= content_tag(:div) do %>Hello world!<% end %>")
-    assert_dom_equal "<div>Hello world!</div>", buffer
-  end
-
-  def test_tag_builder_with_block_in_erb
-    buffer = render_erb("<%= tag.div do %>Hello world!<% end %>")
-    assert_dom_equal "<div>Hello world!</div>", buffer
-  end
-
-  def test_content_tag_with_block_in_erb_containing_non_displayed_erb
-    buffer = render_erb("<%= content_tag(:p) do %><% 1 %><% end %>")
-    assert_dom_equal "<p></p>", buffer
-  end
-
-  def test_tag_builder_with_block_in_erb_containing_non_displayed_erb
-    buffer = render_erb("<%= tag.p do %><% 1 %><% end %>")
-    assert_dom_equal "<p></p>", buffer
-  end
-
-  def test_content_tag_with_block_and_options_in_erb
-    buffer = render_erb("<%= content_tag(:div, :class => 'green') do %>Hello world!<% end %>")
-    assert_dom_equal %(<div class="green">Hello world!</div>), buffer
-  end
-
-  def test_tag_builder_with_block_and_options_in_erb
-    buffer = render_erb("<%= tag.div(class: 'green') do %>Hello world!<% end %>")
-    assert_dom_equal %(<div class="green">Hello world!</div>), buffer
-  end
-
-  def test_content_tag_with_block_and_options_out_of_erb
-    assert_dom_equal %(<div class="green">Hello world!</div>), content_tag(:div, class: "green") { "Hello world!" }
-  end
-
-  def test_tag_builder_with_block_and_options_out_of_erb
-    assert_dom_equal %(<div class="green">Hello world!</div>), tag.div(class: "green") { "Hello world!" }
-  end
-
-  def test_content_tag_with_block_and_options_outside_out_of_erb
-    assert_equal content_tag("a", "Create", href: "create"),
-                 content_tag("a", "href" => "create") { "Create" }
-  end
-
-  def test_tag_builder_with_block_and_options_outside_out_of_erb
-    assert_equal tag.a("Create", href: "create"),
-                 tag.a("href": "create") { "Create" }
-  end
-
-  def test_content_tag_with_block_and_non_string_outside_out_of_erb
-    assert_equal content_tag("p"),
-                 content_tag("p") { 3.times { "do_something" } }
-  end
-
-  def test_tag_builder_with_block_and_non_string_outside_out_of_erb
-    assert_equal tag.p,
-                 tag.p { 3.times { "do_something" } }
-  end
-
-  def test_content_tag_nested_in_content_tag_out_of_erb
-    assert_equal content_tag("p", content_tag("b", "Hello")),
-                 content_tag("p") { content_tag("b", "Hello") },
-                 output_buffer
-    assert_equal tag.p(tag.b("Hello")),
-                 tag.p { tag.b("Hello") },
-                 output_buffer
-  end
-
-  def test_content_tag_nested_in_content_tag_in_erb
-    assert_equal "<p>\n  <b>Hello</b>\n</p>", view.render("test/content_tag_nested_in_content_tag")
-    assert_equal "<p>\n  <b>Hello</b>\n</p>", view.render("test/builder_tag_nested_in_content_tag")
-  end
-
-  def test_content_tag_nested_in_content_tag_with_data_attributes_out_of_erb
-    assert_equal "<div data-controller=\"read-more\" data-read-more-more-text-value=\"Read more\" data-read-more-less-text-value=\"Read less\"\>\n  <p class=\"content-class\" data-test-name=\"content\">Content text</p>\n  <button class=\"expand-button\" data-action=\"read-more#toggle\">Read more</button>\n</div>",
-                  view.render("test/content_tag_nested_in_content_tag_with_data_attributes_out_of_erb")
-  end
-
-  def test_content_tag_with_escaped_array_class
-    str = content_tag("p", "limelight", class: ["song", "play>"])
-    assert_equal "<p class=\"song play&gt;\">limelight</p>", str
-
-    str = content_tag("p", "limelight", class: ["song", "play"])
-    assert_equal "<p class=\"song play\">limelight</p>", str
-
-    str = content_tag("p", "limelight", class: ["song", ["play"]])
-    assert_equal "<p class=\"song play\">limelight</p>", str
-  end
-
-  def test_tag_builder_with_escaped_array_class
-    str = tag.p "limelight", class: ["song", "play>"]
-    assert_equal "<p class=\"song play&gt;\">limelight</p>", str
-
-    str = tag.p "limelight", class: ["song", "play"]
-    assert_equal "<p class=\"song play\">limelight</p>", str
-
-    str = tag.p "limelight", class: ["song", ["play"]]
-    assert_equal "<p class=\"song play\">limelight</p>", str
-  end
-
-  def test_content_tag_with_unescaped_array_class
-    str = content_tag("p", "limelight", { class: ["song", "play>"] }, false)
-    assert_equal "<p class=\"song play>\">limelight</p>", str
-
-    str = content_tag("p", "limelight", { class: ["song", ["play>"]] }, false)
-    assert_equal "<p class=\"song play>\">limelight</p>", str
-  end
-
-  def test_tag_builder_with_unescaped_array_class
-    str = tag.p "limelight", class: ["song", "play>"], escape: false
-    assert_equal "<p class=\"song play>\">limelight</p>", str
-
-    str = tag.p "limelight", class: ["song", ["play>"]], escape: false
-    assert_equal "<p class=\"song play>\">limelight</p>", str
-  end
-
-  def test_content_tag_with_empty_array_class
-    str = content_tag("p", "limelight", class: [])
-    assert_equal '<p class="">limelight</p>', str
-  end
-
-  def test_tag_builder_with_empty_array_class
-    assert_equal '<p class="">limelight</p>', tag.p("limelight", class: [])
-  end
-
-  def test_content_tag_with_unescaped_empty_array_class
-    str = content_tag("p", "limelight", { class: [] }, false)
-    assert_equal '<p class="">limelight</p>', str
-  end
-
-  def test_tag_builder_with_unescaped_empty_array_class
-    str = tag.p "limelight", class: [], escape: false
-    assert_equal '<p class="">limelight</p>', str
-  end
-
-  def test_content_tag_with_conditional_hash_classes
-    str = content_tag("p", "limelight", class: { "song": true, "play": false })
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = content_tag("p", "limelight", class: [{ "song": true }, { "play": false }])
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = content_tag("p", "limelight", class: { song: true, play: false })
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = content_tag("p", "limelight", class: [{ song: true }, nil, false])
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = content_tag("p", "limelight", class: ["song", { foo: false }])
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = content_tag("p", "limelight", class: [1, 2, 3])
-    assert_equal "<p class=\"1 2 3\">limelight</p>", str
-
-    klass = Class.new do
-      def to_s
-        "1"
+      def migrations_paths
+        @migrations_paths ||= Rails.application.paths["db/migrate"].to_a
       end
-    end
 
-    str = content_tag("p", "limelight", class: [klass.new])
-    assert_equal "<p class=\"1\">limelight</p>", str
-
-    str = content_tag("p", "limelight", class: { "song": true, "play": true })
-    assert_equal "<p class=\"song play\">limelight</p>", str
-
-    str = content_tag("p", "limelight", class: { "song": false, "play": false })
-    assert_equal '<p class="">limelight</p>', str
-  end
-
-  def test_tag_builder_with_conditional_hash_classes
-    str = tag.p "limelight", class: { "song": true, "play": false }
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = tag.p "limelight", class: [{ "song": true }, { "play": false }]
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = tag.p "limelight", class: { song: true, play: false }
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = tag.p "limelight", class: [{ song: true }, nil, false]
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = tag.p "limelight", class: ["song", { foo: false }]
-    assert_equal "<p class=\"song\">limelight</p>", str
-
-    str = tag.p "limelight", class: { "song": true, "play": true }
-    assert_equal "<p class=\"song play\">limelight</p>", str
-
-    str = tag.p "limelight", class: { "song": false, "play": false }
-    assert_equal '<p class="">limelight</p>', str
-  end
-
-  def test_content_tag_with_unescaped_conditional_hash_classes
-    str = content_tag("p", "limelight", { class: { "song": true, "play>": true } }, false)
-    assert_equal "<p class=\"song play>\">limelight</p>", str
-
-    str = content_tag("p", "limelight", { class: ["song", { "play>": true }] }, false)
-    assert_equal "<p class=\"song play>\">limelight</p>", str
-  end
-
-  def test_content_tag_with_invalid_html_tag
-    invalid_tags = ["12p", "", "image file", "div/", "my>element", "_header"]
-    invalid_tags.each do |tag_name|
-      assert_raise(ArgumentError, "expected #{tag_name.inspect} to be invalid") do
-        content_tag(tag_name)
+      def fixtures_path
+        @fixtures_path ||= if ENV["FIXTURES_PATH"]
+          File.join(root, ENV["FIXTURES_PATH"])
+        else
+          File.join(root, "test", "fixtures")
+        end
       end
-    end
-  end
 
-  def test_tag_with_invalid_html_tag
-    invalid_tags = ["12p", "", "image file", "div/", "my>element", "_header"]
-    invalid_tags.each do |tag_name|
-      assert_raise(ArgumentError, "expected #{tag_name.inspect} to be invalid") do
-        tag(tag_name)
+      def root
+        @root ||= Rails.root
       end
+
+      def env
+        @env ||= Rails.env
+      end
+
+      def name
+        @name ||= "primary"
+      end
+
+      def seed_loader
+        @seed_loader ||= Rails.application
+      end
+
+      def create(configuration, *arguments)
+        db_config = resolve_configuration(configuration)
+        database_adapter_for(db_config, *arguments).create
+        $stdout.puts "Created database '#{db_config.database}'" if verbose?
+      rescue DatabaseAlreadyExists
+        $stderr.puts "Database '#{db_config.database}' already exists" if verbose?
+      rescue Exception => error
+        $stderr.puts error
+        $stderr.puts "Couldn't create '#{db_config.database}' database. Please check your configuration."
+        raise
+      end
+
+      def create_all
+        db_config = migration_connection.pool.db_config
+
+        each_local_configuration { |db_config| create(db_config) }
+
+        migration_class.establish_connection(db_config)
+      end
+
+      def setup_initial_database_yaml # :nodoc:
+        return {} unless defined?(Rails)
+
+        Rails.application.config.load_database_yaml
+      end
+
+      def for_each(databases) # :nodoc:
+        return {} unless defined?(Rails)
+
+        database_configs = ActiveRecord::DatabaseConfigurations.new(databases).configs_for(env_name: Rails.env)
+
+        # if this is a single database application we don't want tasks for each primary database
+        return if database_configs.count == 1
+
+        database_configs.each do |db_config|
+          next unless db_config.database_tasks?
+
+          yield db_config.name
+        end
+      end
+
+      def raise_for_multi_db(environment = env, command:) # :nodoc:
+        db_configs = configs_for(env_name: environment)
+
+        if db_configs.count > 1
+          dbs_list = []
+
+          db_configs.each do |db|
+            dbs_list << "#{command}:#{db.name}"
+          end
+
+          raise "You're using a multiple database application. To use `#{command}` you must run the namespaced task with a VERSION. Available tasks are #{dbs_list.to_sentence}."
+        end
+      end
+
+      def create_current(environment = env, name = nil)
+        each_current_configuration(environment, name) { |db_config| create(db_config) }
+
+        migration_class.establish_connection(environment.to_sym)
+      end
+
+      def prepare_all
+        seed = false
+
+        each_current_configuration(env) do |db_config|
+          with_temporary_pool(db_config) do
+            begin
+              database_initialized = migration_connection_pool.schema_migration.table_exists?
+            rescue ActiveRecord::NoDatabaseError
+              create(db_config)
+              retry
+            end
+
+            unless database_initialized
+              if File.exist?(schema_dump_path(db_config))
+                load_schema(db_config, ActiveRecord.schema_format, nil)
+              end
+
+              seed = true
+            end
+          end
+        end
+
+        each_current_environment(env) do |environment|
+          db_configs_with_versions(environment).sort.each do |version, db_configs|
+            db_configs.each do |db_config|
+              with_temporary_pool(db_config) do
+                migrate(version)
+                dump_schema(db_config) if ActiveRecord.dump_schema_after_migration
+              end
+            end
+          end
+        end
+
+        load_seed if seed
+      end
+
+      def drop(configuration, *arguments)
+        db_config = resolve_configuration(configuration)
+        database_adapter_for(db_config, *arguments).drop
+        $stdout.puts "Dropped database '#{db_config.database}'" if verbose?
+      rescue ActiveRecord::NoDatabaseError
+        $stderr.puts "Database '#{db_config.database}' does not exist"
+      rescue Exception => error
+        $stderr.puts error
+        $stderr.puts "Couldn't drop database '#{db_config.database}'"
+        raise
+      end
+
+      def drop_all
+        each_local_configuration { |db_config| drop(db_config) }
+      end
+
+      def drop_current(environment = env)
+        each_current_configuration(environment) { |db_config| drop(db_config) }
+      end
+
+      def truncate_tables(db_config)
+        with_temporary_connection(db_config) do |conn|
+          conn.truncate_tables(*conn.tables)
+        end
+      end
+      private :truncate_tables
+
+      def truncate_all(environment = env)
+        configs_for(env_name: environment).each do |db_config|
+          truncate_tables(db_config)
+        end
+      end
+
+      def migrate(version = nil)
+        scope = ENV["SCOPE"]
+        verbose_was, Migration.verbose = Migration.verbose, verbose?
+
+        check_target_version
+
+        migration_connection_pool.migration_context.migrate(target_version) do |migration|
+          if version.blank?
+            scope.blank? || scope == migration.scope
+          else
+            migration.version == version
+          end
+        end.tap do |migrations_ran|
+          Migration.write("No migrations ran. (using #{scope} scope)") if scope.present? && migrations_ran.empty?
+        end
+
+        migration_connection_pool.schema_cache.clear!
+      ensure
+        Migration.verbose = verbose_was
+      end
+
+      def db_configs_with_versions(environment = env) # :nodoc:
+        db_configs_with_versions = Hash.new { |h, k| h[k] = [] }
+
+        with_temporary_pool_for_each(env: environment) do |pool|
+          db_config = pool.db_config
+          versions_to_run = pool.migration_context.pending_migration_versions
+          target_version = ActiveRecord::Tasks::DatabaseTasks.target_version
+
+          versions_to_run.each do |version|
+            next if target_version && target_version != version
+            db_configs_with_versions[version] << db_config
+          end
+        end
+
+        db_configs_with_versions
+      end
+
+      def migrate_status
+        unless migration_connection_pool.schema_migration.table_exists?
+          Kernel.abort "Schema migrations table does not exist yet."
+        end
+
+        # output
+        puts "\ndatabase: #{migration_connection_pool.db_config.database}\n\n"
+        puts "#{'Status'.center(8)}  #{'Migration ID'.ljust(14)}  Migration Name"
+        puts "-" * 50
+        migration_connection_pool.migration_context.migrations_status.each do |status, version, name|
+          puts "#{status.center(8)}  #{version.ljust(14)}  #{name}"
+        end
+        puts
+      end
+
+      def check_target_version
+        if target_version && !Migration.valid_version_format?(ENV["VERSION"])
+          raise "Invalid format of target version: `VERSION=#{ENV['VERSION']}`"
+        end
+      end
+
+      def target_version
+        ENV["VERSION"].to_i if ENV["VERSION"] && !ENV["VERSION"].empty?
+      end
+
+      def charset_current(env_name = env, db_name = name)
+        db_config = configs_for(env_name: env_name, name: db_name)
+        charset(db_config)
+      end
+
+      def charset(configuration, *arguments)
+        db_config = resolve_configuration(configuration)
+        database_adapter_for(db_config, *arguments).charset
+      end
+
+      def collation_current(env_name = env, db_name = name)
+        db_config = configs_for(env_name: env_name, name: db_name)
+        collation(db_config)
+      end
+
+      def collation(configuration, *arguments)
+        db_config = resolve_configuration(configuration)
+        database_adapter_for(db_config, *arguments).collation
+      end
+
+      def purge(configuration)
+        db_config = resolve_configuration(configuration)
+        database_adapter_for(db_config).purge
+      end
+
+      def purge_all
+        each_local_configuration { |db_config| purge(db_config) }
+      end
+
+      def purge_current(environment = env)
+        each_current_configuration(environment) { |db_config| purge(db_config) }
+
+        migration_class.establish_connection(environment.to_sym)
+      end
+
+      def structure_dump(configuration, *arguments)
+        db_config = resolve_configuration(configuration)
+        filename = arguments.delete_at(0)
+        flags = structure_dump_flags_for(db_config.adapter)
+        database_adapter_for(db_config, *arguments).structure_dump(filename, flags)
+      end
+
+      def structure_load(configuration, *arguments)
+        db_config = resolve_configuration(configuration)
+        filename = arguments.delete_at(0)
+        flags = structure_load_flags_for(db_config.adapter)
+        database_adapter_for(db_config, *arguments).structure_load(filename, flags)
+      end
+
+      def load_schema(db_config, format = ActiveRecord.schema_format, file = nil) # :nodoc:
+        file ||= schema_dump_path(db_config, format)
+        return unless file
+
+        verbose_was, Migration.verbose = Migration.verbose, verbose? && ENV["VERBOSE"]
+        check_schema_file(file)
+
+        case format
+        when :ruby
+          load(file)
+        when :sql
+          structure_load(db_config, file)
+        else
+          raise ArgumentError, "unknown format #{format.inspect}"
+        end
+
+        migration_connection_pool.internal_metadata.create_table_and_set_flags(db_config.env_name, schema_sha1(file))
+      ensure
+        Migration.verbose = verbose_was
+      end
+
+      def schema_up_to_date?(configuration, format = ActiveRecord.schema_format, file = nil)
+        db_config = resolve_configuration(configuration)
+
+        file ||= schema_dump_path(db_config)
+
+        return true unless file && File.exist?(file)
+
+        with_temporary_pool(db_config) do |pool|
+          internal_metadata = pool.internal_metadata
+          return false unless internal_metadata.enabled?
+          return false unless internal_metadata.table_exists?
+
+          internal_metadata[:schema_sha1] == schema_sha1(file)
+        end
+      end
+
+      def reconstruct_from_schema(db_config, format = ActiveRecord.schema_format, file = nil) # :nodoc:
+        file ||= schema_dump_path(db_config, format)
+
+        check_schema_file(file) if file
+
+        with_temporary_pool(db_config, clobber: true) do
+          if schema_up_to_date?(db_config, format, file)
+            truncate_tables(db_config) unless ENV["SKIP_TEST_DATABASE_TRUNCATE"]
+          else
+            purge(db_config)
+            load_schema(db_config, format, file)
+          end
+        rescue ActiveRecord::NoDatabaseError
+          create(db_config)
+          load_schema(db_config, format, file)
+        end
+      end
+
+      def dump_schema(db_config, format = ActiveRecord.schema_format) # :nodoc:
+        return unless db_config.schema_dump
+
+        require "active_record/schema_dumper"
+        filename = schema_dump_path(db_config, format)
+        return unless filename
+
+        FileUtils.mkdir_p(db_dir)
+        case format
+        when :ruby
+          File.open(filename, "w:utf-8") do |file|
+            ActiveRecord::SchemaDumper.dump(migration_connection_pool, file)
+          end
+        when :sql
+          structure_dump(db_config, filename)
+          if migration_connection_pool.schema_migration.table_exists?
+            File.open(filename, "a") do |f|
+              f.puts migration_connection.dump_schema_information
+              f.print "\n"
+            end
+          end
+        end
+      end
+
+      def schema_dump_path(db_config, format = ActiveRecord.schema_format)
+        return ENV["SCHEMA"] if ENV["SCHEMA"]
+
+        filename = db_config.schema_dump(format)
+        return unless filename
+
+        if File.dirname(filename) == ActiveRecord::Tasks::DatabaseTasks.db_dir
+          filename
+        else
+          File.join(ActiveRecord::Tasks::DatabaseTasks.db_dir, filename)
+        end
+      end
+
+      def cache_dump_filename(db_config_or_name, schema_cache_path: nil)
+        if db_config_or_name.is_a?(DatabaseConfigurations::DatabaseConfig)
+          schema_cache_path ||
+            db_config_or_name.schema_cache_path ||
+            schema_cache_env ||
+            db_config_or_name.default_schema_cache_path(ActiveRecord::Tasks::DatabaseTasks.db_dir)
+        else
+          ActiveRecord.deprecator.warn(<<~MSG.squish)
+            Passing a database name to `cache_dump_filename` is deprecated and will be removed in Rails 8.0. Pass a
+            `ActiveRecord::DatabaseConfigurations::DatabaseConfig` object instead.
+          MSG
+
+          filename = if ActiveRecord::Base.configurations.primary?(db_config_or_name)
+            "schema_cache.yml"
+          else
+            "#{db_config_or_name}_schema_cache.yml"
+          end
+
+          schema_cache_path || schema_cache_env || File.join(ActiveRecord::Tasks::DatabaseTasks.db_dir, filename)
+        end
+      end
+
+      def load_schema_current(format = ActiveRecord.schema_format, file = nil, environment = env)
+        each_current_configuration(environment) do |db_config|
+          with_temporary_connection(db_config) do
+            load_schema(db_config, format, file)
+          end
+        end
+      end
+
+      def check_schema_file(filename)
+        unless File.exist?(filename)
+          message = +%{#{filename} doesn't exist yet. Run `bin/rails db:migrate` to create it, then try again.}
+          message << %{ If you do not intend to use a database, you should instead alter #{Rails.root}/config/application.rb to limit the frameworks that will be loaded.} if defined?(::Rails.root)
+          Kernel.abort message
+        end
+      end
+
+      def load_seed
+        if seed_loader
+          seed_loader.load_seed
+        else
+          raise "You tried to load seed data, but no seed loader is specified. Please specify seed " \
+                "loader with ActiveRecord::Tasks::DatabaseTasks.seed_loader = your_seed_loader\n" \
+                "Seed loader should respond to load_seed method"
+        end
+      end
+
+      # Dumps the schema cache in YAML format for the connection into the file
+      #
+      # ==== Examples
+      #   ActiveRecord::Tasks::DatabaseTasks.dump_schema_cache(ActiveRecord::Base.lease_connection, "tmp/schema_dump.yaml")
+      def dump_schema_cache(conn_or_pool, filename)
+        conn_or_pool.schema_cache.dump_to(filename)
+      end
+
+      def clear_schema_cache(filename)
+        FileUtils.rm_f filename, verbose: false
+      end
+
+      def with_temporary_pool_for_each(env: ActiveRecord::Tasks::DatabaseTasks.env, name: nil, clobber: false, &block) # :nodoc:
+        if name
+          db_config = ActiveRecord::Base.configurations.configs_for(env_name: env, name: name)
+          with_temporary_pool(db_config, clobber: clobber, &block)
+        else
+          ActiveRecord::Base.configurations.configs_for(env_name: env, name: name).each do |db_config|
+            with_temporary_pool(db_config, clobber: clobber, &block)
+          end
+        end
+      end
+
+      def with_temporary_connection(db_config, clobber: false, &block) # :nodoc:
+        with_temporary_pool(db_config, clobber: clobber) do |pool|
+          pool.with_connection(&block)
+        end
+      end
+
+      def migration_class # :nodoc:
+        ActiveRecord::Base
+      end
+
+      def migration_connection # :nodoc:
+        migration_class.lease_connection
+      end
+
+      def migration_connection_pool # :nodoc:
+        migration_class.connection_pool
+      end
+
+      private
+        def schema_cache_env
+          if ENV["SCHEMA_CACHE"]
+            ActiveRecord.deprecator.warn(<<~MSG.squish)
+              Setting `ENV["SCHEMA_CACHE"]` is deprecated and will be removed in Rails 8.0.
+              Configure the `:schema_cache_path` in the database configuration instead.
+            MSG
+
+            nil
+          end
+        end
+
+        def with_temporary_pool(db_config, clobber: false)
+          original_db_config = migration_class.connection_db_config
+          pool = migration_class.connection_handler.establish_connection(db_config, clobber: clobber)
+
+          yield pool
+        ensure
+          migration_class.connection_handler.establish_connection(original_db_config, clobber: clobber)
+        end
+
+        def configs_for(**options)
+          Base.configurations.configs_for(**options)
+        end
+
+        def resolve_configuration(configuration)
+          Base.configurations.resolve(configuration)
+        end
+
+        def verbose?
+          ENV["VERBOSE"] ? ENV["VERBOSE"] != "false" : true
+        end
+
+        # Create a new instance for the specified db configuration object
+        # For classes that have been converted to use db_config objects, pass a
+        # `DatabaseConfig`, otherwise pass a `Hash`
+        def database_adapter_for(db_config, *arguments)
+          klass = class_for_adapter(db_config.adapter)
+          converted = klass.respond_to?(:using_database_configurations?) && klass.using_database_configurations?
+
+          config = converted ? db_config : db_config.configuration_hash
+          klass.new(config, *arguments)
+        end
+
+        def class_for_adapter(adapter)
+          _key, task = @tasks.reverse_each.detect { |pattern, _task| adapter[pattern] }
+          unless task
+            raise DatabaseNotSupported, "Rake tasks not supported by '#{adapter}' adapter"
+          end
+          task.is_a?(String) ? task.constantize : task
+        end
+
+        def each_current_configuration(environment, name = nil)
+          each_current_environment(environment) do |env|
+            configs_for(env_name: env).each do |db_config|
+              next if name && name != db_config.name
+
+              yield db_config
+            end
+          end
+        end
+
+        def each_current_environment(environment, &block)
+          environments = [environment]
+          environments << "test" if environment == "development" && !ENV["SKIP_TEST_DATABASE"] && !ENV["DATABASE_URL"]
+          environments.each(&block)
+        end
+
+        def each_local_configuration
+          configs_for.each do |db_config|
+            next unless db_config.database
+
+            if local_database?(db_config)
+              yield db_config
+            else
+              $stderr.puts "This task only modifies local databases. #{db_config.database} is on a remote host."
+            end
+          end
+        end
+
+        def local_database?(db_config)
+          host = db_config.host
+          host.blank? || LOCAL_HOSTS.include?(host)
+        end
+
+        def schema_sha1(file)
+          OpenSSL::Digest::SHA1.hexdigest(File.read(file))
+        end
+
+        def structure_dump_flags_for(adapter)
+          if structure_dump_flags.is_a?(Hash)
+            structure_dump_flags[adapter.to_sym]
+          else
+            structure_dump_flags
+          end
+        end
+
+        def structure_load_flags_for(adapter)
+          if structure_load_flags.is_a?(Hash)
+            structure_load_flags[adapter.to_sym]
+          else
+            structure_load_flags
+          end
+        end
+
+        def check_current_protected_environment!(db_config)
+          with_temporary_pool(db_config) do |pool|
+            migration_context = pool.migration_context
+            current = migration_context.current_environment
+            stored  = migration_context.last_stored_environment
+
+            if migration_context.protected_environment?
+              raise ActiveRecord::ProtectedEnvironmentError.new(stored)
+            end
+
+            if stored && stored != current
+              raise ActiveRecord::EnvironmentMismatchError.new(current: current, stored: stored)
+            end
+          rescue ActiveRecord::NoDatabaseError
+          end
+        end
     end
-  end
-
-  def test_tag_builder_with_unescaped_conditional_hash_classes
-    str = tag.p "limelight", class: { "song": true, "play>": true }, escape: false
-    assert_equal "<p class=\"song play>\">limelight</p>", str
-
-    str = tag.p "limelight", class: ["song", { "play>": true }], escape: false
-    assert_equal "<p class=\"song play>\">limelight</p>", str
-  end
-
-  def test_token_list_and_class_names
-    [:token_list, :class_names].each do |helper_method|
-      helper = ->(*arguments) { public_send(helper_method, *arguments) }
-
-      assert_equal "song play", helper.(["song", { "play": true }])
-      assert_equal "song", helper.({ "song": true, "play": false })
-      assert_equal "song", helper.([{ "song": true }, { "play": false }])
-      assert_equal "song", helper.({ song: true, play: false })
-      assert_equal "song", helper.([{ song: true }, nil, false])
-      assert_equal "song", helper.(["song", { foo: false }])
-      assert_equal "song play", helper.({ "song": true, "play": true })
-      assert_equal "", helper.({ "song": false, "play": false })
-      assert_equal "123", helper.(nil, "", false, 123, { "song": false, "play": false })
-      assert_equal "song", helper.("song", "song")
-      assert_equal "song", helper.("song song")
-      assert_equal "song", helper.("song\nsong")
-    end
-  end
-
-  def test_token_list_and_class_names_returns_an_html_safe_string
-    assert_predicate token_list("a value"), :html_safe?
-    assert_predicate class_names("a value"), :html_safe?
-  end
-
-  def test_token_list_and_class_names_only_html_escape_once
-    [:token_list, :class_names].each do |helper_method|
-      helper = ->(*arguments) { public_send(helper_method, *arguments) }
-
-      tokens = %w[
-        click->controller#action1
-        click->controller#action2
-        click->controller#action3
-        click->controller#action4
-      ]
-
-      token_list = tokens.reduce(&helper)
-
-      assert_predicate token_list, :html_safe?
-      assert_equal tokens, (CGI.unescape_html(token_list)).split
-    end
-  end
-
-  def test_content_tag_with_data_attributes
-    assert_dom_equal '<p data-number="1" data-string="hello" data-string-with-quotes="double&quot;quote&quot;party&quot;">limelight</p>',
-      content_tag("p", "limelight", data: { number: 1, string: "hello", string_with_quotes: 'double"quote"party"' })
-  end
-
-  def test_tag_builder_with_data_attributes
-    assert_dom_equal '<p data-number="1" data-string="hello" data-string-with-quotes="double&quot;quote&quot;party&quot;">limelight</p>',
-      tag.p("limelight", data: { number: 1, string: "hello", string_with_quotes: 'double"quote"party"' })
-  end
-
-  def test_cdata_section
-    assert_equal "<![CDATA[<hello world>]]>", cdata_section("<hello world>")
-  end
-
-  def test_cdata_section_with_string_conversion
-    assert_equal "<![CDATA[]]>", cdata_section(nil)
-  end
-
-  def test_cdata_section_splitted
-    assert_equal "<![CDATA[hello]]]]><![CDATA[>world]]>", cdata_section("hello]]>world")
-    assert_equal "<![CDATA[hello]]]]><![CDATA[>world]]]]><![CDATA[>again]]>", cdata_section("hello]]>world]]>again")
-  end
-
-  def test_escape_once
-    assert_equal "1 &lt; 2 &amp; 3", escape_once("1 < 2 &amp; 3")
-    assert_equal " &#X27; &#x27; &#x03BB; &#X03bb; &quot; &#39; &lt; &gt; ", escape_once(" &#X27; &#x27; &#x03BB; &#X03bb; \" ' < > ")
-  end
-
-  def test_tag_attributes_inlines_html_attributes
-    expected_output = <<~HTML.strip
-      <input type="text" name="name" aria-hidden="false" aria-label="label" data-input-value="data" required="required">
-    HTML
-
-    assert_equal expected_output, render_erb(<<~HTML.strip)
-      <input type="text" <%= tag.attributes value: nil, name: "name", "aria-hidden": false, aria: { label: "label" }, data: { input_value: "data" }, required: true %>>
-    HTML
-  end
-
-  def test_tag_attributes_escapes_values
-    expected_output = <<~HTML.strip
-      <input type="text" xss="&quot;&gt;&lt;script&gt;alert()&lt;/script&gt;">
-    HTML
-
-    assert_equal expected_output, render_erb(<<~HTML.strip)
-      <input type="text" <%= tag.attributes xss: '"><script>alert()</script>' %>>
-    HTML
-  end
-
-  def test_tag_attributes_nil
-    assert_equal %(<input type="text" >), render_erb(%(<input type="text" <%= tag.attributes nil %>>))
-  end
-
-  def test_tag_attributes_empty
-    assert_equal %(<input type="text" >), render_erb(%(<input type="text" <%= tag.attributes({}) %>>))
-  end
-
-  def test_tag_honors_html_safe_for_param_values
-    ["1&amp;2", "1 &lt; 2", "&#8220;test&#8220;"].each do |escaped|
-      assert_equal %(<a href="#{escaped}" />), tag("a", href: escaped.html_safe)
-      assert_equal %(<a href="#{escaped}"></a>), tag.a(href: escaped.html_safe)
-    end
-  end
-
-  def test_tag_honors_html_safe_with_escaped_array_class
-    assert_equal '<p class="song&gt; play>" />', tag("p", class: ["song>", raw("play>")])
-    assert_equal '<p class="song> play&gt;" />', tag("p", class: [raw("song>"), "play>"])
-  end
-
-  def test_tag_builder_honors_html_safe_with_escaped_array_class
-    assert_equal '<p class="song&gt; play>"></p>', tag.p(class: ["song>", raw("play>")])
-    assert_equal '<p class="song> play&gt;"></p>', tag.p(class: [raw("song>"), "play>"])
-  end
-
-  def test_tag_does_not_honor_html_safe_double_quotes_as_attributes
-    assert_dom_equal '<p title="&quot;">content</p>',
-      content_tag("p", "content", title: '"'.html_safe)
-  end
-
-  def test_data_tag_does_not_honor_html_safe_double_quotes_as_attributes
-    assert_dom_equal '<p data-title="&quot;">content</p>',
-      content_tag("p", "content", data: { title: '"'.html_safe })
-  end
-
-  def test_skip_invalid_escaped_attributes
-    ["&1;", "&#1dfa3;", "& #123;"].each do |escaped|
-      assert_equal %(<a href="#{escaped.gsub(/&/, '&amp;')}" />), tag("a", href: escaped)
-      assert_equal %(<a href="#{escaped.gsub(/&/, '&amp;')}"></a>), tag.a(href: escaped)
-    end
-  end
-
-  def test_disable_escaping
-    assert_equal '<a href="&amp;" />', tag("a", { href: "&amp;" }, false, false)
-  end
-
-  def test_tag_builder_disable_escaping
-    assert_equal '<a href="&amp;"></a>', tag.a(href: "&amp;", escape: false)
-    assert_equal '<a href="&amp;">cnt</a>', tag.a(href: "&amp;", escape: false) { "cnt" }
-    assert_equal '<br data-hidden="&amp;">', tag.br("data-hidden": "&amp;", escape: false)
-    assert_equal '<a href="&amp;">content</a>', tag.a("content", href: "&amp;", escape: false)
-    assert_equal '<a href="&amp;">content</a>', tag.a(href: "&amp;", escape: false) { "content" }
-  end
-
-  def test_data_attributes
-    ["data", :data].each { |data|
-      assert_dom_equal '<a data-a-float="3.14" data-a-big-decimal="-123.456" data-a-number="1" data-array="[1,2,3]" data-hash="{&quot;key&quot;:&quot;value&quot;}" data-string-with-quotes="double&quot;quote&quot;party&quot;" data-string="hello" data-symbol="foo" />',
-        tag("a", data => { a_float: 3.14, a_big_decimal: BigDecimal("-123.456"), a_number: 1, string: "hello", symbol: :foo, array: [1, 2, 3], hash: { key: "value" }, string_with_quotes: 'double"quote"party"' })
-      assert_dom_equal '<a data-a-float="3.14" data-a-big-decimal="-123.456" data-a-number="1" data-array="[1,2,3]" data-hash="{&quot;key&quot;:&quot;value&quot;}" data-string-with-quotes="double&quot;quote&quot;party&quot;" data-string="hello" data-symbol="foo" />',
-        tag.a(data: { a_float: 3.14, a_big_decimal: BigDecimal("-123.456"), a_number: 1, string: "hello", symbol: :foo, array: [1, 2, 3], hash: { key: "value" }, string_with_quotes: 'double"quote"party"' })
-    }
-  end
-
-  def test_aria_attributes
-    ["aria", :aria].each { |aria|
-      assert_dom_equal '<a aria-a-float="3.14" aria-a-big-decimal="-123.456" aria-a-number="1" aria-truthy="true" aria-falsey="false" aria-array="1 2 3" aria-hash="a b" aria-tokens="a b" aria-string-with-quotes="double&quot;quote&quot;party&quot;" aria-string="hello" aria-symbol="foo" />',
-        tag("a", aria => { nil: nil, a_float: 3.14, a_big_decimal: BigDecimal("-123.456"), a_number: 1, truthy: true, falsey: false, string: "hello", symbol: :foo, array: [1, 2, 3], empty_array: [], hash: { a: true, b: "truthy", falsey: false, nil: nil }, empty_hash: {}, tokens: ["a", { b: true, c: false }], empty_tokens: [{ a: false }], string_with_quotes: 'double"quote"party"' })
-    }
-
-    assert_dom_equal '<a aria-a-float="3.14" aria-a-big-decimal="-123.456" aria-a-number="1" aria-truthy="true" aria-falsey="false" aria-array="1 2 3" aria-hash="a b" aria-tokens="a b" aria-string-with-quotes="double&quot;quote&quot;party&quot;" aria-string="hello" aria-symbol="foo" />',
-    tag.a(aria: { nil: nil, a_float: 3.14, a_big_decimal: BigDecimal("-123.456"), a_number: 1, truthy: true, falsey: false, string: "hello", symbol: :foo, array: [1, 2, 3], empty_array: [], hash: { a: true, b: "truthy", falsey: false, nil: nil }, empty_hash: {}, tokens: ["a", { b: true, c: false }], empty_tokens: [{ a: false }], string_with_quotes: 'double"quote"party"' })
-  end
-
-  def test_link_to_data_nil_equal
-    div_type1 = content_tag(:div, "test", "data-tooltip" => nil)
-    div_type2 = content_tag(:div, "test", data: { tooltip: nil })
-    assert_dom_equal div_type1, div_type2
-  end
-
-  def test_tag_builder_link_to_data_nil_equal
-    div_type1 = tag.div "test", 'data-tooltip': nil
-    div_type2 = tag.div "test", data: { tooltip: nil }
-    assert_dom_equal div_type1, div_type2
-  end
-
-  def test_tag_builder_allow_call_via_method_object
-    assert_equal "<foo></foo>", tag.method(:foo).call
-  end
-
-  def test_tag_builder_dasherize_names
-    assert_equal "<img-slider></img-slider>", tag.img_slider
-  end
-
-  def test_respond_to
-    assert_respond_to tag, :any_tag
   end
 end

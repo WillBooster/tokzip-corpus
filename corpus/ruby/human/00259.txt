@@ -1,624 +1,609 @@
 # frozen_string_literal: true
 
-require "active_support/core_ext/hash/except"
-require "active_support/core_ext/module/redefine_method"
-require "active_support/core_ext/hash/indifferent_access"
+require "cases/helper"
+require "support/ddl_helper"
+require "models/developer"
+require "models/computer"
+require "models/owner"
+require "models/pet"
+require "models/toy"
+require "models/car"
+require "models/task"
 
-module ActiveRecord
-  module NestedAttributes # :nodoc:
-    class TooManyRecords < ActiveRecordError
+class TimestampTest < ActiveRecord::TestCase
+  fixtures :developers, :owners, :pets, :toys, :cars, :tasks
+
+  def setup
+    @developer = Developer.first
+    @owner = Owner.first
+    @developer.update_columns(updated_at: Time.now.prev_month)
+    @previously_updated_at = @developer.updated_at
+  end
+
+  def test_saving_a_changed_record_updates_its_timestamp
+    @developer.name = "Jack Bauer"
+    @developer.save!
+
+    assert_not_equal @previously_updated_at, @developer.updated_at
+  end
+
+  def test_saving_a_unchanged_record_doesnt_update_its_timestamp
+    @developer.save!
+
+    assert_equal @previously_updated_at, @developer.updated_at
+  end
+
+  def test_touching_a_record_updates_its_timestamp
+    sleep 1.0 unless supports_datetime_with_precision? # Remove once MySQL 5.5 support is dropped.
+
+    previous_salary = @developer.salary
+    @developer.salary = previous_salary + 10000
+    @developer.touch
+
+    assert_not_equal @previously_updated_at, @developer.updated_at
+    assert_equal previous_salary + 10000, @developer.salary
+    assert_predicate @developer, :salary_changed?, "developer salary should have changed"
+    assert_predicate @developer, :changed?, "developer should be marked as changed"
+    assert_equal ["salary"], @developer.changed
+    assert_predicate @developer, :saved_changes?
+    assert_equal ["legacy_updated_at", "legacy_updated_on"], @developer.saved_changes.keys.sort
+
+    @developer.reload
+    assert_equal previous_salary, @developer.salary
+  end
+
+  def test_touching_a_record_with_default_scope_that_excludes_it_updates_its_timestamp
+    sleep 1.0 unless supports_datetime_with_precision? # Remove once MySQL 5.5 support is dropped.
+
+    developer = @developer.becomes(DeveloperCalledJamis)
+    developer.touch
+
+    assert_not_equal @previously_updated_at, developer.updated_at
+    assert_not_predicate developer, :changed?
+    assert_predicate developer, :saved_changes?
+    assert_equal ["legacy_updated_at", "legacy_updated_on"], developer.saved_changes.keys.sort
+
+    developer.reload
+    assert_not_equal @previously_updated_at, developer.updated_at
+  end
+
+  def test_saving_when_record_timestamps_is_false_doesnt_update_its_timestamp
+    Developer.record_timestamps = false
+    @developer.name = "John Smith"
+    @developer.save!
+
+    assert_equal @previously_updated_at, @developer.updated_at
+  ensure
+    Developer.record_timestamps = true
+  end
+
+  def test_saving_when_instance_record_timestamps_is_false_doesnt_update_its_timestamp
+    @developer.record_timestamps = false
+    assert Developer.record_timestamps
+
+    @developer.name = "John Smith"
+    @developer.save!
+
+    assert_equal @previously_updated_at, @developer.updated_at
+  end
+
+  def test_touching_updates_timestamp_with_given_time
+    previously_updated_at = @developer.updated_at
+    new_time = Time.utc(2015, 2, 16, 0, 0, 0)
+    @developer.touch(time: new_time)
+
+    assert_not_equal previously_updated_at, @developer.updated_at
+    assert_equal new_time, @developer.updated_at
+  end
+
+  def test_touching_an_attribute_updates_timestamp
+    previously_created_at = @developer.created_at
+    travel(1.second) do
+      @developer.touch(:created_at)
     end
 
-    extend ActiveSupport::Concern
+    assert_not @developer.created_at_changed?, "created_at should not be changed"
+    assert_not @developer.changed?, "record should not be changed"
+    assert_not_equal previously_created_at, @developer.created_at
+    assert_not_equal @previously_updated_at, @developer.updated_at
+  end
 
-    included do
-      class_attribute :nested_attributes_options, instance_writer: false, default: {}
+  def test_touching_update_at_attribute_as_symbol_updates_timestamp
+    travel(1.second) do
+      @developer.touch(:updated_at)
     end
 
-    # = Active Record Nested \Attributes
-    #
-    # Nested attributes allow you to save attributes on associated records
-    # through the parent. By default nested attribute updating is turned off
-    # and you can enable it using the accepts_nested_attributes_for class
-    # method. When you enable nested attributes an attribute writer is
-    # defined on the model.
-    #
-    # The attribute writer is named after the association, which means that
-    # in the following example, two new methods are added to your model:
-    #
-    # <tt>author_attributes=(attributes)</tt> and
-    # <tt>pages_attributes=(attributes)</tt>.
-    #
-    #   class Book < ActiveRecord::Base
-    #     has_one :author
-    #     has_many :pages
-    #
-    #     accepts_nested_attributes_for :author, :pages
-    #   end
-    #
-    # Note that the <tt>:autosave</tt> option is automatically enabled on every
-    # association that accepts_nested_attributes_for is used for.
-    #
-    # === One-to-one
-    #
-    # Consider a Member model that has one Avatar:
-    #
-    #   class Member < ActiveRecord::Base
-    #     has_one :avatar
-    #     accepts_nested_attributes_for :avatar
-    #   end
-    #
-    # Enabling nested attributes on a one-to-one association allows you to
-    # create the member and avatar in one go:
-    #
-    #   params = { member: { name: 'Jack', avatar_attributes: { icon: 'smiling' } } }
-    #   member = Member.create(params[:member])
-    #   member.avatar.id # => 2
-    #   member.avatar.icon # => 'smiling'
-    #
-    # It also allows you to update the avatar through the member:
-    #
-    #   params = { member: { avatar_attributes: { id: '2', icon: 'sad' } } }
-    #   member.update params[:member]
-    #   member.avatar.icon # => 'sad'
-    #
-    # If you want to update the current avatar without providing the id, you must add <tt>:update_only</tt> option.
-    #
-    #   class Member < ActiveRecord::Base
-    #     has_one :avatar
-    #     accepts_nested_attributes_for :avatar, update_only: true
-    #   end
-    #
-    #   params = { member: { avatar_attributes: { icon: 'sad' } } }
-    #   member.update params[:member]
-    #   member.avatar.id # => 2
-    #   member.avatar.icon # => 'sad'
-    #
-    # By default you will only be able to set and update attributes on the
-    # associated model. If you want to destroy the associated model through the
-    # attributes hash, you have to enable it first using the
-    # <tt>:allow_destroy</tt> option.
-    #
-    #   class Member < ActiveRecord::Base
-    #     has_one :avatar
-    #     accepts_nested_attributes_for :avatar, allow_destroy: true
-    #   end
-    #
-    # Now, when you add the <tt>_destroy</tt> key to the attributes hash, with a
-    # value that evaluates to +true+, you will destroy the associated model:
-    #
-    #   member.avatar_attributes = { id: '2', _destroy: '1' }
-    #   member.avatar.marked_for_destruction? # => true
-    #   member.save
-    #   member.reload.avatar # => nil
-    #
-    # Note that the model will _not_ be destroyed until the parent is saved.
-    #
-    # Also note that the model will not be destroyed unless you also specify
-    # its id in the updated hash.
-    #
-    # === One-to-many
-    #
-    # Consider a member that has a number of posts:
-    #
-    #   class Member < ActiveRecord::Base
-    #     has_many :posts
-    #     accepts_nested_attributes_for :posts
-    #   end
-    #
-    # You can now set or update attributes on the associated posts through
-    # an attribute hash for a member: include the key +:posts_attributes+
-    # with an array of hashes of post attributes as a value.
-    #
-    # For each hash that does _not_ have an <tt>id</tt> key a new record will
-    # be instantiated, unless the hash also contains a <tt>_destroy</tt> key
-    # that evaluates to +true+.
-    #
-    #   params = { member: {
-    #     name: 'joe', posts_attributes: [
-    #       { title: 'Kari, the awesome Ruby documentation browser!' },
-    #       { title: 'The egalitarian assumption of the modern citizen' },
-    #       { title: '', _destroy: '1' } # this will be ignored
-    #     ]
-    #   }}
-    #
-    #   member = Member.create(params[:member])
-    #   member.posts.length # => 2
-    #   member.posts.first.title # => 'Kari, the awesome Ruby documentation browser!'
-    #   member.posts.second.title # => 'The egalitarian assumption of the modern citizen'
-    #
-    # You may also set a +:reject_if+ proc to silently ignore any new record
-    # hashes if they fail to pass your criteria. For example, the previous
-    # example could be rewritten as:
-    #
-    #   class Member < ActiveRecord::Base
-    #     has_many :posts
-    #     accepts_nested_attributes_for :posts, reject_if: proc { |attributes| attributes['title'].blank? }
-    #   end
-    #
-    #   params = { member: {
-    #     name: 'joe', posts_attributes: [
-    #       { title: 'Kari, the awesome Ruby documentation browser!' },
-    #       { title: 'The egalitarian assumption of the modern citizen' },
-    #       { title: '' } # this will be ignored because of the :reject_if proc
-    #     ]
-    #   }}
-    #
-    #   member = Member.create(params[:member])
-    #   member.posts.length # => 2
-    #   member.posts.first.title # => 'Kari, the awesome Ruby documentation browser!'
-    #   member.posts.second.title # => 'The egalitarian assumption of the modern citizen'
-    #
-    # Alternatively, +:reject_if+ also accepts a symbol for using methods:
-    #
-    #   class Member < ActiveRecord::Base
-    #     has_many :posts
-    #     accepts_nested_attributes_for :posts, reject_if: :new_record?
-    #   end
-    #
-    #   class Member < ActiveRecord::Base
-    #     has_many :posts
-    #     accepts_nested_attributes_for :posts, reject_if: :reject_posts
-    #
-    #     def reject_posts(attributes)
-    #       attributes['title'].blank?
-    #     end
-    #   end
-    #
-    # If the hash contains an <tt>id</tt> key that matches an already
-    # associated record, the matching record will be modified:
-    #
-    #   member.attributes = {
-    #     name: 'Joe',
-    #     posts_attributes: [
-    #       { id: 1, title: '[UPDATED] An, as of yet, undisclosed awesome Ruby documentation browser!' },
-    #       { id: 2, title: '[UPDATED] other post' }
-    #     ]
-    #   }
-    #
-    #   member.posts.first.title # => '[UPDATED] An, as of yet, undisclosed awesome Ruby documentation browser!'
-    #   member.posts.second.title # => '[UPDATED] other post'
-    #
-    # However, the above applies if the parent model is being updated as well.
-    # For example, if you wanted to create a +member+ named _joe_ and wanted to
-    # update the +posts+ at the same time, that would give an
-    # ActiveRecord::RecordNotFound error.
-    #
-    # By default the associated records are protected from being destroyed. If
-    # you want to destroy any of the associated records through the attributes
-    # hash, you have to enable it first using the <tt>:allow_destroy</tt>
-    # option. This will allow you to also use the <tt>_destroy</tt> key to
-    # destroy existing records:
-    #
-    #   class Member < ActiveRecord::Base
-    #     has_many :posts
-    #     accepts_nested_attributes_for :posts, allow_destroy: true
-    #   end
-    #
-    #   params = { member: {
-    #     posts_attributes: [{ id: '2', _destroy: '1' }]
-    #   }}
-    #
-    #   member.attributes = params[:member]
-    #   member.posts.detect { |p| p.id == 2 }.marked_for_destruction? # => true
-    #   member.posts.length # => 2
-    #   member.save
-    #   member.reload.posts.length # => 1
-    #
-    # Nested attributes for an associated collection can also be passed in
-    # the form of a hash of hashes instead of an array of hashes:
-    #
-    #   Member.create(
-    #     name: 'joe',
-    #     posts_attributes: {
-    #       first:  { title: 'Foo' },
-    #       second: { title: 'Bar' }
-    #     }
-    #   )
-    #
-    # has the same effect as
-    #
-    #   Member.create(
-    #     name: 'joe',
-    #     posts_attributes: [
-    #       { title: 'Foo' },
-    #       { title: 'Bar' }
-    #     ]
-    #   )
-    #
-    # The keys of the hash which is the value for +:posts_attributes+ are
-    # ignored in this case.
-    # However, it is not allowed to use <tt>'id'</tt> or <tt>:id</tt> for one of
-    # such keys, otherwise the hash will be wrapped in an array and
-    # interpreted as an attribute hash for a single post.
-    #
-    # Passing attributes for an associated collection in the form of a hash
-    # of hashes can be used with hashes generated from HTTP/HTML parameters,
-    # where there may be no natural way to submit an array of hashes.
-    #
-    # === Saving
-    #
-    # All changes to models, including the destruction of those marked for
-    # destruction, are saved and destroyed automatically and atomically when
-    # the parent model is saved. This happens inside the transaction initiated
-    # by the parent's save method. See ActiveRecord::AutosaveAssociation.
-    #
-    # === Validating the presence of a parent model
-    #
-    # The +belongs_to+ association validates the presence of the parent model
-    # by default. You can disable this behavior by specifying <code>optional: true</code>.
-    # This can be used, for example, when conditionally validating the presence
-    # of the parent model:
-    #
-    #   class Veterinarian < ActiveRecord::Base
-    #     has_many :patients, inverse_of: :veterinarian
-    #     accepts_nested_attributes_for :patients
-    #   end
-    #
-    #   class Patient < ActiveRecord::Base
-    #     belongs_to :veterinarian, inverse_of: :patients, optional: true
-    #     validates :veterinarian, presence: true, unless: -> { awaiting_intake }
-    #   end
-    #
-    # Note that if you do not specify the +:inverse_of+ option, then
-    # Active Record will try to automatically guess the inverse association
-    # based on heuristics.
-    #
-    # For one-to-one nested associations, if you build the new (in-memory)
-    # child object yourself before assignment, then this module will not
-    # overwrite it, e.g.:
-    #
-    #   class Member < ActiveRecord::Base
-    #     has_one :avatar
-    #     accepts_nested_attributes_for :avatar
-    #
-    #     def avatar
-    #       super || build_avatar(width: 200)
-    #     end
-    #   end
-    #
-    #   member = Member.new
-    #   member.avatar_attributes = {icon: 'sad'}
-    #   member.avatar.width # => 200
-    #
-    # === Creating forms with nested attributes
-    #
-    # Use ActionView::Helpers::FormHelper#fields_for to create form elements for
-    # nested attributes.
-    #
-    # Integration test params should reflect the structure of the form. For
-    # example:
-    #
-    #   post members_path, params: {
-    #     member: {
-    #       name: 'joe',
-    #       posts_attributes: {
-    #         '0' => { title: 'Foo' },
-    #         '1' => { title: 'Bar' }
-    #       }
-    #     }
-    #   }
-    module ClassMethods
-      REJECT_ALL_BLANK_PROC = proc { |attributes| attributes.all? { |key, value| key == "_destroy" || value.blank? } }
+    assert_not @developer.updated_at_changed?
+    assert_not @developer.changed?
+    assert_not_equal @previously_updated_at, @developer.updated_at
+  end
 
-      # Defines an attributes writer for the specified association(s).
-      #
-      # Supported options:
-      # [:allow_destroy]
-      #   If true, destroys any members from the attributes hash with a
-      #   <tt>_destroy</tt> key and a value that evaluates to +true+
-      #   (e.g. 1, '1', true, or 'true'). This option is false by default.
-      # [:reject_if]
-      #   Allows you to specify a Proc or a Symbol pointing to a method
-      #   that checks whether a record should be built for a certain attribute
-      #   hash. The hash is passed to the supplied Proc or the method
-      #   and it should return either +true+ or +false+. When no +:reject_if+
-      #   is specified, a record will be built for all attribute hashes that
-      #   do not have a <tt>_destroy</tt> value that evaluates to true.
-      #   Passing <tt>:all_blank</tt> instead of a Proc will create a proc
-      #   that will reject a record where all the attributes are blank excluding
-      #   any value for +_destroy+.
-      # [:limit]
-      #   Allows you to specify the maximum number of associated records that
-      #   can be processed with the nested attributes. Limit also can be specified
-      #   as a Proc or a Symbol pointing to a method that should return a number.
-      #   If the size of the nested attributes array exceeds the specified limit,
-      #   NestedAttributes::TooManyRecords exception is raised. If omitted, any
-      #   number of associations can be processed.
-      #   Note that the +:limit+ option is only applicable to one-to-many
-      #   associations.
-      # [:update_only]
-      #   For a one-to-one association, this option allows you to specify how
-      #   nested attributes are going to be used when an associated record already
-      #   exists. In general, an existing record may either be updated with the
-      #   new set of attribute values or be replaced by a wholly new record
-      #   containing those values. By default the +:update_only+ option is false
-      #   and the nested attributes are used to update the existing record only
-      #   if they include the record's <tt>:id</tt> value. Otherwise a new
-      #   record will be instantiated and used to replace the existing one.
-      #   However if the +:update_only+ option is true, the nested attributes
-      #   are used to update the record's attributes always, regardless of
-      #   whether the <tt>:id</tt> is present. The option is ignored for collection
-      #   associations.
-      #
-      # Examples:
-      #   # creates avatar_attributes=
-      #   accepts_nested_attributes_for :avatar, reject_if: proc { |attributes| attributes['name'].blank? }
-      #   # creates avatar_attributes=
-      #   accepts_nested_attributes_for :avatar, reject_if: :all_blank
-      #   # creates avatar_attributes= and posts_attributes=
-      #   accepts_nested_attributes_for :avatar, :posts, allow_destroy: true
-      def accepts_nested_attributes_for(*attr_names)
-        options = { allow_destroy: false, update_only: false }
-        options.update(attr_names.extract_options!)
-        options.assert_valid_keys(:allow_destroy, :reject_if, :limit, :update_only)
-        options[:reject_if] = REJECT_ALL_BLANK_PROC if options[:reject_if] == :all_blank
+  def test_touching_an_attribute_updates_it
+    task = Task.first
+    previous_value = task.ending
+    task.touch(:ending)
 
-        attr_names.each do |association_name|
-          if reflection = _reflect_on_association(association_name)
-            reflection.autosave = true
-            define_autosave_validation_callbacks(reflection)
+    now = Time.now.change(usec: 0)
 
-            nested_attributes_options = self.nested_attributes_options.dup
-            nested_attributes_options[association_name.to_sym] = options
-            self.nested_attributes_options = nested_attributes_options
+    assert_not_equal previous_value, task.ending
+    assert_in_delta now, task.ending, 1
+  end
 
-            type = (reflection.collection? ? :collection : :one_to_one)
-            generate_association_writer(association_name, type)
-          else
-            raise ArgumentError, "No association found for name `#{association_name}'. Has it been defined yet?"
-          end
-        end
+  def test_touching_an_attribute_updates_timestamp_with_given_time
+    previously_updated_at = @developer.updated_at
+    previously_created_at = @developer.created_at
+    new_time = Time.utc(2015, 2, 16, 4, 54, 0)
+    @developer.touch(:created_at, time: new_time)
+
+    assert_not_equal previously_created_at, @developer.created_at
+    assert_not_equal previously_updated_at, @developer.updated_at
+    assert_equal new_time, @developer.created_at
+    assert_equal new_time, @developer.updated_at
+  end
+
+  def test_touching_many_attributes_updates_them
+    task = Task.first
+    previous_starting = task.starting
+    previous_ending = task.ending
+    task.touch(:starting, :ending)
+
+    now = Time.now.change(usec: 0)
+
+    assert_not_equal previous_starting, task.starting
+    assert_not_equal previous_ending, task.ending
+    assert_in_delta now, task.starting, 1
+    assert_in_delta now, task.ending, 1
+  end
+
+  def test_touching_a_record_without_timestamps_is_unexceptional
+    assert_nothing_raised { Car.first.touch }
+  end
+
+  def test_touching_a_no_touching_object
+    Developer.no_touching do
+      assert_predicate @developer, :no_touching?
+      assert_not_predicate @owner, :no_touching?
+      @developer.touch
+    end
+
+    assert_not_predicate @developer, :no_touching?
+    assert_not_predicate @owner, :no_touching?
+    assert_equal @previously_updated_at, @developer.updated_at
+  end
+
+  def test_touching_related_objects
+    @owner = Owner.first
+    @previously_updated_at = @owner.updated_at
+
+    Owner.no_touching do
+      @owner.pets.first.touch
+    end
+
+    assert_equal @previously_updated_at, @owner.updated_at
+  end
+
+  def test_global_no_touching
+    ActiveRecord::Base.no_touching do
+      assert_predicate @developer, :no_touching?
+      assert_predicate @owner, :no_touching?
+      @developer.touch
+    end
+
+    assert_not_predicate @developer, :no_touching?
+    assert_not_predicate @owner, :no_touching?
+    assert_equal @previously_updated_at, @developer.updated_at
+  end
+
+  def test_no_touching_threadsafe
+    Thread.new do
+      Developer.no_touching do
+        assert_predicate @developer, :no_touching?
+
+        sleep(1)
       end
+    end
+
+    assert_not_predicate @developer, :no_touching?
+  end
+
+  def test_no_touching_with_callbacks
+    klass = Class.new(ActiveRecord::Base) do
+      self.table_name = "developers"
+
+      attr_accessor :after_touch_called
+
+      after_touch do |user|
+        user.after_touch_called = true
+      end
+    end
+
+    developer = klass.first
+
+    klass.no_touching do
+      developer.touch
+      assert_not developer.after_touch_called
+    end
+  end
+
+  def test_saving_an_unchanged_record_with_a_mutating_before_save_callback_updates_its_timestamp
+    klass = Class.new(ActiveRecord::Base) do
+      self.table_name = "developers"
+
+      include Developer::TimestampAliases
+
+      before_save :change_name
 
       private
-        # Generates a writer method for this association. Serves as a point for
-        # accessing the objects in the association. For example, this method
-        # could generate the following:
-        #
-        #   def pirate_attributes=(attributes)
-        #     assign_nested_attributes_for_one_to_one_association(:pirate, attributes)
-        #   end
-        #
-        # This redirects the attempts to write objects in an association through
-        # the helper methods defined below. Makes it seem like the nested
-        # associations are just regular associations.
-        def generate_association_writer(association_name, type)
-          generated_association_methods.module_eval <<-eoruby, __FILE__, __LINE__ + 1
-            silence_redefinition_of_method :#{association_name}_attributes=
-            def #{association_name}_attributes=(attributes)
-              assign_nested_attributes_for_#{type}_association(:#{association_name}, attributes)
-            end
-          eoruby
+        def change_name
+          return if new_record?
+
+          self.name = "Jack Bauer"
         end
     end
 
-    # Returns ActiveRecord::AutosaveAssociation#marked_for_destruction? It's
-    # used in conjunction with fields_for to build a form element for the
-    # destruction of this association.
-    #
-    # See ActionView::Helpers::FormHelper#fields_for for more info.
-    def _destroy
-      marked_for_destruction?
+    @developer = klass.create!
+    @previously_updated_at = @developer.updated_at
+    @previous_name = @developer.name
+
+    travel(1.second) do
+      @developer.save!
     end
 
-    private
-      # Attribute hash keys that should not be assigned as normal attributes.
-      # These hash keys are nested attributes implementation details.
-      UNASSIGNABLE_KEYS = %w( id _destroy )
+    assert_not_equal @previous_name, @developer.name
+    assert_not_equal @previously_updated_at, @developer.updated_at
+  end
 
-      # Assigns the given attributes to the association.
-      #
-      # If an associated record does not yet exist, one will be instantiated. If
-      # an associated record already exists, the method's behavior depends on
-      # the value of the update_only option. If update_only is +false+ and the
-      # given attributes include an <tt>:id</tt> that matches the existing record's
-      # id, then the existing record will be modified. If no <tt>:id</tt> is provided
-      # it will be replaced with a new record. If update_only is +true+ the existing
-      # record will be modified regardless of whether an <tt>:id</tt> is provided.
-      #
-      # If the given attributes include a matching <tt>:id</tt> attribute, or
-      # update_only is true, and a <tt>:_destroy</tt> key set to a truthy value,
-      # then the existing record will be marked for destruction.
-      def assign_nested_attributes_for_one_to_one_association(association_name, attributes)
-        if attributes.respond_to?(:permitted?)
-          attributes = attributes.to_h
+  def test_saving_an_unchanged_record_with_a_mutating_before_update_callback_updates_its_timestamp
+    klass = Class.new(ActiveRecord::Base) do
+      self.table_name = "developers"
+
+      include Developer::TimestampAliases
+
+      before_update :change_name
+
+      private
+        def change_name
+          return if new_record?
+
+          self.name = "Jack Bauer"
         end
+    end
 
-        unless attributes.is_a?(Hash)
-          raise ArgumentError, "Hash expected for `#{association_name}` attributes, got #{attributes.class.name}"
-        end
+    @developer = klass.create!
+    @previously_updated_at = @developer.updated_at
+    @previous_name = @developer.name
 
-        options = nested_attributes_options[association_name]
-        attributes = attributes.with_indifferent_access
-        existing_record = send(association_name)
+    travel(1.second) do
+      @developer.save!
+    end
 
-        if (options[:update_only] || !attributes["id"].blank?) && existing_record &&
-            (options[:update_only] || existing_record.id.to_s == attributes["id"].to_s)
-          assign_to_or_mark_for_destruction(existing_record, attributes, options[:allow_destroy]) unless call_reject_if(association_name, attributes)
+    @developer.reload
 
-        elsif attributes["id"].present?
-          raise_nested_attributes_record_not_found!(association_name, attributes["id"])
+    assert_not_equal @previous_name, @developer.name
+    assert_not_equal @previously_updated_at, @developer.updated_at
+  end
 
-        elsif !reject_new_record?(association_name, attributes)
-          assignable_attributes = attributes.except(*UNASSIGNABLE_KEYS)
+  def test_saving_an_unchanged_record_with_a_non_mutating_before_update_callback_does_not_update_its_timestamp
+    klass = Class.new(ActiveRecord::Base) do
+      self.table_name = "developers"
 
-          if existing_record && existing_record.new_record?
-            existing_record.assign_attributes(assignable_attributes)
-            association(association_name).initialize_attributes(existing_record)
-          else
-            method = :"build_#{association_name}"
-            if respond_to?(method)
-              send(method, assignable_attributes)
-            else
-              raise ArgumentError, "Cannot build association `#{association_name}'. Are you trying to build a polymorphic one-to-one association?"
-            end
-          end
-        end
+      include Developer::TimestampAliases
+
+      before_update :change_name
+
+      private
+        def change_name; end
+    end
+
+    @developer = klass.create!
+    @previously_updated_at = @developer.updated_at
+
+    travel(1.second) do
+      @developer.save!
+    end
+
+    @developer.reload
+
+    assert_equal @previously_updated_at, @developer.updated_at
+  end
+
+  def test_saving_a_record_with_a_belongs_to_that_specifies_touching_the_parent_should_update_the_parent_updated_at
+    pet   = Pet.first
+    owner = pet.owner
+    previously_owner_updated_at = owner.updated_at
+
+    travel(1.second) do
+      pet.name = "Fluffy the Third"
+      pet.save
+    end
+
+    assert_not_equal previously_owner_updated_at, pet.owner.updated_at
+  end
+
+  def test_destroying_a_record_with_a_belongs_to_that_specifies_touching_the_parent_should_update_the_parent_updated_at
+    pet   = Pet.first
+    owner = pet.owner
+    previously_owner_updated_at = owner.updated_at
+
+    travel(1.second) do
+      pet.destroy
+    end
+
+    assert_not_equal previously_owner_updated_at, pet.owner.updated_at
+  end
+
+  def test_saving_a_new_record_belonging_to_invalid_parent_with_touch_should_not_raise_exception
+    klass = Class.new(Owner) do
+      def self.name; "Owner"; end
+      validate { errors.add(:base, :invalid) }
+    end
+
+    pet = Pet.new(owner: klass.new)
+    pet.save!
+
+    assert_predicate pet.owner, :new_record?
+  end
+
+  def test_saving_a_record_with_a_belongs_to_that_specifies_touching_a_specific_attribute_the_parent_should_update_that_attribute
+    klass = Class.new(ActiveRecord::Base) do
+      def self.name; "Pet"; end
+      belongs_to :owner, touch: :happy_at
+    end
+
+    pet   = klass.first
+    owner = pet.owner
+    previously_owner_happy_at = owner.happy_at
+
+    pet.name = "Fluffy the Third"
+    pet.save
+
+    assert_not_equal previously_owner_happy_at, pet.owner.happy_at
+  end
+
+  def test_touching_a_record_with_a_belongs_to_that_uses_a_counter_cache_should_update_the_parent
+    klass = Class.new(ActiveRecord::Base) do
+      def self.name; "Pet"; end
+      belongs_to :owner, counter_cache: :use_count, touch: true
+    end
+
+    pet = klass.first
+    owner = pet.owner
+    owner.update_columns(happy_at: 3.days.ago)
+    previously_owner_updated_at = owner.updated_at
+
+    travel(1.second) do
+      pet.name = "I'm a parrot"
+      pet.save
+    end
+
+    assert_not_equal previously_owner_updated_at, pet.owner.updated_at
+  end
+
+  def test_touching_a_record_touches_parent_record_and_grandparent_record
+    klass = Class.new(ActiveRecord::Base) do
+      def self.name; "Toy"; end
+      belongs_to :pet, touch: true
+    end
+
+    toy = klass.first
+    pet = toy.pet
+    owner = pet.owner
+    time = 3.days.ago
+
+    owner.update_columns(updated_at: time)
+    toy.touch
+    owner.reload
+
+    assert_not_equal time, owner.updated_at
+  end
+
+  def test_touching_a_record_touches_polymorphic_record
+    klass = Class.new(ActiveRecord::Base) do
+      def self.name; "Toy"; end
+    end
+
+    wheel_klass = Class.new(ActiveRecord::Base) do
+      def self.name; "Wheel"; end
+      belongs_to :wheelable, polymorphic: true, touch: true
+    end
+
+    toy = klass.first
+    time = 3.days.ago
+    toy.update_columns(updated_at: time)
+
+    wheel = wheel_klass.new
+    wheel.wheelable = toy
+    wheel.save
+    wheel.touch
+
+    assert_not_equal time, toy.updated_at
+  end
+
+  def test_changing_parent_of_a_record_touches_both_new_and_old_parent_record
+    klass = Class.new(ActiveRecord::Base) do
+      def self.name; "Toy"; end
+      belongs_to :pet, touch: true
+    end
+
+    toy1 = klass.find(1)
+    old_pet = toy1.pet
+
+    toy2 = klass.find(2)
+    new_pet = toy2.pet
+    time = 3.days.ago.at_beginning_of_hour
+
+    old_pet.update_columns(updated_at: time)
+    new_pet.update_columns(updated_at: time)
+
+    toy1.pet = new_pet
+    toy1.save!
+
+    old_pet.reload
+    new_pet.reload
+
+    assert_not_equal time, new_pet.updated_at
+    assert_not_equal time, old_pet.updated_at
+  end
+
+  def test_changing_parent_of_a_record_touches_both_new_and_old_polymorphic_parent_record_changes_within_same_class
+    car_class = Class.new(ActiveRecord::Base) do
+      def self.name; "Car"; end
+    end
+
+    wheel_class = Class.new(ActiveRecord::Base) do
+      def self.name; "Wheel"; end
+      belongs_to :wheelable, polymorphic: true, touch: true
+    end
+
+    car1 = car_class.find(1)
+    car2 = car_class.find(2)
+
+    wheel = wheel_class.create!(wheelable: car1)
+
+    time = 3.days.ago.at_beginning_of_hour
+
+    car1.update_columns(updated_at: time)
+    car2.update_columns(updated_at: time)
+
+    wheel.wheelable = car2
+    wheel.save!
+
+    assert_not_equal time, car1.reload.updated_at
+    assert_not_equal time, car2.reload.updated_at
+  end
+
+  def test_changing_parent_of_a_record_touches_both_new_and_old_polymorphic_parent_record_changes_with_other_class
+    car_class = Class.new(ActiveRecord::Base) do
+      def self.name; "Car"; end
+    end
+
+    toy_class = Class.new(ActiveRecord::Base) do
+      def self.name; "Toy"; end
+    end
+
+    wheel_class = Class.new(ActiveRecord::Base) do
+      def self.name; "Wheel"; end
+      belongs_to :wheelable, polymorphic: true, touch: true
+    end
+
+    car = car_class.find(1)
+    toy = toy_class.find(3)
+
+    wheel = wheel_class.create!(wheelable: car)
+
+    time = 3.days.ago.at_beginning_of_hour
+
+    car.update_columns(updated_at: time)
+    toy.update_columns(updated_at: time)
+
+    wheel.wheelable = toy
+    wheel.save!
+
+    assert_not_equal time, car.reload.updated_at
+    assert_not_equal time, toy.reload.updated_at
+  end
+
+  def test_clearing_association_touches_the_old_record
+    klass = Class.new(ActiveRecord::Base) do
+      def self.name; "Toy"; end
+      belongs_to :pet, touch: true
+    end
+
+    toy = klass.find(1)
+    pet = toy.pet
+    time = 3.days.ago.at_beginning_of_hour
+
+    pet.update_columns(updated_at: time)
+
+    toy.pet = nil
+    toy.save!
+
+    pet.reload
+
+    assert_not_equal time, pet.updated_at
+  end
+
+  def test_timestamp_column_values_are_present_in_create_callbacks
+    klass = Class.new(ActiveRecord::Base) do
+      self.table_name = "people"
+
+      before_create do
+        self.born_at = created_at
       end
+    end
 
-      # Assigns the given attributes to the collection association.
-      #
-      # Hashes with an <tt>:id</tt> value matching an existing associated record
-      # will update that record. Hashes without an <tt>:id</tt> value will build
-      # a new record for the association. Hashes with a matching <tt>:id</tt>
-      # value and a <tt>:_destroy</tt> key set to a truthy value will mark the
-      # matched record for destruction.
-      #
-      # For example:
-      #
-      #   assign_nested_attributes_for_collection_association(:people, {
-      #     '1' => { id: '1', name: 'Peter' },
-      #     '2' => { name: 'John' },
-      #     '3' => { id: '2', _destroy: true }
-      #   })
-      #
-      # Will update the name of the Person with ID 1, build a new associated
-      # person with the name 'John', and mark the associated Person with ID 2
-      # for destruction.
-      #
-      # Also accepts an Array of attribute hashes:
-      #
-      #   assign_nested_attributes_for_collection_association(:people, [
-      #     { id: '1', name: 'Peter' },
-      #     { name: 'John' },
-      #     { id: '2', _destroy: true }
-      #   ])
-      def assign_nested_attributes_for_collection_association(association_name, attributes_collection)
-        options = nested_attributes_options[association_name]
-        if attributes_collection.respond_to?(:permitted?)
-          attributes_collection = attributes_collection.to_h
-        end
+    person = klass.create first_name: "David"
+    assert_not_nil person.born_at
+  end
 
-        unless attributes_collection.is_a?(Hash) || attributes_collection.is_a?(Array)
-          raise ArgumentError, "Hash or Array expected for `#{association_name}` attributes, got #{attributes_collection.class.name}"
-        end
+  def test_timestamp_column_values_are_present_in_update_callbacks
+    klass = Class.new(ActiveRecord::Base) do
+      self.table_name = "people"
 
-        check_record_limit!(options[:limit], attributes_collection)
-
-        if attributes_collection.is_a? Hash
-          keys = attributes_collection.keys
-          attributes_collection = if keys.include?("id") || keys.include?(:id)
-            [attributes_collection]
-          else
-            attributes_collection.values
-          end
-        end
-
-        association = association(association_name)
-
-        existing_records = if association.loaded?
-          association.target
-        else
-          attribute_ids = attributes_collection.filter_map { |a| a["id"] || a[:id] }
-          attribute_ids.empty? ? [] : association.scope.where(association.klass.primary_key => attribute_ids)
-        end
-
-        records = attributes_collection.map do |attributes|
-          if attributes.respond_to?(:permitted?)
-            attributes = attributes.to_h
-          end
-          attributes = attributes.with_indifferent_access
-
-          if attributes["id"].blank?
-            unless reject_new_record?(association_name, attributes)
-              association.reader.build(attributes.except(*UNASSIGNABLE_KEYS))
-            end
-          elsif existing_record = existing_records.detect { |record| record.id.to_s == attributes["id"].to_s }
-            unless call_reject_if(association_name, attributes)
-              # Make sure we are operating on the actual object which is in the association's
-              # proxy_target array (either by finding it, or adding it if not found)
-              # Take into account that the proxy_target may have changed due to callbacks
-              target_record = association.target.detect { |record| record.id.to_s == attributes["id"].to_s }
-              if target_record
-                existing_record = target_record
-              else
-                association.add_to_target(existing_record, skip_callbacks: true)
-              end
-
-              assign_to_or_mark_for_destruction(existing_record, attributes, options[:allow_destroy])
-              existing_record
-            end
-          else
-            raise_nested_attributes_record_not_found!(association_name, attributes["id"])
-          end
-        end
-
-        association.nested_attributes_target = records
+      before_update do
+        self.born_at = created_at
       end
+    end
 
-      # Takes in a limit and checks if the attributes_collection has too many
-      # records. It accepts limit in the form of symbol, proc, or
-      # number-like object (anything that can be compared with an integer).
-      #
-      # Raises TooManyRecords error if the attributes_collection is
-      # larger than the limit.
-      def check_record_limit!(limit, attributes_collection)
-        if limit
-          limit = \
-            case limit
-            when Symbol
-              send(limit)
-            when Proc
-              limit.call
-            else
-              limit
-            end
+    person = klass.create first_name: "David"
+    person.update first_name: "John"
+    assert_not_nil person.born_at
+  end
 
-          if limit && attributes_collection.size > limit
-            raise TooManyRecords, "Maximum #{limit} records are allowed. Got #{attributes_collection.size} records instead."
-          end
-        end
+  def test_timestamp_column_values_are_present_in_save_callbacks
+    klass = Class.new(ActiveRecord::Base) do
+      self.table_name = "people"
+
+      before_create do
+        self.born_at = created_at
       end
+    end
 
-      # Updates a record with the +attributes+ or marks it for destruction if
-      # +allow_destroy+ is +true+ and has_destroy_flag? returns +true+.
-      def assign_to_or_mark_for_destruction(record, attributes, allow_destroy)
-        record.assign_attributes(attributes.except(*UNASSIGNABLE_KEYS))
-        record.mark_for_destruction if has_destroy_flag?(attributes) && allow_destroy
-      end
+    person = klass.create first_name: "David"
+    assert_not_nil person.born_at
+  end
 
-      # Determines if a hash contains a truthy _destroy key.
-      def has_destroy_flag?(hash)
-        Type::Boolean.new.cast(hash["_destroy"])
-      end
+  def test_timestamp_attributes_for_create_in_model
+    toy = Toy.first
+    assert_equal ["created_at"], toy.send(:timestamp_attributes_for_create_in_model)
+  end
 
-      # Determines if a new record should be rejected by checking
-      # has_destroy_flag? or if a <tt>:reject_if</tt> proc exists for this
-      # association and evaluates to +true+.
-      def reject_new_record?(association_name, attributes)
-        will_be_destroyed?(association_name, attributes) || call_reject_if(association_name, attributes)
-      end
+  def test_timestamp_attributes_for_update_in_model
+    toy = Toy.first
+    assert_equal ["updated_at"], toy.send(:timestamp_attributes_for_update_in_model)
+  end
 
-      # Determines if a record with the particular +attributes+ should be
-      # rejected by calling the reject_if Symbol or Proc (if defined).
-      # The reject_if option is defined by +accepts_nested_attributes_for+.
-      #
-      # Returns false if there is a +destroy_flag+ on the attributes.
-      def call_reject_if(association_name, attributes)
-        return false if will_be_destroyed?(association_name, attributes)
+  def test_all_timestamp_attributes_in_model
+    toy = Toy.first
+    assert_equal ["created_at", "updated_at"], toy.send(:all_timestamp_attributes_in_model)
+  end
+end
 
-        case callback = nested_attributes_options[association_name][:reject_if]
-        when Symbol
-          method(callback).arity == 0 ? send(callback) : send(callback, attributes)
-        when Proc
-          callback.call(attributes)
-        end
-      end
+class TimestampsWithoutTransactionTest < ActiveRecord::TestCase
+  include DdlHelper
+  self.use_transactional_tests = false
 
-      # Only take into account the destroy flag if <tt>:allow_destroy</tt> is true
-      def will_be_destroyed?(association_name, attributes)
-        allow_destroy?(association_name) && has_destroy_flag?(attributes)
-      end
+  class TimestampAttributePost < ActiveRecord::Base
+    attr_accessor :created_at, :updated_at
+  end
 
-      def allow_destroy?(association_name)
-        nested_attributes_options[association_name][:allow_destroy]
-      end
+  def test_do_not_write_timestamps_on_save_if_they_are_not_attributes
+    with_example_table ActiveRecord::Base.lease_connection, "timestamp_attribute_posts", "id integer primary key" do
+      post = TimestampAttributePost.new(id: 1)
+      post.save! # should not try to assign and persist created_at, updated_at
+      assert_nil post.created_at
+      assert_nil post.updated_at
+    end
+  end
 
-      def raise_nested_attributes_record_not_found!(association_name, record_id)
-        model = self.class._reflect_on_association(association_name).klass.name
-        raise RecordNotFound.new("Couldn't find #{model} with ID=#{record_id} for #{self.class.name} with ID=#{id}",
-                                 model, "id", record_id)
-      end
+  def test_index_is_created_for_both_timestamps
+    ActiveRecord::Base.lease_connection.create_table(:foos, force: true) do |t|
+      t.timestamps null: true, index: true
+    end
+
+    indexes = ActiveRecord::Base.lease_connection.indexes("foos")
+    assert_equal ["created_at", "updated_at"], indexes.flat_map(&:columns).sort
+  ensure
+    ActiveRecord::Base.lease_connection.drop_table(:foos)
   end
 end

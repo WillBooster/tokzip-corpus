@@ -1,83 +1,180 @@
+import { jsonToReadableText } from "../helpers.js";
+import { forEachNoEmitOnErrorScenario } from "../helpers/noEmitOnError.js";
 import {
-    codeFixAll,
-    createCodeFixAction,
-    createImportAdder,
-    createMissingMemberNodes,
-    registerCodeFix,
-    TypeConstructionContext,
-} from "../_namespaces/ts.codefix.js";
+    noChangeRun,
+    TestTscEdit,
+    verifyTsc,
+} from "../helpers/tsc.js";
 import {
-    addToSeen,
-    cast,
-    ClassElement,
-    ClassLikeDeclaration,
-    Diagnostics,
-    first,
-    getEffectiveBaseTypeNode,
-    getNodeId,
-    getSyntacticModifierFlags,
-    getTokenAtPosition,
-    isClassLike,
-    ModifierFlags,
-    SourceFile,
-    Symbol,
-    textChanges,
-    UserPreferences,
-} from "../_namespaces/ts.js";
+    loadProjectFromFiles,
+    replaceText,
+} from "../helpers/vfs.js";
 
-const errorCodes = [
-    Diagnostics.Non_abstract_class_0_does_not_implement_inherited_abstract_member_1_from_class_2.code,
-    Diagnostics.Non_abstract_class_0_is_missing_implementations_for_the_following_members_of_1_Colon_2.code,
-    Diagnostics.Non_abstract_class_0_is_missing_implementations_for_the_following_members_of_1_Colon_2_and_3_more.code,
-    Diagnostics.Non_abstract_class_expression_does_not_implement_inherited_abstract_member_0_from_class_1.code,
-    Diagnostics.Non_abstract_class_expression_is_missing_implementations_for_the_following_members_of_0_Colon_1.code,
-    Diagnostics.Non_abstract_class_expression_is_missing_implementations_for_the_following_members_of_0_Colon_1_and_2_more.code,
-];
+describe("unittests:: tsc:: noEmitOnError::", () => {
+    forEachNoEmitOnErrorScenario(
+        (fsContents, cwd, executingFilePath) => loadProjectFromFiles(fsContents, { cwd, executingFilePath }),
+        (scnearioName, fs) => {
+            describe(scnearioName("verify noEmitOnError"), () => {
+                function verifyNoEmitOnError(subScenario: string, fixModifyFs: TestTscEdit["edit"], modifyFs?: TestTscEdit["edit"]) {
+                    verifyTsc({
+                        scenario: "noEmitOnError",
+                        subScenario: scnearioName(subScenario),
+                        fs,
+                        commandLineArgs: [],
+                        modifyFs,
+                        edits: [
+                            noChangeRun,
+                            {
+                                caption: "incremental-declaration-doesnt-change",
+                                edit: fixModifyFs,
+                            },
+                            noChangeRun,
+                        ],
+                        baselinePrograms: true,
+                    });
+                }
+                verifyNoEmitOnError(
+                    "syntax errors",
+                    fs =>
+                        fs.writeFileSync(
+                            "src/main.ts",
+                            `import { A } from "../shared/types/db";
+const a = {
+    lastName: 'sdsd'
+};`,
+                            "utf-8",
+                        ),
+                );
 
-const fixId = "fixClassDoesntImplementInheritedAbstractMember";
-registerCodeFix({
-    errorCodes,
-    getCodeActions: function getCodeActionsToFixClassNotImplementingInheritedMembers(context) {
-        const { sourceFile, span } = context;
-        const changes = textChanges.ChangeTracker.with(context, t => addMissingMembers(getClass(sourceFile, span.start), sourceFile, context, t, context.preferences));
-        return changes.length === 0 ? undefined : [createCodeFixAction(fixId, changes, Diagnostics.Implement_inherited_abstract_class, fixId, Diagnostics.Implement_all_inherited_abstract_classes)];
-    },
-    fixIds: [fixId],
-    getAllCodeActions: function getAllCodeActionsToFixClassDoesntImplementInheritedAbstractMember(context) {
-        const seenClassDeclarations = new Map<number, true>();
-        return codeFixAll(context, errorCodes, (changes, diag) => {
-            const classDeclaration = getClass(diag.file, diag.start);
-            if (addToSeen(seenClassDeclarations, getNodeId(classDeclaration))) {
-                addMissingMembers(classDeclaration, context.sourceFile, context, changes, context.preferences);
-            }
-        });
-    },
+                verifyNoEmitOnError(
+                    "semantic errors",
+                    fs =>
+                        fs.writeFileSync(
+                            "src/main.ts",
+                            `import { A } from "../shared/types/db";
+const a: string = "hello";`,
+                            "utf-8",
+                        ),
+                    fs =>
+                        fs.writeFileSync(
+                            "src/main.ts",
+                            `import { A } from "../shared/types/db";
+const a: string = 10;`,
+                            "utf-8",
+                        ),
+                );
+            });
+        },
+    );
+
+    verifyTsc({
+        scenario: "noEmitOnError",
+        subScenario: `when declarationMap changes`,
+        fs: () =>
+            loadProjectFromFiles({
+                "/src/project/tsconfig.json": jsonToReadableText({
+                    compilerOptions: {
+                        noEmitOnError: true,
+                        declaration: true,
+                        composite: true,
+                    },
+                }),
+                "/src/project/a.ts": "const x = 10;",
+                "/src/project/b.ts": "const y = 10;",
+            }),
+        commandLineArgs: ["--p", "/src/project"],
+        edits: [
+            {
+                caption: "error and enable declarationMap",
+                edit: fs => replaceText(fs, "/src/project/a.ts", "x", "x: 20"),
+                commandLineArgs: ["--p", "/src/project", "--declarationMap"],
+                discrepancyExplanation: () => [
+                    `Clean build does not emit any file so will have emitSignatures with all files since they are not emitted`,
+                    `Incremental build has emitSignatures from before, so it will have a.ts with signature since file.version isnt same`,
+                    `Incremental build will also have emitSignatureDtsMapDiffers for both files since the emitSignatures were without declarationMap but currentOptions have declrationMap`,
+                ],
+            },
+            {
+                caption: "fix error declarationMap",
+                edit: fs => replaceText(fs, "/src/project/a.ts", "x: 20", "x"),
+                commandLineArgs: ["--p", "/src/project", "--declarationMap"],
+            },
+        ],
+    });
+
+    verifyTsc({
+        scenario: "noEmitOnError",
+        subScenario: `when declarationMap changes with outFile`,
+        fs: () =>
+            loadProjectFromFiles({
+                "/src/project/tsconfig.json": jsonToReadableText({
+                    compilerOptions: {
+                        noEmitOnError: true,
+                        declaration: true,
+                        composite: true,
+                        outFile: "../outFile.js",
+                    },
+                }),
+                "/src/project/a.ts": "const x = 10;",
+                "/src/project/b.ts": "const y = 10;",
+            }),
+        commandLineArgs: ["--p", "/src/project"],
+        edits: [
+            {
+                caption: "error and enable declarationMap",
+                edit: fs => replaceText(fs, "/src/project/a.ts", "x", "x: 20"),
+                commandLineArgs: ["--p", "/src/project", "--declarationMap"],
+            },
+            {
+                caption: "fix error declarationMap",
+                edit: fs => replaceText(fs, "/src/project/a.ts", "x: 20", "x"),
+                commandLineArgs: ["--p", "/src/project", "--declarationMap"],
+            },
+        ],
+    });
+
+    verifyTsc({
+        scenario: "noEmitOnError",
+        subScenario: "file deleted before fixing error with noEmitOnError",
+        fs: () =>
+            loadProjectFromFiles({
+                "/src/project/tsconfig.json": jsonToReadableText({
+                    compilerOptions: {
+                        outDir: "outDir",
+                        noEmitOnError: true,
+                    },
+                }),
+                "/src/project/file1.ts": `export const x: 30 = "hello";`,
+                "/src/project/file2.ts": `export class D { }`,
+            }),
+        commandLineArgs: ["--p", "/src/project", "-i"],
+        edits: [{
+            caption: "delete file without error",
+            edit: fs => fs.unlinkSync("/src/project/file2.ts"),
+        }],
+        baselinePrograms: true,
+    });
+
+    verifyTsc({
+        scenario: "noEmitOnError",
+        subScenario: "file deleted before fixing error with noEmitOnError with outFile",
+        fs: () =>
+            loadProjectFromFiles({
+                "/src/project/tsconfig.json": jsonToReadableText({
+                    compilerOptions: {
+                        outFile: "../outFile.js",
+                        module: "amd",
+                        noEmitOnError: true,
+                    },
+                }),
+                "/src/project/file1.ts": `export const x: 30 = "hello";`,
+                "/src/project/file2.ts": `export class D { }`,
+            }),
+        commandLineArgs: ["--p", "/src/project", "-i"],
+        edits: [{
+            caption: "delete file without error",
+            edit: fs => fs.unlinkSync("/src/project/file2.ts"),
+        }],
+        baselinePrograms: true,
+    });
 });
-
-function getClass(sourceFile: SourceFile, pos: number): ClassLikeDeclaration {
-    // Token is the identifier in the case of a class declaration
-    // or the class keyword token in the case of a class expression.
-    const token = getTokenAtPosition(sourceFile, pos);
-    return cast(token.parent, isClassLike);
-}
-
-function addMissingMembers(classDeclaration: ClassLikeDeclaration, sourceFile: SourceFile, context: TypeConstructionContext, changeTracker: textChanges.ChangeTracker, preferences: UserPreferences): void {
-    const extendsNode = getEffectiveBaseTypeNode(classDeclaration)!;
-    const checker = context.program.getTypeChecker();
-    const instantiatedExtendsType = checker.getTypeAtLocation(extendsNode);
-
-    // Note that this is ultimately derived from a map indexed by symbol names,
-    // so duplicates cannot occur.
-    const abstractAndNonPrivateExtendsSymbols = checker.getPropertiesOfType(instantiatedExtendsType).filter(symbolPointsToNonPrivateAndAbstractMember);
-
-    const importAdder = createImportAdder(sourceFile, context.program, preferences, context.host);
-    createMissingMemberNodes(classDeclaration, abstractAndNonPrivateExtendsSymbols, sourceFile, context, preferences, importAdder, member => changeTracker.insertMemberAtStart(sourceFile, classDeclaration, member as ClassElement));
-    importAdder.writeFixes(changeTracker);
-}
-
-function symbolPointsToNonPrivateAndAbstractMember(symbol: Symbol): boolean {
-    // See `codeFixClassExtendAbstractProtectedProperty.ts` in https://github.com/Microsoft/TypeScript/pull/11547/files
-    // (now named `codeFixClassExtendAbstractPrivateProperty.ts`)
-    const flags = getSyntacticModifierFlags(first(symbol.getDeclarations()!));
-    return !(flags & ModifierFlags.Private) && !!(flags & ModifierFlags.Abstract);
-}

@@ -2,173 +2,177 @@ from __future__ import annotations
 
 import typing as t
 
-from werkzeug.exceptions import BadRequest
-from werkzeug.exceptions import HTTPException
-from werkzeug.wrappers import Request as RequestBase
-from werkzeug.wrappers import Response as ResponseBase
+from jinja2.loaders import BaseLoader
+from werkzeug.routing import RequestRedirect
 
-from . import json
-from .globals import current_app
-from .helpers import _split_blueprint_path
+from .blueprints import Blueprint
+from .globals import request_ctx
+from .sansio.app import App
 
-if t.TYPE_CHECKING:  # pragma: no cover
-    from werkzeug.routing import Rule
+if t.TYPE_CHECKING:
+    from .sansio.scaffold import Scaffold
+    from .wrappers import Request
 
 
-class Request(RequestBase):
-    """The request object used by default in Flask.  Remembers the
-    matched endpoint and view arguments.
-
-    It is what ends up as :class:`~flask.request`.  If you want to replace
-    the request object used you can subclass this and set
-    :attr:`~flask.Flask.request_class` to your subclass.
-
-    The request object is a :class:`~werkzeug.wrappers.Request` subclass and
-    provides all of the attributes Werkzeug defines plus a few Flask
-    specific ones.
+class UnexpectedUnicodeError(AssertionError, UnicodeError):
+    """Raised in places where we want some better error reporting for
+    unexpected unicode or binary data.
     """
 
-    json_module: t.Any = json
 
-    #: The internal URL rule that matched the request.  This can be
-    #: useful to inspect which methods are allowed for the URL from
-    #: a before/after handler (``request.url_rule.methods``) etc.
-    #: Though if the request's method was invalid for the URL rule,
-    #: the valid list is available in ``routing_exception.valid_methods``
-    #: instead (an attribute of the Werkzeug exception
-    #: :exc:`~werkzeug.exceptions.MethodNotAllowed`)
-    #: because the request was never internally bound.
-    #:
-    #: .. versionadded:: 0.6
-    url_rule: Rule | None = None
+class DebugFilesKeyError(KeyError, AssertionError):
+    """Raised from request.files during debugging.  The idea is that it can
+    provide a better error message than just a generic KeyError/BadRequest.
+    """
 
-    #: A dict of view arguments that matched the request.  If an exception
-    #: happened when matching, this will be ``None``.
-    view_args: dict[str, t.Any] | None = None
+    def __init__(self, request: Request, key: str) -> None:
+        form_matches = request.form.getlist(key)
+        buf = [
+            f"You tried to access the file {key!r} in the request.files"
+            " dictionary but it does not exist. The mimetype for the"
+            f" request is {request.mimetype!r} instead of"
+            " 'multipart/form-data' which means that no file contents"
+            " were transmitted. To fix this error you should provide"
+            ' enctype="multipart/form-data" in your form.'
+        ]
+        if form_matches:
+            names = ", ".join(repr(x) for x in form_matches)
+            buf.append(
+                "\n\nThe browser instead transmitted some file names. "
+                f"This was submitted: {names}"
+            )
+        self.msg = "".join(buf)
 
-    #: If matching the URL failed, this is the exception that will be
-    #: raised / was raised as part of the request handling.  This is
-    #: usually a :exc:`~werkzeug.exceptions.NotFound` exception or
-    #: something similar.
-    routing_exception: HTTPException | None = None
+    def __str__(self) -> str:
+        return self.msg
 
-    @property
-    def max_content_length(self) -> int | None:  # type: ignore[override]
-        """Read-only view of the ``MAX_CONTENT_LENGTH`` config key."""
-        if current_app:
-            return current_app.config["MAX_CONTENT_LENGTH"]  # type: ignore[no-any-return]
+
+class FormDataRoutingRedirect(AssertionError):
+    """This exception is raised in debug mode if a routing redirect
+    would cause the browser to drop the method or body. This happens
+    when method is not GET, HEAD or OPTIONS and the status code is not
+    307 or 308.
+    """
+
+    def __init__(self, request: Request) -> None:
+        exc = request.routing_exception
+        assert isinstance(exc, RequestRedirect)
+        buf = [
+            f"A request was sent to '{request.url}', but routing issued"
+            f" a redirect to the canonical URL '{exc.new_url}'."
+        ]
+
+        if f"{request.base_url}/" == exc.new_url.partition("?")[0]:
+            buf.append(
+                " The URL was defined with a trailing slash. Flask"
+                " will redirect to the URL with a trailing slash if it"
+                " was accessed without one."
+            )
+
+        buf.append(
+            " Send requests to the canonical URL, or use 307 or 308 for"
+            " routing redirects. Otherwise, browsers will drop form"
+            " data.\n\n"
+            "This exception is only raised in debug mode."
+        )
+        super().__init__("".join(buf))
+
+
+def attach_enctype_error_multidict(request: Request) -> None:
+    """Patch ``request.files.__getitem__`` to raise a descriptive error
+    about ``enctype=multipart/form-data``.
+
+    :param request: The request to patch.
+    :meta private:
+    """
+    oldcls = request.files.__class__
+
+    class newcls(oldcls):  # type: ignore[valid-type, misc]
+        def __getitem__(self, key: str) -> t.Any:
+            try:
+                return super().__getitem__(key)
+            except KeyError as e:
+                if key not in request.form:
+                    raise
+
+                raise DebugFilesKeyError(request, key).with_traceback(
+                    e.__traceback__
+                ) from None
+
+    newcls.__name__ = oldcls.__name__
+    newcls.__module__ = oldcls.__module__
+    request.files.__class__ = newcls
+
+
+def _dump_loader_info(loader: BaseLoader) -> t.Iterator[str]:
+    yield f"class: {type(loader).__module__}.{type(loader).__name__}"
+    for key, value in sorted(loader.__dict__.items()):
+        if key.startswith("_"):
+            continue
+        if isinstance(value, (tuple, list)):
+            if not all(isinstance(x, str) for x in value):
+                continue
+            yield f"{key}:"
+            for item in value:
+                yield f"  - {item}"
+            continue
+        elif not isinstance(value, (str, int, float, bool)):
+            continue
+        yield f"{key}: {value!r}"
+
+
+def explain_template_loading_attempts(
+    app: App,
+    template: str,
+    attempts: list[
+        tuple[
+            BaseLoader,
+            Scaffold,
+            tuple[str, str | None, t.Callable[[], bool] | None] | None,
+        ]
+    ],
+) -> None:
+    """This should help developers understand what failed"""
+    info = [f"Locating template {template!r}:"]
+    total_found = 0
+    blueprint = None
+    if request_ctx and request_ctx.request.blueprint is not None:
+        blueprint = request_ctx.request.blueprint
+
+    for idx, (loader, srcobj, triple) in enumerate(attempts):
+        if isinstance(srcobj, App):
+            src_info = f"application {srcobj.import_name!r}"
+        elif isinstance(srcobj, Blueprint):
+            src_info = f"blueprint {srcobj.name!r} ({srcobj.import_name})"
         else:
-            return None
+            src_info = repr(srcobj)
 
-    @property
-    def endpoint(self) -> str | None:
-        """The endpoint that matched the request URL.
+        info.append(f"{idx + 1:5}: trying loader of {src_info}")
 
-        This will be ``None`` if matching failed or has not been
-        performed yet.
+        for line in _dump_loader_info(loader):
+            info.append(f"       {line}")
 
-        This in combination with :attr:`view_args` can be used to
-        reconstruct the same URL or a modified URL.
-        """
-        if self.url_rule is not None:
-            return self.url_rule.endpoint
+        if triple is None:
+            detail = "no match"
+        else:
+            detail = f"found ({triple[1] or '<string>'!r})"
+            total_found += 1
+        info.append(f"       -> {detail}")
 
-        return None
+    seems_fishy = False
+    if total_found == 0:
+        info.append("Error: the template could not be found.")
+        seems_fishy = True
+    elif total_found > 1:
+        info.append("Warning: multiple loaders returned a match for the template.")
+        seems_fishy = True
 
-    @property
-    def blueprint(self) -> str | None:
-        """The registered name of the current blueprint.
+    if blueprint is not None and seems_fishy:
+        info.append(
+            "  The template was looked up from an endpoint that belongs"
+            f" to the blueprint {blueprint!r}."
+        )
+        info.append("  Maybe you did not place a template in the right folder?")
+        info.append("  See https://flask.palletsprojects.com/blueprints/#templates")
 
-        This will be ``None`` if the endpoint is not part of a
-        blueprint, or if URL matching failed or has not been performed
-        yet.
-
-        This does not necessarily match the name the blueprint was
-        created with. It may have been nested, or registered with a
-        different name.
-        """
-        endpoint = self.endpoint
-
-        if endpoint is not None and "." in endpoint:
-            return endpoint.rpartition(".")[0]
-
-        return None
-
-    @property
-    def blueprints(self) -> list[str]:
-        """The registered names of the current blueprint upwards through
-        parent blueprints.
-
-        This will be an empty list if there is no current blueprint, or
-        if URL matching failed.
-
-        .. versionadded:: 2.0.1
-        """
-        name = self.blueprint
-
-        if name is None:
-            return []
-
-        return _split_blueprint_path(name)
-
-    def _load_form_data(self) -> None:
-        super()._load_form_data()
-
-        # In debug mode we're replacing the files multidict with an ad-hoc
-        # subclass that raises a different error for key errors.
-        if (
-            current_app
-            and current_app.debug
-            and self.mimetype != "multipart/form-data"
-            and not self.files
-        ):
-            from .debughelpers import attach_enctype_error_multidict
-
-            attach_enctype_error_multidict(self)
-
-    def on_json_loading_failed(self, e: ValueError | None) -> t.Any:
-        try:
-            return super().on_json_loading_failed(e)
-        except BadRequest as e:
-            if current_app and current_app.debug:
-                raise
-
-            raise BadRequest() from e
-
-
-class Response(ResponseBase):
-    """The response object that is used by default in Flask.  Works like the
-    response object from Werkzeug but is set to have an HTML mimetype by
-    default.  Quite often you don't have to create this object yourself because
-    :meth:`~flask.Flask.make_response` will take care of that for you.
-
-    If you want to replace the response object used you can subclass this and
-    set :attr:`~flask.Flask.response_class` to your subclass.
-
-    .. versionchanged:: 1.0
-        JSON support is added to the response, like the request. This is useful
-        when testing to get the test client response data as JSON.
-
-    .. versionchanged:: 1.0
-
-        Added :attr:`max_cookie_size`.
-    """
-
-    default_mimetype: str | None = "text/html"
-
-    json_module = json
-
-    autocorrect_location_header = False
-
-    @property
-    def max_cookie_size(self) -> int:  # type: ignore
-        """Read-only view of the :data:`MAX_COOKIE_SIZE` config key.
-
-        See :attr:`~werkzeug.wrappers.Response.max_cookie_size` in
-        Werkzeug's docs.
-        """
-        if current_app:
-            return current_app.config["MAX_COOKIE_SIZE"]  # type: ignore[no-any-return]
-
-        # return Werkzeug's default when not in an app context
-        return super().max_cookie_size
+    app.logger.info("\n".join(info))

@@ -1,21 +1,99 @@
----
-title: 0CTF 2023 Writeups
-date: 2023-12-11 13:40:00
-catalog: true
-tags: [Security]
-categories: [Security]
-photos: /img/0ctf-2023-writeup/cover-en.png
----
+Compared to Same Origin, Same Site is obviously more relaxed. Even if the ports are different, it is still Same Site, and as long as the host belongs to the same parent domain, it is basically Same Site.
 
-This year's 0CTF had a total of three web challenges, one of which was client-side. I only solved this particular challenge and managed to get the first blood. This post will briefly document my solution.
+However, as I mentioned at the beginning, although the above definitions are correct in most cases, they are not precise. Let's take a look at the spec to see what exceptions there are.
 
-Keyword list:
+## Examining Same Origin
 
-1. CSS injection
-2. CSS exfiltration
+In the article [CORS Complete Guide (Part 1): Why CORS Errors Occur?](https://blog.huli.tw/2021/02/19/cors-guide-1/), I mentioned the definition of Origin. In the [7.5 Origin](https://html.spec.whatwg.org/multipage/origin.html#origin) section of the HTML specification, you can see the complete definition. Let's first take a look at the explanation of Origin in the specification:
 
-<!-- more -->
+> Origins are the fundamental currency of the web's security model. Two actors in the web platform that share an origin are assumed to trust each other and to have the same authority. Actors with differing origins are considered potentially hostile versus each other, and are isolated from each other to varying degrees.
 
-## Web - newdiary (14 solves)
+This passage explains that if two websites share the same origin, they trust each other and have the same authority. If they have different origins, they are considered potentially hostile and are isolated from each other to varying degrees.
 
-The challenge is a typical note-taking app where you can create notes and report them to an admin bot. The notes have a length restriction but no filtering is applied. The client-side uses innerHTML directly, so HTML injection is evident:
+The specification divides origins into two types: "An opaque origin" and "A tuple origin". Opaque origins are special cases that occur in certain situations, such as when a web page is opened locally and the URL is "file:///...". In this case, the origin is an opaque origin, which is "null".
+
+Tuple origins are more common and are of greater concern. The document states that a tuple contains:
+
+1. Scheme (an ASCII string).
+2. Host (a host).
+3. Port (null or a 16-bit unsigned integer).
+4. Domain (null or a domain). Null unless stated otherwise.
+
+You may wonder why there is both a host and a domain. We will discuss this later.
+
+The specification also includes an algorithm for determining whether two origins, A and B, are the same origin:
+
+1. If A and B are the same opaque origin, then return true.
+2. If A and B are both tuple origins and their schemes, hosts, and port are identical, then return true.
+3. Return false.
+
+Either the two are the same opaque origin, or their schemes, hosts, and ports are all the same to be the same origin. In addition to the same origin, you will also see the term "same origin-domain" in the spec, which we will discuss later.
+
+As I mentioned earlier, the same origin is a strict restriction. For example, for the URL "https://huli.tw/api", because the origin does not include the path, its origin will be "https://huli.tw". This means that the URLs of websites that share the same origin must all be "https://huli.tw/*" to be considered the same origin.
+
+Although "https://huli.tw" and "https://blog.huli.tw" are only related to domain and subdomain, they are not the same origin because the hosts are different.
+
+Remember this, it is important.
+
+The definition of origin and same origin explored here, as well as the "inaccurate statement" mentioned at the beginning, differ in that there is an opaque origin and same origin-domain, and the origin tuple includes a "domain" that we did not use.
+
+Finally, one more thing to note is that when I say "'https://huli.tw/api' has an origin of 'https://huli.tw'", a more accurate statement is: "'https://huli.tw/api' serialized its origin as 'https://huli.tw'". 
+
+This is because the origin is actually a tuple, which is represented as follows: "(https, huli.tw, null, null)". The tuple becomes a string, which is "https://huli.tw". When the information represented by both the tuple and the serialized string is similar, I prefer to use the latter method.
+
+## Examining SameSite
+
+The definition of site is also in the same spec, which states:
+
+> A site is an opaque origin or a scheme-and-host.
+
+Therefore, a site can be an opaque origin or a scheme-and-host.
+
+In the spec, we can find another term called "schemelessly same site" in addition to same site, and the difference between the two is also very clear. Same site considers the scheme, while schemelessly same site does not.
+
+Therefore, the algorithm for determining whether two origins A and B are same site is as follows:
+
+> Two origins, A and B, are said to be same site if both of the following statements are true:
+> 
+> * A and B are schemelessly same site  
+> * A and B are either both opaque origins, or both tuple origins with the same scheme
+
+If A and B are same site, either they are both opaque origins, or both have the same scheme and are schemelessly same site.
+
+So same site considers the scheme, and two URLs with different schemes like http and https will never be same site, but they may be schemelessly same site.
+
+There is actually a small historical context here. When same site was first introduced, it did not consider the scheme, and it was not until later that the scheme was included in the consideration.
+
+In this 2016 RFC: Same-site Cookies, you can see that the judgment of same site did not include the scheme, so at that time, `https://huli.tw` and `http://huli.tw` were same site.
+
+It wasn't until June 2019 that the discussion began on whether to include the scheme in the consideration. For more details, please refer to: Treat http://foo.com -> https://foo.com requests as Sec-Fetch-Site: cross-site. #34.
+
+At that time, the spec for same site was not defined in the HTML spec we see today, but in another URL spec, so the discussion was moved there: Consider introducing a "same-site" concept that includes scheme. #448, and then in September 2019, this PR was created: Tighten 'same site' checks to include 'scheme'. #449, which officially included the scheme in the consideration in the specification, defining same site as "considering the scheme", while a new term was introduced for not considering the scheme: schemelessly same site.
+
+Then, two months later, the relevant spec was moved from URL to HTML. Please refer to these two PRs: Let HTML handle the "same site" definition #457, Define (schemelessly) same site for origins #5076.
+
+Spec is spec, and sometimes specification revisions do not mean that browsers will immediately follow suit. So what is the current implementation of browsers?
+
+In November 2020, Chrome wrote an article: Schemeful Same-Site, which seems to still consider different schemes as same site at that time, but from Chrome platform status: Feature: Schemeful same-site, we can see that Chrome has included the scheme in the consideration since version 89.
+
+As for Firefox, from the status of this issue: [meta] Enable cookie sameSite schemeful, it seems that it has not yet considered this behavior as the default value, and if there is no special setting adjustment, different schemes will also be considered as same site.
+
+After reviewing the history, let's take a look at how the most important schemelessly same site is determined:
+
+![schemelessly same site](/img/same-site-to-same-origin/p1-schemelessly-same-site.png)
+
+We won't discuss the opaque part for now. The key point above is obviously a new term: "registrable domain," which is used to compare two hosts when determining if they are the same site.
+
+The definition of this registrable domain is in another [URL spec](https://url.spec.whatwg.org/#host-registrable-domain):
+
+> A host’s registrable domain is a domain formed by the most specific public suffix, along with the domain label immediately preceding it, if any.
+
+Here, another new term is mentioned: "public suffix," which we discussed in the [DoS attack using Cookie features: Cookie Bomb](https://blog.huli.tw/2021/07/10/cookie-bomb/) post.
+
+An example will make it easier to understand. The registrable domain of `blog.huli.tw` is `huli.tw`, and the registrable domain of `huli.tw` is also `huli.tw`.
+
+However, the registrable domain of `bob.github.io` is not `github.io`, but `bob.github.io`.
+
+Why is that? I'll explain briefly below.
+
+If there were no concepts of "registrable domain" and "public suffix," then the definition of same site would be what we mentioned earlier: `huli.tw` and `blog.huli.tw` are the same site, which is not a problem.

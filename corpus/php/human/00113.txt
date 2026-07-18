@@ -10,130 +10,178 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Plugin;
+namespace Composer\Test\Command;
 
-use Composer\EventDispatcher\Event;
-use Composer\Package\PackageInterface;
+use Composer\Test\TestCase;
+use RuntimeException;
 
-/**
- * The post file download event.
- *
- * @author Nils Adermann <naderman@naderman.de>
- */
-class PostFileDownloadEvent extends Event
+class ConfigCommandTest extends TestCase
 {
     /**
-     * @var string
+     * @dataProvider provideConfigUpdates
+     * @param array<mixed> $before
+     * @param array<mixed> $command
+     * @param array<mixed> $expected
      */
-    private $fileName;
-
-    /**
-     * @var string|null
-     */
-    private $checksum;
-
-    /**
-     * @var string
-     */
-    private $url;
-
-    /**
-     * @var mixed
-     */
-    private $context;
-
-    /**
-     * @var string
-     */
-    private $type;
-
-    /**
-     * Constructor.
-     *
-     * @param string      $name     The event name
-     * @param string|null $fileName The file name
-     * @param string|null $checksum The checksum
-     * @param string      $url      The processed url
-     * @param string      $type     The type (package or metadata).
-     * @param mixed       $context  Additional context for the download.
-     */
-    public function __construct(string $name, ?string $fileName, ?string $checksum, string $url, string $type, $context = null)
+    public function testConfigUpdates(array $before, array $command, array $expected): void
     {
-        /** @phpstan-ignore instanceof.alwaysFalse, booleanAnd.alwaysFalse */
-        if ($context === null && $type instanceof PackageInterface) {
-            $context = $type;
-            $type = 'package';
-            trigger_error('PostFileDownloadEvent::__construct should receive a $type=package and the package object in $context since Composer 2.1.', E_USER_DEPRECATED);
-        }
+        $this->initTempComposer($before);
 
-        parent::__construct($name);
-        $this->fileName = $fileName;
-        $this->checksum = $checksum;
-        $this->url = $url;
-        $this->context = $context;
-        $this->type = $type;
+        $appTester = $this->getApplicationTester();
+        $appTester->run(array_merge(['command' => 'config'], $command));
+
+        $appTester->assertCommandIsSuccessful($appTester->getDisplay());
+
+        self::assertSame($expected, json_decode((string) file_get_contents('composer.json'), true));
+    }
+
+    public static function provideConfigUpdates(): \Generator
+    {
+        yield 'set scripts' => [
+            [],
+            ['setting-key' => 'scripts.test', 'setting-value' => ['foo bar']],
+            ['scripts' => ['test' => 'foo bar']],
+        ];
+        yield 'unset scripts' => [
+            ['scripts' => ['test' => 'foo bar', 'lala' => 'baz']],
+            ['setting-key' => 'scripts.lala', '--unset' => true],
+            ['scripts' => ['test' => 'foo bar']],
+        ];
+        yield 'set single config with bool normalizer' => [
+            [],
+            ['setting-key' => 'use-github-api', 'setting-value' => ['1']],
+            ['config' => ['use-github-api' => true]],
+        ];
+        yield 'set multi config' => [
+            [],
+            ['setting-key' => 'github-protocols', 'setting-value' => ['https', 'git']],
+            ['config' => ['github-protocols' => ['https', 'git']]],
+        ];
+        yield 'set version' => [
+            [],
+            ['setting-key' => 'version', 'setting-value' => ['1.0.0']],
+            ['version' => '1.0.0'],
+        ];
+        yield 'unset version' => [
+            ['version' => '1.0.0'],
+            ['setting-key' => 'version', '--unset' => true],
+            [],
+        ];
+        yield 'unset arbitrary property' => [
+            ['random-prop' => '1.0.0'],
+            ['setting-key' => 'random-prop', '--unset' => true],
+            [],
+        ];
+        yield 'set preferred-install' => [
+            [],
+            ['setting-key' => 'preferred-install.foo/*', 'setting-value' => ['source']],
+            ['config' => ['preferred-install' => ['foo/*' => 'source']]],
+        ];
+        yield 'unset preferred-install' => [
+            ['config' => ['preferred-install' => ['foo/*' => 'source']]],
+            ['setting-key' => 'preferred-install.foo/*', '--unset' => true],
+            ['config' => ['preferred-install' => []]],
+        ];
+        yield 'unset platform' => [
+            ['config' => ['platform' => ['php' => '7.2.5'], 'platform-check' => false]],
+            ['setting-key' => 'platform.php', '--unset' => true],
+            ['config' => ['platform' => [], 'platform-check' => false]],
+        ];
+        yield 'set extra with merge' => [
+            [],
+            ['setting-key' => 'extra.patches.foo/bar', 'setting-value' => ['{"123":"value"}'], '--json' => true, '--merge' => true],
+            ['extra' => ['patches' => ['foo/bar' => [123 => 'value']]]],
+        ];
+        yield 'combine extra with merge' => [
+            ['extra' => ['patches' => ['foo/bar' => [5 => 'oldvalue']]]],
+            ['setting-key' => 'extra.patches.foo/bar', 'setting-value' => ['{"123":"value"}'], '--json' => true, '--merge' => true],
+            ['extra' => ['patches' => ['foo/bar' => [123 => 'value', 5 => 'oldvalue']]]],
+        ];
+        yield 'combine extra with list' => [
+            ['extra' => ['patches' => ['foo/bar' => ['oldvalue']]]],
+            ['setting-key' => 'extra.patches.foo/bar', 'setting-value' => ['{"123":"value"}'], '--json' => true, '--merge' => true],
+            ['extra' => ['patches' => ['foo/bar' => [123 => 'value', 0 => 'oldvalue']]]],
+        ];
+        yield 'overwrite extra with merge' => [
+            ['extra' => ['patches' => ['foo/bar' => [123 => 'oldvalue']]]],
+            ['setting-key' => 'extra.patches.foo/bar', 'setting-value' => ['{"123":"value"}'], '--json' => true, '--merge' => true],
+            ['extra' => ['patches' => ['foo/bar' => [123 => 'value']]]],
+        ];
+        yield 'unset autoload' => [
+            ['autoload' => ['psr-4' => ['test'], 'classmap' => ['test']]],
+            ['setting-key' => 'autoload.psr-4', '--unset' => true],
+            ['autoload' => ['classmap' => ['test']]],
+        ];
+        yield 'unset autoload-dev' => [
+            ['autoload-dev' => ['psr-4' => ['test'], 'classmap' => ['test']]],
+            ['setting-key' => 'autoload-dev.psr-4', '--unset' => true],
+            ['autoload-dev' => ['classmap' => ['test']]],
+        ];
     }
 
     /**
-     * Retrieves the target file name location.
-     *
-     * If this download is of type metadata, null is returned.
+     * @dataProvider provideConfigReads
+     * @param array<mixed> $composerJson
+     * @param array<mixed> $command
      */
-    public function getFileName(): ?string
+    public function testConfigReads(array $composerJson, array $command, string $expected): void
     {
-        return $this->fileName;
+        $this->initTempComposer($composerJson);
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run(array_merge(['command' => 'config'], $command));
+
+        $appTester->assertCommandIsSuccessful();
+
+        self::assertSame($expected, trim($appTester->getDisplay(true)));
+        self::assertSame($composerJson, json_decode((string) file_get_contents('composer.json'), true), 'The composer.json should not be modified by config reads');
     }
 
-    /**
-     * Gets the checksum.
-     */
-    public function getChecksum(): ?string
+    public static function provideConfigReads(): \Generator
     {
-        return $this->checksum;
+        yield 'read description' => [
+            ['description' => 'foo bar'],
+            ['setting-key' => 'description'],
+            'foo bar',
+        ];
+        yield 'read vendor-dir with source' => [
+            ['config' => ['vendor-dir' => 'lala']],
+            ['setting-key' => 'vendor-dir', '--source' => true],
+            'lala (./composer.json)',
+        ];
+        yield 'read default vendor-dir' => [
+            [],
+            ['setting-key' => 'vendor-dir'],
+            'vendor',
+        ];
+        yield 'read repos by named key' => [
+            ['repositories' => ['foo' => ['type' => 'vcs', 'url' => 'https://example.org'], 'packagist.org' => ['type' => 'composer', 'url' => 'https://repo.packagist.org']]],
+            ['setting-key' => 'repositories.foo'],
+            '{"type":"vcs","url":"https://example.org"}',
+        ];
+        yield 'read repos by numeric index' => [
+            ['repositories' => [['type' => 'vcs', 'url' => 'https://example.org'], 'packagist.org' => ['type' => 'composer', 'url' => 'https://repo.packagist.org']]],
+            ['setting-key' => 'repos.0'],
+            '{"type":"vcs","url":"https://example.org"}',
+        ];
+        yield 'read all repos includes the default packagist' => [
+            ['repositories' => ['foo' => ['type' => 'vcs', 'url' => 'https://example.org'], 'packagist.org' => ['type' => 'composer', 'url' => 'https://repo.packagist.org']]],
+            ['setting-key' => 'repos'],
+            '{"foo":{"type":"vcs","url":"https://example.org"},"packagist.org":{"type":"composer","url":"https://repo.packagist.org"}}',
+        ];
+        yield 'read all repos does not include the disabled packagist' => [
+            ['repositories' => ['foo' => ['type' => 'vcs', 'url' => 'https://example.org'], 'packagist.org' => false]],
+            ['setting-key' => 'repos'],
+            '{"foo":{"type":"vcs","url":"https://example.org"}}',
+        ];
     }
 
-    /**
-     * Gets the processed URL.
-     */
-    public function getUrl(): string
+    public function testConfigThrowsForInvalidArgCombination(): void
     {
-        return $this->url;
-    }
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('--file and --global can not be combined');
 
-    /**
-     * Returns the context of this download, if any.
-     *
-     * If this download is of type package, the package object is returned. If
-     * this download is of type metadata, an array{response: Response, repository: RepositoryInterface} is returned.
-     *
-     * @return mixed
-     */
-    public function getContext()
-    {
-        return $this->context;
-    }
-
-    /**
-     * Get the package.
-     *
-     * If this download is of type metadata, null is returned.
-     *
-     * @return \Composer\Package\PackageInterface|null The package.
-     * @deprecated Use getContext instead
-     */
-    public function getPackage(): ?PackageInterface
-    {
-        trigger_error('PostFileDownloadEvent::getPackage is deprecated since Composer 2.1, use getContext instead.', E_USER_DEPRECATED);
-        $context = $this->getContext();
-
-        return $context instanceof PackageInterface ? $context : null;
-    }
-
-    /**
-     * Returns the type of this download (package, metadata).
-     */
-    public function getType(): string
-    {
-        return $this->type;
+        $appTester = $this->getApplicationTester();
+        $appTester->run(['command' => 'config', '--file' => 'alt.composer.json', '--global' => true]);
     }
 }

@@ -1,76 +1,33 @@
-{-# LANGUAGE NoImplicitPrelude #-}
-{-# LANGUAGE OverloadedStrings #-}
+import Control.Monad (forM_, unless, when)
+import Data.List (isInfixOf, stripPrefix)
+import StackTest
 
--- | Function to parse command line arguments for Stack's @dot@ command and
--- certain command line arguments for Stack's @ls dependencies@ command.
-module Stack.Options.DotParser
-  ( dotOptsParser
-  ) where
+-- The package 'files' depends directly on filemanip, which depends directly on
+-- packages directory, filepath and unix-compat. Package directory also depends
+-- directly on filepath. Package unix-compat depends directly on directory,
+-- filepath, time, unix and Win32.
+-- The stack.yaml file, however, identifies filepath-1.4.100.4 as a local
+-- package. Consequently, filepath is a mutable package and the packages
+-- that depend on it should also be treated as mutable packages.
 
-import           Data.Char ( isSpace )
-import           Data.List.Split ( splitOn )
-import qualified Data.Set as Set
-import           Distribution.Types.PackageName ( mkPackageName )
-import           Options.Applicative
-                   ( Parser, auto, help, idm, long, metavar, option, strOption
-                   , switch
-                   )
-import           Options.Applicative.Builder.Extra ( boolFlags )
-import           Stack.Options.BuildParser ( flagsParser, targetsParser )
-import           Stack.Prelude
-import           Stack.Types.DotOpts ( DotOpts (..) )
-
--- | Parser for arguments to `stack dot`
-dotOptsParser :: Bool -> Parser DotOpts
-dotOptsParser externalDefault = DotOpts
-  <$> includeExternal
-  <*> includeBase
-  <*> depthLimit
-  <*> fmap (maybe Set.empty $ Set.fromList . splitNames) prunedPkgs
-  <*> targetsParser
-  <*> flagsParser
-  <*> testTargets
-  <*> benchTargets
-  <*> globalHints
- where
-  includeExternal = boolFlags externalDefault
-    "external"
-    "inclusion of external dependencies."
-    idm
-  includeBase = boolFlags True
-    "include-base"
-    "inclusion of dependencies on base."
-    idm
-  depthLimit = optional (option auto
-    (  long "depth"
-    <> metavar "DEPTH"
-    <> help "Limit the depth of dependency resolution. (default: no limit)"
-    ))
-  prunedPkgs = optional (strOption
-    (  long "prune"
-    <> metavar "PACKAGES"
-    <> help "Prune specified package(s). PACKAGES is a comma-separated list of \
-            \package names."
-    ))
-  testTargets = switch
-    (  long "test"
-    <> help "Consider dependencies of test components."
-    )
-  benchTargets = switch
-    (  long "bench"
-    <> help "Consider dependencies of benchmark components."
-    )
-
-  splitNames :: String -> [PackageName]
-  splitNames = map
-      ( mkPackageName
-      . takeWhile (not . isSpace)
-      . dropWhile isSpace
-      )
-    . splitOn ","
-
-  globalHints = switch
-    (  long "global-hints"
-    <> help "Do not require an install GHC; instead, use a hints file for \
-            \global packages."
-    )
+main :: IO ()
+main = unless isWindows $ do -- dependency issues on Windows
+    let isBuild package line =
+          case stripPrefix package line of
+            Just x -> "> build" `isInfixOf` line
+            Nothing -> False
+        expectRecompilation pkgs stderr = forM_ pkgs $ \p ->
+          unless (any (isBuild p) $ lines stderr) $
+          error $ "package " ++ show p ++ " recompilation was expected"
+        expectNoRecompilation pkgs stderr = forM_ pkgs $ \p ->
+          when (any (isBuild p) $ lines stderr) $
+          error $ "package " ++ show p ++ " recompilation was not expected"
+        mutablePackages = [ "filepath"
+                          , "directory"
+                          , "filemanip"
+                          , "files"
+                          ]
+    stackCheckStderr ["build"] $ expectRecompilation mutablePackages
+    stackCheckStderr ["build" , "--profile"] $ expectRecompilation mutablePackages
+    stackCheckStderr ["build"] $ expectNoRecompilation mutablePackages
+    stackCheckStderr ["build" , "--profile"] $ expectNoRecompilation mutablePackages

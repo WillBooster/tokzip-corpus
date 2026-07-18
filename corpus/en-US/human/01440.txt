@@ -1,52 +1,55 @@
-Deno supports sending bearer tokens when requesting a remote module. Bearer
-tokens are the predominant type of access token used with OAuth 2.0, and are
-broadly supported by hosting services (e.g., GitHub, GitLab, Bitbucket,
-Cloudsmith, etc.).
+## Encapsulating business logic with a service layer
 
-## DENO_AUTH_TOKENS
+When your application's persistence needs become more complex - such as when you
+need to create [secondary indexes](./secondary_indexes) to query your data by
+different keys, or maintain relationships between objects - you will want to
+create a set of functions to sit on top of your DTOs to ensure that the data
+being passed around is valid (and not merely typed correctly).
 
-The Deno CLI will look for an environment variable named `DENO_AUTH_TOKENS` to
-determine what authentication tokens it should consider using when requesting
-remote modules. The value of the environment variable is in the format of _n_
-number of tokens delimited by a semi-colon (`;`) where each token is either:
+From our business objects above, the `Post` object is complex enough where it is
+likely to need a small layer of code to save and retrieve an instance of the
+object. Below is an example of two functions that wrap the underlying Deno KV
+APIs, and return strongly typed object instances for the `Post` interface.
 
-- a bearer token in the format of `{token}@{hostname[:port]}` or
-- basic auth data in the format of `{username}:{password}@{hostname[:port]}`
+Notably, we need to store an identifier for an `Author` object, so we can
+retrieve author information from KV later.
 
-For example, a single token for `deno.land` would look something like this:
+```ts
+import { Author, Post } from "./model.ts";
 
-```sh
-DENO_AUTH_TOKENS=a1b2c3d4e5f6@deno.land
+const kv = await Deno.openKv();
+
+interface RawPost extends Post {
+  authorUsername: string;
+}
+
+export async function savePost(p: Post): Promise<Post> {
+  const postData: RawPost = Object.assign({}, p, {
+    authorUsername: p.author.username,
+  });
+
+  await kv.set(["posts", p.slug], postData);
+  return p;
+}
+
+export async function getPost(slug: string): Promise<Post> {
+  const postResponse = await kv.get(["posts", slug]);
+  const rawPost = postResponse.value as RawPost;
+  const authorResponse = await kv.get(["authors", rawPost.authorUsername]);
+
+  const author = authorResponse.value as Author;
+  const post = Object.assign({}, postResponse.value, {
+    author,
+  }) as Post;
+
+  return post;
+}
 ```
 
-or:
+This thin layer uses a `RawPost` interface, which extends the actual `Post`
+interface, to include some additional data that is used to reference data at
+another index (the associated `Author` object).
 
-```sh
-DENO_AUTH_TOKENS=username:password@deno.land
-```
-
-And multiple tokens would look like this:
-
-```sh
-DENO_AUTH_TOKENS=a1b2c3d4e5f6@deno.land;f1e2d3c4b5a6@example.com:8080;username:password@deno.land
-```
-
-When Deno goes to fetch a remote module, where the hostname matches the hostname
-of the remote module, Deno will set the `Authorization` header of the request to
-the value of `Bearer {token}` or `Basic {base64EncodedData}`. This allows the
-remote server to recognize that the request is an authorized request tied to a
-specific authenticated user, and provide access to the appropriate resources and
-modules on the server.
-
-## GitHub
-
-To access private repositories on GitHub, you would need to issue yourself a
-_personal access token_. You do this by logging into GitHub and going under
-_Settings -> Developer settings -> Personal access tokens_:
-
-![Personal access tokens settings on GitHub](./images/private-pat.png)
-
-You would then choose to _Generate new token_ and give your token a description
-and appropriate access to the `repo` scope. The `repo` scope will enable reading
-file contents (more on
-[scopes in the GitHub docs](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps#available-scopes)):
+The `savePost` and `getPost` functions take the place of a direct Deno KV `get`
+or `set` operation, so that they can properly serialize and "hydrate" model
+objects for us with appropriate types and associations.

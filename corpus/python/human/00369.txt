@@ -1,122 +1,227 @@
-"""Tools to provide pretty/human-readable display of objects."""
+from decimal import Decimal
+from fractions import Fraction
+from typing import Annotated
 
-from __future__ import annotations as _annotations
+import annotated_types
+import pytest
 
-import types
-from collections.abc import Callable, Collection, Generator, Iterable
-from typing import TYPE_CHECKING, Any, ForwardRef, TypeAlias, cast
-
-import typing_extensions
-from typing_inspection import typing_objects
-from typing_inspection.introspection import is_union_origin
-
-from . import _typing_extra
-
-if TYPE_CHECKING:
-    ReprArgs: TypeAlias = Iterable[tuple[str | None, Any]]
-    RichReprResult: TypeAlias = Iterable[Any | tuple[Any] | tuple[str, Any] | tuple[str, Any, Any]]
+from pydantic import Field, TypeAdapter, ValidationError
 
 
-class PlainRepr(str):
-    """String class where repr doesn't include quotes. Useful with Representation when you want to return a string
-    representation of something that is valid (or pseudo-valid) python.
-    """
-
-    def __repr__(self) -> str:
-        return str(self)
+class FractionSubclass(Fraction):
+    pass
 
 
-class Representation:
-    # Mixin to provide `__str__`, `__repr__`, and `__pretty__` and `__rich_repr__` methods.
-    # `__pretty__` is used by [devtools](https://python-devtools.helpmanual.io/).
-    # `__rich_repr__` is used by [rich](https://rich.readthedocs.io/en/stable/pretty.html).
-    # (this is not a docstring to avoid adding a docstring to classes which inherit from Representation)
-
-    __slots__ = ()
-
-    def __repr_args__(self) -> ReprArgs:
-        """Returns the attributes to show in __str__, __repr__, and __pretty__ this is generally overridden.
-
-        Can either return:
-        * name - value pairs, e.g.: `[('foo_name', 'foo'), ('bar_name', ['b', 'a', 'r'])]`
-        * or, just values, e.g.: `[(None, 'foo'), (None, ['b', 'a', 'r'])]`
-        """
-        attrs_names = cast(Collection[str], self.__slots__)
-        if not attrs_names and hasattr(self, '__dict__'):
-            attrs_names = self.__dict__.keys()
-        attrs = ((s, getattr(self, s)) for s in attrs_names)
-        return [(a, v if v is not self else self.__repr_recursion__(v)) for a, v in attrs if v is not None]
-
-    def __repr_name__(self) -> str:
-        """Name of the instance's class, used in __repr__."""
-        return self.__class__.__name__
-
-    def __repr_recursion__(self, object: Any) -> str:
-        """Returns the string representation of a recursive object."""
-        # This is copied over from the stdlib `pprint` module:
-        return f'<Recursion on {type(object).__name__} with id={id(object)}>'
-
-    def __repr_str__(self, join_str: str) -> str:
-        return join_str.join(repr(v) if a is None else f'{a}={v!r}' for a, v in self.__repr_args__())
-
-    def __pretty__(self, fmt: Callable[[Any], Any], **kwargs: Any) -> Generator[Any]:
-        """Used by devtools (https://python-devtools.helpmanual.io/) to pretty print objects."""
-        yield self.__repr_name__() + '('
-        yield 1
-        for name, value in self.__repr_args__():
-            if name is not None:
-                yield name + '='
-            yield fmt(value)
-            yield ','
-            yield 0
-        yield -1
-        yield ')'
-
-    def __rich_repr__(self) -> RichReprResult:
-        """Used by Rich (https://rich.readthedocs.io/en/stable/pretty.html) to pretty print objects."""
-        for name, field_repr in self.__repr_args__():
-            if name is None:
-                yield field_repr
-            else:
-                yield name, field_repr
-
-    def __str__(self) -> str:
-        return self.__repr_str__(' ')
-
-    def __repr__(self) -> str:
-        return f'{self.__repr_name__()}({self.__repr_str__(", ")})'
+@pytest.mark.parametrize(
+    'input_value,expected',
+    [
+        (0, Fraction(0)),
+        (1, Fraction(1)),
+        (42, Fraction(42)),
+        ('42', Fraction(42)),
+        ('42.123', Fraction('42.123')),
+        (42.0, Fraction(42)),
+        (42.5, Fraction('42.5')),
+        (Decimal('1.333'), Fraction('1.333')),
+        (1e10, Fraction('1E10')),
+        (Fraction('42.0'), Fraction(42)),
+        (Fraction('42.5'), Fraction('42.5')),
+        (Fraction('1e10'), Fraction('1E10')),
+        ('1/3', Fraction(1, 3)),
+        ('0/100', Fraction(0)),
+        (Fraction('1/3'), Fraction(1, 3)),
+        (Fraction('-47e-2'), Fraction(-47, 100)),
+        (
+            Fraction('123456789123456789123456789.123456789123456789123456789'),
+            Fraction('123456789123456789123456789.123456789123456789123456789'),
+        ),
+        (FractionSubclass('42.0'), Fraction(42)),
+        (FractionSubclass('42.5'), Fraction('42.5')),
+        (FractionSubclass('1e10'), Fraction('1E10')),
+        (True, Fraction(1)),
+        (False, Fraction(0)),
+    ],
+)
+def test_fraction(input_value, expected):
+    ta = TypeAdapter(Fraction)
+    assert ta.validate_python(input_value) == expected
 
 
-def display_as_type(obj: Any) -> str:
-    """Pretty representation of a type, should be as close as possible to the original type definition string.
+@pytest.mark.parametrize(
+    'json_str,expected',
+    [
+        ('"1/3"', Fraction(1, 3)),
+        ('"42.5"', Fraction('42.5')),
+        ('"0"', Fraction(0)),
+        ('42', Fraction(42)),
+        ('42.5', Fraction('42.5')),
+        ('"0/100"', Fraction(0)),
+        ('"-47e-2"', Fraction(-47, 100)),
+    ],
+)
+def test_fraction_validate_json(json_str, expected):
+    ta = TypeAdapter(Fraction)
+    assert ta.validate_json(json_str) == expected
 
-    Takes some logic from `typing._type_repr`.
-    """
-    if isinstance(obj, (types.FunctionType, types.BuiltinFunctionType)):
-        return obj.__name__
-    elif obj is ...:
-        return '...'
-    elif isinstance(obj, Representation):
-        return repr(obj)
-    elif isinstance(obj, ForwardRef) or typing_objects.is_typealiastype(obj):
-        return str(obj)
 
-    if not isinstance(obj, (_typing_extra.typing_base, _typing_extra.WithArgsTypes, type)):
-        obj = obj.__class__
+@pytest.mark.parametrize(
+    'str,expected',
+    [
+        ('1/3', Fraction(1, 3)),
+        ('42.5', Fraction('42.5')),
+        ('0', Fraction(0)),
+        ('42', Fraction(42)),
+        ('42.5', Fraction('42.5')),
+        ('0/100', Fraction(0)),
+        ('-47e-2', Fraction(-47, 100)),
+    ],
+)
+def test_fraction_validate_strings(str, expected):
+    ta = TypeAdapter(Fraction)
+    assert ta.validate_strings(str) == expected
 
-    if is_union_origin(typing_extensions.get_origin(obj)):
-        args = ', '.join(map(display_as_type, typing_extensions.get_args(obj)))
-        return f'Union[{args}]'
-    elif isinstance(obj, _typing_extra.WithArgsTypes):
-        if typing_objects.is_literal(typing_extensions.get_origin(obj)):
-            args = ', '.join(map(repr, typing_extensions.get_args(obj)))
-        else:
-            args = ', '.join(map(display_as_type, typing_extensions.get_args(obj)))
-        try:
-            return f'{obj.__qualname__}[{args}]'
-        except AttributeError:
-            return str(obj).replace('typing.', '').replace('typing_extensions.', '')  # handles TypeAliasType in 3.12
-    elif isinstance(obj, type):
-        return obj.__qualname__
-    else:
-        return repr(obj).replace('typing.', '').replace('typing_extensions.', '')
+
+@pytest.mark.parametrize(
+    'json_str,error',
+    [
+        ('"not a number"', ValidationError),
+        ('"1/0"', ValidationError),
+        (float('inf'), ValidationError),
+        (float('nan'), ValidationError),
+    ],
+)
+def test_fraction_validate_json_error(json_str, error):
+    ta = TypeAdapter(Fraction)
+    with pytest.raises(error):
+        ta.validate_json(json_str)
+
+
+@pytest.mark.parametrize(
+    'input_value',
+    [
+        (0),
+        (True),
+        (False),
+        ('not a number'),
+        ('1/0'),
+        ('1/3'),
+        (1.333),
+        (Decimal('1.333')),
+        (float('inf')),
+        (float('nan')),
+    ],
+)
+def test_fraction_validation_error_strict(input_value):
+    with pytest.raises(ValidationError):
+        ta = TypeAdapter(Fraction)
+        ta.validate_python(input_value, strict=True)
+
+
+@pytest.mark.parametrize(
+    'input_value',
+    [
+        Fraction(1, 3),
+        Fraction(0),
+        Fraction('42.5'),
+        FractionSubclass('1/7'),
+    ],
+)
+def test_fraction_strict_accepts_fraction(input_value):
+    ta = TypeAdapter(Fraction)
+    assert ta.validate_python(input_value, strict=True) == input_value
+
+
+@pytest.mark.parametrize(
+    ['input', 'error_type'],
+    [
+        ('wrong_format', 'fraction_parsing'),  # Raises `ValueError` internally
+        ('1/0', 'fraction_parsing'),  # Raises `ZeroDivisionError` internally
+        (float('inf'), 'fraction_parsing'),  # Raises `OverflowError` internally
+        (float('nan'), 'fraction_parsing'),  # Raises `ValueError` internally
+        (type, 'fraction_type'),  # Raises `TypeError` internally
+    ],
+)
+def test_fraction_validation_error(input: object, error_type: str):
+
+    ta = TypeAdapter(Fraction)
+
+    with pytest.raises(ValidationError, check=lambda e: e.errors()[0]['type'] == error_type):
+        ta.validate_python(input)
+
+
+@pytest.mark.parametrize(
+    'input_value,expected',
+    [
+        (Fraction(0), '0'),
+        (Fraction(1), '1'),
+        (Fraction(1, 3), '1/3'),
+        (Fraction(-1, 2), '-1/2'),
+        (Fraction('42.5'), '85/2'),
+        (Fraction('123456789/1000000'), '123456789/1000000'),
+    ],
+)
+def test_fraction_dump_python(input_value, expected):
+    ta = TypeAdapter(Fraction)
+    assert ta.dump_python(input_value) == expected
+
+
+@pytest.mark.parametrize(
+    'input_value,expected',
+    [
+        (Fraction(0), b'"0"'),
+        (Fraction(1), b'"1"'),
+        (Fraction(1, 3), b'"1/3"'),
+        (Fraction(-1, 2), b'"-1/2"'),
+        (Fraction('42.5'), b'"85/2"'),
+        (Fraction('123456789/1000000'), b'"123456789/1000000"'),
+    ],
+)
+def test_fraction_dump_json(input_value, expected):
+    ta = TypeAdapter(Fraction)
+    assert ta.dump_json(input_value) == expected
+
+
+@pytest.mark.parametrize(
+    'constraint,input_value,expected',
+    [
+        (annotated_types.Gt(0), '1/3', Fraction(1, 3)),
+        (annotated_types.Ge(0), 0, Fraction(0)),
+        (annotated_types.Ge(0), '1/3', Fraction(1, 3)),
+        (annotated_types.Lt(1), '1/3', Fraction(1, 3)),
+        (annotated_types.Le(1), 1, Fraction(1)),
+        (annotated_types.Le(1), '1/3', Fraction(1, 3)),
+        # float bound
+        (annotated_types.Gt(0.5), 1, Fraction(1)),
+    ],
+)
+def test_fraction_constraints(constraint, input_value, expected):
+    ta = TypeAdapter(Annotated[Fraction, constraint])
+    assert ta.validate_python(input_value) == expected
+
+
+@pytest.mark.parametrize(
+    'constraint,input_value',
+    [
+        (annotated_types.Gt(0), 0),
+        (annotated_types.Gt(0), -1),
+        (annotated_types.Ge(0), -1),
+        (annotated_types.Lt(1), 1),
+        (annotated_types.Lt(1), 2),
+        (annotated_types.Le(1), 2),
+        # float bound
+        (annotated_types.Gt(0.5), '1/3'),
+    ],
+)
+def test_fraction_constraints_error(constraint, input_value):
+    ta = TypeAdapter(Annotated[Fraction, constraint])
+    with pytest.raises(ValidationError):
+        ta.validate_python(input_value)
+
+
+def test_fraction_json_schema():
+    ta = TypeAdapter(Fraction)
+    assert ta.json_schema(mode='serialization') == {'type': 'string', 'format': 'fraction'}
+
+    ta = TypeAdapter(Annotated[Fraction, Field(ge=Fraction(1))])
+
+    assert ta.json_schema() == {'anyOf': [{'minimum': 1.0, 'type': 'number'}, {'format': 'fraction', 'type': 'string'}]}

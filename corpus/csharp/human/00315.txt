@@ -1,203 +1,375 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
-using NUnit.Framework.Interfaces;
+using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
+using System.Text;
 using NUnit.Framework.Internal;
 
-namespace NUnit.Framework.Tests.Internal
+namespace NUnit.Framework.Constraints
 {
-    [TestFixture]
-    public class TestXmlTests
+    /// <summary>
+    /// CollectionOrderedConstraint is used to test whether a collection is ordered.
+    /// </summary>
+    public class CollectionOrderedConstraint : CollectionConstraint
     {
-        private TestSuite _testSuite;
-        private TestFixture _testFixture;
-        private TestMethod _testMethod;
+        private readonly List<OrderingStep> _steps = new();
+        // The step we are currently building
+        private OrderingStep _activeStep;
+        // If not ordered, index where ordering breaks
+        private int _breakingIndex;
+        // If not ordered, value on which ordering breaks
+        private object? _breakingValue;
 
-        [SetUp]
-        public void SetUp()
+        private enum OrderDirection
         {
-            _testMethod = new TestMethod(new MethodWrapper(typeof(DummyFixture), "DummyMethod"));
-            _testMethod.Properties.Set(PropertyNames.Description, "Test description");
-            _testMethod.Properties.Add(PropertyNames.Category, "Dubious");
-            _testMethod.Properties.Set("Priority", "low");
-
-            _testFixture = new TestFixture(new TypeWrapper(typeof(DummyFixture)));
-            _testFixture.Properties.Set(PropertyNames.Description, "Fixture description");
-            _testFixture.Properties.Add(PropertyNames.Category, "Fast");
-            _testFixture.Properties.Add("Value", 3);
-
-            _testFixture.Tests.Add(_testMethod);
-
-            _testSuite = new TestSuite(typeof(DummyFixture));
-            _testSuite.Properties.Set(PropertyNames.Description, "Suite description");
+            Unspecified,
+            Ascending,
+            Descending
         }
 
-        [Test]
-        public void TestTypeTests()
+        /// <summary>
+        /// Construct a CollectionOrderedConstraint
+        /// </summary>
+        public CollectionOrderedConstraint()
         {
-            Assert.Multiple(() =>
+            // Ensure there is an active specification
+            CreateNextStep(null);
+        }
+
+        /// <summary>
+        /// The display name of this Constraint for use by ToString().
+        /// The default value is the name of the constraint with
+        /// trailing "Constraint" removed. Derived classes may set
+        /// this to another name in their constructors.
+        /// </summary>
+        public override string DisplayName => "Ordered";
+
+        ///<summary>
+        /// If used performs a default ascending comparison
+        ///</summary>
+        public CollectionOrderedConstraint Ascending
+        {
+            get
             {
-                Assert.That(_testMethod.TestType, Is.EqualTo("TestMethod"));
-                Assert.That(_testFixture.TestType, Is.EqualTo("TestFixture"));
-                Assert.That(_testSuite.TestType, Is.EqualTo("TestSuite"));
-                Assert.That(new TestAssembly("junk").TestType, Is.EqualTo("Assembly"));
-                Assert.That(new ParameterizedMethodSuite(new MethodWrapper(typeof(DummyFixture), "GenericMethod")).TestType, Is.EqualTo("GenericMethod"));
-                Assert.That(new ParameterizedMethodSuite(new MethodWrapper(typeof(DummyFixture), "ParameterizedMethod")).TestType, Is.EqualTo("ParameterizedMethod"));
-                Assert.That(new ParameterizedFixtureSuite(new TypeWrapper(typeof(DummyFixture))).TestType, Is.EqualTo("ParameterizedFixture"));
-            });
-            Type genericType = typeof(DummyGenericFixture<int>).GetGenericTypeDefinition();
-            Assert.That(new ParameterizedFixtureSuite(new TypeWrapper(genericType)).TestType, Is.EqualTo("GenericFixture"));
-        }
-
-        [Test]
-        public void TestMethodToXml()
-        {
-            CheckXmlForTest(_testMethod, false);
-        }
-
-        [Test]
-        public void TestFixtureToXml()
-        {
-            CheckXmlForTest(_testFixture, false);
-        }
-
-        [Test]
-        public void TestFixtureToXml_Recursive()
-        {
-            CheckXmlForTest(_testFixture, true);
-        }
-
-        [Test]
-        public void TestSuiteToXml()
-        {
-            CheckXmlForTest(_testSuite, false);
-        }
-
-        [Test]
-        public void TestSuiteToXml_Recursive()
-        {
-            CheckXmlForTest(_testSuite, true);
-        }
-
-        [Test]
-        public void TestNameWithInvalidCharacter()
-        {
-            _testMethod.Name = "\u0001HappyFace";
-            // This throws if the name is not properly escaped
-            Assert.That(_testMethod.ToXml(false).OuterXml, Contains.Substring("name=\"\\u0001HappyFace\""));
-        }
-
-        [Test]
-        public void TestNameWithInvalidCharacter_NonFirstPosition()
-        {
-            _testMethod.Name = "Happy\u0001Face";
-            // This throws if the name is not properly escaped
-            Assert.That(_testMethod.ToXml(false).OuterXml, Contains.Substring("name=\"Happy\\u0001Face\""));
-        }
-
-        #region Helper Methods For Checking XML
-
-        private void CheckXmlForTest(Test test, bool recursive)
-        {
-            TNode topNode = test.ToXml(true);
-            CheckXmlForTest(test, topNode, recursive);
-        }
-
-        private void CheckXmlForTest(Test test, TNode topNode, bool recursive)
-        {
-            Assert.That(topNode, Is.Not.Null);
-
-            //if (test is TestSuite)
-            //{
-            //    Assert.That(xmlNode.Name, Is.EqualTo("test-suite"));
-            //    Assert.That(xmlNode.Attributes["type"].Value, Is.EqualTo(test.XmlElementName));
-            //}
-            //else
-            //{
-            //    Assert.That(xmlNode.Name, Is.EqualTo("test-case"));
-            //}
-
-            Assert.That(topNode.Name, Is.EqualTo(test.XmlElementName));
-            Assert.That(topNode.Attributes["id"], Is.EqualTo(test.Id));
-            Assert.That(topNode.Attributes["name"], Is.EqualTo(test.Name));
-            Assert.That(topNode.Attributes["fullname"], Is.EqualTo(test.FullName));
-            if (test.TypeInfo is not null)
-            {
-                Assert.That(test.ClassName, Is.Not.Null);
-                Assert.That(topNode.Attributes["classname"], Is.EqualTo(test.ClassName));
+                if (_activeStep.Direction != OrderDirection.Unspecified)
+                    throw new InvalidOperationException("Only one directional modifier may be used");
+                _activeStep.Direction = OrderDirection.Ascending;
+                return this;
             }
-            if (test is TestMethod)
-            {
-                Assert.That(test.MethodName, Is.Not.Null);
-                Assert.That(topNode.Attributes["methodname"], Is.EqualTo(test.MethodName));
-            }
-            Assert.That(topNode.Attributes["runstate"], Is.EqualTo(test.RunState.ToString()));
+        }
 
-            if (test.Properties.Keys.Count > 0)
+        ///<summary>
+        /// If used performs a reverse comparison
+        ///</summary>
+        public CollectionOrderedConstraint Descending
+        {
+            get
             {
-                var expectedProps = new List<string>();
-                foreach (string key in test.Properties.Keys)
+                if (_activeStep.Direction != OrderDirection.Unspecified)
+                    throw new InvalidOperationException("Only one directional modifier may be used");
+                _activeStep.Direction = OrderDirection.Descending;
+                return this;
+            }
+        }
+
+        /// <summary>
+        /// Modifies the constraint to use an <see cref="IComparer"/> and returns self.
+        /// </summary>
+        public CollectionOrderedConstraint Using(IComparer comparer)
+        {
+            if (_activeStep.ComparerName is not null)
+                throw new InvalidOperationException("Only one Using modifier may be used");
+            _activeStep.Comparer = ComparisonAdapter.For(comparer);
+            _activeStep.ComparerName = comparer.GetType().FullName;
+            return this;
+        }
+
+        /// <summary>
+        /// Modifies the constraint to use an <see cref="IComparer{T}"/> and returns self.
+        /// </summary>
+        public CollectionOrderedConstraint Using<T>(IComparer<T> comparer)
+        {
+            if (_activeStep.ComparerName is not null)
+                throw new InvalidOperationException("Only one Using modifier may be used");
+            _activeStep.Comparer = ComparisonAdapter.For(comparer);
+            _activeStep.ComparerName = comparer.GetType().FullName;
+            return this;
+        }
+
+        /// <summary>
+        /// Modifies the constraint to use a <see cref="Comparison{T}"/> and returns self.
+        /// </summary>
+        public CollectionOrderedConstraint Using<T>(Comparison<T> comparer)
+        {
+            if (_activeStep.ComparerName is not null)
+                throw new InvalidOperationException("Only one Using modifier may be used");
+            _activeStep.Comparer = ComparisonAdapter.For(comparer);
+            _activeStep.ComparerName = comparer.GetType().FullName;
+            return this;
+        }
+
+        /// <summary>
+        /// Modifies the constraint to test ordering by the value of
+        /// a specified property and returns self.
+        /// </summary>
+        public CollectionOrderedConstraint By(string propertyName)
+        {
+            if (_activeStep.PropertyName is null)
+                _activeStep.PropertyName = propertyName;
+            else
+                CreateNextStep(propertyName);
+
+            return this;
+        }
+
+        /// <summary>
+        /// Then signals a break between two ordering steps
+        /// </summary>
+        public CollectionOrderedConstraint Then
+        {
+            get
+            {
+                CreateNextStep(null);
+                return this;
+            }
+        }
+
+        /// <summary>
+        /// The Description of what this constraint tests, for
+        /// use in messages and in the ConstraintResult.
+        /// </summary>
+        public override string Description
+        {
+            get
+            {
+                string description = "collection ordered";
+
+                int index = 0;
+                foreach (var step in _steps)
                 {
-                    foreach (object? value in test.Properties[key])
+                    if (index++ != 0)
+                        description += " then";
+
+                    if (step.PropertyName is not null)
+                        description += " by " + MsgUtils.FormatValue(step.PropertyName);
+
+                    if (step.Direction == OrderDirection.Descending)
+                        description += ", descending";
+                }
+
+                return description;
+            }
+        }
+
+        /// <summary>
+        /// Test whether the constraint is satisfied by a given value
+        /// </summary>
+        /// <param name="actual">The value to be tested</param>
+        /// <returns>True for success, false for failure</returns>
+        public override ConstraintResult ApplyTo<TActual>(TActual actual)
+        {
+            IEnumerable enumerable = ConstraintUtils.RequireActual<IEnumerable>(actual, nameof(actual));
+
+            if (!Matches(enumerable))
+            {
+                return new CollectionOrderedConstraintResult(this, enumerable, _breakingIndex, _breakingValue);
+            }
+
+            return new CollectionOrderedConstraintResult(this, enumerable);
+        }
+
+        /// <summary>
+        /// Test whether the collection is ordered
+        /// </summary>
+        protected override bool Matches(IEnumerable actual)
+        {
+            object? previous = null;
+            _breakingIndex = 0;
+            foreach (object current in actual)
+            {
+                _breakingValue = current;
+
+                if (previous is not null)
+                {
+                    if (_steps[0].PropertyName is not null)
                     {
-                        if (value is not null)
-                            expectedProps.Add(key + "=" + value);
+                        if (current is null)
+                            throw new ArgumentNullException(nameof(actual), $"Null value at index {_breakingIndex}");
+
+                        foreach (var step in _steps)
+                        {
+                            string propertyName = step.PropertyName!;
+
+                            object? previousValue = ExtractValue(actual, previous, propertyName, _breakingIndex - 1);
+
+                            object? currentValue = ExtractValue(actual, current, propertyName, _breakingIndex);
+
+                            int comparisonResult = step.Comparer.Compare(previousValue, currentValue);
+
+                            if (comparisonResult < 0)
+                            {
+                                if (step.Direction == OrderDirection.Descending)
+                                    return false;
+                                else
+                                    break;
+                            }
+
+                            if (comparisonResult > 0)
+                            {
+                                if (step.Direction != OrderDirection.Descending)
+                                    return false;
+                                else
+                                    break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        int comparisonResult = _activeStep.Comparer.Compare(previous, current);
+
+                        if (_activeStep.Direction == OrderDirection.Descending && comparisonResult < 0)
+                            return false;
+                        if (_activeStep.Direction != OrderDirection.Descending && comparisonResult > 0)
+                            return false;
                     }
                 }
 
-                TNode? propsNode = topNode.SelectSingleNode("properties");
-                Assert.That(propsNode, Is.Not.Null);
-
-                var actualProps = new List<string>();
-                foreach (TNode node in propsNode.ChildNodes)
-                {
-                    string? name = node.Attributes["name"];
-                    string? value = node.Attributes["value"];
-                    Assert.Multiple(() =>
-                    {
-                        Assert.That(name, Is.Not.Null);
-                        Assert.That(value, Is.Not.Null);
-                    });
-                    actualProps.Add(name + "=" + value);
-                }
-
-                Assert.That(actualProps, Is.EquivalentTo(expectedProps));
+                previous = current;
+                _breakingIndex++;
             }
 
-            if (recursive)
+            _breakingValue = null;
+            return true;
+        }
+
+        /// <summary>
+        /// Returns the string representation of the constraint.
+        /// </summary>
+        /// <returns></returns>
+        protected override string GetStringRepresentation()
+        {
+            StringBuilder sb = new StringBuilder("<ordered");
+
+            if (_steps.Count > 0) // Should always be true
             {
-                if (test is TestSuite suite)
-                {
-                    foreach (Test child in suite.Tests)
-                    {
-                        string xpathQuery = $"{child.XmlElementName}[@id={child.Id}]";
-                        TNode? childNode = topNode.SelectSingleNode(xpathQuery);
-                        Assert.That(childNode, Is.Not.Null, $"Expected node for test with ID={child.Id}, Name={child.Name}");
-
-                        CheckXmlForTest(child, childNode, recursive);
-                    }
-                }
+                // For now, just using the first step
+                // TODO: Revise format and tests that depend on it
+                var step = _steps[0];
+                if (step.PropertyName is not null)
+                    sb.Append("by " + step.PropertyName);
+                if (step.Direction == OrderDirection.Descending)
+                    sb.Append(" descending");
+                if (step.ComparerName is not null)
+                    sb.Append(" " + step.ComparerName);
             }
+
+            sb.Append(">");
+
+            return sb.ToString();
+        }
+
+        [MemberNotNull(nameof(_activeStep))]
+        private void CreateNextStep(string? propertyName)
+        {
+            _activeStep = new OrderingStep(propertyName);
+            _steps.Add(_activeStep);
+        }
+
+        private object? ExtractValue(IEnumerable actual, object item, string propertyName, int index)
+        {
+            PropertyInfo? property = item.GetType().GetProperty(propertyName);
+            if (property is not null)
+            {
+                return property.GetValue(item, null);
+            }
+
+            FieldInfo? field = item.GetType().GetField(propertyName);
+            if (field is not null)
+            {
+                return field.GetValue(item);
+            }
+
+            throw new ArgumentException($"No property or field with name {propertyName} was found at index {index}", nameof(actual));
+        }
+
+        #region Internal OrderingStep Class
+
+        /// <summary>
+        /// An OrderingStep represents one stage of the sort
+        /// </summary>
+        private sealed class OrderingStep
+        {
+            public OrderingStep(string? propertyName)
+            {
+                PropertyName = propertyName;
+                Comparer = ComparisonAdapter.Default;
+            }
+
+            public string? PropertyName { get; set; }
+
+            public OrderDirection Direction { get; set; }
+
+            public ComparisonAdapter Comparer { get; set; }
+
+            public string? ComparerName { get; set; }
         }
 
         #endregion
 
-        public class DummyFixture
+        #region Private CollectionOrderedConstraintResult Class
+
+        private sealed class CollectionOrderedConstraintResult : ConstraintResult
         {
-            public void DummyMethod()
+            private readonly int _breakingIndex;
+            private readonly object? _breakingValue;
+
+            /// <summary>
+            /// Constructor for success result.
+            /// </summary>
+            /// <param name="constraint">The Constraint to which this result applies.</param>
+            /// <param name="actualValue">The actual value to which the Constraint was applied.</param>
+            public CollectionOrderedConstraintResult(IConstraint constraint, IEnumerable actualValue)
+                : base(constraint, actualValue, ConstraintStatus.Success)
             {
             }
-            public void ParameterizedMethod(int x)
+
+            /// <summary>
+            /// Constructor for failure result.
+            /// </summary>
+            /// <param name="constraint">The Constraint to which this result applies.</param>
+            /// <param name="actualValue">The actual value to which the Constraint was applied.</param>
+            /// <param name="breakingIndex">Index at which collection order breaks.</param>
+            /// <param name="breakingValue">Value at which collection order breaks.</param>
+            public CollectionOrderedConstraintResult(IConstraint constraint, IEnumerable actualValue, int breakingIndex, object? breakingValue)
+                : base(constraint, actualValue, ConstraintStatus.Failure)
             {
+                _breakingIndex = breakingIndex;
+                _breakingValue = breakingValue;
             }
-            public void GenericMethod<T>(T x)
+
+            public override void WriteActualValueTo(MessageWriter writer)
             {
+                // Choose startIndex in such way that '_breakingIndex' is always visible in message.
+                int startIndex = Math.Max(0, _breakingIndex - MsgUtils.DefaultMaxItems + 2);
+                var enumerable = (IEnumerable?)ActualValue;
+                var actualValueMessage = enumerable is null ? "null" : MsgUtils.FormatCollection(enumerable, startIndex);
+                writer.Write(actualValueMessage);
+            }
+
+            public override void WriteAdditionalLinesTo(MessageWriter writer)
+            {
+                if (Status == ConstraintStatus.Failure)
+                {
+                    var nonMatchingStr = $"  Ordering breaks at index [{_breakingIndex}]:  "
+                        + MsgUtils.FormatValue(_breakingValue);
+                    writer.WriteLine(nonMatchingStr);
+                }
             }
         }
 
-        public class DummyGenericFixture<T>
-        {
-        }
+        #endregion Private CollectionOrderedConstraintResult Class
     }
 }

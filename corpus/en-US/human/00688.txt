@@ -1,63 +1,613 @@
-Let’s simulate a long-running operation to illustrate the starvation problem,
-then explore how to solve it. Listing 17-14 introduces a `slow` function.
+## Refactoring to Improve Modularity and Error Handling
 
-<Listing number="17-14" caption="Using `thread::sleep` to simulate slow operations" file-name="src/main.rs">
+To improve our program, we’ll fix four problems that have to do with the
+program’s structure and how it’s handling potential errors. First, our `main`
+function now performs two tasks: It parses arguments and reads files. As our
+program grows, the number of separate tasks the `main` function handles will
+increase. As a function gains responsibilities, it becomes more difficult to
+reason about, harder to test, and harder to change without breaking one of its
+parts. It’s best to separate functionality so that each function is responsible
+for one task.
 
-```rust
-{{#rustdoc_include ../listings/ch17-async-await/listing-17-14/src/main.rs:slow}}
+This issue also ties into the second problem: Although `query` and `file_path`
+are configuration variables to our program, variables like `contents` are used
+to perform the program’s logic. The longer `main` becomes, the more variables
+we’ll need to bring into scope; the more variables we have in scope, the harder
+it will be to keep track of the purpose of each. It’s best to group the
+configuration variables into one structure to make their purpose clear.
+
+The third problem is that we’ve used `expect` to print an error message when
+reading the file fails, but the error message just prints `Should have been able to read the file`. Reading a file can fail in a number of ways: For
+example, the file could be missing, or we might not have permission to open it.
+Right now, regardless of the situation, we’d print the same error message for
+everything, which wouldn’t give the user any information!
+
+Fourth, we use `expect` to handle an error, and if the user runs our program
+without specifying enough arguments, they’ll get an `index out of bounds` error
+from Rust that doesn’t clearly explain the problem. It would be best if all the
+error-handling code were in one place so that future maintainers had only one
+place to consult the code if the error-handling logic needed to change. Having
+all the error-handling code in one place will also ensure that we’re printing
+messages that will be meaningful to our end users.
+
+Let’s address these four problems by refactoring our project.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id="separation-of-concerns-for-binary-projects"></a>
+
+### Separating Concerns in Binary Projects
+
+The organizational problem of allocating responsibility for multiple tasks to
+the `main` function is common to many binary projects. As a result, many Rust
+programmers find it useful to split up the separate concerns of a binary
+program when the `main` function starts getting large. This process has the
+following steps:
+
+* Split your program into a *main.rs* file and a *lib.rs* file and move your
+  program’s logic to *lib.rs*.
+* As long as your command line parsing logic is small, it can remain in
+  the `main` function.
+* When the command line parsing logic starts getting complicated, extract it
+  from the `main` function into other functions or types.
+
+The responsibilities that remain in the `main` function after this process
+should be limited to the following:
+
+* Calling the command line parsing logic with the argument values
+* Setting up any other configuration
+* Calling a `run` function in *lib.rs*
+* Handling the error if `run` returns an error
+
+This pattern is about separating concerns: *main.rs* handles running the
+program and *lib.rs* handles all the logic of the task at hand. Because you
+can’t test the `main` function directly, this structure lets you test all of
+your program’s logic by moving it out of the `main` function. The code that
+remains in the `main` function will be small enough to verify its correctness
+by reading it. Let’s rework our program by following this process.
+
+#### Extracting the Argument Parser
+
+We’ll extract the functionality for parsing arguments into a function that
+`main` will call. Listing 12-5 shows the new start of the `main` function that
+calls a new function `parse_config`, which we’ll define in *src/main.rs*.
+
+src/main.rs
+
+```
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    let (query, file_path) = parse_config(&args);
+
+    // --snip--
+}
+
+fn parse_config(args: &[String]) -> (&str, &str) {
+    let query = &args[1];
+    let file_path = &args[2];
+
+    (query, file_path)
+}
 ```
 
-</Listing>
+Listing 12-5: Extracting a `parse_config` function from `main`
 
-This code uses `std::thread::sleep` instead of `trpl::sleep` so that calling
-`slow` will block the current thread for some number of milliseconds. We can
-use `slow` to stand in for real-world operations that are both long-running and
-blocking.
+We’re still collecting the command line arguments into a vector, but instead of
+assigning the argument value at index 1 to the variable `query` and the
+argument value at index 2 to the variable `file_path` within the `main`
+function, we pass the whole vector to the `parse_config` function. The
+`parse_config` function then holds the logic that determines which argument
+goes in which variable and passes the values back to `main`. We still create
+the `query` and `file_path` variables in `main`, but `main` no longer has the
+responsibility of determining how the command line arguments and variables
+correspond.
 
-In Listing 17-15, we use `slow` to emulate doing this kind of CPU-bound work in
-a pair of futures.
+This rework may seem like overkill for our small program, but we’re refactoring
+in small, incremental steps. After making this change, run the program again to
+verify that the argument parsing still works. It’s good to check your progress
+often, to help identify the cause of problems when they occur.
 
-<Listing number="17-15" caption="Calling the `slow` function to simulate slow operations" file-name="src/main.rs">
+#### Grouping Configuration Values
 
-```rust
-{{#rustdoc_include ../listings/ch17-async-await/listing-17-15/src/main.rs:slow-futures}}
+We can take another small step to improve the `parse_config` function further.
+At the moment, we’re returning a tuple, but then we immediately break that
+tuple into individual parts again. This is a sign that perhaps we don’t have
+the right abstraction yet.
+
+Another indicator that shows there’s room for improvement is the `config` part
+of `parse_config`, which implies that the two values we return are related and
+are both part of one configuration value. We’re not currently conveying this
+meaning in the structure of the data other than by grouping the two values into
+a tuple; we’ll instead put the two values into one struct and give each of the
+struct fields a meaningful name. Doing so will make it easier for future
+maintainers of this code to understand how the different values relate to each
+other and what their purpose is.
+
+Listing 12-6 shows the improvements to the `parse_config` function.
+
+src/main.rs
+
+```
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    let config = parse_config(&args);
+
+    println!("Searching for {}", config.query);
+    println!("In file {}", config.file_path);
+
+    let contents = fs::read_to_string(config.file_path)
+        .expect("Should have been able to read the file");
+
+    // --snip--
+}
+
+struct Config {
+    query: String,
+    file_path: String,
+}
+
+fn parse_config(args: &[String]) -> Config {
+    let query = args[1].clone();
+    let file_path = args[2].clone();
+
+    Config { query, file_path }
+}
 ```
 
-</Listing>
+Listing 12-6: Refactoring `parse_config` to return an instance of a `Config` struct
 
-Each future hands control back to the runtime only _after_ carrying out a bunch
-of slow operations. If you run this code, you will see this output:
+We’ve added a struct named `Config` defined to have fields named `query` and
+`file_path`. The signature of `parse_config` now indicates that it returns a
+`Config` value. In the body of `parse_config`, where we used to return
+string slices that reference `String` values in `args`, we now define `Config`
+to contain owned `String` values. The `args` variable in `main` is the owner of
+the argument values and is only letting the `parse_config` function borrow
+them, which means we’d violate Rust’s borrowing rules if `Config` tried to take
+ownership of the values in `args`.
 
-<!-- manual-regeneration
-cd listings/ch17-async-await/listing-17-15/
-cargo run
-copy just the output
--->
+There are a number of ways we could manage the `String` data; the easiest,
+though somewhat inefficient, route is to call the `clone` method on the values.
+This will make a full copy of the data for the `Config` instance to own, which
+takes more time and memory than storing a reference to the string data.
+However, cloning the data also makes our code very straightforward because we
+don’t have to manage the lifetimes of the references; in this circumstance,
+giving up a little performance to gain simplicity is a worthwhile trade-off.
 
-```text
-'a' started.
-'a' ran for 30ms
-'a' ran for 10ms
-'a' ran for 20ms
-'b' started.
-'b' ran for 75ms
-'b' ran for 10ms
-'b' ran for 15ms
-'b' ran for 350ms
-'a' finished.
+> ### The Trade-Offs of Using clone
+> 
+> There’s a tendency among many Rustaceans to avoid using `clone` to fix
+> ownership problems because of its runtime cost. In
+> Chapter 13, you’ll learn how to use more efficient
+> methods in this type of situation. But for now, it’s okay to copy a few
+> strings to continue making progress because you’ll make these copies only
+> once and your file path and query string are very small. It’s better to have
+> a working program that’s a bit inefficient than to try to hyperoptimize code
+> on your first pass. As you become more experienced with Rust, it’ll be
+> easier to start with the most efficient solution, but for now, it’s
+> perfectly acceptable to call `clone`.
+
+We’ve updated `main` so that it places the instance of `Config` returned by
+`parse_config` into a variable named `config`, and we updated the code that
+previously used the separate `query` and `file_path` variables so that it now
+uses the fields on the `Config` struct instead.
+
+Now our code more clearly conveys that `query` and `file_path` are related and
+that their purpose is to configure how the program will work. Any code that
+uses these values knows to find them in the `config` instance in the fields
+named for their purpose.
+
+#### Creating a Constructor for Config
+
+So far, we’ve extracted the logic responsible for parsing the command line
+arguments from `main` and placed it in the `parse_config` function. Doing so
+helped us see that the `query` and `file_path` values were related, and that
+relationship should be conveyed in our code. We then added a `Config` struct to
+name the related purpose of `query` and `file_path` and to be able to return the
+values’ names as struct field names from the `parse_config` function.
+
+So, now that the purpose of the `parse_config` function is to create a `Config`
+instance, we can change `parse_config` from a plain function to a function
+named `new` that is associated with the `Config` struct. Making this change
+will make the code more idiomatic. We can create instances of types in the
+standard library, such as `String`, by calling `String::new`. Similarly, by
+changing `parse_config` into a `new` function associated with `Config`, we’ll
+be able to create instances of `Config` by calling `Config::new`. Listing 12-7
+shows the changes we need to make.
+
+src/main.rs
+
+```
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    let config = Config::new(&args);
+
+    // --snip--
+}
+
+// --snip--
+
+impl Config {
+    fn new(args: &[String]) -> Config {
+        let query = args[1].clone();
+        let file_path = args[2].clone();
+
+        Config { query, file_path }
+    }
+}
 ```
 
-As with Listing 17-5 where we used `trpl::select` to race futures fetching two
-URLs, `select` still finishes as soon as `a` is done. There’s no interleaving
-between the calls to `slow` in the two futures, though. The `a` future does all
-of its work until the `trpl::sleep` call is awaited, then the `b` future does
-all of its work until its own `trpl::sleep` call is awaited, and finally the
-`a` future completes. To allow both futures to make progress between their slow
-tasks, we need await points so we can hand control back to the runtime. That
-means we need something we can await!
+Listing 12-7: Changing `parse_config` into `Config::new`
 
-We can already see this kind of handoff happening in Listing 17-15: if we
-removed the `trpl::sleep` at the end of the `a` future, it would complete
-without the `b` future running _at all_. Let’s try using the `trpl::sleep`
-function as a starting point for letting operations switch off making progress,
-as shown in Listing 17-16.
+We’ve updated `main` where we were calling `parse_config` to instead call
+`Config::new`. We’ve changed the name of `parse_config` to `new` and moved it
+within an `impl` block, which associates the `new` function with `Config`. Try
+compiling this code again to make sure it works.
+
+### Fixing the Error Handling
+
+Now we’ll work on fixing our error handling. Recall that attempting to access
+the values in the `args` vector at index 1 or index 2 will cause the program to
+panic if the vector contains fewer than three items. Try running the program
+without any arguments; it will look like this:
+
+```
+$ cargo run
+   Compiling minigrep v0.1.0 (file:///projects/minigrep)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.0s
+     Running `target/debug/minigrep`
+
+thread 'main' panicked at src/main.rs:27:21:
+index out of bounds: the len is 1 but the index is 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+The line `index out of bounds: the len is 1 but the index is 1` is an error
+message intended for programmers. It won’t help our end users understand what
+they should do instead. Let’s fix that now.
+
+#### Improving the Error Message
+
+In Listing 12-8, we add a check in the `new` function that will verify that the
+slice is long enough before accessing index 1 and index 2. If the slice isn’t
+long enough, the program panics and displays a better error message.
+
+src/main.rs
+
+```
+    // --snip--
+    fn new(args: &[String]) -> Config {
+        if args.len() < 3 {
+            panic!("not enough arguments");
+        }
+        // --snip--
+```
+
+Listing 12-8: Adding a check for the number of arguments
+
+This code is similar to the `Guess::new` function we wrote in Listing
+9-13, where we called `panic!` when the
+`value` argument was out of the range of valid values. Instead of checking for
+a range of values here, we’re checking that the length of `args` is at least
+`3` and the rest of the function can operate under the assumption that this
+condition has been met. If `args` has fewer than three items, this condition
+will be `true`, and we call the `panic!` macro to end the program immediately.
+
+With these extra few lines of code in `new`, let’s run the program without any
+arguments again to see what the error looks like now:
+
+```
+$ cargo run
+   Compiling minigrep v0.1.0 (file:///projects/minigrep)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.0s
+     Running `target/debug/minigrep`
+
+thread 'main' panicked at src/main.rs:26:13:
+not enough arguments
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+This output is better: We now have a reasonable error message. However, we also
+have extraneous information we don’t want to give to our users. Perhaps the
+technique we used in Listing 9-13 isn’t the best one to use here: A call to
+`panic!` is more appropriate for a programming problem than a usage problem,
+as discussed in Chapter 9. Instead,
+we’ll use the other technique you learned about in Chapter 9—returning a
+`Result` that indicates either success or an error.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id="returning-a-result-from-new-instead-of-calling-panic"></a>
+
+#### Returning a Result Instead of Calling panic!
+
+We can instead return a `Result` value that will contain a `Config` instance in
+the successful case and will describe the problem in the error case. We’re also
+going to change the function name from `new` to `build` because many
+programmers expect `new` functions to never fail. When `Config::build` is
+communicating to `main`, we can use the `Result` type to signal there was a
+problem. Then, we can change `main` to convert an `Err` variant into a more
+practical error for our users without the surrounding text about `thread 'main'` and `RUST_BACKTRACE` that a call to `panic!` causes.
+
+Listing 12-9 shows the changes we need to make to the return value of the
+function we’re now calling `Config::build` and the body of the function needed
+to return a `Result`. Note that this won’t compile until we update `main` as
+well, which we’ll do in the next listing.
+
+src/main.rs
+
+```
+impl Config {
+    fn build(args: &[String]) -> Result<Config, &'static str> {
+        if args.len() < 3 {
+            return Err("not enough arguments");
+        }
+
+        let query = args[1].clone();
+        let file_path = args[2].clone();
+
+        Ok(Config { query, file_path })
+    }
+}
+```
+
+Listing 12-9: Returning a `Result` from `Config::build`
+
+Our `build` function returns a `Result` with a `Config` instance in the success
+case and a string literal in the error case. Our error values will always be
+string literals that have the `'static` lifetime.
+
+We’ve made two changes in the body of the function: Instead of calling `panic!`
+when the user doesn’t pass enough arguments, we now return an `Err` value, and
+we’ve wrapped the `Config` return value in an `Ok`. These changes make the
+function conform to its new type signature.
+
+Returning an `Err` value from `Config::build` allows the `main` function to
+handle the `Result` value returned from the `build` function and exit the
+process more cleanly in the error case.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id="calling-confignew-and-handling-errors"></a>
+
+#### Calling Config::build and Handling Errors
+
+To handle the error case and print a user-friendly message, we need to update
+`main` to handle the `Result` being returned by `Config::build`, as shown in
+Listing 12-10. We’ll also take the responsibility of exiting the command line
+tool with a nonzero error code away from `panic!` and instead implement it by
+hand. A nonzero exit status is a convention to signal to the process that
+called our program that the program exited with an error state.
+
+src/main.rs
+
+```
+use std::process;
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    let config = Config::build(&args).unwrap_or_else(|err| {
+        println!("Problem parsing arguments: {err}");
+        process::exit(1);
+    });
+
+    // --snip--
+```
+
+Listing 12-10: Exiting with an error code if building a `Config` fails
+
+In this listing, we’ve used a method we haven’t covered in detail yet:
+`unwrap_or_else`, which is defined on `Result<T, E>` by the standard library.
+Using `unwrap_or_else` allows us to define some custom, non-`panic!` error
+handling. If the `Result` is an `Ok` value, this method’s behavior is similar
+to `unwrap`: It returns the inner value that `Ok` is wrapping. However, if the
+value is an `Err` value, this method calls the code in the closure, which is
+an anonymous function we define and pass as an argument to `unwrap_or_else`.
+We’ll cover closures in more detail in Chapter 13. For
+now, you just need to know that `unwrap_or_else` will pass the inner value of
+the `Err`, which in this case is the static string `"not enough arguments"`
+that we added in Listing 12-9, to our closure in the argument `err` that
+appears between the vertical pipes. The code in the closure can then use the
+`err` value when it runs.
+
+We’ve added a new `use` line to bring `process` from the standard library into
+scope. The code in the closure that will be run in the error case is only two
+lines: We print the `err` value and then call `process::exit`. The
+`process::exit` function will stop the program immediately and return the
+number that was passed as the exit status code. This is similar to the
+`panic!`-based handling we used in Listing 12-8, but we no longer get all the
+extra output. Let’s try it:
+
+```
+$ cargo run
+   Compiling minigrep v0.1.0 (file:///projects/minigrep)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.48s
+     Running `target/debug/minigrep`
+Problem parsing arguments: not enough arguments
+```
+
+Great! This output is much friendlier for our users.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id="extracting-logic-from-the-main-function"></a>
+
+### Extracting Logic from main
+
+Now that we’ve finished refactoring the configuration parsing, let’s turn to
+the program’s logic. As we stated in “Separating Concerns in Binary
+Projects”, we’ll
+extract a function named `run` that will hold all the logic currently in the
+`main` function that isn’t involved with setting up configuration or handling
+errors. When we’re done, the `main` function will be concise and easy to verify
+by inspection, and we’ll be able to write tests for all the other logic.
+
+Listing 12-11 shows the small, incremental improvement of extracting a `run`
+function.
+
+src/main.rs
+
+```
+fn main() {
+    // --snip--
+
+    println!("Searching for {}", config.query);
+    println!("In file {}", config.file_path);
+
+    run(config);
+}
+
+fn run(config: Config) {
+    let contents = fs::read_to_string(config.file_path)
+        .expect("Should have been able to read the file");
+
+    println!("With text:\n{contents}");
+}
+
+// --snip--
+```
+
+Listing 12-11: Extracting a `run` function containing the rest of the program logic
+
+The `run` function now contains all the remaining logic from `main`, starting
+from reading the file. The `run` function takes the `Config` instance as an
+argument.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id="returning-errors-from-the-run-function"></a>
+
+#### Returning Errors from run
+
+With the remaining program logic separated into the `run` function, we can
+improve the error handling, as we did with `Config::build` in Listing 12-9.
+Instead of allowing the program to panic by calling `expect`, the `run`
+function will return a `Result<T, E>` when something goes wrong. This will let
+us further consolidate the logic around handling errors into `main` in a
+user-friendly way. Listing 12-12 shows the changes we need to make to the
+signature and body of `run`.
+
+src/main.rs
+
+```
+use std::error::Error;
+
+// --snip--
+
+fn run(config: Config) -> Result<(), Box<dyn Error>> {
+    let contents = fs::read_to_string(config.file_path)?;
+
+    println!("With text:\n{contents}");
+
+    Ok(())
+}
+```
+
+Listing 12-12: Changing the `run` function to return `Result`
+
+We’ve made three significant changes here. First, we changed the return type of
+the `run` function to `Result<(), Box<dyn Error>>`. This function previously
+returned the unit type, `()`, and we keep that as the value returned in the
+`Ok` case.
+
+For the error type, we used the trait object `Box<dyn Error>` (and we brought
+`std::error::Error` into scope with a `use` statement at the top). We’ll cover
+trait objects in Chapter 18. For now, just know that
+`Box<dyn Error>` means the function will return a type that implements the
+`Error` trait, but we don’t have to specify what particular type the return
+value will be. This gives us flexibility to return error values that may be of
+different types in different error cases. The `dyn` keyword is short for
+*dynamic*.
+
+Second, we’ve removed the call to `expect` in favor of the `?` operator, as we
+talked about in Chapter 9. Rather than
+`panic!` on an error, `?` will return the error value from the current function
+for the caller to handle.
+
+Third, the `run` function now returns an `Ok` value in the success case.
+We’ve declared the `run` function’s success type as `()` in the signature,
+which means we need to wrap the unit type value in the `Ok` value. This
+`Ok(())` syntax might look a bit strange at first. But using `()` like this is
+the idiomatic way to indicate that we’re calling `run` for its side effects
+only; it doesn’t return a value we need.
+
+When you run this code, it will compile but will display a warning:
+
+```
+$ cargo run -- the poem.txt
+   Compiling minigrep v0.1.0 (file:///projects/minigrep)
+warning: unused `Result` that must be used
+  --> src/main.rs:19:5
+   |
+19 |     run(config);
+   |     ^^^^^^^^^^^
+   |
+   = note: this `Result` may be an `Err` variant, which should be handled
+   = note: `#[warn(unused_must_use)]` on by default
+help: use `let _ = ...` to ignore the resulting value
+   |
+19 |     let _ = run(config);
+   |     +++++++
+
+warning: `minigrep` (bin "minigrep") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s
+     Running `target/debug/minigrep the poem.txt`
+Searching for the
+In file poem.txt
+With text:
+I'm nobody! Who are you?
+Are you nobody, too?
+Then there's a pair of us - don't tell!
+They'd banish us, you know.
+
+How dreary to be somebody!
+How public, like a frog
+To tell your name the livelong day
+To an admiring bog!
+
+```
+
+Rust tells us that our code ignored the `Result` value and the `Result` value
+might indicate that an error occurred. But we’re not checking to see whether or
+not there was an error, and the compiler reminds us that we probably meant to
+have some error-handling code here! Let’s rectify that problem now.
+
+#### Handling Errors Returned from run in main
+
+We’ll check for errors and handle them using a technique similar to one we used
+with `Config::build` in Listing 12-10, but with a slight difference:
+
+Filename: src/main.rs
+
+```
+fn main() {
+    // --snip--
+
+    println!("Searching for {}", config.query);
+    println!("In file {}", config.file_path);
+
+    if let Err(e) = run(config) {
+        println!("Application error: {e}");
+        process::exit(1);
+    }
+}
+```
+
+We use `if let` rather than `unwrap_or_else` to check whether `run` returns an
+`Err` value and to call `process::exit(1)` if it does. The `run` function
+doesn’t return a value that we want to `unwrap` in the same way that
+`Config::build` returns the `Config` instance. Because `run` returns `()` in
+the success case, we only care about detecting an error, so we don’t need
+`unwrap_or_else` to return the unwrapped value, which would only be `()`.
+
+The bodies of the `if let` and the `unwrap_or_else` functions are the same in
+both cases: We print the error and exit.
+
+### Splitting Code into a Library Crate
+
+Our `minigrep` project is looking good so far! Now we’ll split the
+*src/main.rs* file and put some code into the *src/lib.rs* file. That way, we
+can test the code and have a *src/main.rs* file with fewer responsibilities.

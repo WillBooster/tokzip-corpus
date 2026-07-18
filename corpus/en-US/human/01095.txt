@@ -1,67 +1,124 @@
-const kv = await Deno.openKv();
+Next, we need to update the definition of `Config::build`. Let’s change the
+signature of `Config::build` to look like Listing 13-19. This still won’t
+compile, because we need to update the function body.
 
-const r = await kv.get<Author>(["authors", "acdoyle"]);
+<Listing number="13-19" file-name="src/main.rs" caption="Updating the signature of `Config::build` to expect an iterator">
 
-console.log(r.value.fullName);
+```rust,ignore,does_not_compile
+{{#rustdoc_include ../listings/ch13-functional-features/listing-13-19/src/main.rs:here}}
 ```
 
-For simpler data structures, this technique may be sufficient. But often, you
-will want or need to apply some business logic when creating or accessing your
-domain objects. When this need arises, you can develop a set of pure functions
-that can operate on your DTOs.
+</Listing>
 
-## Encapsulating business logic with a service layer
+The standard library documentation for the `env::args` function shows that the
+type of the iterator it returns is `std::env::Args`, and that type implements
+the `Iterator` trait and returns `String` values.
 
-When your application's persistence needs become more complex - such as when you
-need to create [secondary indexes](./secondary_indexes) to query your data by
-different keys, or maintain relationships between objects - you will want to
-create a set of functions to sit on top of your DTOs to ensure that the data
-being passed around is valid (and not merely typed correctly).
+We’ve updated the signature of the `Config::build` function so that the
+parameter `args` has a generic type with the trait bounds `impl Iterator<Item =
+String>` instead of `&[String]`. This usage of the `impl Trait` syntax we
+discussed in the [“Using Traits as Parameters”][impl-trait]<!-- ignore -->
+section of Chapter 10 means that `args` can be any type that implements the
+`Iterator` trait and returns `String` items.
 
-From our business objects above, the `Post` object is complex enough where it is
-likely to need a small layer of code to save and retrieve an instance of the
-object. Below is an example of two functions that wrap the underlying Deno KV
-APIs, and return strongly typed object instances for the `Post` interface.
+Because we’re taking ownership of `args` and we’ll be mutating `args` by
+iterating over it, we can add the `mut` keyword into the specification of the
+`args` parameter to make it mutable.
 
-Notably, we need to store an identifier for an `Author` object, so we can
-retrieve author information from KV later.
+<!-- Old headings. Do not remove or links may break. -->
 
-```ts
-import { Author, Post } from "./model.ts";
+<a id="using-iterator-trait-methods-instead-of-indexing"></a>
 
-const kv = await Deno.openKv();
+#### Using `Iterator` Trait Methods
 
-interface RawPost extends Post {
-  authorUsername: string;
-}
+Next, we’ll fix the body of `Config::build`. Because `args` implements the
+`Iterator` trait, we know we can call the `next` method on it! Listing 13-20
+updates the code from Listing 12-23 to use the `next` method.
 
-export async function savePost(p: Post): Promise<Post> {
-  const postData: RawPost = Object.assign({}, p, {
-    authorUsername: p.author.username,
-  });
+<Listing number="13-20" file-name="src/main.rs" caption="Changing the body of `Config::build` to use iterator methods">
 
-  await kv.set(["posts", p.slug], postData);
-  return p;
-}
-
-export async function getPost(slug: string): Promise<Post> {
-  const postResponse = await kv.get(["posts", slug]);
-  const rawPost = postResponse.value as RawPost;
-  const authorResponse = await kv.get(["authors", rawPost.authorUsername]);
-
-  const author = authorResponse.value as Author;
-  const post = Object.assign({}, postResponse.value, {
-    author,
-  }) as Post;
-
-  return post;
-}
+```rust,ignore,noplayground
+{{#rustdoc_include ../listings/ch13-functional-features/listing-13-20/src/main.rs:here}}
 ```
 
-This thin layer uses a `RawPost` interface, which extends the actual `Post`
-interface, to include some additional data that is used to reference data at
-another index (the associated `Author` object).
+</Listing>
 
-The `savePost` and `getPost` functions take the place of a direct Deno KV `get`
-or `set` operation, so that they can properly serialize and "hydrate" model
-objects for us with appropriate types and associations.
+Remember that the first value in the return value of `env::args` is the name of
+the program. We want to ignore that and get to the next value, so first we call
+`next` and do nothing with the return value. Then, we call `next` to get the
+value we want to put in the `query` field of `Config`. If `next` returns
+`Some`, we use a `match` to extract the value. If it returns `None`, it means
+not enough arguments were given, and we return early with an `Err` value. We do
+the same thing for the `file_path` value.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id="making-code-clearer-with-iterator-adapters"></a>
+
+### Clarifying Code with Iterator Adapters
+
+We can also take advantage of iterators in the `search` function in our I/O
+project, which is reproduced here in Listing 13-21 as it was in Listing 12-19.
+
+<Listing number="13-21" file-name="src/lib.rs" caption="The implementation of the `search` function from Listing 12-19">
+
+```rust,ignore
+{{#rustdoc_include ../listings/ch12-an-io-project/listing-12-19/src/lib.rs:ch13}}
+```
+
+</Listing>
+
+We can write this code in a more concise way using iterator adapter methods.
+Doing so also lets us avoid having a mutable intermediate `results` vector. The
+functional programming style prefers to minimize the amount of mutable state to
+make code clearer. Removing the mutable state might enable a future enhancement
+to make searching happen in parallel because we wouldn’t have to manage
+concurrent access to the `results` vector. Listing 13-22 shows this change.
+
+<Listing number="13-22" file-name="src/lib.rs" caption="Using iterator adapter methods in the implementation of the `search` function">
+
+```rust,ignore
+{{#rustdoc_include ../listings/ch13-functional-features/listing-13-22/src/lib.rs:here}}
+```
+
+</Listing>
+
+Recall that the purpose of the `search` function is to return all lines in
+`contents` that contain the `query`. Similar to the `filter` example in Listing
+13-16, this code uses the `filter` adapter to keep only the lines for which
+`line.contains(query)` returns `true`. We then collect the matching lines into
+another vector with `collect`. Much simpler! Feel free to make the same change
+to use iterator methods in the `search_case_insensitive` function as well.
+
+For a further improvement, return an iterator from the `search` function by
+removing the call to `collect` and changing the return type to `impl
+Iterator<Item = &'a str>` so that the function becomes an iterator adapter.
+Note that you’ll also need to update the tests! Search through a large file
+using your `minigrep` tool before and after making this change to observe the
+difference in behavior. Before this change, the program won’t print any results
+until it has collected all of the results, but after the change, the results
+will be printed as each matching line is found because the `for` loop in the
+`run` function is able to take advantage of the laziness of the iterator.
+
+<!-- Old headings. Do not remove or links may break. -->
+
+<a id="choosing-between-loops-or-iterators"></a>
+
+### Choosing Between Loops and Iterators
+
+The next logical question is which style you should choose in your own code and
+why: the original implementation in Listing 13-21 or the version using
+iterators in Listing 13-22 (assuming we’re collecting all the results before
+returning them rather than returning the iterator). Most Rust programmers
+prefer to use the iterator style. It’s a bit tougher to get the hang of at
+first, but once you get a feel for the various iterator adapters and what they
+do, iterators can be easier to understand. Instead of fiddling with the various
+bits of looping and building new vectors, the code focuses on the high-level
+objective of the loop. This abstracts away some of the commonplace code so that
+it’s easier to see the concepts that are unique to this code, such as the
+filtering condition each element in the iterator must pass.
+
+But are the two implementations truly equivalent? The intuitive assumption
+might be that the lower-level loop will be faster. Let’s talk about performance.
+
+[impl-trait]: ch10-02-traits.html#traits-as-parameters

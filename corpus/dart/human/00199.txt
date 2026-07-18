@@ -1,128 +1,170 @@
-// Copyright (c) 2013, the Dart project authors.  Please see the AUTHORS file
+// Copyright (c) 2024, the Dart project authors.  Please see the AUTHORS file
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-import 'dart:convert';
+import 'dart:typed_data';
 
-import 'package:http/http.dart' as http;
-import 'package:http_parser/http_parser.dart';
+import 'package:async/async.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:test/test.dart';
+import 'package:web_socket/web_socket.dart';
 
-/// A dummy URL for constructing requests that won't be sent.
-Uri get dummyUrl => Uri.http('dart.dev', '');
+import 'close_local_server_vm.dart'
+    if (dart.library.html) 'close_local_server_web.dart';
 
-/// Removes eight spaces of leading indentation from a multiline string.
-///
-/// Note that this is very sensitive to how the literals are styled. They should
-/// be:
-///     '''
-///     Text starts on own line. Lines up with subsequent lines.
-///     Lines are indented exactly 8 characters from the left margin.
-///     Close is on the same line.'''
-///
-/// This does nothing if text is only a single line.
-// TODO(nweiz): Make this auto-detect the indentation level from the first
-// non-whitespace line.
-String cleanUpLiteral(String text) {
-  var lines = text.split('\n');
-  if (lines.length <= 1) return text;
+import 'continuously_writing_server_vm.dart'
+    if (dart.library.html) 'continuously_writing_server_web.dart'
+    as writing_server;
 
-  for (var j = 0; j < lines.length; j++) {
-    if (lines[j].length > 8) {
-      lines[j] = lines[j].substring(8, lines[j].length);
-    } else {
-      lines[j] = '';
-    }
-  }
+/// Tests that the [WebSocket] can correctly close the connection to the peer.
+void testCloseLocal(
+    Future<WebSocket> Function(Uri uri, {Iterable<String>? protocols})
+        channelFactory) {
+  group('remote writing', () {
+    late Uri uri;
+    late StreamChannel<Object?> httpServerChannel;
+    late StreamQueue<Object?> httpServerQueue;
 
-  return lines.join('\n');
-}
+    setUp(() async {
+      httpServerChannel = await writing_server.startServer();
+      httpServerQueue = StreamQueue(httpServerChannel.stream);
+      uri = Uri.parse('ws://localhost:${await httpServerQueue.next}');
+    });
+    tearDown(() async {
+      httpServerChannel.sink.add(null);
+    });
 
-/// A matcher that matches JSON that parses to a value that matches the inner
-/// matcher.
-Matcher parse(Matcher matcher) => _Parse(matcher);
+    test('peer writes after close are ignored', () async {
+      final channel = await channelFactory(uri);
+      await channel.close();
+      expect(await channel.events.isEmpty, true);
+    });
+  });
 
-class _Parse extends Matcher {
-  final Matcher _matcher;
+  group('local close', () {
+    late Uri uri;
+    late StreamChannel<Object?> httpServerChannel;
+    late StreamQueue<Object?> httpServerQueue;
 
-  _Parse(this._matcher);
+    setUp(() async {
+      httpServerChannel = await startServer();
+      httpServerQueue = StreamQueue(httpServerChannel.stream);
+      uri = Uri.parse('ws://localhost:${await httpServerQueue.next}');
+    });
+    tearDown(() async {
+      httpServerChannel.sink.add(null);
+    });
 
-  @override
-  bool matches(Object? item, Map<dynamic, dynamic> matchState) {
-    if (item is String) {
-      dynamic parsed;
-      try {
-        parsed = json.decode(item);
-      } catch (e) {
-        return false;
-      }
+    test('reserved close code: 1004', () async {
+      final channel = await channelFactory(uri);
+      await expectLater(
+          () => channel.close(1004), throwsA(isA<ArgumentError>()));
+    });
 
-      return _matcher.matches(parsed, matchState);
-    }
-    return false;
-  }
+    test('reserved close code: 2999', () async {
+      final channel = await channelFactory(uri);
+      await expectLater(
+          () => channel.close(2999), throwsA(isA<ArgumentError>()));
+    });
 
-  @override
-  Description describe(Description description) =>
-      description.add('parses to a value that ').addDescriptionOf(_matcher);
-}
+    test('reserved close code: 5000', () async {
+      final channel = await channelFactory(uri);
+      await expectLater(
+          () => channel.close(5000), throwsA(isA<ArgumentError>()));
+    });
 
-/// A matcher that validates the body of a multipart request after finalization.
-///
-/// The string "{{boundary}}" in [pattern] will be replaced by the boundary
-/// string for the request, and LF newlines will be replaced with CRLF.
-/// Indentation will be normalized.
-Matcher bodyMatches(String pattern) => _BodyMatches(pattern);
+    test('too long close reason', () async {
+      final channel = await channelFactory(uri);
+      await expectLater(() => channel.close(3000, 'a'.padLeft(124)),
+          throwsA(isA<ArgumentError>()));
+    });
 
-class _BodyMatches extends Matcher {
-  final String _pattern;
+    test('close', () async {
+      final channel = await channelFactory(uri);
 
-  _BodyMatches(this._pattern);
+      await channel.close();
+      final closeCode = await httpServerQueue.next as int?;
+      final closeReason = await httpServerQueue.next as String?;
 
-  @override
-  bool matches(Object? item, Map<dynamic, dynamic> matchState) {
-    if (item is http.MultipartRequest) {
-      return completes.matches(_checks(item), matchState);
-    }
+      expect(closeCode, 1005);
+      expect(closeReason, '');
+      expect(await channel.events.isEmpty, true);
+    });
 
-    return false;
-  }
+    test('close with 1000', () async {
+      final channel = await channelFactory(uri);
 
-  Future<void> _checks(http.MultipartRequest item) async {
-    var bodyBytes = await item.finalize().toBytes();
-    var body = utf8.decode(bodyBytes);
-    var contentType = MediaType.parse(item.headers['content-type']!);
-    var boundary = contentType.parameters['boundary']!;
-    var expected = cleanUpLiteral(_pattern)
-        .replaceAll('\n', '\r\n')
-        .replaceAll('{{boundary}}', boundary);
+      await channel.close(1000);
+      final closeCode = await httpServerQueue.next as int?;
+      final closeReason = await httpServerQueue.next as String?;
 
-    expect(body, equals(expected));
-    expect(item.contentLength, equals(bodyBytes.length));
-  }
+      expect(closeCode, 1000);
+      expect(closeReason, '');
+      expect(await channel.events.isEmpty, true);
+    });
 
-  @override
-  Description describe(Description description) =>
-      description.add('has a body that matches "$_pattern"');
-}
+    test('with code 3000', () async {
+      final channel = await channelFactory(uri);
 
-/// A matcher that matches function or future that throws a
-/// [http.ClientException] with the given [message].
-///
-/// [message] can be a String or a [Matcher].
-Matcher throwsClientException([String? message]) {
-  var exception = isA<http.ClientException>();
-  if (message != null) {
-    exception = exception.having((e) => e.message, 'message', message);
-  }
-  return throwsA(exception);
-}
+      await channel.close(3000);
+      final closeCode = await httpServerQueue.next as int?;
+      final closeReason = await httpServerQueue.next as String?;
 
-/// Spawn an isolate in the test runner with an http server.
-///
-/// The server isolate will be killed on teardown.
-Future<Uri> startServer() async {
-  final channel = spawnHybridUri(Uri(path: '/test/stub_server.dart'));
-  final port = await channel.stream.first as int;
-  return Uri.http('localhost:$port', '');
+      expect(closeCode, 3000);
+      expect(closeReason, '');
+      expect(await channel.events.isEmpty, true);
+    });
+
+    test('with code 4999', () async {
+      final channel = await channelFactory(uri);
+
+      await channel.close(4999);
+      final closeCode = await httpServerQueue.next as int?;
+      final closeReason = await httpServerQueue.next as String?;
+
+      expect(closeCode, 4999);
+      expect(closeReason, '');
+      expect(await channel.events.isEmpty, true);
+    });
+
+    test('with code and reason', () async {
+      final channel = await channelFactory(uri);
+
+      await channel.close(3000, 'Client initiated closure');
+      final closeCode = await httpServerQueue.next as int?;
+      final closeReason = await httpServerQueue.next as String?;
+
+      expect(closeCode, 3000);
+      expect(closeReason, 'Client initiated closure');
+      expect(await channel.events.isEmpty, true);
+    });
+
+    test('close after close', () async {
+      final channel = await channelFactory(uri);
+
+      await channel.close(3000, 'Client initiated closure');
+
+      await expectLater(
+          () async => await channel.close(3001, 'Client initiated closure'),
+          throwsA(isA<WebSocketConnectionClosed>()));
+    });
+
+    test('sendBytes after close', () async {
+      final channel = await channelFactory(uri);
+
+      await channel.close(3000, 'Client initiated closure');
+
+      expect(() => channel.sendBytes(Uint8List(10)),
+          throwsA(isA<WebSocketConnectionClosed>()));
+    });
+
+    test('sendText after close', () async {
+      final channel = await channelFactory(uri);
+
+      await channel.close(3000, 'Client initiated closure');
+
+      expect(() => channel.sendText('Hello World'),
+          throwsA(isA<WebSocketConnectionClosed>()));
+    });
+  });
 }

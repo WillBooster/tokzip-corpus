@@ -1,76 +1,99 @@
 # frozen_string_literal: true
 
-require "active_support/core_ext/module/attribute_accessors"
-require "active_support/core_ext/module/delegation"
-require "json"
+require "generators/generators_test_helper"
+require "rails/generators/rails/resource/resource_generator"
 
-module ActiveSupport
-  # Look for and parse JSON strings that look like ISO 8601 times.
-  mattr_accessor :parse_json_times
+class ResourceGeneratorTest < Rails::Generators::TestCase
+  include GeneratorsTestHelper
+  arguments %w(account)
 
-  module JSON
-    # matches YAML-formatted dates
-    DATE_REGEX = /\A\d{4}-\d{2}-\d{2}\z/
-    DATETIME_REGEX = /\A(?:\d{4}-\d{2}-\d{2}|\d{4}-\d{1,2}-\d{1,2}[T \t]+\d{1,2}:\d{2}:\d{2}(\.[0-9]*)?(([ \t]*)Z|[-+]\d{2}?(:\d{2})?)?)\z/
+  def setup
+    super
+    copy_routes
+    Rails::Generators::ModelHelpers.skip_warn = false
+  end
 
-    class << self
-      # Parses a JSON string (JavaScript Object Notation) into a hash.
-      # See http://www.json.org for more info.
-      #
-      #   ActiveSupport::JSON.decode("{\"team\":\"rails\",\"players\":\"36\"}")
-      #   => {"team" => "rails", "players" => "36"}
-      def decode(json)
-        data = ::JSON.parse(json, quirks_mode: true)
+  def test_help_with_usage_description
+    content = run_generator ["--help"]
+    assert_match(/Generates a new resource/, content)
+  end
 
-        if ActiveSupport.parse_json_times
-          convert_dates_from(data)
-        else
-          data
-        end
-      end
-      alias_method :load, :decode
+  def test_help_with_inherited_options
+    content = run_generator ["--help"]
+    assert_match(/ActiveRecord options:/, content)
+    assert_match(/TestUnit options:/, content)
+  end
 
-      # Returns the class of the error that will be raised when there is an
-      # error in decoding JSON. Using this method means you won't directly
-      # depend on the ActiveSupport's JSON implementation, in case it changes
-      # in the future.
-      #
-      #   begin
-      #     obj = ActiveSupport::JSON.decode(some_string)
-      #   rescue ActiveSupport::JSON.parse_error
-      #     Rails.logger.warn("Attempted to decode invalid JSON: #{some_string}")
-      #   end
-      def parse_error
-        ::JSON::ParserError
-      end
+  def test_files_from_inherited_invocation
+    run_generator
 
-      private
-        def convert_dates_from(data)
-          case data
-          when nil
-            nil
-          when DATE_REGEX
-            begin
-              Date.parse(data)
-            rescue ArgumentError
-              data
-            end
-          when DATETIME_REGEX
-            begin
-              Time.zone.parse(data)
-            rescue ArgumentError
-              data
-            end
-          when Array
-            data.map! { |d| convert_dates_from(d) }
-          when Hash
-            data.transform_values! do |value|
-              convert_dates_from(value)
-            end
-          else
-            data
-          end
-        end
+    %w(
+      app/models/account.rb
+      test/models/account_test.rb
+      test/fixtures/accounts.yml
+    ).each { |path| assert_file path }
+
+    assert_migration "db/migrate/create_accounts.rb"
+  end
+
+  def test_inherited_invocations_with_attributes
+    run_generator ["account", "name:string"]
+    assert_migration "db/migrate/create_accounts.rb", /t.string :name/
+  end
+
+  def test_resource_controller_with_pluralized_class_name
+    run_generator
+    assert_file "app/controllers/accounts_controller.rb", /class AccountsController < ApplicationController/
+    assert_file "test/controllers/accounts_controller_test.rb", /class AccountsControllerTest < ActionDispatch::IntegrationTest/
+
+    assert_file "app/helpers/accounts_helper.rb", /module AccountsHelper/
+  end
+
+  def test_resource_controller_with_actions
+    run_generator ["account", "--actions", "index", "new"]
+
+    assert_file "app/controllers/accounts_controller.rb" do |controller|
+      assert_instance_method :index, controller
+      assert_instance_method :new, controller
+    end
+
+    assert_file "app/views/accounts/index.html.erb"
+    assert_file "app/views/accounts/new.html.erb"
+  end
+
+  def test_resource_routes_are_added
+    run_generator
+
+    assert_file "config/routes.rb" do |route|
+      assert_match(/resources :accounts$/, route)
+    end
+  end
+
+  def test_plural_names_are_singularized
+    content = run_generator ["accounts"]
+    assert_file "app/models/account.rb", /class Account < ApplicationRecord/
+    assert_file "test/models/account_test.rb", /class AccountTest/
+    assert_match(/\[WARNING\] The model name 'accounts' was recognized as a plural, using the singular 'account' instead\. Override with --force-plural or setup custom inflection rules for this noun before running the generator\./, content)
+  end
+
+  def test_plural_names_can_be_forced
+    content = run_generator ["accounts", "--force-plural"]
+    assert_file "app/models/accounts.rb", /class Accounts < ApplicationRecord/
+    assert_file "test/models/accounts_test.rb", /class AccountsTest/
+    assert_no_match(/\[WARNING\]/, content)
+  end
+
+  def test_mass_nouns_do_not_throw_warnings
+    content = run_generator ["sheep"]
+    assert_no_match(/\[WARNING\]/, content)
+  end
+
+  def test_route_is_removed_on_revoke
+    run_generator
+    run_generator ["account"], behavior: :revoke
+
+    assert_file "config/routes.rb" do |route|
+      assert_no_match(/resources :accounts$/, route)
     end
   end
 end

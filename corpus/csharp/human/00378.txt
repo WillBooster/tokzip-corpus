@@ -1,219 +1,317 @@
 // Copyright (c) Charlie Poole, Rob Prouse and Contributors. MIT License - see LICENSE.txt
 
 using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
-using System.Reflection;
-using System.Text;
+using System.Threading;
+using NUnit.Framework.Interfaces;
+using NUnit.Framework.Internal;
+using NUnit.Framework.Internal.Execution;
 
-namespace NUnit.Framework.Internal
+namespace NUnit.Framework.Tests.Internal
 {
     /// <summary>
-    /// ExceptionHelper provides static methods for working with exceptions
+    /// Summary description for EventQueueTests.
     /// </summary>
-    public static class ExceptionHelper
+    [TestFixture]
+    public class EventQueueTests
     {
-        /// <summary>
-        /// Rethrows an exception, preserving its stack trace
-        /// </summary>
-        /// <param name="exception">The exception to rethrow</param>
-        [DoesNotReturn]
-        public static void Rethrow(Exception exception)
+        private static readonly Event[] Events =
         {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception).Throw();
+            // These are all in violation of contract
+            // However the code here doesn't use the argument.
+#pragma warning disable CS8625 // Cannot convert null literal to non-nullable reference type.
+            new TestStartedEvent(null),
+            new TestOutputEvent(null),
+            new TestStartedEvent(null),
+            new TestFinishedEvent(null),
+            new TestStartedEvent(null),
+            new TestOutputEvent(null),
+            new TestMessageEvent(null),
+            new TestFinishedEvent(null),
+            new TestFinishedEvent(null),
+#pragma warning restore CS8625 // Cannot convert null literal to non-nullable reference type.
+        };
+
+        private static void EnqueueEvents(EventQueue q)
+        {
+            foreach (Event e in Events)
+                q.Enqueue(e);
         }
 
-        /// <summary>
-        /// Builds up a message, using the Message field of the specified exception
-        /// as well as any InnerExceptions. Optionally excludes exception names,
-        /// creating a more readable message.
-        /// </summary>
-        /// <param name="exception">The exception.</param>
-        /// <param name="excludeExceptionNames">Flag indicating whether exception names should be excluded.</param>
-        /// <returns>A combined message string.</returns>
-        public static string BuildMessage(Exception exception, bool excludeExceptionNames = false)
+        private static void SendEvents(ITestListener listener)
         {
-            Guard.ArgumentNotNull(exception, nameof(exception));
-
-            StringBuilder sb = new StringBuilder();
-            if (!excludeExceptionNames)
-                sb.AppendFormat("{0} : ", exception.GetType());
-            sb.Append(GetExceptionMessage(exception));
-            AppendExceptionDataContents(exception, sb);
-
-            foreach (Exception inner in FlattenExceptionHierarchy(exception))
-            {
-                sb.Append(Environment.NewLine);
-                sb.Append("  ----> ");
-                if (!excludeExceptionNames)
-                    sb.AppendFormat("{0} : ", inner.GetType());
-                sb.Append(GetExceptionMessage(inner));
-                AppendExceptionDataContents(inner, sb);
-            }
-
-            return sb.ToString();
+            foreach (Event e in Events)
+                e.Send(listener);
         }
 
-        /// <summary>
-        /// Builds up a message, using the Message field of the specified exception
-        /// as well as any InnerExceptions.
-        /// </summary>
-        /// <param name="exception">The exception.</param>
-        /// <returns>A combined stack trace.</returns>
-        public static string BuildStackTrace(Exception exception)
+        private static void VerifyQueue(EventQueue q)
         {
-            StringBuilder sb = new StringBuilder(exception.GetStackTraceWithoutThrowing());
-
-            foreach (Exception inner in FlattenExceptionHierarchy(exception))
+            for (int index = 0; index < Events.Length; index++)
             {
-                sb.Append(Environment.NewLine);
-                sb.Append("--");
-                sb.Append(inner.GetType().Name);
-                sb.Append(Environment.NewLine);
-                sb.Append(inner.GetStackTraceWithoutThrowing());
+                Event? e = q.Dequeue(false);
+                Assert.That(e, Is.Not.Null);
+                Assert.That(e.GetType(), Is.EqualTo(Events[index].GetType()), $"Event {index}");
             }
-
-            return sb.ToString();
         }
 
-        private static string GetExceptionMessage(Exception ex)
+        private static void StartPump(EventPump pump, int waitTime)
         {
-            var message = ex.GetMessageWithoutThrowing();
-
-            if (string.IsNullOrEmpty(message))
-            {
-                // Special handling for Mono 5.0, which returns an empty message
-                return ex is System.IO.FileNotFoundException fnfEx
-                    ? "Could not load assembly. File not found: " + fnfEx.FileName
-                    : "No message provided";
-            }
-
-            return message;
+            pump.Start();
+            WaitForPumpToStart(pump, waitTime);
         }
 
-        private static void AppendExceptionDataContents(Exception ex, StringBuilder sb)
+        private static void StopPump(EventPump pump, int waitTime)
         {
-            var data = ex.GetDataWithoutThrowing();
+            pump.Stop();
+            WaitForPumpToStop(pump, waitTime);
+        }
 
-            if (data.IsError(out var message))
+        private static void WaitForPumpToStart(EventPump pump, int waitTime)
+        {
+            while (waitTime > 0 && pump.PumpState != EventPumpState.Pumping)
             {
-                sb.AppendLine();
-                sb.Append(message);
+                Thread.Sleep(100);
+                waitTime -= 100;
             }
-            else
+        }
+
+        private static void WaitForPumpToStop(EventPump pump, int waitTime)
+        {
+            while (waitTime > 0 && pump.PumpState != EventPumpState.Stopped)
             {
-                IDictionary dictionary = data.Value!;
-                if (dictionary.Count != 0)
+                Thread.Sleep(100);
+                waitTime -= 100;
+            }
+        }
+
+        #region EventQueue Tests
+
+        [Test]
+        public void QueueEvents()
+        {
+            EventQueue q = new EventQueue();
+            EnqueueEvents(q);
+            VerifyQueue(q);
+        }
+
+        [Test]
+        public void DequeueEmpty()
+        {
+            EventQueue q = new EventQueue();
+            Assert.That(q.Dequeue(false), Is.Null);
+        }
+
+        [TestFixture]
+        public class DequeueBlocking_StopTest : ProducerConsumerTest
+        {
+            private volatile int _receivedEvents;
+
+            [Test]
+#if THREAD_ABORT
+            [Timeout(1000)]
+#endif
+            public void DequeueBlocking_Stop()
+            {
+                var q = new EventQueue();
+                _receivedEvents = 0;
+                RunProducerConsumer(q);
+                Assert.That(_receivedEvents, Is.EqualTo(Events.Length + 1));
+            }
+
+            protected override void Producer(object? parameter)
+            {
+                if (parameter is not EventQueue q)
+                    throw new ArgumentException("Expected an EventQueue", nameof(parameter));
+                EnqueueEvents(q);
+                while (_receivedEvents < Events.Length)
+                    Thread.Sleep(30);
+
+                q.Stop();
+            }
+
+            protected override void Consumer(object? parameter)
+            {
+                if (parameter is not EventQueue q)
+                    throw new ArgumentException("Expected an EventQueue", nameof(parameter));
+                Event? e;
+                do
                 {
-                    sb.AppendLine();
-                    sb.Append("Data:");
-                    foreach (DictionaryEntry kvp in dictionary)
+                    e = q.Dequeue(true);
+                    _receivedEvents++;
+                    Thread.MemoryBarrier();
+                }
+                while (e is not null);
+            }
+        }
+
+        #endregion
+
+        #region QueuingEventListener Tests
+
+        [Test]
+        public void SendEvents()
+        {
+            QueuingEventListener el = new QueuingEventListener();
+            SendEvents(el);
+            VerifyQueue(el.Events);
+        }
+
+        #endregion
+
+        #region EventPump Tests
+
+        [Test]
+        public void StartAndStopPumpOnEmptyQueue()
+        {
+            using (EventPump pump = new EventPump(TestListener.NULL, new EventQueue()))
+            {
+                pump.Name = "StartAndStopPumpOnEmptyQueue";
+                StartPump(pump, 1000);
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Pumping));
+                StopPump(pump, 1000);
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Stopped));
+            }
+        }
+
+        [Test]
+#if THREAD_ABORT
+        [Timeout(3000)]
+#endif
+        public void PumpEvents()
+        {
+            EventQueue q = new EventQueue();
+            QueuingEventListener el = new QueuingEventListener();
+            using (EventPump pump = new EventPump(el, q))
+            {
+                pump.Name = "PumpEvents";
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Stopped));
+                StartPump(pump, 1000);
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Pumping));
+                EnqueueEvents(q);
+                StopPump(pump, 1000);
+                Assert.That(pump.PumpState, Is.EqualTo(EventPumpState.Stopped));
+            }
+            VerifyQueue(el.Events);
+        }
+
+        [Test]
+#if THREAD_ABORT
+        [Timeout(3000)]
+#endif
+        public void PumpSynchronousAndAsynchronousEvents()
+        {
+            EventQueue q = new EventQueue();
+            using (EventPump pump = new EventPump(TestListener.NULL, q))
+            {
+                pump.Name = "PumpSynchronousAndAsynchronousEvents";
+                pump.Start();
+
+                int numberOfAsynchronousEvents = 0;
+                int sumOfAsynchronousQueueLength = 0;
+                const int repetitions = 2;
+                for (int i = 0; i < repetitions; i++)
+                {
+                    foreach (Event e in Events)
                     {
-                        sb.AppendLine();
-                        sb.AppendFormat("  {0}: {1}", kvp.Key, kvp.Value?.ToString() ?? "<null>");
+                        q.Enqueue(e);
+
+                        sumOfAsynchronousQueueLength += q.Count;
+                        numberOfAsynchronousEvents++;
                     }
+                }
+
+                Console.WriteLine("Average queue length: {0}", (float)sumOfAsynchronousQueueLength / numberOfAsynchronousEvents);
+            }
+        }
+
+        #endregion
+
+        public abstract class ProducerConsumerTest
+        {
+            private volatile Exception? _myConsumerException;
+
+            protected void RunProducerConsumer(object? parameter)
+            {
+                _myConsumerException = null;
+                Thread consumerThread = new Thread(ConsumerThreadWrapper);
+                try
+                {
+                    consumerThread.Start(parameter);
+                    Producer(parameter);
+                    bool consumerStopped = consumerThread.Join(1000);
+                    Assert.That(consumerStopped, Is.True);
+                }
+                finally
+                {
+#if THREAD_ABORT
+                    ThreadUtility.Kill(consumerThread);
+#endif
+                }
+
+                Assert.That(_myConsumerException, Is.Null);
+            }
+
+            protected abstract void Producer(object? parameter);
+
+            protected abstract void Consumer(object? parameter);
+
+            private void ConsumerThreadWrapper(object? parameter)
+            {
+                try
+                {
+                    Consumer(parameter);
+                }
+#if THREAD_ABORT
+                catch (System.Threading.ThreadAbortException)
+                {
+                    Thread.ResetAbort();
+                }
+#endif
+                catch (Exception ex)
+                {
+                    _myConsumerException = ex;
                 }
             }
         }
 
-        private static List<Exception> FlattenExceptionHierarchy(Exception exception)
+        private class EventProducer
         {
-            var result = new List<Exception>();
+            public readonly Thread ProducerThread;
+            public int SentEventsCount;
+            public int MaxQueueLength;
+            public Exception? Exception;
+            private readonly EventQueue _queue;
+            private readonly bool _delay;
 
-            if (exception is ReflectionTypeLoadException reflectionException)
+            public EventProducer(EventQueue q, int id, bool delay)
             {
-                foreach (var innerException in reflectionException.LoaderExceptions)
-                {
-                    if (innerException is not null)
-                        result.Add(exception);
-                }
-
-                foreach (var innerException in reflectionException.LoaderExceptions)
-                {
-                    if (innerException is not null)
-                        result.AddRange(FlattenExceptionHierarchy(innerException));
-                }
-            }
-            if (exception is AggregateException aggregateException)
-            {
-                result.AddRange(aggregateException.InnerExceptions);
-
-                foreach (var innerException in aggregateException.InnerExceptions)
-                    result.AddRange(FlattenExceptionHierarchy(innerException));
-            }
-            else if (exception.InnerException is not null)
-            {
-                result.Add(exception.InnerException);
-                result.AddRange(FlattenExceptionHierarchy(exception.InnerException));
+                _queue = q;
+                ProducerThread = new Thread(new ThreadStart(Produce));
+                ProducerThread.Name = GetType().FullName + id;
+                _delay = delay;
             }
 
-            return result;
-        }
-
-        /// <summary>
-        /// Executes a parameterless synchronous or async delegate and returns the exception it throws, if any.
-        /// </summary>
-        internal static Exception? RecordException(Delegate parameterlessDelegate, string parameterName)
-        {
-            Guard.ArgumentNotNull(parameterlessDelegate, parameterName);
-
-            Guard.ArgumentValid(
-                parameterlessDelegate.GetType().GetMethod("Invoke")?.GetParameters().Length == 0,
-                $"The actual value must be a parameterless delegate but was {parameterlessDelegate.GetType().Name}.",
-                parameterName);
-
-            Guard.ArgumentNotAsyncVoid(parameterlessDelegate, parameterName);
-
-            using (new TestExecutionContext.IsolatedContext())
+            private void Produce()
             {
-                if (AsyncToSyncAdapter.IsAsyncOperation(parameterlessDelegate))
+                try
                 {
-                    try
+                    Event e = new TestStartedEvent(new TestSuite("Dummy"));
+                    DateTime start = DateTime.Now;
+                    while (DateTime.Now - start <= TimeSpan.FromSeconds(3))
                     {
-                        AsyncToSyncAdapter.Await(parameterlessDelegate.DynamicInvokeWithTransparentExceptions);
-                    }
-                    catch (Exception ex)
-                    {
-                        return ex;
+                        _queue.Enqueue(e);
+                        SentEventsCount++;
+                        MaxQueueLength = Math.Max(_queue.Count, MaxQueueLength);
+
+                        // without Sleep or with just a Sleep(0), the EventPump thread does not keep up and the queue gets very long
+                        if (_delay)
+                            Thread.Sleep(1);
                     }
                 }
-                else
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        parameterlessDelegate.DynamicInvokeWithTransparentExceptions();
-                    }
-                    catch (Exception ex)
-                    {
-                        return ex;
-                    }
+                    Exception = ex;
                 }
             }
-
-            return null;
-        }
-
-        /// <summary>
-        /// Unwraps the exception of type <see cref="TargetInvocationException"/> to its InnerException.
-        /// </summary>
-        /// <param name="exception">The exception to unwrap.</param>
-        /// <returns>The InnerException is available, otherwise the <paramref name="exception"/>.</returns>
-        public static Exception Unwrap(this Exception exception)
-        {
-            if (exception is NUnitException nUnitException &&
-                nUnitException.InnerException is not null)
-            {
-                exception = nUnitException.InnerException;
-            }
-
-            while (exception is TargetInvocationException targetInvocationException &&
-                targetInvocationException.InnerException is not null)
-            {
-                exception = targetInvocationException.InnerException;
-            }
-
-            return exception;
         }
     }
 }

@@ -1,17 +1,523 @@
-To set this configuration setting within the application, an initializer should
-be used. By using an initializer, the configuration will be set up before the
-application starts and calls the engine's models, which may depend on this
-configuration setting existing.
+## 介紹
 
-Create a new initializer at `config/initializers/blorgh.rb` inside the
-application where the `blorgh` engine is installed and put this content in it:
+樣式 (*style*) 是支配我們程式碼的慣例。實際上由於這些約定不僅僅只涵蓋程式碼格式化的部分（`gofmt` 能替我們處理），術語「**樣式**」不是很恰當的說法。
 
-```ruby
-Blorgh.author_class = "User"
+本指南的目的是透過詳細描述在 Uber 撰寫 Go 程式碼的注意事項來梳理這種複雜的規則。這些規則的存在是為了使函式庫易於管理，同時也能讓工程師能更有效地運用 Go 語言的功能。
+
+該指南最初由 [Prashant Varanasi] 和 [Simon Newton] 編寫，目的是使一些同事能快速使用 Go。多年來，這份指南已根據其他人的回饋進行數次修訂。
+
+  [Prashant Varanasi]: https://github.com/prashantv
+  [Simon Newton]: https://github.com/nomis52
+
+本文件記錄了我們在 Uber 遵循的 Go 程式碼中的慣用約定。其中許多是 Go 的通則，而其他準則是延伸自這些外部資源：
+
+1. [Effective Go](https://golang.org/doc/effective_go.html)
+2. [Go Common Mistakes](https://github.com/golang/go/wiki/CommonMistakes)
+3. [Go Code Review Comments](https://github.com/golang/go/wiki/CodeReviewComments)
+
+程式碼範例部分，主要目標是能使最新兩個小[版本](https://go.dev/doc/devel/release)的 Go 得以準確執行。
+
+所有程式碼都應該透過 `golint` 和 `go vet` 的檢查並無錯誤。我們建議您將編輯器設定為：
+
+- 儲存時使用 `goimports`
+- 使用 `golint` 和 `go vet` 檢查錯誤
+
+您可以在以下 Go 編輯器工具的相關頁面中找到更為詳細的資訊：
+<https://github.com/golang/go/wiki/IDEsAndTextEditorPlugins>
+
+## 指導準則
+
+### 指向介面的指標
+
+大部分情況下都不需要指向介面 (*interface*) 類型的指標 (*pointer*)。您應該將介面作為數值進行傳遞，在這樣的傳遞過程中，實質上傳遞的基底 (*underlying*) 資料仍然可以是指標。
+
+介面由兩個欄位構成：
+
+1. 指向某個特定類型資訊的指標。您可以將其視為「類型 (*type*)」。
+2. 資料指標。如果儲存的資料是指標，則直接儲存；如果儲存的資料是數值，則儲存指向這個數值的指標。
+
+如果想要介面方法修改基底資料，則必須使用指標傳遞（將物件指標賦值給介面變數）。
+
+```go
+type F interface {
+  f()
+}
+
+type S1 struct{}
+
+func (s S1) f() {}
+
+type S2 struct{}
+
+func (s *S2) f() {}
+
+// f1.f() 無法修改基底資料
+// f2.f() 可以修改基底資料，給介面變數 f2 賦值時使用的是物件指標
+var f1 F = S1{}
+var f2 F = &S2{}
 ```
 
-WARNING: It's very important here to use the `String` version of the class,
-rather than the class itself. If you were to use the class, Rails would attempt
-to load that class and then reference the related table. This could lead to
-problems if the table didn't already exist. Therefore, a `String` should be
-used and then converted to a class using `constantize` in the engine later on.
+### 介面合理性驗證
+
+可以的話，在編譯時驗證介面的合理性，包括：
+
+- 需要用來實作特定介面以滿足 API 契約的匯出類型
+- 實作同個介面，屬於一整組的匯出或非匯出類型
+- 會打斷使用者編譯的其它違反介面原則情況
+
+補充[^src-from-cn]：上面 3 點是編譯器對介面的檢查機制，大致意思是錯誤使用介面會在編譯期間報錯。所以可以利用這個機制讓部分問題在編譯期間暴露。
+
+<table>
+<thead><tr><th>不妥做法</th> <th>較佳做法</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+// 如果 Handler 沒有實作 http.Handler，會在運作時報錯
+type Handler struct {
+  // ...
+}
+func (h *Handler) ServeHTTP(
+  w http.ResponseWriter,
+  r *http.Request,
+) {
+  ...
+}
+```
+
+</td><td>
+
+```go
+type Handler struct {
+  // ...
+}
+// 用於觸發編譯時期的介面合理性檢查機制
+// 如果 Handler 沒有實作 http.Handler，會在編譯期間報錯
+var _ http.Handler = (*Handler)(nil)
+func (h *Handler) ServeHTTP(
+  w http.ResponseWriter,
+  r *http.Request,
+) {
+  // ...
+}
+```
+
+</td></tr>
+</tbody></table>
+
+如果 `*Handler` 與 `http.Handler` 的介面不同，那麼語句 `var _ http.Handler = (*Handler)(nil)` 將無法編譯通過。
+
+賦值的右邊應該是斷言類型的零值——指標類型（如 `*Handler`）、切片和 map (映射) 是 `nil`；結構體類型是空結構體 (`structName{}`)。
+
+```go
+type LogHandler struct {
+  h   http.Handler
+  log *zap.Logger
+}
+var _ http.Handler = LogHandler{}
+func (h LogHandler) ServeHTTP(
+  w http.ResponseWriter,
+  r *http.Request,
+) {
+  // ...
+}
+```
+
+### 接收器 (receiver) 與介面
+
+使用數值接收器的方法，既可以透過數值呼叫，也可以透過指標呼叫。
+
+具指標接收器的方法，只能透過指標或 [可定址數值 (addressable values)] 呼叫。
+
+  [可定址數值 (addressable values)]: https://golang.org/ref/spec#Method_values
+
+例如：
+
+```go
+type S struct {
+  data string
+}
+
+func (s S) Read() string {
+  return s.data
+}
+
+func (s *S) Write(str string) {
+  s.data = str
+}
+
+// 我們無法取得儲存在 map 中的值的指標，因為它們不是可尋址的數值
+sVals := map[int]S{1: {"A"}}
+
+// 我們可以對儲存在 map 中的值呼叫 Read 方法，
+// 因為 Read 方法是使用數值接受器，其不要求
+// 數值是可以尋址的。
+sVals[1].Read()
+
+// 我們不能對儲存在 map 中的值呼叫 Write 方法，
+// 因為 Write 方法是使用指標接收器，其無法
+// 取得儲存在 map 中的值的指標。
+//
+//  sVals[1].Write("test")
+
+sPtrs := map[int]*S{1: {"A"}}
+
+// 如果 map 儲存的是指標，則可以呼叫 Read 和 Write，
+// 因為指標本身就可以尋址。
+sPtrs[1].Read
+sPtrs[1].Write("test")
+```
+
+類似的，即使方法有數值接收器，也同樣可以用指標接收器來滿足介面。
+
+```go
+type F interface {
+  f()
+}
+
+type S1 struct{}
+
+func (s S1) f() {}
+
+type S2 struct{}
+
+func (s *S2) f() {}
+
+s1Val := S1{}
+s1Ptr := &S1{}
+s2Val := S2{}
+s2Ptr := &S2{}
+
+var i F
+i = s1Val
+i = s1Ptr
+i = s2Ptr
+
+//  下面程式碼無法通過編譯。因為 s2Val 是數值，而 S2 的 f 方法中沒有使用數值接收器
+//   i = s2Val
+```
+
+Effective Go 中有一段關於 [Pointers vs. Values] 的精闢講解。
+
+  [Pointers vs. Values]: https://golang.org/doc/effective_go.html#pointers_vs_values
+
+補充[^src-from-cn]：
+
+- 一個類型可以有數值接收器方法集和指標接收器方法集
+  - 數值接收器方法集是指標接收器方法集的子集，反之不是
+- 規則
+  - 數值只能使用數值接收器方法集
+  - 指標可以使用 `數值接收器方法集` + `指標接收器方法集`
+- 介面的匹配（或稱「實作」）
+  - 類型實作了介面的所有方法，叫匹配
+  - 具體來說，可以是類型的數值方法集匹配介面，或者是指標方法集匹配介面
+
+具體的匹配分兩種：
+
+- 數值方法集和介面匹配
+  - 給介面變數賦值的，不管是數值還是指標都 ok，因為都包含數值方法集
+- 指針方法集和介面匹配
+  - 只能將指標賦值給介面變數，因為只有指標方法集和介面匹配
+  - 如果將數值賦值給介面變數，會在編譯期間報錯（會觸發介面合理性檢查機制）
+
+`i = s2Val` 會報錯的本因，是數值方法集和介面不匹配。
+
+  [^src-from-cn]: 這個補充來源自[簡體中文翻譯](https://github.com/xxjwxc/uber_go_guide_cn)
+
+### 零值 Mutex 是有效的
+
+`sync.Mutex` 和 `sync.RWMutex` 的零值是有效的。所以指向 mutex 的指標基本是不必要的。
+
+<table>
+<thead><tr><th>不妥做法</th> <th>較佳做法</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+mu := new(sync.Mutex)
+mu.Lock()
+```
+
+</td><td>
+
+```go
+var mu sync.Mutex
+mu.Lock()
+```
+
+</td></tr>
+</tbody></table>
+
+如果你使用結構體 (*struct*) 指標，mutex 應該作為結構體的非指標成員。即使不匯出結構體，也不要直接把 mutex 嵌入 (*embed*) 到結構體中。
+
+<table>
+<thead><tr><th>不妥做法</th> <th>較佳做法</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+type SMap struct {
+  sync.Mutex
+
+  data map[string]string
+}
+
+func NewSMap() *SMap {
+  return &SMap{
+    data: make(map[string]string),
+  }
+}
+
+func (m *SMap) Get(k string) string {
+  m.Lock()
+  defer m.Unlock()
+
+  return m.data[k]
+}
+```
+
+</td><td>
+
+```go
+type SMap struct {
+  mu sync.Mutex
+
+  data map[string]string
+}
+
+func NewSMap() *SMap {
+  return &SMap{
+    data: make(map[string]string),
+  }
+}
+
+func (m *SMap) Get(k string) string {
+  m.mu.Lock()
+  defer m.mu.Unlock()
+
+  return m.data[k]
+}
+```
+
+</td></tr>
+<tr><td>
+
+`Mutex` 欄位以及 `Lock` 和 `Unlock` 方法，是 `SMap` 匯出 (*export*) 的 API 中沒有刻意說明的部分。
+
+ </td><td>
+
+mutex 及其方法是 `SMap` 的實作，對其呼叫者來說是不可見的。
+
+ </td></tr>
+ </tbody></table>
+
+### 在邊界處複製切片和 maps
+
+切片 (*slices*) 和 maps（映射、對應）包含了指向基底資料的指標，因此在需要複製它們時要特別注意。
+
+#### 接收切片和 maps
+
+請記住，當切片或 map 作為函式參數傳入時，如果您儲存了對它們的引用，則使用者可以對其進行修改。
+
+<table>
+<thead><tr><th>不妥做法</th> <th>較佳做法</th></tr></thead>
+<tbody>
+<tr>
+<td>
+
+```go
+func (d *Driver) SetTrips(trips []Trip) {
+  d.trips = trips
+}
+
+trips := ...
+d1.SetTrips(trips)
+
+// 你是要修改 d1.trips 嗎？
+trips[0] = ...
+```
+
+</td>
+<td>
+
+```go
+func (d *Driver) SetTrips(trips []Trip) {
+  d.trips = make([]Trip, len(trips))
+  copy(d.trips, trips)
+}
+
+trips := ...
+d1.SetTrips(trips)
+
+// 這裡我們修改 trips[0]，但不會影響到 d1.trips
+trips[0] = ...
+```
+
+</td>
+</tr>
+
+</tbody>
+</table>
+
+> 補充[^src-from-cn]：這是 Go 語言中很基本的深淺複製概念，我們必須要熟記哪些資料結構屬於淺複製，哪些又屬於深複製。在不清楚結構體特性的情況下，很有可能會修改到不應受影響的資料，造成非預期行為發生。
+
+#### 回傳切片或 maps
+
+同樣，留意使用者可能會對暴露內部狀態的切片或 map 進行修改。
+
+<table>
+<thead><tr><th>不妥做法</th><th>較佳做法</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+type Stats struct {
+  mu sync.Mutex
+
+  counters map[string]int
+}
+
+// Snapshot 回傳目前狀態。
+func (s *Stats) Snapshot() map[string]int {
+  s.mu.Lock()
+  defer s.mu.Unlock()
+
+  return s.counters
+}
+
+// snapshot 不再受互斥鎖保護
+// 因此對 snapshot 的任何存取都將受到 data races 影響
+// 影響 stats.counters
+snapshot := stats.Snapshot()
+```
+
+</td><td>
+
+```go
+type Stats struct {
+  mu sync.Mutex
+
+  counters map[string]int
+}
+
+func (s *Stats) Snapshot() map[string]int {
+  s.mu.Lock()
+  defer s.mu.Unlock()
+
+  result := make(map[string]int, len(s.counters))
+  for k, v := range s.counters {
+    result[k] = v
+  }
+  return result
+}
+
+// snapshot 現在是一個複本
+snapshot := stats.Snapshot()
+```
+
+</td></tr>
+</tbody></table>
+
+### 使用 defer 釋放資源
+
+使用 defer 釋放資源，諸如檔案和鎖。
+
+<table>
+<thead><tr><th>不妥做法</th> <th>較佳做法</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+p.Lock()
+if p.count < 10 {
+  p.Unlock()
+  return p.count
+}
+
+p.count++
+newCount := p.count
+p.Unlock()
+
+return newCount
+
+// 當有多個 return 分支時，很容易遺忘 unlock
+```
+
+</td><td>
+
+```go
+p.Lock()
+defer p.Unlock()
+
+if p.count < 10 {
+  return p.count
+}
+
+p.count++
+return p.count
+
+// 更可讀
+```
+
+</td></tr>
+</tbody></table>
+
+Defer 的開銷非常小，除非您可以證明函式執行時間在奈秒級的程度，否則都應該用 Defer。因為使用 defer 的成本微不足道，因此值得使用 defer 提升可讀性。這尤其適用於那些不單單進行簡單記憶體存取的規模較大方法——在這些方法中，其他計算的資源消耗遠超過 `defer`。
+
+### Channel 的 size 要麼是 1，不然就是無暫存的
+
+channel 通常 size 應為 1 或是無暫存的。預設情況下，channel 是無暫存的，其 size 為 0。任何其他大小都必須經過嚴格的檢查。我們需要考慮如何確定大小，考慮是什麼阻止了 channel 在高負載下和阻塞型寫入時的寫入，以及當這種情況發生時系統邏輯有哪些變化。（翻譯解釋[^src-from-cn]：按照原文意思是需要界定通道邊界、競爭條件，以及邏輯上下文的梳理）
+
+<table>
+<thead><tr><th>不妥做法</th> <th>較佳做法</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+// 應該足以滿足任何情況！
+c := make(chan int, 64)
+```
+
+</td><td>
+
+```go
+// 大小：1
+c := make(chan int, 1) // 或者
+// 無暫存 channel，大小為 0
+c := make(chan int)
+```
+
+</td></tr>
+</tbody></table>
+
+### 列舉從 1 開始
+
+在 Go 中引入列舉的標準方法是宣告一個自訂類型和一個使用了 iota 的 const 組。由於變數的預設值為 0，因此通常應以非零值開頭列舉。
+
+<table>
+<thead><tr><th>不妥做法</th> <th>較佳做法</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+type Operation int
+
+const (
+  Add Operation = iota
+  Subtract
+  Multiply
+)
+
+// Add=0, Subtract=1, Multiply=2
+```
+
+</td><td>
+
+```go
+type Operation int
+
+const (
+  Add Operation = iota + 1
+  Subtract
+  Multiply
+)

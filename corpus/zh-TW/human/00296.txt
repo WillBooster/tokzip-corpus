@@ -1,70 +1,71 @@
-<!-- more -->
+有一套叫做 Objection 的工具是以 Frida 為基礎開發的，建議可以直接裝這個，因為會順便連 Frida 一起裝好，安裝教學可參考：https://github.com/sensepost/objection/wiki/Installation
 
-## 漏洞分析
+要用 Frida 的話，除了手機上要安裝以外，電腦也要安裝，至於如何安裝可直接參考官方網站的指示：https://frida.re/docs/installation/
 
-在 GitHub 上面也有一個比較偏技術的說明：[CVE-2023-46729: SSRF via Next.js SDK tunnel endpoint](https://github.com/getsentry/sentry-javascript/security/advisories/GHSA-2rmr-xw8m-22q9)
+另外提醒一下，如果是手機裡面已經有了但是換一台電腦，要記得安裝的版本要一致，步驟是：
 
-可以看到這一段：
+1. 先去手機裡面看 frida 版本：`frida-server --version`，假設是 15.1.14 好了
+2. 到這邊找 frida-tools 的版本號 https://github.com/frida/frida/releases/tag/15.1.14
+3. 在電腦上安裝這兩個：
 
-> An unsanitized input of Next.js SDK tunnel endpoint allows sending HTTP requests to arbitrary URLs and reflecting the response back to the user. 
-
-在 Sentry 裡面，有一個叫做 tunnel 的功能，這張來自於[官方文件](https://docs.sentry.io/platforms/javascript/troubleshooting/#dealing-with-ad-blockers)的圖完美地解釋了為什麼需要 tunnel：
-
-![tunnel](/img/sentry-nextjs-sdk-cve-2023-46729/p1.png)
-
-如果沒有 tunnel 的話，送給 Sentry 的請求會在前端直接透過瀏覽器發送，而這些直接發給 Sentry 的請求可能會被一些 ad blocker 擋住，Sentry 就沒辦法接收到數據。若是有開啟 tunnel，就會變成先將請求發送給自己的 server，再從自己的 server 轉發給 Sentry，這樣就變成了 same-origin 的請求，便不會被 ad blocker 擋住。
-
-在專門提供給 Next.js 使用的 Sentry SDK 中，是用了一個叫做 [rewrite](https://nextjs.org/docs/app/api-reference/next-config-js/rewrites) 的功能，官方範例如下：
-
-``` js
-module.exports = {
-  async rewrites() {
-    return [
-      {
-        source: '/blog',
-        destination: 'https://example.com/blog',
-      },
-      {
-        source: '/blog/:slug',
-        destination: 'https://example.com/blog/:slug', // Matched parameters can be used in the destination
-      },
-    ]
-  },
-}
+```
+pip install frida==15.1.14
+pip install frida-tools==10.4.1
 ```
 
-Next.js 的 rewrite 基本上可以分為兩種，internal 跟 external，後者的話其實更像是 proxy 的感覺，可以直接把請求導向到外部網站，然後顯示出 response。
+主要是版本號要對，不然會出現一堆錯誤。
 
-Next.js Sentry SDK 的實作在 [sentry-javascript/packages/nextjs/src/config/withSentryConfig.ts](https://github.com/getsentry/sentry-javascript/blob/7.69.0/packages/nextjs/src/config/withSentryConfig.ts#L98)：
+另外，雖然說 Frida 這種東西感覺就是要 root 才能使用，但其實它有兩種方法可以跑，一種確實需要 root，另外一種不需要 root
+
+需要 root 的要在手機上安裝 frida-server，詳情可參考官網：https://frida.re/docs/android/
+
+基本上就是丟個執行檔進去手機，然後用 root 的權限跑起來，檔案推進去要跑起來的時候如果不是預設 root，可以用 adb shell 進去改：
+
+``` shell
+adb shell
+
+# 先刪掉舊的
+ps -e | grep frida-server
+kill -9 {your_process_id}
+
+# 確認用 root 跑
+su
+/data/local/tmp/frida-server &
+```
+
+跑起來之後可以用 `frida-ps -U` 確認是否有跑起來
+
+第二種不需要 root 的方法要改 apk，原理是在 apk 裡面加一個 Frida 的 so 檔，並在入口點加一行 `System.loadLibrary()`，就可以使用 Frida，在 wiki 裡面有詳細說明：https://github.com/sensepost/objection/wiki/Patching-Android-Applications
+
+上面改 apk 的流程不需要自己執行，有現成的指令幫你做，如果打包不起來可以用這個指令：
+
+``` shell
+objection patchapk --source test.apk --skip-resources --ignore-nativelibs
+```
+
+如果還是不行，可以運用我們之前學到的知識自己動手改造，先用 `apktool d` 把包好的 apk 拆開，然後自己改裡面東西，例如說有時候會有 so 檔案 align 的問題，就可以把 `AndroidManifest.xml` 裡的 `android:extractNativeLibs` 改成 true，再包回去就好了。
+
+## Frida 基本使用
+
+先講一下 Frida 是做什麼的，最普遍的用途是寫一些程式碼來 hook function，hook 指的就是你可以自己覆蓋任何一個 function 的實作，就可以觀察輸入以及輸出，也可以改變函式的回傳值。
+
+而這些程式碼會用 JavaScript 來寫，並在啟動 app 時注入進去，以我自己的經驗來說，其實只要看多一點範例之後，就能滿快上手的。
+
+講這麼多，不如動手來做做看，這次用的範例 app 跟第一篇一樣，就是個按下按鈕以後會檢測是否有 root 的 app：https://github.com/aszx87410/demo/raw/master/android/demoapp.apk
+
+這個 app 開啟之後預設的 activity 會是 `com.cymetrics.demo/MainActivity`，我們先來 hook 這個 class 的 onCreate 方法看看。
+
+我們先新建一個檔案 `script.js`，內容為：
 
 ``` js
-/**
- * Injects rewrite rules into the Next.js config provided by the user to tunnel
- * requests from the `tunnelPath` to Sentry.
- *
- * See https://nextjs.org/docs/api-reference/next.config.js/rewrites.
- */
-function setUpTunnelRewriteRules(userNextConfig: NextConfigObject, tunnelPath: string): void {
-  const originalRewrites = userNextConfig.rewrites;
+function run() {
+  Java.perform(() => {
+    var MainActivity = Java.use('com.cymetrics.demo.MainActivity')
+    MainActivity.onCreate.implementation = function() {
+      console.log('MainActivity onCreate')
+    }
+  })
+}
 
-  // This function doesn't take any arguments at the time of writing but we future-proof
-  // here in case Next.js ever decides to pass some
-  userNextConfig.rewrites = async (...args: unknown[]) => {
-    const injectedRewrite = {
-      // Matched rewrite routes will look like the following: `[tunnelPath]?o=[orgid]&p=[projectid]`
-      // Nextjs will automatically convert `source` into a regex for us
-      source: `${tunnelPath}(/?)`,
-      has: [
-        {
-          type: 'query',
-          key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
-          value: '(?<orgid>.*)',
-        },
-        {
-          type: 'query',
-          key: 'p', // short for projectId - we keep it short so matching is harder for ad-blockers
-          value: '(?<projectid>.*)',
-        },
-      ],
-      destination: 'https://o:orgid.ingest.sentry.io/api/:projectid/envelope/?hsts=0',
-    };
+setImmediate(run)
+```

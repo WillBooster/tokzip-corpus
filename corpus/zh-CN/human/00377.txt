@@ -1,63 +1,41 @@
-```rust
-{{#rustdoc_include ../listings/ch04-understanding-ownership/no-listing-07-reference/src/main.rs:all}}
-```
+现在就可以真切的看出我们的服务端有多么的原始：真实的库将会以更简洁的方式处理多个请求的识别！
 
-首先，注意变量声明和函数返回值中的元组代码都消失了。其次，注意我们把 `&s1` 传给 `calculate_length`，而在函数定义中，我们接收的是 `&String` 而不是 `String`。这些 `&` 符号表示 **引用**；它们让你引用某个值而不取得它的所有权。图 4-6 展示了这一概念。
+使用 `cargo run` 启动服务端，并接着打开两个浏览器窗口：一个请求 *http://127.0.0.1:7878/* 而另一个请求 *http://127.0.0.1:7878/sleep* 。如果像之前一样多次请求 */*，会发现响应的比较快速。不过如果请求 */sleep* 之后再请求 */*，就会看到 */* 会等待直到 `sleep` 休眠完五秒之后才响应。
 
-<img alt="Three tables: the table for s contains only a pointer to the table
-for s1. The table for s1 contains the stack data for s1 and points to the
-string data on the heap." src="img/trpl04-06.svg" class="center" />
+有多种技术可以用来避免所有请求都排在慢请求之后，包括我们在第十七章中所使用的异步；我们将要实现的一个便是线程池。
 
-<span class="caption">图 4-6：`&String s` 指向 `String s1` 示意图</span>
+### 使用线程池改善吞吐量
 
-> 注意：与使用 `&` 引用相反的操作是 **解引用**（*dereferencing*），它使用解引用运算符 `*` 实现。我们将会在第八章遇到一些解引用运算符，并在第十五章详细讨论解引用。
+**线程池**（*thread pool*）是一组预先分配的等待或准备处理任务的线程。当程序收到一个新任务，线程池中的一个线程会被分配该任务，并负责处理它。其余线程在该线程处理任务的同时可以处理任何其他接收到的任务。当第一个线程处理完任务时，它会返回空闲线程池中等待处理新任务。线程池允许我们并发处理连接，提高服务端的吞吐量。
 
-仔细看看这个函数调用：
+我们会将池中线程限制为较少的数量，以防拒绝服务（Denial of Service，DoS）攻击；如果程序为每一个接收的请求都新建一个线程，某人向服务端发起千万级的请求时会耗尽服务器的资源并导致请求处理陷入停滞。
 
-```rust
-{{#rustdoc_include ../listings/ch04-understanding-ownership/no-listing-07-reference/src/main.rs:here}}
-```
+不同于分配无限的线程，线程池中将有固定数量的等待线程。当新进请求时，将请求发送到线程池中做处理。线程池会维护一个接收请求的队列。每一个线程会从队列中取出一个请求，处理请求，接着向队列获取下一个请求。通过这种设计，则可以并发处理 *`N`* 个请求，其中 *`N`* 为线程数。如果每一个线程都在响应慢请求，之后的请求仍然会阻塞队列，不过相比之前已经增加了能处理的慢请求的数量。
 
-`&s1` 语法让我们创建一个**指向**值 `s1` 的引用，但并不拥有它。因为这个引用并不拥有该值，所以当引用停止使用时，它所指向的值也不会被丢弃。
+这个设计仅仅是多种改善 web 服务端吞吐量的方法之一。其他可供探索的方法有 fork/join 模型（fork/join model）、单线程异步 I/O 模型（single-threaded async I/O model）或者多线程异步 I/O 模型（multi-threaded async I/O model）。如果你对这个主题感兴趣，则可以阅读更多关于其他解决方案的内容并尝试实现它们；对于一个像 Rust 这样的底层语言，所有这些方法都是可行的。
 
-同理，函数签名使用 `&` 来表明参数 `s` 的类型是一个引用。让我们增加一些解释性的注释：
+在开始之前，让我们讨论一下线程池应用看起来如何。当尝试设计代码时，首先编写客户端接口（client interface）有助于指导代码设计。以期望的调用方式来构建 API 代码的结构，接着在这个结构之内实现功能，而不是先实现功能再设计公有 API。
 
-```rust
-{{#rustdoc_include ../listings/ch04-understanding-ownership/no-listing-08-reference-with-annotations/src/main.rs:here}}
-```
+类似于第十二章项目中使用的测试驱动开发。这里将要使用编译器驱动开发（compiler-driven development）。我们将编写调用所期望的函数的代码，接着观察编译器错误告诉我们接下来需要修改什么使得代码可以工作。不过在开始之前，我们将探索不会作为起点使用的技术。
 
-变量 `s` 的有效作用域与其他函数参数相同，不过当 `s` 停止使用时，它所指向的值不会被丢弃，因为 `s` 并不拥有它。当函数把引用而不是实际值作为参数时，就不需要通过返回值来交还所有权，因为函数从未拥有过它。
+#### 为每一个请求分配线程
 
-我们将创建一个引用的行为称为 **借用**（*borrowing*）。正如现实生活中，如果一个人拥有某样东西，你可以从他那里借来。当你使用完后，必须还回去。因为我们并不拥有它的所有权。
-
-那如果我们尝试修改借用的变量呢？尝试示例 4-6 中的代码。剧透：这行不通！
+首先，让我们探索一下如果为每一个连接都创建一个线程的代码看起来如何。这并不是最终方案，因为正如之前讲到的它会潜在的分配无限的线程，不过这是一个可用的多线程服务端的起点。接着我们会增加线程池作为改进，这样比较两个方案将会更容易。示例 21-11 展示了 `main` 的改变，它在 `for` 循环中为每一个流分配了一个新线程进行处理：
 
 <span class="filename">文件名：src/main.rs</span>
 
-```rust,ignore,does_not_compile
-{{#rustdoc_include ../listings/ch04-understanding-ownership/listing-04-06/src/main.rs}}
+```rust,no_run
+{{#rustdoc_include ../listings/ch21-web-server/listing-21-11/src/main.rs:here}}
 ```
 
-<span class="caption">示例 4-6：尝试修改借用的值</span>
+<span class="caption">示例 21-11: 为每一个流新建一个线程</span>
 
-这里是错误：
+正如第十六章讲到的，`thread::spawn` 会创建一个新线程并在其中运行闭包中的代码。如果运行这段代码并在在浏览器中加载 */sleep*，接着在另两个浏览器标签页中加载 */*，确实会发现 */* 请求不必等待 */sleep* 结束。不过正如之前提到的，这最终会使系统崩溃因为我们会无限制地创建新线程。
 
-```console
-{{#include ../listings/ch04-understanding-ownership/listing-04-06/output.txt}}
-```
+你可能也会回想起第十七章中正是这一类情况才是 async 和 await 真正闪光的地方！在我们用线程池构建项目时请记住并思考这与异步有什么不同或相同的地方。
 
-正如变量默认是不可变的，引用默认也是不可变的。我们不允许通过引用修改它指向的值。
+#### 创建有限数量的线程
 
-### 可变引用
-
-我们通过一个小调整就能修复示例 4-6 代码中的错误，允许我们修改一个借用的值，这就是 **可变引用**（*mutable reference*）：
+我们期望线程池以类似且熟悉的方式工作，以便从线程切换到线程池并不会对使用该 API 的代码做出大幅修改。示例 21-12 展示我们希望用来替换 `thread::spawn` 的 `ThreadPool` 结构体的假想接口：
 
 <span class="filename">文件名：src/main.rs</span>
-
-```rust
-{{#rustdoc_include ../listings/ch04-understanding-ownership/no-listing-09-fixes-listing-04-06/src/main.rs}}
-```
-
-首先，我们必须把 `s` 改成 `mut`。然后在调用 `change` 函数时创建一个可变引用 `&mut s`，并更新函数签名，让它接收一个可变引用 `some_string: &mut String`。这样就很清楚地表明，`change` 函数会修改它所借用的值。
-
-可变引用有一个很大的限制：如果你有一个对该变量的可变引用，你就不能再创建对该变量的引用。这些尝试创建两个 `s` 的可变引用的代码会失败：

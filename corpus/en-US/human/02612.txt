@@ -1,0 +1,184 @@
+`GET /revisions/{revisionId}/progress`
+
+Emits events as the build progresses. Ends when the revision reaches a terminal
+state (`succeeded`, `failed`, or `skipped`). Replaces the v1 pattern of polling
+deployment status in a loop.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: text/event-stream" \
+  "https://api.deno.com/v2/revisions/$REVISION_ID/progress"
+```
+
+#### Stream build logs
+
+`GET /revisions/{revisionId}/build_logs`
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: text/event-stream" \
+  "https://api.deno.com/v2/revisions/$REVISION_ID/build_logs"
+```
+
+| Aspect         | v1                                         | v2                                                     |
+| -------------- | ------------------------------------------ | ------------------------------------------------------ |
+| Formats        | `application/x-ndjson`, `application/json` | `text/event-stream` (SSE), `application/x-ndjson`      |
+| Log fields     | `level`, `message`                         | `timestamp`, `level`, `message`, `step`, `timeline`    |
+| Filter by step | Not supported                              | `step` param (preparing/installing/building/deploying) |
+
+### Query app logs
+
+**v1**: `GET /deployments/{deploymentId}/app_logs`
+
+**v2**: `GET /apps/{app}/logs`
+
+In v1, logs are scoped to a single deployment. In v2, logs are scoped to an app
+with optional filtering by `revision_id`.
+
+```bash
+# v1
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v1/deployments/$DEPLOYMENT_ID/app_logs?since=2024-01-01T00:00:00Z&until=2024-01-01T01:00:00Z"
+
+# v2
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v2/apps/my-app-slug/logs?start=2024-01-01T00:00:00Z&end=2024-01-01T01:00:00Z"
+```
+
+Parameter mapping:
+
+| v1       | v2       | Notes                                |
+| -------- | -------- | ------------------------------------ |
+| `since`  | `start`  | Required in v2                       |
+| `until`  | `end`    | Optional                             |
+| `limit`  | `limit`  | v1: max 10000. v2: max 1000          |
+| `order`  | _(none)_ | v2 returns chronological order       |
+| `q`      | `query`  | Text search                          |
+| `level`  | `level`  | v1: `warning`. v2: `warn`            |
+| `region` | _(none)_ | Region filtering not available in v2 |
+
+Response field mapping:
+
+| v1 field  | v2 field      |
+| --------- | ------------- |
+| `time`    | `timestamp`   |
+| `level`   | `level`       |
+| `message` | `message`     |
+| `region`  | `region`      |
+| —         | `revision_id` |
+| —         | `trace_id`    |
+| —         | `span_id`     |
+
+V2 wraps logs in an object with `next_cursor` for pagination:
+
+```json
+{
+  "logs": [
+    {
+      "timestamp": "2024-01-01T00:00:01Z",
+      "level": "info",
+      "message": "Listening on http://0.0.0.0:8000",
+      "region": "us-east-1",
+      "revision_id": "abcdef12"
+    }
+  ],
+  "next_cursor": "eyJsYXN0X3RzIjoiMjAy..."
+}
+```
+
+**Streaming:** In v1, omitting `since` and `until` enables real-time streaming.
+In v2, omit the `end` parameter to stream. Set the `Accept` header to
+`text/event-stream` for SSE format or `application/x-ndjson` for NDJSON.
+Requesting `application/json` without `end` returns an error.
+
+## Using labels to group apps
+
+Labels replace the v1 pattern of grouping multiple deployments under a single
+project:
+
+```bash
+# Create an app with labels
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://api.deno.com/v2/apps" \
+  -d '{
+    "slug": "my-service-auth",
+    "labels": {
+      "service": "my-service",
+      "function": "auth"
+    },
+    "config": {
+      "install": "deno install",
+      "runtime": {
+        "type": "dynamic",
+        "entrypoint": "main.ts"
+      }
+    }
+  }'
+
+# List all apps in a service
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.deno.com/v2/apps?labels[service]=my-service"
+```
+
+## Using layers for shared configuration
+
+Layers let you share environment variables across multiple apps. This was not
+possible in v1, where env vars had to be duplicated in every deployment request.
+
+```bash
+# Create a layer with shared env vars
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://api.deno.com/v2/layers" \
+  -d '{
+    "slug": "my-service-shared",
+    "env_vars": [
+      {"key": "DATABASE_URL", "value": "postgres://...", "secret": true},
+      {"key": "API_KEY", "value": "sk-...", "secret": true}
+    ]
+  }'
+
+# Create an app that uses the layer
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://api.deno.com/v2/apps" \
+  -d '{
+    "slug": "my-service-auth",
+    "layers": ["my-service-shared"],
+    "labels": {"service": "my-service"},
+    "config": {
+      "install": "deno install",
+      "runtime": {
+        "type": "dynamic",
+        "entrypoint": "main.ts"
+      }
+    }
+  }'
+```
+
+When a layer's env vars are updated, all apps using that layer pick up the
+changes immediately.
+
+## Migration checklist
+
+1. **Create a v2 organization token** in the Deno Deploy dashboard (`ddo_`
+   prefix).
+2. **Create one app per function** instead of deploying multiple functions to a
+   single project. Use labels to group related apps.
+3. **Set up layers** for environment variables shared across functions.
+4. **Update deploy requests:**
+   - Move `entryPointUrl` to `config.runtime.entrypoint`
+   - Set `config.install` to `"deno install"`
+   - Convert `envVars` object to `env_vars` array, or set on the app/layer
+   - Add `kind: "file"` to assets
+5. **Update build log tailing** to use `GET /revisions/{id}/progress` (SSE)
+   instead of polling.
+6. **Update log queries:**
+   - `since`/`until` → `start`/`end`
+   - `warning` → `warn`
+   - `time` → `timestamp` in log response body
+   - Handle `{logs: [...], next_cursor: ...}` response wrapper
+7. **Update pagination** from page-based to cursor-based.
+8. **Update status values**: `pending` → `queued`, `success` → `succeeded`.
+9. **Update field names** from camelCase to snake_case.

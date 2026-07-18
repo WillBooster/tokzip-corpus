@@ -10,279 +10,690 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Test\Installer;
+namespace Composer\Test\Command;
 
-use Composer\Installer\LibraryInstaller;
-use Composer\Repository\InstalledArrayRepository;
-use Composer\Util\Filesystem;
+use Composer\Command\InitCommand;
+use Composer\Json\JsonFile;
 use Composer\Test\TestCase;
-use Composer\Composer;
-use Composer\Config;
+use Symfony\Component\Console\Tester\ApplicationTester;
 
-class LibraryInstallerTest extends TestCase
+class InitCommandTest extends TestCase
 {
-    /**
-     * @var \Composer\Composer
-     */
-    protected $composer;
-
-    /**
-     * @var \Composer\Config
-     */
-    protected $config;
-
-    /**
-     * @var string
-     */
-    protected $rootDir;
-
-    /**
-     * @var string
-     */
-    protected $vendorDir;
-
-    /**
-     * @var string
-     */
-    protected $binDir;
-
-    /**
-     * @var \Composer\Downloader\DownloadManager&\PHPUnit\Framework\MockObject\MockObject
-     */
-    protected $dm;
-
-    /**
-     * @var \Composer\Repository\InstalledRepositoryInterface&\PHPUnit\Framework\MockObject\MockObject
-     */
-    protected $repository;
-
-    /**
-     * @var \Composer\IO\IOInterface&\PHPUnit\Framework\MockObject\MockObject
-     */
-    protected $io;
-
-    /**
-     * @var \Composer\Util\Filesystem
-     */
-    protected $fs;
-
-    protected function setUp(): void
+    public function testParseValidAuthorString(): void
     {
-        $this->fs = new Filesystem;
+        $command = new InitCommand;
+        $author = $this->callParseAuthorString($command, 'John Smith <john@example.com>');
+        self::assertEquals('John Smith', $author['name']);
+        self::assertEquals('john@example.com', $author['email']);
+    }
 
-        $this->composer = new Composer();
-        $this->config = new Config(false);
-        $this->composer->setConfig($this->config);
+    public function testParseValidAuthorStringWithoutEmail(): void
+    {
+        $command = new InitCommand;
+        $author = $this->callParseAuthorString($command, 'John Smith');
+        self::assertEquals('John Smith', $author['name']);
+        self::assertNull($author['email']);
+    }
 
-        $this->rootDir = self::getUniqueTmpDirectory();
-        $this->vendorDir = $this->rootDir.DIRECTORY_SEPARATOR.'vendor';
-        self::ensureDirectoryExistsAndClear($this->vendorDir);
+    public function testParseValidUtf8AuthorString(): void
+    {
+        $command = new InitCommand;
+        $author = $this->callParseAuthorString($command, 'Matti Meikäläinen <matti@example.com>');
+        self::assertEquals('Matti Meikäläinen', $author['name']);
+        self::assertEquals('matti@example.com', $author['email']);
+    }
 
-        $this->binDir = $this->rootDir.DIRECTORY_SEPARATOR.'bin';
-        self::ensureDirectoryExistsAndClear($this->binDir);
+    public function testParseValidUtf8AuthorStringWithNonSpacingMarks(): void
+    {
+        // \xCC\x88 is UTF-8 for U+0308 diaeresis (umlaut) combining mark
+        $utf8_expected = "Matti Meika\xCC\x88la\xCC\x88inen";
+        $command = new InitCommand;
+        $author = $this->callParseAuthorString($command, $utf8_expected." <matti@example.com>");
+        self::assertEquals($utf8_expected, $author['name']);
+        self::assertEquals('matti@example.com', $author['email']);
+    }
 
-        $this->config->merge([
-            'config' => [
-                'vendor-dir' => $this->vendorDir,
-                'bin-dir' => $this->binDir,
+    public function testParseNumericAuthorString(): void
+    {
+        $command = new InitCommand;
+        $author = $this->callParseAuthorString($command, 'h4x0r <h4x@example.com>');
+        self::assertEquals('h4x0r', $author['name']);
+        self::assertEquals('h4x@example.com', $author['email']);
+    }
+
+    /**
+     * Test scenario for issue #5631
+     * @link https://github.com/composer/composer/issues/5631 Issue #5631
+     */
+    public function testParseValidAlias1AuthorString(): void
+    {
+        $command = new InitCommand;
+        $author = $this->callParseAuthorString(
+            $command,
+            'Johnathon "Johnny" Smith <john@example.com>'
+        );
+        self::assertEquals('Johnathon "Johnny" Smith', $author['name']);
+        self::assertEquals('john@example.com', $author['email']);
+    }
+
+    /**
+     * Test scenario for issue #5631
+     * @link https://github.com/composer/composer/issues/5631 Issue #5631
+     */
+    public function testParseValidAlias2AuthorString(): void
+    {
+        $command = new InitCommand;
+        $author = $this->callParseAuthorString(
+            $command,
+            'Johnathon (Johnny) Smith <john@example.com>'
+        );
+        self::assertEquals('Johnathon (Johnny) Smith', $author['name']);
+        self::assertEquals('john@example.com', $author['email']);
+    }
+
+    public function testParseEmptyAuthorString(): void
+    {
+        $command = new InitCommand;
+        self::expectException('InvalidArgumentException');
+        $this->callParseAuthorString($command, '');
+    }
+
+    public function testParseAuthorStringWithInvalidEmail(): void
+    {
+        $command = new InitCommand;
+        self::expectException('InvalidArgumentException');
+        $this->callParseAuthorString($command, 'John Smith <john>');
+    }
+
+    public function testNamespaceFromValidPackageName(): void
+    {
+        $command = new InitCommand;
+        $namespace = $command->namespaceFromPackageName('new_projects.acme-extra/package-name');
+        self::assertEquals('NewProjectsAcmeExtra\PackageName', $namespace);
+    }
+
+    public function testNamespaceFromInvalidPackageName(): void
+    {
+        $command = new InitCommand;
+        $namespace = $command->namespaceFromPackageName('invalid-package-name');
+        self::assertNull($namespace);
+    }
+
+    public function testNamespaceFromMissingPackageName(): void
+    {
+        $command = new InitCommand;
+        $namespace = $command->namespaceFromPackageName('');
+        self::assertNull($namespace);
+    }
+
+    /**
+     * @return array{name: string, email: string|null}
+     */
+    private function callParseAuthorString(InitCommand $command, string $string): array
+    {
+        $reflMethod = new \ReflectionMethod($command, 'parseAuthorString');
+        $reflMethod->setAccessible(true);
+
+        return $reflMethod->invoke($command, $string);
+    }
+
+    public function testRunNoInteraction(): void
+    {
+        $this->expectException(\RuntimeException::class);
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run(['command' => 'init', '--no-interaction' => true]);
+    }
+
+    public function testRunInvalidNameArgument(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run(['command' => 'init', '--no-interaction' => true, '--name' => 'test']);
+    }
+
+    public function testRunNameArgument(): void
+    {
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run(['command' => 'init', '--no-interaction' => true, '--name' => 'test/pkg']);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
+    }
+
+    public function testRunInvalidAuthorArgumentInvalidEmail(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--author' => 'Mr. Test <test>',
+        ]);
+    }
+
+    public function testRunAuthorArgument(): void
+    {
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--author' => 'Mr. Test <test@example.org>',
+        ]);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'authors' => [
+                [
+                    'name' => 'Mr. Test',
+                    'email' => 'test@example.org',
+                ]
+            ],
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
+    }
+
+    public function testRunAuthorArgumentMissingEmail(): void
+    {
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--author' => 'Mr. Test',
+        ]);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'authors' => [
+                [
+                    'name' => 'Mr. Test',
+                ]
+            ],
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
+    }
+
+    public function testRunSingleRepositoryArgument(): void
+    {
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--repository' => [
+                '{"type":"vcs","url":"http://packages.example.com"}'
             ],
         ]);
 
-        $this->dm = $this->getMockBuilder('Composer\Downloader\DownloadManager')
-            ->disableOriginalConstructor()
-            ->getMock();
-        $this->composer->setDownloadManager($this->dm);
+        self::assertSame(0, $appTester->getStatusCode());
 
-        $this->repository = $this->getMockBuilder('Composer\Repository\InstalledRepositoryInterface')->getMock();
-        $this->io = $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'repositories' => [
+                [
+                    'type' => 'vcs',
+                    'url' => 'http://packages.example.com'
+                ]
+            ]
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
     }
 
-    protected function tearDown(): void
+    public function testRunMultipleRepositoryArguments(): void
     {
-        parent::tearDown();
-        $this->fs->removeDirectory($this->rootDir);
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--repository' => [
+                '{"type":"vcs","url":"http://vcs.example.com"}',
+                '{"type":"composer","url":"http://composer.example.com"}',
+                '{"type":"composer","url":"http://composer2.example.com","options":{"ssl":{"verify_peer":"true"}}}',
+            ],
+        ]);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'repositories' => [
+                [
+                    'type' => 'vcs',
+                    'url' => 'http://vcs.example.com'
+                ],
+                [
+                    'type' => 'composer',
+                    'url' => 'http://composer.example.com'
+                ],
+                [
+                    'type' => 'composer',
+                    'url' => 'http://composer2.example.com',
+                    'options' => [
+                        'ssl' => [
+                            'verify_peer' => 'true'
+                        ]
+                    ]
+                ]
+            ]
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
     }
 
-    public function testInstallerCreationShouldNotCreateVendorDirectory(): void
+    public function testRunStability(): void
     {
-        $this->fs->removeDirectory($this->vendorDir);
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
 
-        new LibraryInstaller($this->io, $this->composer);
-        self::assertFileDoesNotExist($this->vendorDir);
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--stability' => 'dev',
+        ]);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'minimum-stability' => 'dev',
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
     }
 
-    public function testInstallerCreationShouldNotCreateBinDirectory(): void
+    public function testRunInvalidStability(): void
     {
-        $this->fs->removeDirectory($this->binDir);
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
 
-        new LibraryInstaller($this->io, $this->composer);
-        self::assertFileDoesNotExist($this->binDir);
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--stability' => 'bogus',
+        ], ['capture_stderr_separately' => true]);
+
+        self::assertSame(1, $appTester->getStatusCode());
+
+        self::assertMatchesRegularExpression("/minimum-stability\s+:\s+Does not have a value in the enumeration/", $appTester->getErrorOutput());
     }
 
-    public function testIsInstalled(): void
+    public function testRunRequireOne(): void
     {
-        $library = new LibraryInstaller($this->io, $this->composer);
-        $package = self::getPackage('test/pkg', '1.0.0');
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
 
-        $repository = new InstalledArrayRepository();
-        self::assertFalse($library->isInstalled($repository, $package));
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--require' => [
+                'first/pkg:1.0.0'
+            ],
+        ]);
 
-        // package being in repo is not enough to be installed
-        $repository->addPackage($package);
-        self::assertFalse($library->isInstalled($repository, $package));
+        self::assertSame(0, $appTester->getStatusCode());
 
-        // package being in repo and vendor/pkg/foo dir present means it is seen as installed
-        self::ensureDirectoryExistsAndClear($this->vendorDir.'/'.$package->getPrettyName());
-        self::assertTrue($library->isInstalled($repository, $package));
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [
+                'first/pkg' => '1.0.0'
+            ],
+        ];
 
-        $repository->removePackage($package);
-        self::assertFalse($library->isInstalled($repository, $package));
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
     }
 
-    /**
-     * @depends testInstallerCreationShouldNotCreateVendorDirectory
-     * @depends testInstallerCreationShouldNotCreateBinDirectory
-     */
-    public function testInstall(): void
+    public function testRunRequireMultiple(): void
     {
-        $library = new LibraryInstaller($this->io, $this->composer);
-        $package = self::getPackage('some/package', '1.0.0');
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
 
-        $this->dm
-            ->expects($this->once())
-            ->method('install')
-            ->with($package, $this->vendorDir.'/some/package')
-            ->will($this->returnValue(\React\Promise\resolve(null)));
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--require' => [
+                'first/pkg:1.0.0',
+                'second/pkg:^3.4'
+            ],
+        ]);
 
-        $this->repository
-            ->expects($this->once())
-            ->method('addPackage')
-            ->with($package);
+        self::assertSame(0, $appTester->getStatusCode());
 
-        $library->install($this->repository, $package);
-        self::assertFileExists($this->vendorDir, 'Vendor dir should be created');
-        self::assertFileExists($this->binDir, 'Bin dir should be created');
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [
+                'first/pkg' => '1.0.0',
+                'second/pkg' => '^3.4',
+            ],
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
     }
 
-    /**
-     * @depends testInstallerCreationShouldNotCreateVendorDirectory
-     * @depends testInstallerCreationShouldNotCreateBinDirectory
-     */
-    public function testUpdate(): void
+    public function testRunInvalidRequire(): void
     {
-        $filesystem = $this->getMockBuilder('Composer\Util\Filesystem')
-          ->getMock();
-        $filesystem
-          ->expects($this->once())
-          ->method('rename')
-          ->with($this->vendorDir.'/vendor/package1/oldtarget', $this->vendorDir.'/vendor/package1/newtarget');
+        $this->expectException(\UnexpectedValueException::class);
+        $this->expectExceptionMessage("Option first is missing a version constraint, use e.g. first:^1.0");
 
-        $initial = self::getPackage('vendor/package1', '1.0.0');
-        $target = self::getPackage('vendor/package1', '2.0.0');
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
 
-        $initial->setTargetDir('oldtarget');
-        $target->setTargetDir('newtarget');
-
-        $this->repository
-            ->expects($this->exactly(3))
-            ->method('hasPackage')
-            ->will($this->onConsecutiveCalls(true, false, false));
-
-        $this->dm
-            ->expects($this->once())
-            ->method('update')
-            ->with($initial, $target, $this->vendorDir.'/vendor/package1/newtarget')
-            ->will($this->returnValue(\React\Promise\resolve(null)));
-
-        $this->repository
-            ->expects($this->once())
-            ->method('removePackage')
-            ->with($initial);
-
-        $this->repository
-            ->expects($this->once())
-            ->method('addPackage')
-            ->with($target);
-
-        $library = new LibraryInstaller($this->io, $this->composer, 'library', $filesystem);
-        $library->update($this->repository, $initial, $target);
-        self::assertFileExists($this->vendorDir, 'Vendor dir should be created');
-        self::assertFileExists($this->binDir, 'Bin dir should be created');
-
-        self::expectException('InvalidArgumentException');
-
-        $library->update($this->repository, $initial, $target);
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--require' => [
+                'first',
+            ],
+        ]);
     }
 
-    public function testUninstall(): void
+    public function testRunRequireDevOne(): void
     {
-        $library = new LibraryInstaller($this->io, $this->composer);
-        $package = self::getPackage('vendor/pkg', '1.0.0');
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
 
-        $this->repository
-            ->expects($this->exactly(2))
-            ->method('hasPackage')
-            ->with($package)
-            ->will($this->onConsecutiveCalls(true, false));
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--require-dev' => [
+                'first/pkg:1.0.0'
+            ],
+        ]);
 
-        $this->dm
-            ->expects($this->once())
-            ->method('remove')
-            ->with($package, $this->vendorDir.'/vendor/pkg')
-            ->will($this->returnValue(\React\Promise\resolve(null)));
+        self::assertSame(0, $appTester->getStatusCode());
 
-        $this->repository
-            ->expects($this->once())
-            ->method('removePackage')
-            ->with($package);
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'require-dev' => [
+                'first/pkg' => '1.0.0'
+            ],
+        ];
 
-        $library->uninstall($this->repository, $package);
-
-        self::expectException('InvalidArgumentException');
-
-        $library->uninstall($this->repository, $package);
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
     }
 
-    public function testGetInstallPathWithoutTargetDir(): void
+    public function testRunRequireDevMultiple(): void
     {
-        $library = new LibraryInstaller($this->io, $this->composer);
-        $package = self::getPackage('Vendor/Pkg', '1.0.0');
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
 
-        self::assertEquals($this->vendorDir.'/'.$package->getPrettyName(), $library->getInstallPath($package));
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--require-dev' => [
+                'first/pkg:1.0.0',
+                'second/pkg:^3.4'
+            ],
+        ]);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'require-dev' => [
+                'first/pkg' => '1.0.0',
+                'second/pkg' => '^3.4',
+            ],
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
     }
 
-    public function testGetInstallPathWithTargetDir(): void
+    public function testRunInvalidRequireDev(): void
     {
-        $library = new LibraryInstaller($this->io, $this->composer);
-        $package = self::getPackage('Foo/Bar', '1.0.0');
-        $package->setTargetDir('Some/Namespace');
+        $this->expectException(\UnexpectedValueException::class);
+        $this->expectExceptionMessage("Option first is missing a version constraint, use e.g. first:^1.0");
 
-        self::assertEquals($this->vendorDir.'/'.$package->getPrettyName().'/Some/Namespace', $library->getInstallPath($package));
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--require-dev' => [
+                'first',
+            ],
+        ]);
     }
 
-    /**
-     * @depends testInstallerCreationShouldNotCreateVendorDirectory
-     * @depends testInstallerCreationShouldNotCreateBinDirectory
-     */
-    public function testEnsureBinariesInstalled(): void
+    public function testRunAutoload(): void
     {
-        $binaryInstallerMock = $this->getMockBuilder('Composer\Installer\BinaryInstaller')
-            ->disableOriginalConstructor()
-            ->getMock();
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
 
-        $library = new LibraryInstaller($this->io, $this->composer, 'library', null, $binaryInstallerMock);
-        $package = self::getPackage('foo/bar', '1.0.0');
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--autoload' => 'testMapping/'
+        ]);
 
-        $binaryInstallerMock
-            ->expects($this->never())
-            ->method('removeBinaries')
-            ->with($package);
+        self::assertSame(0, $appTester->getStatusCode());
 
-        $binaryInstallerMock
-            ->expects($this->once())
-            ->method('installBinaries')
-            ->with($package, $library->getInstallPath($package), false);
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'autoload' => [
+                'psr-4' => [
+                    'Test\\Pkg\\' => 'testMapping/',
+                ]
+            ],
+        ];
 
-        $library->ensureBinariesPresence($package);
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
+    }
+
+    public function testRunHomepage(): void
+    {
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--homepage' => 'https://example.org/'
+        ]);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'homepage' => 'https://example.org/'
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
+    }
+
+    public function testRunInvalidHomepage(): void
+    {
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--homepage' => 'not-a-url',
+        ], ['capture_stderr_separately' => true]);
+
+        self::assertSame(1, $appTester->getStatusCode());
+        self::assertMatchesRegularExpression("/homepage\s*:\s*Invalid URL format/", $appTester->getErrorOutput());
+    }
+
+    public function testRunDescription(): void
+    {
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--description' => 'My first example package'
+        ]);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'description' => 'My first example package'
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
+    }
+
+    public function testRunType(): void
+    {
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--type' => 'library'
+        ]);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'type' => 'library'
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
+    }
+
+    public function testRunLicense(): void
+    {
+        $dir = $this->initTempComposer();
+        unlink($dir . '/composer.json');
+        unlink($dir . '/auth.json');
+
+        $appTester = $this->getApplicationTester();
+        $appTester->run([
+            'command' => 'init',
+            '--no-interaction' => true,
+            '--name' => 'test/pkg',
+            '--license' => 'MIT'
+        ]);
+
+        self::assertSame(0, $appTester->getStatusCode());
+
+        $expected = [
+            'name' => 'test/pkg',
+            'require' => [],
+            'license' => 'MIT'
+        ];
+
+        $file = new JsonFile($dir . '/composer.json');
+        self::assertEquals($expected, $file->read());
     }
 }

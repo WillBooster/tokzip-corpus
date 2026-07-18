@@ -1,47 +1,126 @@
-The `println!` macro is only capable of printing to standard output, so we have
-to use something else to print to standard error.
+The note in this error message tells us that we should use the `pin!` macro to
+*pin* the values, which means putting them inside the `Pin` type that
+guarantees the values won’t be moved in memory. The error message says pinning
+is required because `dyn Future<Output = ()>` needs to implement the `Unpin`
+trait and it currently does not.
 
-### Checking Where Errors Are Written
+The `trpl::join_all` function returns a struct called `JoinAll`. That struct is
+generic over a type `F`, which is constrained to implement the `Future` trait.
+Directly awaiting a future with `await` pins the future implicitly. That’s why
+we don’t need to use `pin!` everywhere we want to await futures.
 
-First, let’s observe how the content printed by `minigrep` is currently being
-written to standard output, including any error messages we want to write to
-standard error instead. We’ll do that by redirecting the standard output stream
-to a file while intentionally causing an error. We won’t redirect the standard
-error stream, so any content sent to standard error will continue to display on
-the screen.
+However, we’re not directly awaiting a future here. Instead, we construct a new
+future, JoinAll, by passing a collection of futures to the `join_all` function.
+The signature for `join_all` requires that the types of the items in the
+collection all implement the `Future` trait, and `Box<T>` implements `Future`
+only if the `T` it wraps is a future that implements the `Unpin` trait.
 
-Command line programs are expected to send error messages to the standard error
-stream so that we can still see error messages on the screen even if we
-redirect the standard output stream to a file. Our program is not currently
-well behaved: We’re about to see that it saves the error message output to a
-file instead!
+That’s a lot to absorb! To really understand it, let’s dive a little further
+into how the `Future` trait actually works, in particular around pinning. Look
+again at the definition of the `Future` trait:
 
-To demonstrate this behavior, we’ll run the program with `>` and the file path,
-_output.txt_, that we want to redirect the standard output stream to. We won’t
-pass any arguments, which should cause an error:
+```
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-```console
-$ cargo run > output.txt
+pub trait Future {
+    type Output;
+
+    // Required method
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
+}
 ```
 
-The `>` syntax tells the shell to write the contents of standard output to
-_output.txt_ instead of the screen. We didn’t see the error message we were
-expecting printed to the screen, so that means it must have ended up in the
-file. This is what _output.txt_ contains:
+The `cx` parameter and its `Context` type are the key to how a runtime actually
+knows when to check any given future while still being lazy. Again, the details
+of how that works are beyond the scope of this chapter, and you generally only
+need to think about this when writing a custom `Future` implementation. We’ll
+focus instead on the type for `self`, as this is the first time we’ve seen a
+method where `self` has a type annotation. A type annotation for `self` works
+like type annotations for other function parameters but with two key
+differences:
 
-```text
-Problem parsing arguments: not enough arguments
-```
+* It tells Rust what type `self` must be for the method to be called.
+* It can’t be just any type. It’s restricted to the type on which the method is
+  implemented, a reference or smart pointer to that type, or a `Pin` wrapping a
+  reference to that type.
 
-Yup, our error message is being printed to standard output. It’s much more
-useful for error messages like this to be printed to standard error so that
-only data from a successful run ends up in the file. We’ll change that.
+We’ll see more on this syntax in Chapter 18. For now,
+it’s enough to know that if we want to poll a future to check whether it is
+`Pending` or `Ready(Output)`, we need a `Pin`-wrapped mutable reference to the
+type.
 
-### Printing Errors to Standard Error
+`Pin` is a wrapper for pointer-like types such as `&`, `&mut`, `Box`, and `Rc`.
+(Technically, `Pin` works with types that implement the `Deref` or `DerefMut`
+traits, but this is effectively equivalent to working only with references and
+smart pointers.) `Pin` is not a pointer itself and doesn’t have any behavior of
+its own like `Rc` and `Arc` do with reference counting; it’s purely a tool the
+compiler can use to enforce constraints on pointer usage.
 
-We’ll use the code in Listing 12-24 to change how error messages are printed.
-Because of the refactoring we did earlier in this chapter, all the code that
-prints error messages is in one function, `main`. The standard library provides
-the `eprintln!` macro that prints to the standard error stream, so let’s change
-the two places we were calling `println!` to print errors to use `eprintln!`
-instead.
+Recalling that `await` is implemented in terms of calls to `poll` starts to
+explain the error message we saw earlier, but that was in terms of `Unpin`, not
+`Pin`. So how exactly does `Pin` relate to `Unpin`, and why does `Future` need
+`self` to be in a `Pin` type to call `poll`?
+
+Remember from earlier in this chapter that a series of await points in a future
+get compiled into a state machine, and the compiler makes sure that state
+machine follows all of Rust’s normal rules around safety, including borrowing
+and ownership. To make that work, Rust looks at what data is needed between one
+await point and either the next await point or the end of the async block. It
+then creates a corresponding variant in the compiled state machine. Each
+variant gets the access it needs to the data that will be used in that section
+of the source code, whether by taking ownership of that data or by getting a
+mutable or immutable reference to it.
+
+So far, so good: if we get anything wrong about the ownership or references in
+a given async block, the borrow checker will tell us. When we want to move
+around the future that corresponds to that block—like moving it into a `Vec` to
+pass to `join_all`—things get trickier.
+
+When we move a future—whether by pushing it into a data structure to use as an
+iterator with `join_all` or by returning it from a function—that actually means
+moving the state machine Rust creates for us. And unlike most other types in
+Rust, the futures Rust creates for async blocks can end up with references to
+themselves in the fields of any given variant, as shown in the simplified illustration in Figure 17-4.
+
+<img alt="A single-column, three-row table representing a future, fut1, which has data values 0 and 1 in the first two rows and an arrow pointing from the third row back to the second row, representing an internal reference within the future." src="img/trpl17-04.svg" class="center" />
+
+Figure 17-4: A self-referential data type
+
+By default, though, any object that has a reference to itself is unsafe to move,
+because references always point to the actual memory address of whatever they
+refer to (see Figure 17-5). If you move the data structure itself, those
+internal references will be left pointing to the old location. However, that
+memory location is now invalid. For one thing, its value will not be updated
+when you make changes to the data structure. For another—more important—thing,
+the computer is now free to reuse that memory for other purposes! You could end
+up reading completely unrelated data later.
+
+<img alt="Two tables, depicting two futures, fut1 and fut2, each of which has one column and three rows, representing the result of having moved a future out of fut1 into fut2. The first, fut1, is grayed out, with a question mark in each index, representing unknown memory. The second, fut2, has 0 and 1 in the first and second rows and an arrow pointing from its third row back to the second row of fut1, representing a pointer that is referencing the old location in memory of the future before it was moved." src="img/trpl17-05.svg" class="center" />
+
+Figure 17-5: The unsafe result of moving a self-referential data type
+
+Theoretically, the Rust compiler could try to update every reference to an
+object whenever it gets moved, but that could add a lot of performance overhead,
+especially if a whole web of references needs updating. If we could instead make
+sure the data structure in question *doesn’t move in memory*, we wouldn’t have
+to update any references. This is exactly what Rust’s borrow checker is for:
+in safe code, it prevents you from moving any item with an active reference to
+it.
+
+`Pin` builds on that to give us the exact guarantee we need. When we *pin* a
+value by wrapping a pointer to that value in `Pin`, it can no longer move. Thus,
+if you have `Pin<Box<SomeType>>`, you actually pin the `SomeType` value, *not*
+the `Box` pointer. Figure 17-6 illustrates this process.
+
+<img alt="Three boxes laid out side by side. The first is labeled “Pin”, the second “b1”, and the third “pinned”. Within “pinned” is a table labeled “fut”, with a single column; it represents a future with cells for each part of the data structure. Its first cell has the value “0”, its second cell has an arrow coming out of it and pointing to the fourth and final cell, which has the value “1” in it, and the third cell has dashed lines and an ellipsis to indicate there may be other parts to the data structure. All together, the “fut” table represents a future which is self-referential. An arrow leaves the box labeled “Pin”, goes through the box labeled “b1” and terminates inside the “pinned” box at the “fut” table." src="img/trpl17-06.svg" class="center" />
+
+Figure 17-6: Pinning a `Box` that points to a self-referential future type
+
+In fact, the `Box` pointer can still move around freely. Remember: we care about
+making sure the data ultimately being referenced stays in place. If a pointer
+moves around, *but the data it points to* is in the same place, as in Figure
+17-7, there’s no potential problem. (As an independent exercise, look at the docs
+for the types as well as the `std::pin` module and try to work out how you’d do
+this with a `Pin` wrapping a `Box`.) The key is that the self-referential type
+itself cannot move, because it is still pinned.

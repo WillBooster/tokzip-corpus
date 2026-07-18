@@ -1,156 +1,166 @@
-@TestOn('vm')
+import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
-import 'dart:io';
-import 'dart:typed_data';
+import 'dart:developer' as dev;
 
-import 'package:cookie_jar/cookie_jar.dart';
-import 'package:dio/dio.dart';
-import 'package:dio/io.dart';
-import 'package:dio_cookie_manager/dio_cookie_manager.dart';
-import 'package:test/fake.dart';
-import 'package:test/test.dart';
+import 'options.dart';
+import 'parameter.dart';
 
-typedef _FetchCallback = Future<ResponseBody> Function(
-  RequestOptions options,
-  Stream<Uint8List>? requestStream,
-  Future<void>? cancelFuture,
-);
+// See https://github.com/flutter/flutter/pull/112122.
+const kIsWeb = bool.hasEnvironment('dart.library.js_util')
+    ? bool.fromEnvironment('dart.library.js_util')
+    : identical(0, 0.0);
 
-class _TestAdapter implements HttpClientAdapter {
-  _TestAdapter({required _FetchCallback fetch}) : _fetch = fetch;
+// For the web platform, an inline `bool.fromEnvironment` translates to
+// `core.bool.fromEnvironment` instead of correctly being replaced by the
+// constant value found in the environment at build time.
+//
+// See https://github.com/flutter/flutter/issues/51186.
+const kReleaseMode = bool.fromEnvironment('dart.vm.product');
 
-  final _FetchCallback _fetch;
-  final HttpClientAdapter _adapter = IOHttpClientAdapter();
+/// Pipes all data and errors from [stream] into [sink]. Completes [Future] once
+/// [stream] is done. Unlike [store], [sink] remains open after [stream] is
+/// done.
+Future<void> writeStreamToSink<T>(Stream<T> stream, EventSink<T> sink) {
+  final completer = Completer<void>();
+  stream.listen(
+    sink.add,
+    onError: sink.addError,
+    onDone: () => completer.complete(),
+  );
+  return completer.future;
+}
 
-  @override
-  Future<ResponseBody> fetch(
-    RequestOptions options,
-    Stream<Uint8List>? requestStream,
-    Future<void>? cancelFuture,
-  ) =>
-      _fetch(options, requestStream, cancelFuture);
+/// Returns the [Encoding] that corresponds to [charset]. Returns [fallback] if
+/// [charset] is null or if no [Encoding] was found that corresponds to
+/// [charset].
+Encoding encodingForCharset(String? charset, [Encoding fallback = latin1]) {
+  if (charset == null) {
+    return fallback;
+  }
+  final encoding = Encoding.getByName(charset);
+  return encoding ?? fallback;
+}
 
-  @override
-  void close({bool force = false}) {
-    _adapter.close(force: force);
+typedef DioEncodeHandler = String? Function(String key, Object? value);
+
+String encodeMap(
+  Object data,
+  DioEncodeHandler handler, {
+  bool encode = true,
+  bool isQuery = false,
+  ListFormat listFormat = ListFormat.multi,
+}) {
+  final urlData = StringBuffer('');
+  bool first = true;
+  // URL Query parameters are generally encoded but not their
+  // index or nested names in square brackets.
+  // When [encode] is false, for example for [FormData], nothing is encoded.
+  final leftBracket = isQuery || !encode ? '[' : '%5B';
+  final rightBracket = isQuery || !encode ? ']' : '%5D';
+
+  final String Function(String) encodeComponent =
+      encode ? Uri.encodeQueryComponent : (e) => e;
+  Object? maybeEncode(Object? value) {
+    if (!isQuery || value == null || value is! String) {
+      return value;
+    }
+    return encodeComponent(value);
+  }
+
+  void urlEncode(Object? sub, String path) {
+    // Detect if the list format for this parameter derivatives from default.
+    final format = sub is ListParam ? sub.format : listFormat;
+    final separatorChar = _getSeparatorChar(format, isQuery);
+
+    if (sub is ListParam) {
+      // Need to unwrap all param objects here
+      sub = sub.value;
+    }
+
+    if (sub is List) {
+      if (format == ListFormat.multi || format == ListFormat.multiCompatible) {
+        for (int i = 0; i < sub.length; i++) {
+          final isCollection =
+              sub[i] is Map || sub[i] is List || sub[i] is ListParam;
+          if (format == ListFormat.multi) {
+            urlEncode(
+              maybeEncode(sub[i]),
+              '$path${isCollection ? '$leftBracket$i$rightBracket' : ''}',
+            );
+          } else {
+            // Forward compatibility
+            urlEncode(
+              maybeEncode(sub[i]),
+              '$path$leftBracket${isCollection ? i : ''}$rightBracket',
+            );
+          }
+        }
+      } else {
+        urlEncode(sub.map(maybeEncode).join(separatorChar), path);
+      }
+    } else if (sub is Map) {
+      sub.forEach((k, v) {
+        if (path == '') {
+          urlEncode(maybeEncode(v), encodeComponent(k));
+        } else {
+          urlEncode(
+            maybeEncode(v),
+            '$path$leftBracket${encodeComponent(k)}$rightBracket',
+          );
+        }
+      });
+    } else {
+      final str = handler(path, sub);
+      final isNotEmpty = str != null && str.trim().isNotEmpty;
+      if (!first && isNotEmpty) {
+        urlData.write('&');
+      }
+      first = false;
+      if (isNotEmpty) {
+        urlData.write(str);
+      }
+    }
+  }
+
+  urlEncode(data, '');
+  return urlData.toString();
+}
+
+String _getSeparatorChar(ListFormat collectionFormat, bool isQuery) {
+  switch (collectionFormat) {
+    case ListFormat.csv:
+      return ',';
+    case ListFormat.ssv:
+      return isQuery ? '%20' : ' ';
+    case ListFormat.tsv:
+      return r'\t';
+    case ListFormat.pipes:
+      return '|';
+    default:
+      return '';
   }
 }
 
-class _SaveCall {
-  _SaveCall(this.uri, this.cookies);
-
-  final String uri;
-  final String cookies;
-
-  @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is _SaveCall &&
-          runtimeType == other.runtimeType &&
-          uri == other.uri &&
-          cookies == other.cookies;
-
-  @override
-  int get hashCode => uri.hashCode ^ cookies.hashCode;
-
-  @override
-  String toString() {
-    return '_SaveCall{uri: $uri, cookies: $cookies}';
+Map<String, V> caseInsensitiveKeyMap<V>([Map<String, V>? value]) {
+  final map = LinkedHashMap<String, V>(
+    equals: (key1, key2) => key1.toLowerCase() == key2.toLowerCase(),
+    hashCode: (key) => key.toLowerCase().hashCode,
+  );
+  if (value != null && value.isNotEmpty) {
+    map.addAll(value);
   }
+  return map;
 }
 
-class _FakeCookieJar extends Fake implements CookieJar {
-  final _saveCalls = <_SaveCall>[];
-
-  List<_SaveCall> get saveCalls => UnmodifiableListView(_saveCalls);
-
-  @override
-  Future<List<Cookie>> loadForRequest(Uri uri) async {
-    return const [];
-  }
-
-  @override
-  Future<void> saveFromResponse(Uri uri, List<Cookie> cookies) async {
-    _saveCalls.add(
-      _SaveCall(
-        uri.toString(),
-        cookies.join('; '),
-      ),
+// TODO(Alex): Provide a configurable property on the Dio class once https://github.com/cfug/dio/discussions/1982 has made some progress.
+void warningLog(String message, StackTrace stackTrace) {
+  if (!kReleaseMode) {
+    dev.log(
+      message,
+      level: 900,
+      name: '🔔 Dio',
+      stackTrace: stackTrace,
     );
   }
-}
-
-void main() {
-  group('CookieJar.saveFromResponse()', () {
-    test(
-      'is called with a full Uri for requests that had relative redirects',
-      () async {
-        final cookieJar = _FakeCookieJar();
-        final dio = Dio()
-          ..httpClientAdapter = _TestAdapter(
-            fetch: (options, requestStream, cancelFuture) async => ResponseBody(
-              Stream.value(Uint8List.fromList(utf8.encode(''))),
-              HttpStatus.ok,
-              redirects: [
-                RedirectRecord(
-                  HttpStatus.found,
-                  'GET',
-                  Uri(path: 'redirect'),
-                ),
-              ],
-              headers: {
-                HttpHeaders.setCookieHeader: ['Cookie1=value1; Path=/'],
-              },
-            ),
-          )
-          ..interceptors.add(CookieManager(cookieJar))
-          ..options.validateStatus =
-              (status) => status != null && status >= 200 && status < 400;
-
-        await dio.get('https://test.com');
-        expect(cookieJar.saveCalls, [
-          _SaveCall(
-            'https://test.com/redirect',
-            'Cookie1=value1; Path=/',
-          ),
-        ]);
-      },
-    );
-
-    test(
-      'saves cookies only for final destination upon non-relative redirects',
-      () async {
-        final cookieJar = _FakeCookieJar();
-        final dio = Dio()
-          ..httpClientAdapter = _TestAdapter(
-            fetch: (options, requestStream, cancelFuture) async => ResponseBody(
-              Stream.value(Uint8List.fromList(utf8.encode(''))),
-              HttpStatus.ok,
-              redirects: [
-                RedirectRecord(
-                  HttpStatus.found,
-                  'GET',
-                  Uri.parse('https://example.com/redirect'),
-                ),
-              ],
-              headers: {
-                HttpHeaders.setCookieHeader: ['Cookie1=value1; Path=/'],
-              },
-            ),
-          )
-          ..interceptors.add(CookieManager(cookieJar))
-          ..options.validateStatus =
-              (status) => status != null && status >= 200 && status < 400;
-
-        await dio.get('https://test.com');
-        expect(cookieJar.saveCalls, [
-          _SaveCall(
-            'https://example.com/redirect',
-            'Cookie1=value1; Path=/',
-          ),
-        ]);
-      },
-    );
-  });
 }

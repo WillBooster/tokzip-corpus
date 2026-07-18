@@ -1,45 +1,81 @@
-// Copyright (c) 2022, the Dart project authors.  Please see the AUTHORS file
+// Copyright (c) 2012, the Dart project authors.  Please see the AUTHORS file
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-import 'dart:async';
-import 'dart:io';
+import 'dart:convert';
+import 'dart:typed_data';
 
-import 'package:stream_channel/stream_channel.dart';
+import 'package:http_parser/http_parser.dart';
 
-/// Starts an HTTP server and sends the port back on the given channel.
+import 'base_request.dart';
+import 'base_response.dart';
+import 'streamed_response.dart';
+import 'utils.dart';
+
+/// An HTTP response where the entire response body is known in advance.
+class Response extends BaseResponse {
+  /// The bytes comprising the body of this response.
+  final Uint8List bodyBytes;
+
+  /// The body of the response as a string.
+  ///
+  /// This is converted from [bodyBytes] using the `charset` parameter of the
+  /// `Content-Type` header field, if available. If it's unavailable or if the
+  /// encoding name is unknown, [latin1] is used by default, as per
+  /// [RFC 2616][].
+  ///
+  /// [RFC 2616]: http://www.w3.org/Protocols/rfc2616/rfc2616-sec3.html
+  String get body => _encodingForHeaders(headers).decode(bodyBytes);
+
+  /// Creates a new HTTP response with a string body.
+  Response(String body, int statusCode,
+      {BaseRequest? request,
+      Map<String, String> headers = const {},
+      bool isRedirect = false,
+      bool persistentConnection = true,
+      String? reasonPhrase})
+      : this.bytes(_encodingForHeaders(headers).encode(body), statusCode,
+            request: request,
+            headers: headers,
+            isRedirect: isRedirect,
+            persistentConnection: persistentConnection,
+            reasonPhrase: reasonPhrase);
+
+  /// Create a new HTTP response with a byte array body.
+  Response.bytes(List<int> bodyBytes, super.statusCode,
+      {super.request,
+      super.headers,
+      super.isRedirect,
+      super.persistentConnection,
+      super.reasonPhrase})
+      : bodyBytes = toUint8List(bodyBytes),
+        super(contentLength: bodyBytes.length);
+
+  /// Creates a new HTTP response by waiting for the full body to become
+  /// available from a [StreamedResponse].
+  static Future<Response> fromStream(StreamedResponse response) async {
+    final body = await response.stream.toBytes();
+    return Response.bytes(body, response.statusCode,
+        request: response.request,
+        headers: response.headers,
+        isRedirect: response.isRedirect,
+        persistentConnection: response.persistentConnection,
+        reasonPhrase: response.reasonPhrase);
+  }
+}
+
+/// Returns the encoding to use for a response with the given headers.
 ///
-/// Quits when anything is received on the channel.
+/// Defaults to [latin1] if the headers don't specify a charset or if that
+/// charset is unknown.
+Encoding _encodingForHeaders(Map<String, String> headers) =>
+    encodingForCharset(_contentTypeForHeaders(headers).parameters['charset']);
+
+/// Returns the [MediaType] object for the given headers' content-type.
 ///
-///        URI |  Redirects TO
-/// ===========|==============
-/// ".../loop" |    ".../loop"
-///   ".../10" |       ".../9"
-///    ".../9" |       ".../8"
-///        ... |           ...
-///    ".../1" |           "/"
-///        "/" |  <200 return>
-void hybridMain(StreamChannel<Object?> channel) async {
-  late HttpServer server;
-
-  server = await HttpServer.bind('localhost', 0)
-    ..listen((request) async {
-      request.response.headers.set('Access-Control-Allow-Origin', '*');
-      if (request.requestedUri.pathSegments.isEmpty) {
-        unawaited(request.response.close());
-      } else if (request.requestedUri.pathSegments.last == 'loop') {
-        unawaited(request.response
-            .redirect(Uri.http('localhost:${server.port}', '/loop')));
-      } else {
-        final n = int.parse(request.requestedUri.pathSegments.last);
-        final nextPath = n - 1 == 0 ? '' : '${n - 1}';
-        unawaited(request.response
-            .redirect(Uri.http('localhost:${server.port}', '/$nextPath')));
-      }
-    });
-
-  channel.sink.add(server.port);
-  await channel
-      .stream.first; // Any writes indicates that the server should exit.
-  unawaited(server.close());
+/// Defaults to `application/octet-stream`.
+MediaType _contentTypeForHeaders(Map<String, String> headers) {
+  var contentType = headers['content-type'];
+  if (contentType != null) return MediaType.parse(contentType);
+  return MediaType('application', 'octet-stream');
 }

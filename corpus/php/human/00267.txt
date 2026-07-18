@@ -10,290 +10,249 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Config;
+namespace Composer\Repository\Vcs;
 
-use Composer\Json\JsonFile;
-use Composer\Json\JsonManipulator;
-use Composer\Json\JsonValidationException;
 use Composer\Pcre\Preg;
+use Composer\Util\ProcessExecutor;
 use Composer\Util\Filesystem;
-use Composer\Util\Silencer;
+use Composer\Util\Url;
+use Composer\Util\Git as GitUtil;
+use Composer\IO\IOInterface;
+use Composer\Cache;
+use Composer\Config;
 
 /**
- * JSON Configuration Source
- *
  * @author Jordi Boggiano <j.boggiano@seld.be>
- * @author Beau Simensen <beau@dflydev.com>
  */
-class JsonConfigSource implements ConfigSourceInterface
+class GitDriver extends VcsDriver
 {
-    /**
-     * @var JsonFile
-     */
-    private $file;
+    /** @var array<int|string, string> Map of tag name (can be turned to an int by php if it is a numeric name) to identifier */
+    protected $tags;
+    /** @var array<int|string, string> Map of branch name (can be turned to an int by php if it is a numeric name) to identifier */
+    protected $branches;
+    /** @var string */
+    protected $rootIdentifier;
+    /** @var string */
+    protected $repoDir;
 
     /**
-     * @var bool
+     * @inheritDoc
      */
-    private $authConfig;
-
-    /**
-     * Constructor
-     */
-    public function __construct(JsonFile $file, bool $authConfig = false)
+    public function initialize(): void
     {
-        $this->file = $file;
-        $this->authConfig = $authConfig;
+        if (Filesystem::isLocalPath($this->url)) {
+            $this->url = Preg::replace('{[\\/]\.git/?$}', '', $this->url);
+            if (!is_dir($this->url)) {
+                throw new \RuntimeException('Failed to read package information from '.$this->url.' as the path does not exist');
+            }
+            $this->repoDir = $this->url;
+            $cacheUrl = realpath($this->url);
+        } else {
+            if (!Cache::isUsable($this->config->get('cache-vcs-dir'))) {
+                throw new \RuntimeException('GitDriver requires a usable cache directory, and it looks like you set it to be disabled');
+            }
+
+            $this->repoDir = $this->config->get('cache-vcs-dir') . '/' . Preg::replace('{[^a-z0-9.]}i', '-', $this->url) . '/';
+
+            GitUtil::cleanEnv();
+
+            $fs = new Filesystem();
+            $fs->ensureDirectoryExists(dirname($this->repoDir));
+
+            if (!is_writable(dirname($this->repoDir))) {
+                throw new \RuntimeException('Can not clone '.$this->url.' to access package information. The "'.dirname($this->repoDir).'" directory is not writable by the current user.');
+            }
+
+            if (Preg::isMatch('{^ssh://[^@]+@[^:]+:[^0-9]+}', $this->url)) {
+                throw new \InvalidArgumentException('The source URL '.$this->url.' is invalid, ssh URLs should have a port number after ":".'."\n".'Use ssh://git@example.com:22/path or just git@example.com:path if you do not want to provide a password or custom port.');
+            }
+
+            $gitUtil = new GitUtil($this->io, $this->config, $this->process, $fs);
+            if (!$gitUtil->syncMirror($this->url, $this->repoDir)) {
+                if (!is_dir($this->repoDir)) {
+                    throw new \RuntimeException('Failed to clone '.$this->url.' to read package information from it');
+                }
+                $this->io->writeError('<error>Failed to update '.$this->url.', package information from this repository may be outdated</error>');
+            }
+
+            $cacheUrl = $this->url;
+        }
+
+        $this->getTags();
+        $this->getBranches();
+
+        $this->cache = new Cache($this->io, $this->config->get('cache-repo-dir').'/'.Preg::replace('{[^a-z0-9.]}i', '-', Url::sanitize($cacheUrl)));
+        $this->cache->setReadOnly($this->config->get('cache-read-only'));
     }
 
     /**
      * @inheritDoc
      */
-    public function getName(): string
+    public function getRootIdentifier(): string
     {
-        return $this->file->getPath();
-    }
+        if (null === $this->rootIdentifier) {
+            $this->rootIdentifier = 'master';
 
-    /**
-     * @inheritDoc
-     */
-    public function addRepository(string $name, $config, bool $append = true): void
-    {
-        $this->manipulateJson('addRepository', static function (&$config, $repo, $repoConfig) use ($append): void {
-            // if converting from an array format to hashmap format, and there is a {"packagist.org":false} repo, we have
-            // to convert it to "packagist.org": false key on the hashmap otherwise it fails schema validation
-            if (isset($config['repositories'])) {
-                foreach ($config['repositories'] as $index => $val) {
-                    if ($index === $repo) {
-                        continue;
-                    }
-                    if (is_numeric($index) && ($val === ['packagist' => false] || $val === ['packagist.org' => false])) {
-                        unset($config['repositories'][$index]);
-                        $config['repositories']['packagist.org'] = false;
+            $gitUtil = new GitUtil($this->io, $this->config, $this->process, new Filesystem());
+            if (!Filesystem::isLocalPath($this->url)) {
+                $defaultBranch = $gitUtil->getMirrorDefaultBranch($this->url, $this->repoDir, false);
+                if ($defaultBranch !== null) {
+                    return $this->rootIdentifier = $defaultBranch;
+                }
+            }
+
+            // select currently checked out branch as default branch
+            $this->process->execute('git branch --no-color', $output, $this->repoDir);
+            $branches = $this->process->splitLines($output);
+            if (!in_array('* master', $branches)) {
+                foreach ($branches as $branch) {
+                    if ($branch && Preg::isMatchStrictGroups('{^\* +(\S+)}', $branch, $match)) {
+                        $this->rootIdentifier = $match[1];
                         break;
                     }
                 }
             }
+        }
 
-            if ($append) {
-                $config['repositories'][$repo] = $repoConfig;
-            } else {
-                $config['repositories'] = [$repo => $repoConfig] + $config['repositories'];
-            }
-        }, $name, $config, $append);
+        return $this->rootIdentifier;
     }
 
     /**
      * @inheritDoc
      */
-    public function removeRepository(string $name): void
+    public function getUrl(): string
     {
-        $this->manipulateJson('removeRepository', static function (&$config, $repo): void {
-            unset($config['repositories'][$repo]);
-        }, $name);
+        return $this->url;
     }
 
     /**
      * @inheritDoc
      */
-    public function addConfigSetting(string $name, $value): void
+    public function getSource(string $identifier): array
     {
-        $authConfig = $this->authConfig;
-        $this->manipulateJson('addConfigSetting', static function (&$config, $key, $val) use ($authConfig): void {
-            if (Preg::isMatch('{^(bitbucket-oauth|github-oauth|gitlab-oauth|gitlab-token|bearer|http-basic|platform)\.}', $key)) {
-                [$key, $host] = explode('.', $key, 2);
-                if ($authConfig) {
-                    $config[$key][$host] = $val;
-                } else {
-                    $config['config'][$key][$host] = $val;
+        return ['type' => 'git', 'url' => $this->getUrl(), 'reference' => $identifier];
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getDist(string $identifier): ?array
+    {
+        return null;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getFileContent(string $file, string $identifier): ?string
+    {
+        if (isset($identifier[0]) && $identifier[0] === '-') {
+            throw new \RuntimeException('Invalid git identifier detected. Identifier must not start with a -, given: ' . $identifier);
+        }
+
+        $resource = sprintf('%s:%s', ProcessExecutor::escape($identifier), ProcessExecutor::escape($file));
+        $this->process->execute(sprintf('git show %s', $resource), $content, $this->repoDir);
+
+        if (!trim($content)) {
+            return null;
+        }
+
+        return $content;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getChangeDate(string $identifier): ?\DateTimeImmutable
+    {
+        $this->process->execute(sprintf(
+            'git -c log.showSignature=false log -1 --format=%%at %s',
+            ProcessExecutor::escape($identifier)
+        ), $output, $this->repoDir);
+
+        return new \DateTimeImmutable('@'.trim($output), new \DateTimeZone('UTC'));
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getTags(): array
+    {
+        if (null === $this->tags) {
+            $this->tags = [];
+
+            $this->process->execute('git show-ref --tags --dereference', $output, $this->repoDir);
+            foreach ($output = $this->process->splitLines($output) as $tag) {
+                if ($tag && Preg::isMatch('{^([a-f0-9]{40}) refs/tags/(\S+?)(\^\{\})?$}', $tag, $match)) {
+                    $this->tags[$match[2]] = (string) $match[1];
                 }
-            } else {
-                $config['config'][$key] = $val;
             }
-        }, $name, $value);
+        }
+
+        return $this->tags;
     }
 
     /**
      * @inheritDoc
      */
-    public function removeConfigSetting(string $name): void
+    public function getBranches(): array
     {
-        $authConfig = $this->authConfig;
-        $this->manipulateJson('removeConfigSetting', static function (&$config, $key) use ($authConfig): void {
-            if (Preg::isMatch('{^(bitbucket-oauth|github-oauth|gitlab-oauth|gitlab-token|bearer|http-basic|platform)\.}', $key)) {
-                [$key, $host] = explode('.', $key, 2);
-                if ($authConfig) {
-                    unset($config[$key][$host]);
-                } else {
-                    unset($config['config'][$key][$host]);
-                }
-            } else {
-                unset($config['config'][$key]);
-            }
-        }, $name);
-    }
+        if (null === $this->branches) {
+            $branches = [];
 
-    /**
-     * @inheritDoc
-     */
-    public function addProperty(string $name, $value): void
-    {
-        $this->manipulateJson('addProperty', static function (&$config, $key, $val): void {
-            if (strpos($key, 'extra.') === 0 || strpos($key, 'scripts.') === 0) {
-                $bits = explode('.', $key);
-                $last = array_pop($bits);
-                $arr = &$config[reset($bits)];
-                foreach ($bits as $bit) {
-                    if (!isset($arr[$bit])) {
-                        $arr[$bit] = [];
+            $this->process->execute('git branch --no-color --no-abbrev -v', $output, $this->repoDir);
+            foreach ($this->process->splitLines($output) as $branch) {
+                if ($branch && !Preg::isMatch('{^ *[^/]+/HEAD }', $branch)) {
+                    if (Preg::isMatchStrictGroups('{^(?:\* )? *(\S+) *([a-f0-9]+)(?: .*)?$}', $branch, $match) && $match[1][0] !== '-') {
+                        $branches[$match[1]] = $match[2];
                     }
-                    $arr = &$arr[$bit];
                 }
-                $arr[$last] = $val;
-            } else {
-                $config[$key] = $val;
             }
-        }, $name, $value);
+
+            $this->branches = $branches;
+        }
+
+        return $this->branches;
     }
 
     /**
      * @inheritDoc
      */
-    public function removeProperty(string $name): void
+    public static function supports(IOInterface $io, Config $config, string $url, bool $deep = false): bool
     {
-        $this->manipulateJson('removeProperty', static function (&$config, $key): void {
-            if (strpos($key, 'extra.') === 0 || strpos($key, 'scripts.') === 0 || stripos($key, 'autoload.') === 0 || stripos($key, 'autoload-dev.') === 0) {
-                $bits = explode('.', $key);
-                $last = array_pop($bits);
-                $arr = &$config[reset($bits)];
-                foreach ($bits as $bit) {
-                    if (!isset($arr[$bit])) {
-                        return;
-                    }
-                    $arr = &$arr[$bit];
-                }
-                unset($arr[$last]);
-            } else {
-                unset($config[$key]);
-            }
-        }, $name);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function addLink(string $type, string $name, string $value): void
-    {
-        $this->manipulateJson('addLink', static function (&$config, $type, $name, $value): void {
-            $config[$type][$name] = $value;
-        }, $type, $name, $value);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function removeLink(string $type, string $name): void
-    {
-        $this->manipulateJson('removeSubNode', static function (&$config, $type, $name): void {
-            unset($config[$type][$name]);
-        }, $type, $name);
-        $this->manipulateJson('removeMainKeyIfEmpty', static function (&$config, $type): void {
-            if (0 === count($config[$type])) {
-                unset($config[$type]);
-            }
-        }, $type);
-    }
-
-    /**
-     * @param mixed ...$args
-     */
-    private function manipulateJson(string $method, callable $fallback, ...$args): void
-    {
-        if ($this->file->exists()) {
-            if (!is_writable($this->file->getPath())) {
-                throw new \RuntimeException(sprintf('The file "%s" is not writable.', $this->file->getPath()));
-            }
-
-            if (!Filesystem::isReadable($this->file->getPath())) {
-                throw new \RuntimeException(sprintf('The file "%s" is not readable.', $this->file->getPath()));
-            }
-
-            $contents = file_get_contents($this->file->getPath());
-        } elseif ($this->authConfig) {
-            $contents = "{\n}\n";
-        } else {
-            $contents = "{\n    \"config\": {\n    }\n}\n";
+        if (Preg::isMatch('#(^git://|\.git/?$|git(?:olite)?@|//git\.|//github.com/)#i', $url)) {
+            return true;
         }
 
-        $manipulator = new JsonManipulator($contents);
+        // local filesystem
+        if (Filesystem::isLocalPath($url)) {
+            $url = Filesystem::getPlatformPath($url);
+            if (!is_dir($url)) {
+                return false;
+            }
 
-        $newFile = !$this->file->exists();
-
-        // override manipulator method for auth config files
-        if ($this->authConfig && $method === 'addConfigSetting') {
-            $method = 'addSubNode';
-            [$mainNode, $name] = explode('.', $args[0], 2);
-            $args = [$mainNode, $name, $args[1]];
-        } elseif ($this->authConfig && $method === 'removeConfigSetting') {
-            $method = 'removeSubNode';
-            [$mainNode, $name] = explode('.', $args[0], 2);
-            $args = [$mainNode, $name];
+            $process = new ProcessExecutor($io);
+            // check whether there is a git repo in that path
+            if ($process->execute('git tag', $output, $url) === 0) {
+                return true;
+            }
         }
 
-        // try to update cleanly
-        if (call_user_func_array([$manipulator, $method], $args)) {
-            file_put_contents($this->file->getPath(), $manipulator->getContents());
-        } else {
-            // on failed clean update, call the fallback and rewrite the whole file
-            $config = $this->file->read();
-            $this->arrayUnshiftRef($args, $config);
-            $fallback(...$args);
-            // avoid ending up with arrays for keys that should be objects
-            foreach (['require', 'require-dev', 'conflict', 'provide', 'replace', 'suggest', 'config', 'autoload', 'autoload-dev', 'scripts', 'scripts-descriptions', 'scripts-aliases', 'support'] as $prop) {
-                if (isset($config[$prop]) && $config[$prop] === []) {
-                    $config[$prop] = new \stdClass;
-                }
-            }
-            foreach (['psr-0', 'psr-4'] as $prop) {
-                if (isset($config['autoload'][$prop]) && $config['autoload'][$prop] === []) {
-                    $config['autoload'][$prop] = new \stdClass;
-                }
-                if (isset($config['autoload-dev'][$prop]) && $config['autoload-dev'][$prop] === []) {
-                    $config['autoload-dev'][$prop] = new \stdClass;
-                }
-            }
-            foreach (['platform', 'http-basic', 'bearer', 'gitlab-token', 'gitlab-oauth', 'github-oauth', 'preferred-install'] as $prop) {
-                if (isset($config['config'][$prop]) && $config['config'][$prop] === []) {
-                    $config['config'][$prop] = new \stdClass;
-                }
-            }
-            $this->file->write($config);
+        if (!$deep) {
+            return false;
         }
+
+        $gitUtil = new GitUtil($io, $config, new ProcessExecutor($io), new Filesystem());
+        GitUtil::cleanEnv();
 
         try {
-            $this->file->validateSchema(JsonFile::LAX_SCHEMA);
-        } catch (JsonValidationException $e) {
-            // restore contents to the original state
-            file_put_contents($this->file->getPath(), $contents);
-            throw new \RuntimeException('Failed to update composer.json with a valid format, reverting to the original content. Please report an issue to us with details (command you run and a copy of your composer.json). '.PHP_EOL.implode(PHP_EOL, $e->getErrors()), 0, $e);
+            $gitUtil->runCommand(static function ($url): string {
+                return 'git ls-remote --heads -- ' . ProcessExecutor::escape($url);
+            }, $url, sys_get_temp_dir());
+        } catch (\RuntimeException $e) {
+            return false;
         }
 
-        if ($newFile) {
-            Silencer::call('chmod', $this->file->getPath(), 0600);
-        }
-    }
-
-    /**
-     * Prepend a reference to an element to the beginning of an array.
-     *
-     * @param  mixed[] $array
-     * @param  mixed $value
-     */
-    private function arrayUnshiftRef(array &$array, &$value): int
-    {
-        $return = array_unshift($array, '');
-        $array[0] = &$value;
-
-        return $return;
+        return true;
     }
 }

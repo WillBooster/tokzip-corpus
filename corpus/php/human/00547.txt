@@ -1,130 +1,80 @@
 <?php
 
-namespace GuzzleHttp\Tests\Handler;
+namespace GuzzleHttp\Cookie;
 
-use GuzzleHttp\Exception\ConnectException;
-use GuzzleHttp\Handler\CurlMultiHandler;
-use GuzzleHttp\Promise as P;
-use GuzzleHttp\Psr7\Request;
-use GuzzleHttp\Psr7\Response;
-use GuzzleHttp\Tests\Helpers;
-use GuzzleHttp\Tests\Server;
-use GuzzleHttp\Utils;
-use PHPUnit\Framework\TestCase;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
 
-class CurlMultiHandlerTest extends TestCase
+/**
+ * Stores HTTP cookies.
+ *
+ * It extracts cookies from HTTP requests, and returns them in HTTP responses.
+ * CookieJarInterface instances automatically expire contained cookies when
+ * necessary. Subclasses are also responsible for storing and retrieving
+ * cookies from a file, database, etc.
+ *
+ * @see https://docs.python.org/2/library/cookielib.html Inspiration
+ *
+ * @extends \IteratorAggregate<SetCookie>
+ */
+interface CookieJarInterface extends \Countable, \IteratorAggregate
 {
-    public function setUp(): void
-    {
-        $_SERVER['curl_test'] = true;
-        unset($_SERVER['_curl_multi']);
-    }
+    /**
+     * Create a request with added cookie headers.
+     *
+     * If no matching cookies are found in the cookie jar, then no Cookie
+     * header is added to the request and the same request is returned.
+     *
+     * @param RequestInterface $request Request object to modify.
+     *
+     * @return RequestInterface returns the modified request.
+     */
+    public function withCookieHeader(RequestInterface $request): RequestInterface;
 
-    public function tearDown(): void
-    {
-        unset($_SERVER['_curl_multi'], $_SERVER['curl_test']);
-    }
+    /**
+     * Extract cookies from an HTTP response and store them in the CookieJar.
+     *
+     * @param RequestInterface  $request  Request that was sent
+     * @param ResponseInterface $response Response that was received
+     */
+    public function extractCookies(RequestInterface $request, ResponseInterface $response): void;
 
-    public function testCanAddCustomCurlOptions()
-    {
-        Server::flush();
-        Server::enqueue([new Response()]);
-        $a = new CurlMultiHandler(['options' => [
-            \CURLMOPT_MAXCONNECTS => 5,
-        ]]);
-        $request = new Request('GET', Server::$url);
-        $a($request, []);
-        self::assertEquals(5, $_SERVER['_curl_multi'][\CURLMOPT_MAXCONNECTS]);
-    }
+    /**
+     * Sets a cookie in the cookie jar.
+     *
+     * @param SetCookie $cookie Cookie to set.
+     *
+     * @return bool Returns true on success or false on failure
+     */
+    public function setCookie(SetCookie $cookie): bool;
 
-    public function testSendsRequest()
-    {
-        Server::enqueue([new Response()]);
-        $a = new CurlMultiHandler();
-        $request = new Request('GET', Server::$url);
-        $response = $a($request, [])->wait();
-        self::assertSame(200, $response->getStatusCode());
-    }
+    /**
+     * Remove cookies currently held in the cookie jar.
+     *
+     * Invoking this method without arguments will empty the whole cookie jar.
+     * If given a $domain argument only cookies belonging to that domain will
+     * be removed. If given a $domain and $path argument, cookies belonging to
+     * the specified path within that domain are removed. If given all three
+     * arguments, then the cookie with the specified name, path and domain is
+     * removed.
+     *
+     * @param string|null $domain Clears cookies matching a domain
+     * @param string|null $path   Clears cookies matching a domain and path
+     * @param string|null $name   Clears cookies matching a domain, path, and name
+     */
+    public function clear(?string $domain = null, ?string $path = null, ?string $name = null): void;
 
-    public function testCreatesExceptions()
-    {
-        $a = new CurlMultiHandler();
+    /**
+     * Discard all sessions cookies.
+     *
+     * Removes cookies that don't have an expire field or a have a discard
+     * field set to true. To be called when the user agent shuts down according
+     * to RFC 2965.
+     */
+    public function clearSessionCookies(): void;
 
-        $this->expectException(ConnectException::class);
-        $this->expectExceptionMessage('cURL error');
-        $a(new Request('GET', 'http://localhost:123'), [])->wait();
-    }
-
-    public function testCanSetSelectTimeout()
-    {
-        $a = new CurlMultiHandler(['select_timeout' => 2]);
-        self::assertEquals(2, Helpers::readObjectAttribute($a, 'selectTimeout'));
-    }
-
-    public function testCanCancel()
-    {
-        Server::flush();
-        $response = new Response(200);
-        Server::enqueue(\array_fill_keys(\range(0, 10), $response));
-        $a = new CurlMultiHandler();
-        $responses = [];
-        for ($i = 0; $i < 10; ++$i) {
-            $response = $a(new Request('GET', Server::$url), []);
-            $response->cancel();
-            $responses[] = $response;
-        }
-
-        foreach ($responses as $r) {
-            self::assertTrue(P\Is::rejected($r));
-        }
-    }
-
-    public function testCannotCancelFinished()
-    {
-        Server::flush();
-        Server::enqueue([new Response(200)]);
-        $a = new CurlMultiHandler();
-        $response = $a(new Request('GET', Server::$url), []);
-        $response->wait();
-        $response->cancel();
-        self::assertTrue(P\Is::fulfilled($response));
-    }
-
-    public function testDelaysConcurrently()
-    {
-        Server::flush();
-        Server::enqueue([new Response()]);
-        $a = new CurlMultiHandler();
-        $expected = Utils::currentTime() + (100 / 1000);
-        $response = $a(new Request('GET', Server::$url), ['delay' => 100]);
-        $response->wait();
-        self::assertGreaterThanOrEqual($expected, Utils::currentTime());
-    }
-
-    public function testUsesTimeoutEnvironmentVariables()
-    {
-        unset($_SERVER['GUZZLE_CURL_SELECT_TIMEOUT']);
-        \putenv('GUZZLE_CURL_SELECT_TIMEOUT=');
-
-        try {
-            $a = new CurlMultiHandler();
-            // Default if no options are given and no environment variable is set
-            self::assertEquals(1, Helpers::readObjectAttribute($a, 'selectTimeout'));
-
-            \putenv('GUZZLE_CURL_SELECT_TIMEOUT=3');
-            $a = new CurlMultiHandler();
-            // Handler reads from the environment if no options are given
-            self::assertEquals(3, Helpers::readObjectAttribute($a, 'selectTimeout'));
-        } finally {
-            \putenv('GUZZLE_CURL_SELECT_TIMEOUT=');
-        }
-    }
-
-    public function throwsWhenAccessingInvalidProperty()
-    {
-        $h = new CurlMultiHandler();
-
-        $this->expectException(\BadMethodCallException::class);
-        $h->foo;
-    }
+    /**
+     * Converts the cookie jar to an array.
+     */
+    public function toArray(): array;
 }

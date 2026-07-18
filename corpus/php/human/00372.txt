@@ -10,238 +10,95 @@
  * file that was distributed with this source code.
  */
 
-namespace Composer\Repository\Vcs;
-
-use Composer\Cache;
-use Composer\Config;
-use Composer\Pcre\Preg;
-use Composer\Util\ProcessExecutor;
-use Composer\Util\Filesystem;
-use Composer\IO\IOInterface;
+namespace Composer\Package\Archiver;
 
 /**
- * @author BohwaZ <http://bohwaz.net/>
+ * @author Till Klampaeckel <till@php.net>
+ * @author Nils Adermann <naderman@naderman.de>
+ * @author Matthieu Moquet <matthieu@moquet.net>
  */
-class FossilDriver extends VcsDriver
+class PharArchiver implements ArchiverInterface
 {
-    /** @var array<int|string, string> Map of tag name to identifier */
-    protected $tags;
-    /** @var array<int|string, string> Map of branch name to identifier */
-    protected $branches;
-    /** @var ?string */
-    protected $rootIdentifier = null;
-    /** @var ?string */
-    protected $repoFile = null;
-    /** @var string */
-    protected $checkoutDir;
+    /** @var array<string, int> */
+    protected static $formats = [
+        'zip' => \Phar::ZIP,
+        'tar' => \Phar::TAR,
+        'tar.gz' => \Phar::TAR,
+        'tar.bz2' => \Phar::TAR,
+    ];
+
+    /** @var array<string, int> */
+    protected static $compressFormats = [
+        'tar.gz' => \Phar::GZ,
+        'tar.bz2' => \Phar::BZ2,
+    ];
 
     /**
      * @inheritDoc
      */
-    public function initialize(): void
+    public function archive(string $sources, string $target, string $format, array $excludes = [], bool $ignoreFilters = false): string
     {
-        // Make sure fossil is installed and reachable.
-        $this->checkFossil();
+        $sources = realpath($sources);
 
-        // Ensure we are allowed to use this URL by config.
-        $this->config->prohibitUrlByConfig($this->url, $this->io);
+        // Phar would otherwise load the file which we don't want
+        if (file_exists($target)) {
+            unlink($target);
+        }
 
-        // Only if url points to a locally accessible directory, assume it's the checkout directory.
-        // Otherwise, it should be something fossil can clone from.
-        if (Filesystem::isLocalPath($this->url) && is_dir($this->url)) {
-            $this->checkoutDir = $this->url;
-        } else {
-            if (!Cache::isUsable($this->config->get('cache-repo-dir')) || !Cache::isUsable($this->config->get('cache-vcs-dir'))) {
-                throw new \RuntimeException('FossilDriver requires a usable cache directory, and it looks like you set it to be disabled');
+        try {
+            $filename = substr($target, 0, strrpos($target, $format) - 1);
+
+            // Check if compress format
+            if (isset(static::$compressFormats[$format])) {
+                // Current compress format supported base on tar
+                $target = $filename . '.tar';
             }
 
-            $localName = Preg::replace('{[^a-z0-9]}i', '-', $this->url);
-            $this->repoFile = $this->config->get('cache-repo-dir') . '/' . $localName . '.fossil';
-            $this->checkoutDir = $this->config->get('cache-vcs-dir') . '/' . $localName . '/';
+            $phar = new \PharData(
+                $target,
+                \FilesystemIterator::KEY_AS_PATHNAME | \FilesystemIterator::CURRENT_AS_FILEINFO,
+                '',
+                static::$formats[$format]
+            );
+            $files = new ArchivableFilesFinder($sources, $excludes, $ignoreFilters);
+            $filesOnly = new ArchivableFilesFilter($files);
+            $phar->buildFromIterator($filesOnly, $sources);
+            $filesOnly->addEmptyDir($phar, $sources);
 
-            $this->updateLocalRepo();
-        }
+            if (isset(static::$compressFormats[$format])) {
+                // Check can be compressed?
+                if (!$phar->canCompress(static::$compressFormats[$format])) {
+                    throw new \RuntimeException(sprintf('Can not compress to %s format', $format));
+                }
 
-        $this->getTags();
-        $this->getBranches();
-    }
+                // Delete old tar
+                unlink($target);
 
-    /**
-     * Check that fossil can be invoked via command line.
-     */
-    protected function checkFossil(): void
-    {
-        if (0 !== $this->process->execute('fossil version', $ignoredOutput)) {
-            throw new \RuntimeException("fossil was not found, check that it is installed and in your PATH env.\n\n" . $this->process->getErrorOutput());
-        }
-    }
+                // Compress the new tar
+                $phar->compress(static::$compressFormats[$format]);
 
-    /**
-     * Clone or update existing local fossil repository.
-     */
-    protected function updateLocalRepo(): void
-    {
-        $fs = new Filesystem();
-        $fs->ensureDirectoryExists($this->checkoutDir);
-
-        if (!is_writable(dirname($this->checkoutDir))) {
-            throw new \RuntimeException('Can not clone '.$this->url.' to access package information. The "'.$this->checkoutDir.'" directory is not writable by the current user.');
-        }
-
-        // update the repo if it is a valid fossil repository
-        if (is_file($this->repoFile) && is_dir($this->checkoutDir) && 0 === $this->process->execute('fossil info', $output, $this->checkoutDir)) {
-            if (0 !== $this->process->execute('fossil pull', $output, $this->checkoutDir)) {
-                $this->io->writeError('<error>Failed to update '.$this->url.', package information from this repository may be outdated ('.$this->process->getErrorOutput().')</error>');
-            }
-        } else {
-            // clean up directory and do a fresh clone into it
-            $fs->removeDirectory($this->checkoutDir);
-            $fs->remove($this->repoFile);
-
-            $fs->ensureDirectoryExists($this->checkoutDir);
-
-            if (0 !== $this->process->execute(sprintf('fossil clone -- %s %s', ProcessExecutor::escape($this->url), ProcessExecutor::escape($this->repoFile)), $output)) {
-                $output = $this->process->getErrorOutput();
-
-                throw new \RuntimeException('Failed to clone '.$this->url.' to repository ' . $this->repoFile . "\n\n" .$output);
+                // Make the correct filename
+                $target = $filename . '.' . $format;
             }
 
-            if (0 !== $this->process->execute(sprintf('fossil open --nested -- %s', ProcessExecutor::escape($this->repoFile)), $output, $this->checkoutDir)) {
-                $output = $this->process->getErrorOutput();
+            return $target;
+        } catch (\UnexpectedValueException $e) {
+            $message = sprintf(
+                "Could not create archive '%s' from '%s': %s",
+                $target,
+                $sources,
+                $e->getMessage()
+            );
 
-                throw new \RuntimeException('Failed to open repository '.$this->repoFile.' in ' . $this->checkoutDir . "\n\n" .$output);
-            }
+            throw new \RuntimeException($message, $e->getCode(), $e);
         }
     }
 
     /**
      * @inheritDoc
      */
-    public function getRootIdentifier(): string
+    public function supports(string $format, ?string $sourceType): bool
     {
-        if (null === $this->rootIdentifier) {
-            $this->rootIdentifier = 'trunk';
-        }
-
-        return $this->rootIdentifier;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getUrl(): string
-    {
-        return $this->url;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getSource(string $identifier): array
-    {
-        return ['type' => 'fossil', 'url' => $this->getUrl(), 'reference' => $identifier];
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getDist(string $identifier): ?array
-    {
-        return null;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getFileContent(string $file, string $identifier): ?string
-    {
-        $command = sprintf('fossil cat -r %s -- %s', ProcessExecutor::escape($identifier), ProcessExecutor::escape($file));
-        $this->process->execute($command, $content, $this->checkoutDir);
-
-        if (!trim($content)) {
-            return null;
-        }
-
-        return $content;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getChangeDate(string $identifier): ?\DateTimeImmutable
-    {
-        $this->process->execute('fossil finfo -b -n 1 composer.json', $output, $this->checkoutDir);
-        [, $date] = explode(' ', trim($output), 3);
-
-        return new \DateTimeImmutable($date, new \DateTimeZone('UTC'));
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getTags(): array
-    {
-        if (null === $this->tags) {
-            $tags = [];
-
-            $this->process->execute('fossil tag list', $output, $this->checkoutDir);
-            foreach ($this->process->splitLines($output) as $tag) {
-                $tags[$tag] = $tag;
-            }
-
-            $this->tags = $tags;
-        }
-
-        return $this->tags;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getBranches(): array
-    {
-        if (null === $this->branches) {
-            $branches = [];
-
-            $this->process->execute('fossil branch list', $output, $this->checkoutDir);
-            foreach ($this->process->splitLines($output) as $branch) {
-                $branch = trim(Preg::replace('/^\*/', '', trim($branch)));
-                $branches[$branch] = $branch;
-            }
-
-            $this->branches = $branches;
-        }
-
-        return $this->branches;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public static function supports(IOInterface $io, Config $config, string $url, bool $deep = false): bool
-    {
-        if (Preg::isMatch('#(^(?:https?|ssh)://(?:[^@]@)?(?:chiselapp\.com|fossil\.))#i', $url)) {
-            return true;
-        }
-
-        if (Preg::isMatch('!/fossil/|\.fossil!', $url)) {
-            return true;
-        }
-
-        // local filesystem
-        if (Filesystem::isLocalPath($url)) {
-            $url = Filesystem::getPlatformPath($url);
-            if (!is_dir($url)) {
-                return false;
-            }
-
-            $process = new ProcessExecutor($io);
-            // check whether there is a fossil repo in that path
-            if ($process->execute('fossil info', $output, $url) === 0) {
-                return true;
-            }
-        }
-
-        return false;
+        return isset(static::$formats[$format]);
     }
 }

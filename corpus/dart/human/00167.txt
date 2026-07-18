@@ -1,388 +1,255 @@
-// Copyright (c) 2022, the Dart project authors.  Please see the AUTHORS file
+// Copyright (c) 2017, the Dart project authors.  Please see the AUTHORS file
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-import 'dart:io';
-
-import 'package:cupertino_http/cupertino_http.dart';
-import 'package:integration_test/integration_test.dart';
+import 'package:fake_async/fake_async.dart';
+import 'package:http/http.dart';
+import 'package:http/retry.dart';
+import 'package:http/testing.dart';
 import 'package:test/test.dart';
 
-void testWebSocketTask() {
-  group('websocket', () {
-    late HttpServer server;
-    int? lastCloseCode;
-    String? lastCloseReason;
-
-    setUp(() async {
-      lastCloseCode = null;
-      lastCloseReason = null;
-      server = await HttpServer.bind('localhost', 0)
-        ..listen((request) {
-          if (request.uri.path.endsWith('error')) {
-            request.response.statusCode = 500;
-            request.response.close();
-          } else {
-            WebSocketTransformer.upgrade(request)
-                .then((websocket) => websocket.listen((event) {
-                      final code = request.uri.queryParameters['code'];
-                      final reason = request.uri.queryParameters['reason'];
-
-                      websocket.add(event);
-                      if (!request.uri.queryParameters.containsKey('noclose')) {
-                        websocket.close(
-                            code == null ? null : int.parse(code), reason);
-                      }
-                    }, onDone: () {
-                      lastCloseCode = websocket.closeCode;
-                      lastCloseReason = websocket.closeReason;
-                    }));
-          }
-        });
-    });
-
-    tearDown(() async {
-      await server.close();
-    });
-
-    test('background session', () {
-      final session = URLSession.sessionWithConfiguration(
-          URLSessionConfiguration.backgroundSession('background'));
-      expect(
-          () => session.webSocketTaskWithRequest(URLRequest.fromUrl(
-              Uri.parse('ws://localhost:${server.port}/?noclose'))),
-          throwsUnsupportedError);
-    });
-
-    test('client code and reason', () async {
-      final session = URLSession.sharedSession();
-      final task = session.webSocketTaskWithRequest(URLRequest.fromUrl(
-          Uri.parse('ws://localhost:${server.port}/?noclose')))
-        ..resume();
-      await task
-          .sendMessage(URLSessionWebSocketMessage.fromString('Hello World!'));
-      await task.receiveMessage();
-      task.cancelWithCloseCode(4998, Data.fromList('Bye'.codeUnits));
-
-      // Allow the server to run and save the close code.
-      while (lastCloseCode == null) {
-        await Future<void>.delayed(const Duration(milliseconds: 10));
-      }
-      expect(lastCloseCode, 4998);
-      expect(lastCloseReason, 'Bye');
-    });
-
-    test('server code and reason', () async {
-      final session = URLSession.sharedSession();
-      final task = session.webSocketTaskWithRequest(URLRequest.fromUrl(
-          Uri.parse('ws://localhost:${server.port}/?code=4999&reason=fun')))
-        ..resume();
-      await task
-          .sendMessage(URLSessionWebSocketMessage.fromString('Hello World!'));
-      await task.receiveMessage();
-      await expectLater(task.receiveMessage(),
-          throwsA(isA<Error>().having((e) => e.code, 'code', 57 // NOT_CONNECTED
-              )));
-
-      expect(task.closeCode, 4999);
-      expect(task.closeReason!.bytes, 'fun'.codeUnits);
-      task.cancel();
-    });
-
-    test('data message', () async {
-      final session = URLSession.sharedSession();
-      final task = session.webSocketTaskWithRequest(
-          URLRequest.fromUrl(Uri.parse('ws://localhost:${server.port}')))
-        ..resume();
-      await task.sendMessage(
-          URLSessionWebSocketMessage.fromData(Data.fromList([1, 2, 3])));
-      final receivedMessage = await task.receiveMessage();
-      expect(receivedMessage.type,
-          URLSessionWebSocketMessageType.urlSessionWebSocketMessageTypeData);
-      expect(receivedMessage.data!.bytes, [1, 2, 3]);
-      expect(receivedMessage.string, null);
-      task.cancel();
-    });
-
-    test('text message', () async {
-      final session = URLSession.sharedSession();
-      final task = session.webSocketTaskWithRequest(
-          URLRequest.fromUrl(Uri.parse('ws://localhost:${server.port}')))
-        ..resume();
-      await task
-          .sendMessage(URLSessionWebSocketMessage.fromString('Hello World!'));
-      final receivedMessage = await task.receiveMessage();
-      expect(receivedMessage.type,
-          URLSessionWebSocketMessageType.urlSessionWebSocketMessageTypeString);
-      expect(receivedMessage.data, null);
-      expect(receivedMessage.string, 'Hello World!');
-      task.cancel();
-    });
-
-    test('send failure', () async {
-      final session = URLSession.sharedSession();
-      final task = session.webSocketTaskWithRequest(
-          URLRequest.fromUrl(Uri.parse('ws://localhost:${server.port}/error')))
-        ..resume();
-      await expectLater(
-          task.sendMessage(
-              URLSessionWebSocketMessage.fromString('Hello World!')),
-          throwsA(isA<Error>().having(
-              (e) => e.code, 'code', -1011 // NSURLErrorBadServerResponse
-              )));
-      task.cancel();
-    });
-
-    test('receive failure', () async {
-      final session = URLSession.sharedSession();
-      final task = session.webSocketTaskWithRequest(
-          URLRequest.fromUrl(Uri.parse('ws://localhost:${server.port}')))
-        ..resume();
-      await task
-          .sendMessage(URLSessionWebSocketMessage.fromString('Hello World!'));
-      await task.receiveMessage();
-      await expectLater(task.receiveMessage(),
-          throwsA(isA<Error>().having((e) => e.code, 'code', 57 // NOT_CONNECTED
-              )));
-      task.cancel();
-    });
-  });
-}
-
-void testURLSessionTaskCommon(
-    URLSessionTask Function(URLSession session, Uri url) f,
-    {bool suspendedAfterCancel = false}) {
-  group('task states', () {
-    late HttpServer server;
-    late URLSessionTask task;
-    setUp(() async {
-      server = (await HttpServer.bind('localhost', 0))
-        ..listen((request) async {
-          await request.drain<void>();
-          request.response.headers.set('Content-Type', 'text/plain');
-          request.response.write('Hello World');
-          await request.response.close();
-        });
-      final session = URLSession.sharedSession();
-      task = f(session, Uri.parse('http://localhost:${server.port}'));
-    });
-    tearDown(() {
-      task.cancel();
-      server.close();
-    });
-    test('starts suspended', () {
-      expect(task.state, URLSessionTaskState.urlSessionTaskStateSuspended);
-      expect(task.response, null);
-      task.toString(); // Just verify that there is no crash.
-    });
-
-    test('resume to running', () {
-      task.resume();
-      expect(task.state, URLSessionTaskState.urlSessionTaskStateRunning);
-      expect(task.response, null);
-      task.toString(); // Just verify that there is no crash.
-    });
-
-    test('cancel', () {
-      task.cancel();
-      if (suspendedAfterCancel) {
-        expect(task.state, URLSessionTaskState.urlSessionTaskStateSuspended);
-      } else {
-        expect(task.state, URLSessionTaskState.urlSessionTaskStateCanceling);
-      }
-      expect(task.response, null);
-      task.toString(); // Just verify that there is no crash.
-    });
-
-    test('completed', () async {
-      task.resume();
-      while (task.state != URLSessionTaskState.urlSessionTaskStateCompleted) {
-        // Let the event loop run.
-        await Future<void>(() {});
-      }
-    });
-  });
-
-  group('task completed', () {
-    late HttpServer server;
-    late URLSessionTask task;
-    setUp(() async {
-      server = (await HttpServer.bind('localhost', 0))
-        ..listen((request) async {
-          await request.drain<void>();
-          request.response.headers.set('Content-Type', 'text/plain');
-          request.response.write('Hello World');
-          await request.response.close();
-        });
-      final session = URLSession.sharedSession();
-      task = session.dataTaskWithRequest(
-          MutableURLRequest.fromUrl(
-              Uri.parse('http://localhost:${server.port}/mypath'))
-            ..httpMethod = 'POST'
-            ..httpBody = Data.fromList([1, 2, 3]))
-        ..prefersIncrementalDelivery = false
-        ..priority = 0.2
-        ..taskDescription = 'my task description'
-        ..resume();
-
-      while (task.state != URLSessionTaskState.urlSessionTaskStateCompleted) {
-        // Let the event loop run.
-        await Future<void>(() {});
-      }
-    });
-    tearDown(() {
-      task.cancel();
-      server.close();
-    });
-
-    test('priority', () async {
-      expect(task.priority, inInclusiveRange(0.19, 0.21));
-    });
-
-    test('current request', () async {
-      expect(task.currentRequest!.url!.path, '/mypath');
-    });
-
-    test('original request', () async {
-      expect(task.originalRequest!.url!.path, '/mypath');
-    });
-
-    test('has response', () async {
-      expect(task.response, isA<HTTPURLResponse>());
-    });
-
-    test('no error', () async {
-      expect(task.error, null);
-    });
-
-    test('countOfBytesExpectedToReceive - no content length set', () async {
-      expect(task.countOfBytesExpectedToReceive, -1);
-    });
-
-    test('countOfBytesReceived', () async {
-      expect(task.countOfBytesReceived, 11);
-    });
-
-    test('countOfBytesExpectedToSend', () async {
-      expect(task.countOfBytesExpectedToSend, 3);
-    });
-
-    test('countOfBytesSent', () async {
-      expect(task.countOfBytesSent, 3);
-    });
-
-    test('taskDescription', () {
-      expect(task.taskDescription, 'my task description');
-    });
-
-    test('taskIdentifier', () {
-      task.taskIdentifier; // Just verify that there is no crash.
-    });
-
-    test('prefersIncrementalDelivery', () {
-      expect(task.prefersIncrementalDelivery, false);
-    });
-
-    test('toString', () {
-      task.toString(); // Just verify that there is no crash.
-    });
-  });
-
-  group('task failed', () {
-    late URLSessionTask task;
-    setUp(() async {
-      final session = URLSession.sharedSession();
-      task = session.dataTaskWithRequest(
-          MutableURLRequest.fromUrl(Uri.parse('http://notarealserver')))
-        ..resume();
-
-      while (task.state != URLSessionTaskState.urlSessionTaskStateCompleted) {
-        // Let the event loop run.
-        await Future<void>(() {});
-      }
-    });
-    tearDown(() {
-      task.cancel();
-    });
-
-    test('no response', () async {
-      expect(task.response, null);
-    });
-
-    test('no error', () async {
-      expect(task.error!.code, -1003); // CannotFindHost
-    });
-
-    test('toString', () {
-      task.toString(); // Just verify that there is no crash.
-    });
-  });
-
-  group('task redirect', () {
-    late HttpServer server;
-    late URLSessionTask task;
-    setUp(() async {
-      // The task will request http://localhost:XXX/launch, which will be
-      // redirected to http://localhost:XXX/landed.
-      server = (await HttpServer.bind('localhost', 0))
-        ..listen((request) async {
-          await request.drain<void>();
-          if (request.requestedUri.path != '/landed') {
-            await request.response.redirect(Uri(path: '/landed'));
-            return;
-          }
-          request.response.headers.set('Content-Type', 'text/plain');
-          request.response.write('Hello World');
-          await request.response.close();
-        });
-      final session = URLSession.sharedSession();
-      task = session.dataTaskWithRequest(MutableURLRequest.fromUrl(
-          Uri.parse('http://localhost:${server.port}/launch')))
-        ..resume();
-
-      while (task.state != URLSessionTaskState.urlSessionTaskStateCompleted) {
-        // Let the event loop run.
-        await Future<void>(() {});
-      }
-    });
-    tearDown(() {
-      task.cancel();
-      server.close();
-    });
-
-    test('current request', () async {
-      expect(task.currentRequest!.url!.path, '/landed');
-    });
-
-    test('original request', () async {
-      expect(task.originalRequest!.url!.path, '/launch');
-    });
-
-    test('toString', () {
-      task.toString(); // Just verify that there is no crash.
-    });
-  });
-}
-
 void main() {
-  IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+  group("doesn't retry when", () {
+    test('a request has a non-503 error code', () async {
+      final client = RetryClient(
+          MockClient(expectAsync1((_) async => Response('', 502), count: 1)));
+      final response = await client.get(Uri.http('example.org', ''));
+      expect(response.statusCode, equals(502));
+    });
 
-  group('data task', () {
-    testURLSessionTaskCommon(
-        (session, uri) => session.dataTaskWithRequest(URLRequest.fromUrl(uri)));
+    test("a request doesn't match when()", () async {
+      final client = RetryClient(
+          MockClient(expectAsync1((_) async => Response('', 503), count: 1)),
+          when: (_) => false);
+      final response = await client.get(Uri.http('example.org', ''));
+      expect(response.statusCode, equals(503));
+    });
+
+    test('retries is 0', () async {
+      final client = RetryClient(
+          MockClient(expectAsync1((_) async => Response('', 503), count: 1)),
+          retries: 0);
+      final response = await client.get(Uri.http('example.org', ''));
+      expect(response.statusCode, equals(503));
+    });
   });
 
-  group('download task', () {
-    testURLSessionTaskCommon((session, uri) =>
-        session.downloadTaskWithRequest(URLRequest.fromUrl(uri)));
+  test('retries on a 503 by default', () async {
+    var count = 0;
+    final client = RetryClient(
+        MockClient(expectAsync1((request) async {
+          count++;
+          return count < 2 ? Response('', 503) : Response('', 200);
+        }, count: 2)),
+        delay: (_) => Duration.zero);
+
+    final response = await client.get(Uri.http('example.org', ''));
+    expect(response.statusCode, equals(200));
   });
 
-  group('websocket task', () {
-    testURLSessionTaskCommon(
-        (session, uri) =>
-            session.webSocketTaskWithRequest(URLRequest.fromUrl(uri)),
-        suspendedAfterCancel: true);
+  test('retries on any request where when() returns true', () async {
+    var count = 0;
+    final client = RetryClient(
+        MockClient(expectAsync1((request) async {
+          count++;
+          return Response('', 503,
+              headers: {'retry': count < 2 ? 'true' : 'false'});
+        }, count: 2)),
+        when: (response) => response.headers['retry'] == 'true',
+        delay: (_) => Duration.zero);
+
+    final response = await client.get(Uri.http('example.org', ''));
+    expect(response.headers, containsPair('retry', 'false'));
+    expect(response.statusCode, equals(503));
   });
 
-  testWebSocketTask();
+  test('retries on any request where whenError() returns true', () async {
+    var count = 0;
+    final client = RetryClient(
+        MockClient(expectAsync1((request) async {
+          count++;
+          if (count < 2) throw StateError('oh no');
+          return Response('', 200);
+        }, count: 2)),
+        whenError: (error, _) =>
+            error is StateError && error.message == 'oh no',
+        delay: (_) => Duration.zero);
+
+    final response = await client.get(Uri.http('example.org', ''));
+    expect(response.statusCode, equals(200));
+  });
+
+  test("doesn't retry a request where whenError() returns false", () async {
+    final client = RetryClient(
+        MockClient(expectAsync1((request) async => throw StateError('oh no'))),
+        whenError: (error, _) => error == 'oh yeah',
+        delay: (_) => Duration.zero);
+
+    expect(client.get(Uri.http('example.org', '')),
+        throwsA(isStateError.having((e) => e.message, 'message', 'oh no')));
+  });
+
+  test('retries three times by default', () async {
+    final client = RetryClient(
+        MockClient(expectAsync1((_) async => Response('', 503), count: 4)),
+        delay: (_) => Duration.zero);
+    final response = await client.get(Uri.http('example.org', ''));
+    expect(response.statusCode, equals(503));
+  });
+
+  test('retries the given number of times', () async {
+    final client = RetryClient(
+        MockClient(expectAsync1((_) async => Response('', 503), count: 13)),
+        retries: 12,
+        delay: (_) => Duration.zero);
+    final response = await client.get(Uri.http('example.org', ''));
+    expect(response.statusCode, equals(503));
+  });
+
+  test('waits 1.5x as long each time by default', () {
+    FakeAsync().run((fake) {
+      var count = 0;
+      final client = RetryClient(MockClient(expectAsync1((_) async {
+        count++;
+        if (count == 1) {
+          expect(fake.elapsed, equals(Duration.zero));
+        } else if (count == 2) {
+          expect(fake.elapsed, equals(const Duration(milliseconds: 500)));
+        } else if (count == 3) {
+          expect(fake.elapsed, equals(const Duration(milliseconds: 1250)));
+        } else if (count == 4) {
+          expect(fake.elapsed, equals(const Duration(milliseconds: 2375)));
+        }
+
+        return Response('', 503);
+      }, count: 4)));
+
+      expect(client.get(Uri.http('example.org', '')), completes);
+      fake.elapse(const Duration(minutes: 10));
+    });
+  });
+
+  test('waits according to the delay parameter', () {
+    FakeAsync().run((fake) {
+      var count = 0;
+      final client = RetryClient(
+          MockClient(expectAsync1((_) async {
+            count++;
+            if (count == 1) {
+              expect(fake.elapsed, equals(Duration.zero));
+            } else if (count == 2) {
+              expect(fake.elapsed, equals(Duration.zero));
+            } else if (count == 3) {
+              expect(fake.elapsed, equals(const Duration(seconds: 1)));
+            } else if (count == 4) {
+              expect(fake.elapsed, equals(const Duration(seconds: 3)));
+            }
+
+            return Response('', 503);
+          }, count: 4)),
+          delay: (requestCount) => Duration(seconds: requestCount));
+
+      expect(client.get(Uri.http('example.org', '')), completes);
+      fake.elapse(const Duration(minutes: 10));
+    });
+  });
+
+  test('waits according to the delay list', () {
+    FakeAsync().run((fake) {
+      var count = 0;
+      final client = RetryClient.withDelays(
+          MockClient(expectAsync1((_) async {
+            count++;
+            if (count == 1) {
+              expect(fake.elapsed, equals(Duration.zero));
+            } else if (count == 2) {
+              expect(fake.elapsed, equals(const Duration(seconds: 1)));
+            } else if (count == 3) {
+              expect(fake.elapsed, equals(const Duration(seconds: 61)));
+            } else if (count == 4) {
+              expect(fake.elapsed, equals(const Duration(seconds: 73)));
+            }
+
+            return Response('', 503);
+          }, count: 4)),
+          const [
+            Duration(seconds: 1),
+            Duration(minutes: 1),
+            Duration(seconds: 12)
+          ]);
+
+      expect(client.get(Uri.http('example.org', '')), completes);
+      fake.elapse(const Duration(minutes: 10));
+    });
+  });
+
+  test('calls onRetry for each retry', () async {
+    var count = 0;
+    final client = RetryClient(
+        MockClient(expectAsync1((_) async => Response('', 503), count: 3)),
+        retries: 2,
+        delay: (_) => Duration.zero,
+        onRetry: expectAsync3((request, response, retryCount) {
+          expect(request.url, equals(Uri.http('example.org', '')));
+          expect(response?.statusCode, equals(503));
+          expect(retryCount, equals(count));
+          count++;
+        }, count: 2));
+    final response = await client.get(Uri.http('example.org', ''));
+    expect(response.statusCode, equals(503));
+  });
+
+  test('copies all request attributes for each attempt', () async {
+    final client = RetryClient.withDelays(
+        MockClient(expectAsync1((request) async {
+          expect(request.contentLength, equals(5));
+          expect(request.followRedirects, isFalse);
+          expect(request.headers, containsPair('foo', 'bar'));
+          expect(request.maxRedirects, equals(12));
+          expect(request.method, equals('POST'));
+          expect(request.persistentConnection, isFalse);
+          expect(request.url, equals(Uri.http('example.org', '')));
+          expect(request.body, equals('hello'));
+          return Response('', 503);
+        }, count: 2)),
+        [Duration.zero]);
+
+    final request = Request('POST', Uri.http('example.org', ''))
+      ..body = 'hello'
+      ..followRedirects = false
+      ..headers['foo'] = 'bar'
+      ..maxRedirects = 12
+      ..persistentConnection = false;
+
+    final response = await client.send(request);
+    expect(response.statusCode, equals(503));
+  });
+
+  test('async when, whenError and onRetry', () async {
+    final client = RetryClient(
+      MockClient(expectAsync1(
+          (request) async => request.headers['Authorization'] != null
+              ? Response('', 200)
+              : Response('', 401),
+          count: 2)),
+      retries: 1,
+      delay: (_) => Duration.zero,
+      when: (response) async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        return response.statusCode == 401;
+      },
+      whenError: (error, stackTrace) async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        return false;
+      },
+      onRetry: (request, response, retryCount) async {
+        expect(response?.statusCode, equals(401));
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        request.headers['Authorization'] = 'Bearer TOKEN';
+      },
+    );
+
+    final response = await client.get(Uri.http('example.org', ''));
+    expect(response.statusCode, equals(200));
+  });
 }

@@ -1,15 +1,51 @@
-两种实现的性能相近！这里我们不会解释性能测试代码，因为重点并不是证明这两个版本完全等价，而是大致感受一下它们在性能上的对比。
+```rust
+pub enum Poll<T> {
+    Ready(T),
+    Pending,
+}
+```
 
-对于更全面的基准测试，你应该尝试把不同大小的文本作为 `contents`、把不同的单词和不同长度的单词作为 `query`，再结合其他各种变化一起测试。重点在于：迭代器虽然是高级抽象，但编译出的代码和你手写底层代码时大致相同。迭代器是 Rust 的**零成本抽象**（*zero-cost abstractions*）之一，也就是说使用这种抽象不会带来额外的运行时开销。这和 C++ 的最初设计者与实现者 Bjarne Stroustrup 在 2012 年 ETAPS 主题演讲《Foundations of C++》中对零开销的定义类似：
+这个 `Poll` 类型有点像 `Option`。它也有一个带值的变体 `Ready(T)`，以及一个不带值的变体 `Pending`。但 `Poll` 的语义和 `Option` 完全不同。`Pending` 表示这个 future 还有工作没做完，因此调用方稍后还需要再次检查。`Ready` 则表示这个 `Future` 已经完成，其结果值 `T` 现在已经可用。
 
-> In general, C++ implementations obey the zero-overhead principle: What you don't use, you don't pay for. And further: What you do use, you couldn't hand code any better.
->
-> 总的来说，C++ 的实现遵循了零开销原则：不使用的功能无需为其付出代价；而已经使用的功能，也不可能通过手写代码做得更好。
+> 注意：直接调用 `poll` 的场景很少，但如果你真的需要这么做，请记住：对于大多数 future 来说，一旦它已经返回过 `Ready`，调用方就不应再对它调用 `poll`。很多 future 在 ready 之后再次被轮询时会 panic。那些可以安全重复轮询的 future，会在文档里明确说明。这和 `Iterator::next` 的行为有些相似。
 
-在很多情况下，使用迭代器的 Rust 代码会编译成与你手写出来相同的汇编。像循环展开、消除数组访问边界检查这样的优化都会生效，并让最终生成的代码极其高效。现在你已经知道这一点了，就可以放心使用迭代器和闭包：它们让代码看起来更高层，但不会因此带来运行时性能损失。
+当你看到使用 `await` 的代码时，Rust 在底层会把它编译成调用 `poll` 的代码。如果你回头看示例 17-4，也就是在单个 URL 的标题解析完成后把它打印出来的那个例子，Rust 编译出来的代码大致会像下面这样（虽然并不完全一致）：
 
-## 总结
+```rust,ignore
+match page_title(url).poll() {
+    Ready(page_title) => match page_title {
+        Some(title) => println!("The title for {url} was {title}"),
+        None => println!("{url} had no title"),
+    }
+    Pending => {
+        // 这里该怎么办？
+    }
+}
+```
 
-闭包和迭代器是 Rust 受函数式编程语言理念启发而来的特性。它们有助于 Rust 以低层性能清晰地表达高层概念。闭包和迭代器的实现不会影响运行时性能，这正是 Rust 致力于提供零成本抽象这一目标的一部分。
+如果 future 仍然是 `Pending`，那我们该怎么办？我们需要一种办法不断重试，直到 future 最终准备好。换句话说，我们需要一个循环：
 
-现在我们已经改进了 I/O 项目的表达力，接下来看看 `cargo` 的更多功能，它们会帮助我们把项目分享给全世界。
+```rust,ignore
+let mut page_title_fut = page_title(url);
+loop {
+    match page_title_fut.poll() {
+        Ready(value) => match page_title {
+            Some(title) => println!("The title for {url} was {title}"),
+            None => println!("{url} had no title"),
+        }
+        Pending => {
+            // continue
+        }
+    }
+}
+```
+
+但如果 Rust 真按这段代码精确地编译，那么每个 `await` 就都会变成阻塞式的，这恰恰和我们想要的效果相反！Rust 实际上会保证：这个循环能够把控制权交给某个东西，由它暂停当前 future 的工作，去处理别的 future，然后稍后再回来重新检查当前这个。正如我们已经见过的，这个“某个东西”就是异步运行时，而调度和协调这些工作，正是运行时的核心职责之一。
+
+在[“通过消息传递在两个任务之间发送数据”][message-passing]<!-- ignore -->一节中，我们描述过等待 `rx.recv` 的过程。`recv` 调用会返回一个 future，而等待这个 future 本质上就是在轮询它。我们之前提到，运行时会暂停这个 future，直到它准备好，最终要么得到 `Some(message)`，要么在信道关闭时得到 `None`。现在，借助对 `Future` trait，尤其是 `Future::poll` 的更深入理解，我们就能看清它的工作方式了：当返回 `Poll::Pending` 时，运行时知道这个 future 还没准备好；反过来，当 `poll` 返回 `Poll::Ready(Some(message))` 或 `Poll::Ready(None)` 时，运行时就知道这个 future 已经准备好，可以继续推进它。
+
+至于运行时具体是怎么做到这一点的，已经超出了本书的范围。不过关键是看清 future 的基本机制：运行时会去*轮询*它所负责的每个 future，而当 future 还没准备好时，就让它重新休眠。
+
+### `Pin` 类型与 `Unpin` trait
+
+回到示例 17-13，我们使用过 `trpl::join!` 宏来等待三个 future。不过，更常见的情况是你会有一个集合，比如一个向量，其中包含若干个 future，而这些 future 的个数要到运行时才知道。让我们把示例 17-13 改成示例 17-23 中的代码：把这三个 future 放进一个向量里，再调用 `trpl::join_all`。不过，这段代码暂时还编译不过。

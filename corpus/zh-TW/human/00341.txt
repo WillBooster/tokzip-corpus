@@ -1,15 +1,98 @@
----
-title: WordPress Plugin VikBooking <= 1.5.3 Unauthorized RCE 漏洞細節
-catalog: true
-date: 2022-05-20 12:00:00
-tags: [Security]
-categories: [Security]
-photos: /img/wordpress-plugin-vikbooking-unauth-rce/cover.png
----
+在 Medium 的文章列表那邊捲動一下並且打開 devtool，可以看到 medium 後面是用 GraphQL：
 
-前陣子在看一些 WordPress Plugin 的東西，發現是個滿好練習的地方，因為那邊 plugin 數量很多，而且每一個都有原始碼可以看，想要黑箱白箱都可以，然後安裝也很方便。
+<img width="792" alt="p1" src="https://user-images.githubusercontent.com/2755720/61093603-2e954300-a400-11e9-9e70-acd06b97a6a8.png">
 
-這篇來講一下前陣子找到的一個洞，用的是最基本而且經典的攻擊手法，檔案上傳導致的 RCE。
 
-漏洞編號：[CVE-2022-27862
- WordPress VikBooking Hotel Booking Engine & PMS plugin <= 1.5.3 - Arbitrary File Upload leading to RCE](https://patchstack.com/database/vulnerability/vikbooking/wordpress-vikbooking-hotel-booking-engine-pms-plugin-1-5-3-arbitrary-file-upload-leading-to-rce)
+這個就麻煩了...我對 GraphQL 不太熟，要花時間去研究一下它的資料結構，感覺要花不少時間，於是那時我就暫時先放棄這條路，決定來試試看用 puppeteer。
+
+## 第二次嘗試：puppeteer
+
+如果你不知道什麼是 puppeteer，我在這邊簡單介紹一下。你可以想成 puppeteer 會自動幫你打開一個瀏覽器，你可以寫程式去操控這個瀏覽器。例如說我要打開一個頁面並且在這頁面上執行 JS 等等，所以使用 puppeteer 的話，爬蟲的原理就是打開某個頁面，執行一段 JS 拿到頁面上的資料。
+
+puppeteer 用起來很簡單，只要找一下現成的範例看一下語法，改一改就可以直接拿來用了。稍微研究了一下 HTML 結構之後，可以寫出下面的程式碼：
+
+``` js
+const puppeteer = require('puppeteer')
+  
+async function main() {
+  const username = 'hulitw'
+  const url = 'https://medium.com/@' + username
+  
+  const browser = await puppeteer.launch({
+    headless: true
+  })
+  
+  // 造訪頁面
+  const page = await browser.newPage()
+  await page.goto(url, {
+    waitUntil: 'domcontentloaded'
+  })
+  
+  // 執行準備好的 script 並回傳資料 
+  const data = await page.evaluate(mediumParser)
+  console.log(data)
+  
+  await page.close()
+  await browser.close()
+}
+  
+function mediumParser() {
+  
+  // selector 是透過觀察而得來的
+  const elements = document.querySelectorAll('section > div:nth-child(2) > div > div')
+  const result = []
+  for (let i = 0; i < elements.length; i++) {
+    const h1 = elements[i].querySelector('h1')
+    const a = elements[i].querySelectorAll('a')
+    if (h1) {
+      result.push({
+        title: h1.innerText,
+        link: a[3].href
+      })
+    }
+  }
+  return result
+}
+  
+main()
+```
+
+只要觀察出 HTML 與 CSS 的規則之後，就可以取得想拿的資料。但 Medium 不好爬是因為在 class name 的部分有使用 [functional CSS](https://blog.techbridge.cc/2019/01/26/functional-css/)，而且 class 的命名都有經過處理，看起來是用程式自動去跑的，所以只要 Medium 一更新，元素的命名應該會不太一樣。
+
+所以最後只能從 HTML 的結構下手，去把文章給抓出來。
+
+解決了這個問題之後，還有一個問題，那就是無限捲動。Medium 跟很多網頁一樣，要一直往下滑才會載入新文章，而這邊必須觀察的規律是滑到什麼時候才要停止。
+
+觀察之後發現當發表過的文章載入完以後，才會顯示 `Highlighted by xxx` 這個區塊，所以可以用這個元素有沒有出現當作終止條件。
+
+接著可以寫一段程式碼，讓頁面不斷往下捲動直到載入所有文章為止：
+
+``` js
+/*
+  要用的話就是： await scroll(page)
+*/
+  
+function getArticlesCount() {
+  const elements = document.querySelectorAll('section > div:nth-child(2) > div > div')
+  return elements.length
+}
+  
+async function scroll(page) {
+  await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+  try {
+  
+    // 終止條件
+    await page.waitForSelector('h4 ~ p', {
+      timeout: 1000
+    })
+  } catch(err) {
+  
+    // 印出目前抓到的文章數目
+    const count = await page.evaluate(getArticlesCount);
+    console.log(`Fetching... ${count} articles`)
+  
+    // 繼續往下捲動
+    await scroll(page);
+  }
+}
+```

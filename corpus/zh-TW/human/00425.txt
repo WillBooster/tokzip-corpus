@@ -1,202 +1,191 @@
-```
-HTTP/2 302 Found
-Location: abc
-test:123
-```
+這是我收到的連結：`https://matters.news/forget?email=user%40example.com&code=UYBQ912rhd_9s3TfywZnk1kQl6PCaDjPlXuNX3Df&type=password_reset`
 
-那若是改成：`abc\n\n<script>alert(1)</script>`，response 就會變成：
+從這邊其實我們就可以發現第一個問題，就是看起來收到的連結的前半段是由 `redirectUrl` 所控制的。如果我們攔截 request 以後修改 `redirectUrl` 參數，修改成 `https://cymetrics.io`，會發現信箱內收到的連結確實變成由 `https://cymetrics.io` 開頭！
 
-```
-HTTP/2 302 Found
-Location: abc
+如此一來，就有了前面所說的漏洞，如果使用者點了信中的連結，那我們的 server 就會收到 token，就可以幫使用者重設密碼。
 
-<script>alert(1)</script>
-....
-```
+接著我們看一下有沒有暴力破解的問題，token 本身看起來複雜度滿高的，長度是 40 個字，由大小寫英文字母、數字以及底線所組成。
 
-藉由 CRLF injection 去改變 response body 的內容，但很遺憾似乎無法直接達成 XSS，因為瀏覽器看到 status code 是 301/302 時會忽略 response body，直接把使用者導去目標頁面。
+雖然看起來應該不會有問題，但 Matters 是開源的，所以我們可以直接去看一下 `SendVerificationCode` 是如何實作的，程式碼在這邊：https://github.com/thematters/matters-server/blob/v3.19.0/src/mutations/user/sendVerificationCode.ts
 
-我找到可以運作的資料都已經是四五年前的了：
-
-1. [[stagecafrstore.starbucks.com] CRLF Injection, XSS](https://hackerone.com/reports/192667)
-2. [[dev.twitter.com] XSS and Open Redirect](https://hackerone.com/reports/260744)
-
-我記得我好像看過有篇文章在講這種情況應該怎麼辦，但我找很久都找不到，如果知道該怎麼繞過的請告訴我。
-
-不過就算改變 response body 沒什麼用，改變其他的 header 也可能串聯其他攻擊，例如說 Set-Cookie，可以幫使用者設置任意 cookie，就有機會再串接 session fixation 或是 CSRF 之類的攻擊。
-
-## 前端：XSS
-
-如果是前端實作的重新導向，要特別注意的一個問題就是 XSS。
-
-你可能會疑惑重新導向跟 XSS 有什麼關係，我們先來回顧一下前端重新導向的程式碼：
+我們關注的是產生 code 的地方，主要是這一段：
 
 ``` js
-const searchParams = new URLSearchParams(location.search)
-window.location = searchParams.get('redirect')
-```
+// insert record
+const { code } = await userService.createVerificationCode({
+  userId: viewer.id,
+  email,
+  type,
+  strong: !!redirectUrl, // strong random code for link
+})
+``` 
 
-這樣會有什麼問題呢？
-
-在 JS 裡面有個應該不少人看過，但可能比較少用的東西，叫做 JavaScript pseudo protocol，像是這樣：
-
-```
-<a href="javascript:alert(1)">click me</a>
-```
-
-點了那個 a 之後，會執行 JS 跳出一個 alert。而這招除了可以用在 href 以外，其實也可以用在 location 上面：
+而這個 `userService.createVerificationCode` 的程式碼則是在這裡：https://github.com/thematters/matters-server/blob/v3.19.0/src/connectors/userService.ts#L1500
 
 ``` js
-window.location = 'javascript:alert(1)'
-```
-
-打開你的瀏覽器開新分頁，然後在 devtool console 直接執行上面那一段，會發現 alert 真的跳出來了，而且以下幾種方式都會觸發：
-
-``` js
-window.location.href = 'javascript:alert(1)'
-window.location.assign('javascript:alert(1)')
-window.location.replace('javascript:alert(1)')
-```
-
-因此攻擊者只要把 redirect 的位置設置成 `javascript:xxx`，就可以執行任意程式碼，觸發 XSS。這個案例前端的朋友們一定要特別注意，因為直接把值 assign 給 location 是個很常見的實作方式。
-
-底下直接帶大家看一個真實世界的案例，對象是之前在另一篇文章：[防止 XSS 可能比想像中困難](https://tech-blog.cymetrics.io/posts/huli/prevent-xss-might-be-harder-than-you-thought/)出現過的網站：[Matters News](https://matters.news/)。
-
-這是他們的登入頁面：
-
-![](/img/open-redirect/matters.png)
-
-在點下登入之後，會呼叫一個叫做 `redirectToTarget` 的 function，而這個函式的程式碼是這樣：
-
-``` js
-/**
- * Redirect to "?target=" or fallback URL with page reload.
- *
- * (works on CSR)
- */
-export const redirectToTarget = ({
-  fallback = 'current',
+createVerificationCode = ({
+  userId,
+  email,
+  type,
+  strong,
+  expiredAt,
 }: {
-  fallback?: 'homepage' | 'current'
-} = {}) => {
-  const fallbackTarget =
-    fallback === 'homepage'
-      ? `/` // FIXME: to purge cache
-      : window.location.href
-  const target = getTarget() || fallbackTarget
+  userId?: string | null
+  email: string
+  type: string
+  strong?: boolean
+  expiredAt?: Date
+}) => {
+  const code = strong ? nanoid(40) : _.random(100000, 999999)
 
-  window.location.href = decodeURIComponent(target)
+  return this.baseCreate(
+    {
+      uuid: v4(),
+      userId,
+      email,
+      type,
+      code,
+      expiredAt:
+        expiredAt || new Date(Date.now() + VERIFICATION_CODE_EXIPRED_AFTER),
+    },
+    'verification_code'
+  )
 }
 ```
 
-在拿到 target 之後直接使用了：`window.location.href = decodeURIComponent(target)` 來做重新導向。而 `getTarget` 其實就是去 url query string 把 target 的值拿出來。所以如果登入的網址是：`https://matters.news/login?target=javascript:alert(1)`，在使用者按下登入並且成功之後，就會跳出一個 alert，觸發 XSS！
+從這邊我們看到一個重點，就是在系統內 code 的產生分兩種類型，strong 的是 `nanoid(40)`，不 strong 的則是 100000~999999 的六碼數字，而這個 strong 的參數是由有沒有傳入 `redirectUrl` 而決定的。
 
-不僅如此，這個 XSS 一旦被觸發了，影響力非同小可，因為這是登入頁面，所以在這個頁面上執行的 XSS，可以直接抓取 input 的值，也就是偷到使用者的帳號密碼。如果要執行實際的攻擊，可以針對網站的使用者寄發釣魚信，在信中放入這個惡意連結讓使用者點擊，由於網址是正常的網址，點擊之後到的頁面也是真的網站的頁面，因此可信程度應該滿高的。
+也就是說，如果我們在建立 reset password 的驗證碼時把 `redirectUrl` 參數拿掉，code 就會從原本的 40 個字，瞬間降低成六位數的數字！
 
-在使用者輸入帳號密碼並且登入之後，用 XSS 把帳號密碼偷走並把使用者導回首頁，就可以不留痕跡地偷走使用者帳號，達成帳號奪取。
+而驗證碼的過期時間 `VERIFICATION_CODE_EXIPRED_AFTER` 是五分鐘，也就是 300 秒，900000/300 = 3000，只要我們一秒能發送 3000 個 request 到 server，就能暴力破解 reset password 的 token，進而奪取使用者帳號。
 
-修復方式是只允許 http/https 開頭的網址：
+但其實這樣的說法不太精確，因為我們可以發 3000 個，不代表 server 就可以處理 3000 個，所以還要看 server 能接受的 request 數量，而且在這之前，還有另一個限制要繞過。
+
+## Rate limiting
+
+增加暴力破解難度的方法之一就是 rate limiting，許多網站或是 WAF 都有這個功能，能夠阻止短時間內大量的 request。
+
+而 Matters 的 rate limit 是用 nginx 來處理，程式碼在這裡：https://github.com/thematters/matters-server/blob/v3.19.0/.ebextensions/rate-limit-connections.config
+
+```
+limit_req_zone $http_x_forwarded_for zone=application:16m rate=5r/s;
+
+limit_req zone=application burst=20 nodelay;
+limit_req_status 429;
+limit_conn_status 429;
+
+# pass real IP from client to NGINX
+real_ip_header X-Forwarded-For;
+set_real_ip_from 0.0.0.0/0;
+
+server {
+    # set error page for HTTP code 429
+    error_page 429 @ratelimit;
+    location @ratelimit {
+        return 429 '["Connection Limit Exceeded"]\n';
+    }
+
+    listen 80;
+
+    # 底下省略
+}
+```
+
+nginx 的 rate limit 基本上都是以 IP 為主，如果真的想繞過的話可以嘗試看看 [IP rotate](https://rhinosecuritylabs.com/aws/bypassing-ip-based-blocking-aws/)，一個簡單的方式是去 AWS 上開很多 API gateway 當 proxy，然後你就有了一堆不同的 IP 可以輪流使用。
+
+但這邊還用不上這個技巧，因為在設定中可以看到它使用了 `$http_x_forwarded_for` 這個參數，如果沒有管理好的話，可以自己傳入 `X-Forwarded-For` 來偽造任意 IP，藉此繞過 rate limit 的限制。
+
+而 Matters 在這邊顯然沒有設置好，因此 rate limit 算是虛設。
+
+做到這邊，只要我們能夠一秒發送 3000 個 request 就能做出 POC，證明攻擊確實可行，但還有沒有其他的方法，能讓這個數字再小一點呢？
+
+## 同時存在的驗證碼
+
+在開頭的時候有提過重設密碼有一些小細節要注意，像是：
+
+1. 重設密碼的 token 應該只能使用一次
+2. 重設密碼的 token 應該要有過期時間
+3. 如果使用者產生了新的重設密碼 token，舊的應該要廢棄
+
+而 Matters 前兩點都做了，就是唯獨第三點沒有做好。從程式碼中我們可以看出當新的驗證碼建立時，舊的並不會刪除或是標記為廢棄。
+
+這會有什麼影響呢？我們來算個簡單的數學吧！
+
+驗證碼的組合總共有 900,000 種，我們有 300 秒的時間可以攻擊，如果可以在這段時間內發送 900,000 個 request 而且 server 也有處理，就一定可以猜到重設密碼的驗證碼。
+
+若是我們改成先不要猜，而是先發送 1000 次的重設密碼請求，因為舊的驗證碼依然有效，所以這時我們猜一次，猜中任何一組的機率就是 1000/900000 = 1/900，變成原本的 1000 倍。
+
+猜 1000 次的話，猜中的機率就是「1 - 每次都猜不中的機率」，大約是 `1 - (899/900)^1000` = 67%，如果猜到 5000 次的話，猜中的機率就是 `1 - (899/900)^5000` = 99.6%。
+
+也就是說，我們只要發送 1000 個重設密碼的請求外加 5000 個確認驗證碼的請求，總共 6000 個請求，就有 99.6% 的機率可以正確猜到至少一組驗證碼！
+
+可以寫個簡單的小程式來驗證我們的機率計算：
 
 ``` js
-const fallbackTarget =
-  fallback === 'homepage'
-    ? `/` // FIXME: to purge cache
-    : window.location.href
-let target = decodeURIComponent(getTarget())
+const _ = require('lodash')
 
-const isValidTarget = /^((http|https):\/\/)/.test(target)
-if (!isValidTarget) {
-  target = fallbackTarget
+const rounds = 100000 // 跑十萬輪取平均 
+const guessRounds = 5000 // 猜 5000 次
+const tokenCount = 1000 // 1000 個合法驗證碼
+let winCount = 0 
+
+for(let r=0; r<rounds; r++) {
+  let ans = {}
+  for(let i=0; i<tokenCount; i++) {
+    ans[_.random(100000, 999999)] = true
+  }
+  let isWin = false
+  for(let i=0; i<guessRounds; i++) {
+    const guessNumber = _.random(100000, 999999)
+    if (ans[guessNumber] === true) {
+      isWin = true
+      break
+    }
+  }
+  if (isWin) winCount++
 }
 
-window.location.href = target || fallbackTarget
+console.log(winCount*100 / rounds)
+// 輸出：99.626，我們算出的機率差不多
 ```
 
-不過這樣其實是先把重新導向功能的 XSS 修掉而已，open redirect 的部分依舊存在，需要進一步對 domain 做檢查才能排除 open redirect。
+原本要發 900,001 個 request 才能有 100% 的機率可以猜中，現在只要犧牲一點點正確性，變成 99.6% 的機率猜中，就可以把 request 數量降低到 6000 次，低了 150 倍！
 
-再次提醒，這個漏洞滿多工程師都不會發現，因為不知道 `window.location.href` 可以放 `javascript:alert(1)` 這樣的網址來執行程式碼，如果大家有實作到重新導向的功能，記得注意一下這個問題。
+原本我們在五分鐘內一秒要發 3000 個 request，現在一秒只要 20 個 request 就好（其實這邊也只是大略計算，因為是有順序性的，必須要等 1000 個發送驗證碼的 request 結束後才能開始猜，而這 1000 個可能又會花個幾秒，但這邊為了方便計算先忽略不計，對整體的影響不大）
 
-## Open redirect 與其他漏洞的搭配
+就因為這個重設密碼的小缺陷，沒有把上一組驗證碼淘汰掉，導致我們可以產生多組驗證碼，大幅降低暴力破解的難度。只要能在五分鐘內發送 6000 個 request，就有 99.6% 的機率可以更改一組帳號的密碼。
 
-從上面兩個問題可以看出光是「實作重新導向」就可能會寫出有漏洞的程式碼，而接下來要談的是「重新導向」這個功能與其他漏洞的結合。有至少兩個類型的漏洞都有機會與 open redirect 結合，一個是 SSRF，另一個是 OAuth 的漏洞。
+由於這是重設密碼功能，所以改完密碼之後你就可以直接用他的身份登入系統，達成帳號奪取，把其他人的帳號都變成是你的。如果想要擴大影響性的話，可以奪取管理員的帳號，就有機會進入管理後台進行更多操作。
 
-SSRF，全名為 Server-Side Request Forgery，通常翻作伺服器請求偽造，關於這個漏洞詳細的介紹跟攻擊未來可能再寫一篇跟大家介紹，我這邊先簡單講一下。
+## 建議修補方式
 
-通常在內部的 Server，都不會讓外部直接存取到，對外可能只會有一台 proxy 把 request forward 到對應的主機。假設有一個服務的伺服器架構如下圖所示，背後有一台 Back-end Server 會去呼叫隱藏在內網中的 PDF service 產生 PDF 檔案：
+第一個要修的地方是重設密碼的小缺陷，在使用者產生新的驗證碼時，舊的應該要被淘汰掉，保證永遠只有最新的一組可以通過驗證，這樣攻擊者猜中的機率就永遠是 1/n，而不會像上面的範例那樣，可以把機率提高 1000 倍或更多倍。
 
-![](/img/open-redirect/ssrf.png)
+第二個則是驗證碼的產生不該由 `redirectUrl` 參數來決定，而是應該由驗證碼的 type 來決定，如果是 reset password，就一定要是 strong，這樣子就會用 `nanoid(40)` 來產生，猜中的機率就變得微乎其微，大幅降低暴力破解的可行性。
 
-而這個 PDF service 限制網址只能是 https://example.com 開頭，避免有人傳入其他網址進來。這時如果某個 URL 有 open redirect 的漏洞，攻擊者就可以傳入：`https://example.com?redirect=http://127.0.0.1`，讓 PDF service 去造訪這個網址，而被轉址到 127.0.0.1，並且回傳它的內容。
+第三個是 redirectUrl 不應該從前端傳入，而是直接把網址寫在後端。如果真的要從前端傳入，那後端要做好完善的檢查，確保 redirectUrl 傳入的是合法的路徑，而不是讓攻擊者可以傳入任意網址（不過如果攻擊者能結合 [open redirect](https://tech-blog.cymetrics.io/posts/huli/open-redirect/)，又是另外一回事了）
 
-這樣就叫做 SSRF，你透過內部的服務，成功發了一個 request 到外網進不去的 service，如此一來你就可以去看看內網還有什麼其他服務存在，例如說 Redis 或是 MySQL 等等，這些直接從外網都進不去，但透過 SSRF 就可以。或更簡單的方式是去看一些 cloud 相關的檔案，有些 cloud 服務只要存取 http://169.254.169.254 就會看到一些 metadata，有興趣可以看這邊：[Abusing SSRF in AWS EC2 environment](https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery#exploitation-in-cloud)。
+最後一個則是 nginx 的 rate limit 限制不應該用 `X-Forwarded-For` 來決定，就算真的要用這個，也要確保它的值無法由攻擊者自行傳入。
 
-所以透過 open redirect，可以繞過原本有做網址檢查的地方。
+## 總結
 
-第二個會碰到的問題則是跟 OAuth 有關，在 OAuth 的流程中通常都會有一個 redirect_uri，接收授權完畢之後的一個 code，以 Facebook 為例的話是長這樣：
+重設密碼機制看似簡單，但其實一不小心還是有可能做出有漏洞的機制，導致攻擊者有機可趁，在 HackTricks 上有個頁面專門在講 reset password 可能會有的問題：[Reset/Forgotten Password Bypass](https://book.hacktricks.xyz/pentesting-web/reset-password)，除了這篇提到的以外還有更多的問題，整理得很詳細，很值得參考看看。
 
-```
-https://www.facebook.com/v11.0/dialog/oauth?
-  client_id={app-id}
-  &redirect_uri={"https://example.com/login"}
-  &state={"{st=state123abc,ds=123456789}"}
-```
+如果你以為只有一般的網站會有這種問題，那你就錯了。一名資安研究員 Laxman Muthiyah 發現可以用 concurrent 的方式繞過 [Instagram](https://thezerohack.com/hack-any-instagram) 的 rate limiting，成功發送 200 個 request，並且用 1000 台機器產生出 20 萬個 request，就有 20% 的機率攻擊成功。
 
-使用者點擊網址後會跳到 Facebook，按下授權就會被導到 `https://example.com/login` 並且可以在網址中拿到 code 或是 token，接著就可以用這個搭配 client id 跟 client secret，拿到 auth token，並且用這個 auth token 代表使用者去跟 Facebook 拿取資料。
+只要有 5000 台機器，就能拿下任何帳號。5000 台聽起來很多，成本應該很高對吧？但如果善用 cloud service 的話，他估算可能只需要 150 美金左右即可達成一次攻擊（因為算小時收費，只要開一兩個小時即可）
 
-如果 redirect_uri 的保護沒有做好，攻擊者就可以把它換成其他值，例如說：`redirect_uri=https://huli.tw`，這樣使用者點擊授權以後，就會把驗證用的 code 傳到我的網站，而不是預期中的網站。
+而他也在去年七月用同樣的手法繞過[微軟](https://thezerohack.com/how-i-might-have-hacked-any-microsoft-account)的 rate limiting，並且拿到 5 萬美金的獎金。
 
-但一般來說 redirect_uri 都會限制 domain，所以沒那麼簡單就可以繞過。這時候就要請出 open redirect 登場了，如果網站有這個漏洞的話，就可以這樣：`redirect_uri=https://example.com?redirect=https://huli.tw`，如此一來就算符合 domain 限制，最後導向的地方依然是個外部網站，攻擊者一樣可以偷到驗證用的 code。
+像這種漏洞如果能成功被利用，就能夠直接奪取他人的帳號，影響很大，需要多加注意相關的安全性。看到這裡，大家不妨也檢查一下自家的重設密碼機制是否安全。
 
-所以為了避免這類型的攻擊，Facebook 或 Google 這種大型服務在設置 App 的時候都會加強限制，redirect_uri 通常都會要求寫死，不讓你設置 wildcard，例如說我填 `https://example.com/auth`，就是真的只有這個網址可以過，其他不同 path 的網址都會失敗。但有些小公司沒有注意到這麼細，對於 redirect_uri 就沒有這麼多規範。
+最後，這次找到漏洞以後一樣有回報給 Matters，底下是完整時間軸：
 
-像是這種 OAuth 結合 open redirect 達成 account takeover（帳號奪取）的例子其實不少，例如說這個：[[cs.money] Open Redirect Leads to Account Takeover](https://hackerone.com/reports/905607)，或是 GitHub 其實也有過這類型的漏洞：[GitHub Gist - Account takeover via open redirect - $10,000 Bounty](https://devcraft.io/2020/10/19/github-gist-account-takeover.html)，而這個 Airbnb 的漏洞也很精彩：[Authentication bypass on Airbnb via OAuth tokens theft](https://www.arneswinnen.net/2017/06/authentication-bypass-on-airbnb-via-oauth-tokens-theft/)。
-
-總結一下，open redirect 的用處除了讓使用者放鬆戒心來進行釣魚以外，另一個就是繞過有針對 domain 進行檢查的地方。上面講的 SSRF 跟 OAuth 這兩個漏洞之所以能跟它結合，就是因為可以用 open redirect 來繞過對 domain 的檢查。
-
-## 那該怎麼防禦 open redirect？
-
-如果想防止 open redirect，可想而知就是要對重新導向的網址進行檢查。這聽起來簡單，實作起來卻容易出現漏洞，例如說底下的例子是一段檢查 domain 的程式碼，根據取出的 hostname 比對是否含有 `cymetrics.io`，有的話就通過，目的是只有 cymetrics.io 跟它的 subdomain 可以通過：
-
-``` js
-const validDomain = 'cymetrics.io'
-function validateDomain(url) {
-  const host = new URL(url).hostname // 取出 hostname
-  return host.includes(validDomain)
-}
-
-validateDomain('https://example.com') // false
-validateDomain('https://cymetrics.io') // true
-validateDomain('https://dev.cymetrics.io') // true
-```
-
-感覺好像沒什麼問題？除了 `cymetrics.io` 或是它的 subdomain 以外，應該不會有其他網域可以通過這檢查吧？
-
-雖然看似如此，但其實有兩個方式可以繞過。這邊先假設 URL parsing 的方式不會有問題，一定會拿到 hostname，所以 `attacker.com?q=cymetrics.io` 這種方式是沒用的，hostname 會拿到 `attacker.com` 而已。
-
-大家可以想一下有哪兩種可以繞過，在公佈答案之前，先來看下一個段落。
- 
-## Google 對於 open redirect 的看法
-
-Google 在官方網站 [Bughunter University](https://sites.google.com/site/bughunteruniversity/nonvuln/open-redirect) 當中有明確提到一般的 open redirect 不會被視為安全性上的漏洞，除非能證明它可以跟其他漏洞結合在一起使用。
-
-那是不是有人成功過呢？當然，底下我舉兩個例子。
-
-第一個例子來自這篇文章：[Vulnerability in Hangouts Chat: from open redirect to code execution](https://blog.bentkowski.info/2018/07/vulnerability-in-hangouts-chat-aka-how.html)，對象是 Google Hangouts Chat 的 Electron App。
-
-在那個 App 裡面如果網址是 `https://chat.google.com` 開頭的話，點擊網址就會直接在 Electron 裡面開啟網頁，而不是用瀏覽器去開。因此只要找到 `https://chat.google.com` 的 open redirect，就可以把使用者導去釣魚網站。而 Electron App 跟瀏覽器的差異之一就在於 Electron App 預設是不會有網址列的，所以使用者根本無從辨別這是不是釣魚網站。詳細的流程跟最後的 payload 可以參考原文，這個漏洞還可以進一步提升成 RCE（不過我不知道是怎麼做的就是了），價值 7500 USD。
-
-第二個例子來自官方的文章：[Open redirects that matter](https://sites.google.com/site/bughunteruniversity/best-reports/openredirectsthatmatter)，這個案例也是超帥。
-
-在 Google I/O 2015 的網站中有個功能是去抓 Picasa 的資料回來並 render 成 JSON，但因為有跨網域的問題，因此後端寫了一個簡單的 proxy 去拿資料，像這樣：`/api/v1/photoproxy?url=to`，而這個 proxy 會檢查 url 的開頭是否為 `https://picasaweb.google.com/data/feed/api`，如果不是的話就回傳錯誤。
-
-所以作者的第一個目標就是找到 picasa 上的 open redirect，他最後找到的是這個網址：`https://picasaweb.google.com/bye?continue=`，只要把這個網址改成：`https://picasaweb.google.com/data/feed/api/../../bye`，就可以成功通過路徑的檢查，讓 server 認為這是一個合法的 URL。
-
-但這還沒結束，因為 bye?continue= 這個 redirect 也會檢查參數，continue 必須是 `https://google.com` 開頭才可以。因此我們需要找到第二個 open redirect，這次是存在於 google.com 上面。而 google.com 有一個知名的 open redirect 是 AMP 用的，例如說 `https://www.google.com/amp/tech-blog.cymetrics.io`，就會連到 https://tech-blog.cymetrics.io （不過我剛嘗試了一下會先跳到中間頁，點擊確認後才會導向，應該是這功能有修正過了）。
-
-結合這兩個 open redirect，就可以讓 proxy 去抓取我們指定的 url 的內容：
-
-```
-https://picasaweb.google.com/data/feed/api/../../../bye/?
-continue=https%3A%2F%2Fwww.google.com%2Famp/
-your-domain.example.com/path?querystring
-```
+`2021-06-24` 回報漏洞給 Matters
+`2021-06-25` 收到 Matters 回覆，確認漏洞存在
+`2021-08-20` Matters 修復部分功能，產生新的驗證碼時會淘汰舊的
+`2021-08-26` Matters 確認漏洞評級為 High，獎金為 150 USD
+`2021-10-28` 關心後續修復狀況，確認是否修補完畢
+`2021-11-30` Matters 增強 non-strong 的驗證碼基數
+`2021-12-02` 文章初稿完成，與 Matters 確認是否可發布
+`2021-12-21` Matters 確認問題已修復完畢以及可發布文章

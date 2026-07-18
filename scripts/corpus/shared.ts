@@ -156,7 +156,7 @@ function shinglesOf(content: string): Set<number> {
   return new Set(distinct.slice(0, SHINGLES_PER_DOC));
 }
 
-const CHUNK_TARGETS = [512, 2048, 8192, 24_576];
+const CHUNK_TARGETS = [256, 512, 2048, 8192, 24_576];
 /** Hard per-sample ceiling shared by whole-file sampling and documentation chunking. */
 export const MAX_SAMPLE_BYTES = 32 * 1024;
 
@@ -192,6 +192,7 @@ export function chunkDocument(text: string): { chunk: string; chunkIndex: number
 }
 
 export function sizeBucketOf(bytes: number): string {
+  if (bytes <= 512) return "0.25k";
   if (bytes <= 1024) return "0.5k";
   if (bytes <= 4096) return "2k";
   if (bytes <= 16 * 1024) return "8k";

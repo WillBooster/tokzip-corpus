@@ -1,252 +1,57 @@
-有 `nopriv` 的代表沒有權限（未登入）也可以呼叫，沒有的代表需要登入 WordPress 系統才能呼叫，而許多的 plugin 會選擇自己處理身份驗證相關的邏輯，所以會把兩個動作都導到同一個地方。
+http_limit_req_module.html)
+```
+http {
 
+  //觸發條件，限制 ip 每秒 10 個 request
+  limit_req_zone $binary_remote_addr zone=one:10m rate=10r/s; 
+  
+  server {
+    location  ~ \.php$ {
 
-而 `wpAmeliaApiCall` 這個函式則是註冊了 routes：
-
-``` php
-/**
- * API Call
- *
- * @throws \InvalidArgumentException
- */
-public static function wpAmeliaApiCall()
-{
-    try {
-        /** @var Container $container */
-        $container = require AMELIA_PATH . '/src/Infrastructure/ContainerConfig/container.php';
-
-        $app = new App($container);
-
-        // Initialize all API routes
-        Routes::routes($app);
-
-        $app->run();
-
-        exit();
-    } catch (Exception $e) {
-        echo 'ERROR: ' . $e->getMessage();
+      //執行的動作
+      limit_req zone=one burst=5 nodelay;   
     }
+  }
 }
 ```
 
-在 `src/Infrastructure/Routes` 底下有許多的資料夾跟檔案，裡面負責處理不同的路由，舉例來說，User 相關的路由在 `src/Infrastructure/Routes/User/User.php`，相關程式碼節錄如下：
+總之就是利用 `limit_req_zone`，這個 nginx 提供的東西
+宣告一個 10mb 的 zone 叫做 `one` 來儲存狀態，這裡的 `10r/s` 指的就是一秒 10 個 request
 
-``` php
-/**
- * Class User
- *
- * @package AmeliaBooking\Infrastructure\Routes\User
- */
-class User
-{
-    /**
-     * @param App $app
-     */
-    public static function routes(App $app)
-    {
-        $app->get('/users/wp-users', GetWPUsersController::class);
-        $app->post('/users/authenticate', LoginCabinetController::class);
-        $app->post('/users/logout', LogoutCabinetController::class);
+接著在你想擋的地方加上：`limit_req zone=one burst=5 nodelay;`，就可以擋掉了
+nginx 會把處理 request 的數量調整成「最多 1 秒 10 個」，如果那個 ip 在同一時間有超過 5 個 request 還沒處理的話，就會傳回 `503 service temporarily unavailable`，這邊的 5 就是 `burst` 設定的值
+傳回去的 status code 也可以自己指定，例如說：`limit_req_status 505;`
 
-        // Customers
-        $app->get('/users/customers/{id:[0-9]+}', GetCustomerController::class);
-        $app->get('/users/customers', GetCustomersController::class);
-        $app->post('/users/customers', AddCustomerController::class);
-        $app->post('/users/customers/{id:[0-9]+}', UpdateCustomerController::class);
-        $app->post('/users/customers/delete/{id:[0-9]+}', DeleteUserController::class);
-        $app->get('/users/customers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
-        $app->post('/users/customers/reauthorize', ReauthorizeController::class);
+儘管這個解法看起來很棒，但不知道為什麼，加了之後好像沒有用似的
+伺服器的警報還是一直在響，DB 還是持續飆高
 
-        // Providers
-        $app->get('/users/providers/{id:[0-9]+}', GetProviderController::class);
-        $app->get('/users/providers', GetProvidersController::class);
-        $app->post('/users/providers', AddProviderController::class);
-        $app->post('/users/providers/{id:[0-9]+}', UpdateProviderController::class);
-        $app->post('/users/providers/status/{id:[0-9]+}', UpdateProviderStatusController::class);
-        $app->post('/users/providers/delete/{id:[0-9]+}', DeleteUserController::class);
-        $app->get('/users/providers/effect/{id:[0-9]+}', GetUserDeleteEffectController::class);
+在請教過其他同事之後，得知 iptabls 也可以擋，而且還是直接從 tcp 層擋
+找到下面兩篇資料：
 
-        // Current User
-        $app->get('/users/current', GetCurrentUserController::class);
-    }
-}
+[淺談DDoS攻擊防護](http://blog.eztable.com/2011/05/17/how-to-prevent-ddos/)
+```
+-A INPUT -p tcp –dports 80 -j WEB_SRV_DOS
+-A WEB_SRV_DOS -p tcp –syn –dports 80 -m recent –rcheck –second 30 –hitcount 200 -j LOG –log-prefix "[Possible DOS Attack]"
+-A WEB_SRV_DOS -p tcp –syn –dports 80 -m recent –rcheck –second 30 –hitcount 200 -j REJECT  
+-A WEB_SRV_DOS -p tcp –syn –dports 80 -m recent –set  
+-A WEB_SRV_DOS -p tcp –dports 80 -j ACCEPT
 ```
 
-那實際上到底要怎麼呼叫到這些路由呢？在 `src/Infrastructure/ContainerConfig/request.php` 中，針對 request 的 query string 做了一些轉換：
-
-``` php
-<?php
-
-use Slim\Http\Request;
-use Slim\Http\Uri;
-
-$entries['request'] = function (AmeliaBooking\Infrastructure\Common\Container $c) {
-
-    $curUri = Uri::createFromEnvironment($c->get('environment'));
-    // 附註：AMELIA_ACTION_SLUG = "action=wpamelia_api&call="
-    $newRoute = str_replace(
-        ['XDEBUG_SESSION_START=PHPSTORM&' . AMELIA_ACTION_SLUG, AMELIA_ACTION_SLUG],
-        '',
-        $curUri->getQuery()
-    );
-
-    $newPath = strpos($newRoute, '&') ? substr(
-        $newRoute,
-        0,
-        strpos($newRoute, '&')
-    ) : $newRoute;
-
-    $newQuery = strpos($newRoute, '&') ? substr(
-        $newRoute,
-        strpos($newRoute, '&') + 1
-    ) : '';
-
-   $request = Request::createFromEnvironment($c->get('environment'))
-       ->withUri(
-           $curUri
-               ->withPath($newPath)
-               ->withQuery($newQuery)
-       );
-
-    if (method_exists($request, 'getParam') && $request->getParam('showAmeliaErrors')) {
-        ini_set('display_errors', 1);
-        ini_set('display_startup_errors', 1);
-        error_reporting(E_ALL);
-    }
-
-    return $request;
-};
+[運用 iptables 限制同一IP單位時間連線數](http://ishm.idv.tw/?p=188)
+```
+-A INPUT -p tcp --dport 80 -m recent --rcheck --seconds 1 --hitcount 5 --name HTTP_LOG --rsource -j DROP
+-A INPUT -p tcp --dport 80 -m recent --set --name HTTP_LOG --rsource
+-A INPUT -p tcp --dport 80 -j ACCEPT
 ```
 
-簡單來說呢，當你的 request URL 長這樣的時候：`/wordpress/wp-admin/admin-ajax.php?action=wpamelia_api&call=/users/wp-users`，query string 就是 `action=wpamelia_api&call=/users/wp-users`，符合 AMELIA_ACTION_SLUG 的地方被換成空白之後，就變成了 `/users/wp-users`，就對應到了上面的檔案看到的路由，重新交由 Slim 這個 PHP 框架去處理。
+兩個的原理都一樣，是透過`-m recent –rcheck –second 30 –hitcount 200` 這段敘述，描述說你要擋住幾秒內發送幾次的 request，把這個連線 reject 或是 drop。
 
-而 `/users/wp-users` 對應到的是 `GetWPUsersController::class`，讓我們來看一下 controller 的程式碼：
+直接從 iptables 去擋聽起來是個更好的解法，這樣 request 連 nginx 都不會進去就被擋住了
+可是天不從人願，用了之後發現還是不行！怎麼會這樣呢
 
-``` php
-<?php
-
-namespace AmeliaBooking\Application\Controller\User;
-
-use AmeliaBooking\Application\Commands\User\GetWPUsersCommand;
-use AmeliaBooking\Application\Controller\Controller;
-use Slim\Http\Request;
-
-/**
- * Class GetWPUsersController
- *
- * @package AmeliaBooking\Application\Controller\User
- */
-class GetWPUsersController extends Controller
-{
-    /**
-     * Instantiates the Get WP Users command to hand it over to the Command Handler
-     *
-     * @param Request $request
-     * @param         $args
-     *
-     * @return GetWPUsersCommand
-     * @throws \RuntimeException
-     */
-    protected function instantiateCommand(Request $request, $args)
-    {
-        $command = new GetWPUsersCommand($args);
-        $command->setField('id', (int)$request->getQueryParam('id'));
-        $command->setField('role', $request->getQueryParam('role'));
-        $requestBody = $request->getParsedBody();
-        $this->setCommandFields($command, $requestBody);
-
-        return $command;
-    }
-}
-```
-
-這邊使用了設計模式中的 Command Pattern，把每一個動作都包裝成一個指令，那這個指令會被誰處理呢？每一個 controller 都繼承了 `AmeliaBooking\Application\Controller\Controller`，所以處理的程式碼就在裡面：
-
-``` php
-/**
- * @param Request  $request
- * @param Response $response
- * @param          $args
- *
- * @return Response
- * @throws \InvalidArgumentException
- * @throws \RuntimeException
- */
-public function __invoke(Request $request, Response $response, $args)
-{
-    /** @var Command $command */
-    $command = $this->instantiateCommand($request, $args);
-
-    if (!wp_verify_nonce($command->getField('ameliaNonce'), 'ajax-nonce') &&
-        (
-            $command instanceof DeleteUserCommand ||
-            $command instanceof DeletePackageCommand ||
-            $command instanceof DeleteCategoryCommand ||
-            $command instanceof DeleteServiceCommand ||
-            $command instanceof DeleteExtraCommand ||
-            $command instanceof DeleteLocationCommand ||
-            $command instanceof DeleteEventCommand ||
-            $command instanceof DeletePaymentCommand ||
-            $command instanceof DeleteCouponCommand ||
-            $command instanceof DeleteCustomFieldCommand ||
-            $command instanceof DeleteAppointmentCommand ||
-            $command instanceof DeleteBookingCommand ||
-            $command instanceof DeleteEventBookingCommand ||
-            $command instanceof DeletePackageCustomerCommand ||
-            $command instanceof DeleteNotificationCommand
-        )
-    ) {
-        return $response->withStatus(self::STATUS_INTERNAL_SERVER_ERROR);
-    }
-
-    /** @var CommandResult $commandResult */
-    $commandResult = $this->commandBus->handle($command);
-
-    if ($commandResult->getUrl() !== null) {
-        $this->emitSuccessEvent($this->eventBus, $commandResult);
-
-        /** @var Response $response */
-        $response = $response->withHeader('Location', $commandResult->getUrl());
-        $response = $response->withStatus(self::STATUS_REDIRECT);
-
-        return $response;
-    }
-
-    if ($commandResult->hasAttachment() === false) {
-        $responseBody = [
-            'message' => $commandResult->getMessage(),
-            'data'    => $commandResult->getData()
-        ];
-
-        $this->emitSuccessEvent($this->eventBus, $commandResult);
-
-        switch ($commandResult->getResult()) {
-            case (CommandResult::RESULT_SUCCESS):
-                $response = $response->withStatus(self::STATUS_OK);
-
-                break;
-            case (CommandResult::RESULT_CONFLICT):
-                $response = $response->withStatus(self::STATUS_CONFLICT);
-
-                break;
-            default:
-                $response = $response->withStatus(self::STATUS_INTERNAL_SERVER_ERROR);
-
-                break;
-        }
-
-        /** @var Response $response */
-        $response = $response->withHeader('Content-Type', 'application/json;charset=utf-8');
-        $response = $response->write(
-            json_encode(
-                $commandResult->hasDataInResponse() ?
-                    $responseBody : array_merge($responseBody, ['data' => []])
-            )
-        );
-    }
-
-    return $response;
-}
-```
-
-這邊先實例化一個指令之後，再丟到 commandBus 去做處理：`$this->commandBus->handle($command)`，程式碼在 `src/Infrastructure/ContainerConfig/command.bus.php`，節錄部分：
+心灰意冷之下，同事又推薦一個好東西叫做：fail2ban
+查了一下之後發現用法非常簡單，而且原理很好懂
+決定用別台機器來測測看，測試成功之後再套用到正式環境的機器
+[用 Fail2Ban 防範暴力破解 (SSH、vsftp、dovecot、sendmail)](http://www.vixual.net/blog/archives/252)
+[fail2ban教學](http://blog.vic.mh4u.org/2011/272)
+[Ubuntu 中使用 fail2ban 針對大量 access 做判斷及阻擋](http://chuhw.pixnet.net/blog/post/167657289-ubuntu-%E4%B8%AD%E4%BD%BF%E7%94%A8-fail2ban-%E9%87%9D%E5%B0%8D%E5%A4%A

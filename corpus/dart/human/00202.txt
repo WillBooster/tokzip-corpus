@@ -2,85 +2,61 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-import 'package:async/async.dart';
-import 'package:http/http.dart';
+import 'dart:async';
+import 'dart:io';
+
 import 'package:stream_channel/stream_channel.dart';
-import 'package:test/test.dart';
 
-import 'compressed_response_body_server_vm.dart'
-    if (dart.library.js_interop) 'compressed_response_body_server_web.dart';
-
-/// Tests that the [Client] correctly implements HTTP responses with compressed
-/// bodies.
+/// Starts an HTTP server that responds with "Hello World!"
 ///
-/// If the response is encoded using a recognized 'Content-Encoding' then the
-/// [Client] must decode it. Otherwise it must return the content unchanged.
-///
-/// The 'Content-Encoding' and 'Content-Length' headers may be absent for
-/// responses with a 'Content-Encoding' and, if present, their values are
-/// undefined.
-///
-/// The value of `StreamedResponse.contentLength` is not defined for responses
-/// with a 'Content-Encoding' header.
-void testCompressedResponseBody(Client client) async {
-  group('response body', () {
-    late final String host;
-    late final StreamChannel<Object?> httpServerChannel;
-    late final StreamQueue<Object?> httpServerQueue;
-    const message = 'Hello World!';
+/// Channel protocol:
+///    On Startup:
+///     - send port
+///    On Request Received:
+///     - send headers as Map<String, List<String>>
+///    When Receive Anything:
+///     - exit
+void hybridMain(StreamChannel<Object?> channel) async {
+  final server = (await HttpServer.bind('localhost', 0))
+    ..listen((request) async {
+      const message = 'Hello World!';
+      late List<int> contents;
 
-    setUpAll(() async {
-      httpServerChannel = await startServer();
-      httpServerQueue = StreamQueue(httpServerChannel.stream);
-      host = 'localhost:${await httpServerQueue.nextAsInt}';
-    });
-    tearDownAll(() => httpServerChannel.sink.add(null));
+      await request.drain<void>();
 
-    test('gzip: small response with content length', () async {
-      // Test a supported content encoding.
-      final response = await client.get(Uri.http(host, '/gzip'));
-      final requestHeaders = await httpServerQueue.next as Map;
+      final headers = <String, List<String>>{};
+      request.headers.forEach((field, value) {
+        headers[field] = value;
+      });
+      channel.sink.add(headers);
 
-      expect((requestHeaders['accept-encoding'] as List).join(', '),
-          contains('gzip'));
-      expect(response.body, message);
-      expect(response.bodyBytes, message.codeUnits);
-      expect(response.contentLength, message.length);
-      expect(response.headers['content-type'], 'text/plain');
-      expect(response.isRedirect, isFalse);
-      expect(response.reasonPhrase, 'OK');
-      expect(response.request!.method, 'GET');
-      expect(response.statusCode, 200);
-    });
+      request.response.headers.set('Access-Control-Allow-Origin', '*');
+      request.response.headers.set('Content-Type', 'text/plain');
 
-    test('gzip: small response streamed with content length', () async {
-      // Test a supported content encoding.
-      final request = Request('GET', Uri.http(host, '/gzip', {'length': ''}));
-      final response = await client.send(request);
-      final requestHeaders = await httpServerQueue.next as Map;
+      if (request.requestedUri.pathSegments.isNotEmpty) {
+        if (request.requestedUri.pathSegments.last == 'gzip') {
+          request.response.headers.set('Content-Encoding', 'gzip');
+          contents = gzip.encode(message.codeUnits);
+        }
+        if (request.requestedUri.pathSegments.last == 'deflate') {
+          request.response.headers.set('Content-Encoding', 'deflate');
+          contents = zlib.encode(message.codeUnits);
+        }
+        if (request.requestedUri.pathSegments.last == 'upper') {
+          request.response.headers.set('Content-Encoding', 'upper');
+          contents = message.toUpperCase().codeUnits;
+        }
+      }
 
-      expect((requestHeaders['accept-encoding'] as List).join(', '),
-          contains('gzip'));
-      expect(await response.stream.bytesToString(), message);
-      expect(response.headers['content-type'], 'text/plain');
-      expect(response.isRedirect, isFalse);
-      expect(response.reasonPhrase, 'OK');
-      expect(response.request!.method, 'GET');
-      expect(response.statusCode, 200);
+      if (request.requestedUri.queryParameters.containsKey('length')) {
+        request.response.contentLength = contents.length;
+      }
+      request.response.add(contents);
+      await request.response.close();
     });
 
-    test('upper: small response streamed with content length', () async {
-      // Test an unsupported content encoding.
-      final request = Request('GET', Uri.http(host, '/upper', {'length': ''}));
-      final response = await client.send(request);
-      await httpServerQueue.next;
-
-      expect(await response.stream.bytesToString(), message.toUpperCase());
-      expect(response.headers['content-type'], 'text/plain');
-      expect(response.isRedirect, isFalse);
-      expect(response.reasonPhrase, 'OK');
-      expect(response.request!.method, 'GET');
-      expect(response.statusCode, 200);
-    });
-  });
+  channel.sink.add(server.port);
+  await channel
+      .stream.first; // Any writes indicates that the server should exit.
+  unawaited(server.close());
 }

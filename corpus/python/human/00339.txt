@@ -1,188 +1,151 @@
-import json
-from enum import Enum
+"""Automate the release draft + PR creation process."""
 
-import pytest
+import re
+from pathlib import Path
+from subprocess import CalledProcessError
 
-from pydantic_core import PydanticSerializationError, SchemaSerializer, core_schema
+import requests
 
-
-def test_str():
-    v = SchemaSerializer(core_schema.str_schema())
-    assert v.to_python('foobar') == 'foobar'
-    assert v.to_python('emoji 💩') == 'emoji 💩'
-    assert v.to_json('foobar') == b'"foobar"'
-    assert v.to_json('foobar', indent=2) == b'"foobar"'
-    assert v.to_json('emoji 💩') == b'"emoji \xf0\x9f\x92\xa9"'
-    assert json.loads(v.to_json('emoji 💩')) == 'emoji 💩'
-
-    assert v.to_python('foobar', mode='json') == 'foobar'
-
-    json_emoji = v.to_json('emoji 💩')
-    # note! serde_json serializes unicode characters differently to json.dumps, but it's still valid JSON
-    assert json_emoji == b'"emoji \xf0\x9f\x92\xa9"'
-    assert json.loads(json_emoji) == 'emoji 💩'
-
-
-# Tests borrowed from:
-# - https://github.com/python/cpython/blob/d87e7f35/Lib/test/test_json/test_encode_basestring_ascii.py
-# - https://github.com/python/cpython/blob/d87e7f35/Lib/test/test_json/test_unicode.py
-@pytest.mark.parametrize(
-    ['input', 'expected'],
-    [
-        (
-            '/\\"\ucafe\ubabe\uab98\ufcde\ubcda\uef4a\x08\x0c\n\r\t`1~!@#$%^&*()_+-=[]{}|;:\',./<>?',
-            '"/\\\\\\"\\ucafe\\ubabe\\uab98\\ufcde\\ubcda\\uef4a\\b\\f\\n\\r\\t`1~!@#$%^&*()_+-=[]{}|;:\',./<>?"',
-        ),
-        ('\u0123\u4567\u89ab\ucdef\uabcd\uef4a', '"\\u0123\\u4567\\u89ab\\ucdef\\uabcd\\uef4a"'),
-        ('controls', '"controls"'),
-        ('\x08\x0c\n\r\t', '"\\b\\f\\n\\r\\t"'),
-        (
-            '{"object with 1 member":["array with 1 element"]}',
-            '"{\\"object with 1 member\\":[\\"array with 1 element\\"]}"',
-        ),
-        (' s p a c e d ', '" s p a c e d "'),
-        ('\U0001d120', '"\\ud834\\udd20"'),
-        pytest.param('\u03b1\u03a9', '"\\u03b1\\u03a9"', id='\\u03b1\\u03a9'),
-        ("`1~!@#$%^&*()_+-={':[,]}|;.</>?", '"`1~!@#$%^&*()_+-={\':[,]}|;.</>?"'),
-        pytest.param(
-            '\N{GREEK SMALL LETTER ALPHA}\N{GREEK CAPITAL LETTER OMEGA}',
-            '"\\u03b1\\u03a9"',
-            id='\\N{GREEK SMALL LETTER ALPHA}\\N{GREEK CAPITAL LETTER OMEGA}',
-        ),
-    ],
+from release.shared import (
+    GITHUB_TOKEN,
+    HISTORY_FILE,
+    REPO,
+    run_command,
 )
-def test_str_ensure_ascii(input: str, expected: str) -> None:
-    v = SchemaSerializer(core_schema.str_schema())
-    assert v.to_json(input, ensure_ascii=True).decode('utf-8') == expected
+
+ROOT_DIR = Path(__file__).parent.parent
+HISTORY_RELEASE_HEAD_REGEX = r'^## v(\d+\.\d+\.\d+[a-zA-Z0-9]*)\s'
 
 
-def test_huge_str():
-    v = SchemaSerializer(core_schema.int_schema())
-    msg = r"Expected `int` - serialized value may not be as expected \[input_value='123456789012345678901234...89012345678901234567890', input_type=str\]"
-    with pytest.warns(UserWarning, match=msg):
-        v.to_python(
-            '12345678901234567890123456789012345678901234567890123456789012345678901234567890\
-                           12345678901234567890123456789012345678901234567890123456789012345678901234567890\
-                           12345678901234567890123456789012345678901234567890123456789012345678901234567890\
-                           12345678901234567890123456789012345678901234567890123456789012345678901234567890'
-        )
+def get_latest_version_from_changelog() -> str:
+    """Get the most recently listed version from the changelog."""
+    with open(ROOT_DIR / HISTORY_FILE, encoding='utf8') as f:
+        for line in f:
+            match = re.match(HISTORY_RELEASE_HEAD_REGEX, line)
+            if match:
+                return match.group(1)
+    raise ValueError('Latest version not found in changelog')
 
 
-def test_str_fallback():
-    s = SchemaSerializer(core_schema.str_schema())
-    assert s.to_python(None) is None
-    assert s.to_python(None, mode='json') is None
-    assert s.to_json(None) == b'null'
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_python(123) == 123
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_python(123, mode='json') == 123
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_json(123) == b'123'
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_python(123, warnings='warn') == 123
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_python(123, mode='json', warnings='warn') == 123
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_json(123, warnings='warn') == b'123'
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_python(123, warnings=True) == 123
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_python(123, mode='json', warnings=True) == 123
-    with pytest.warns(
-        UserWarning,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_json(123, warnings=True) == b'123'
+def get_latest_release_notes_from_changelog() -> str:
+    """Get the release notes for the latest version from the changelog."""
+    with open(ROOT_DIR / HISTORY_FILE, encoding='utf8') as f:
+        for line in f:
+            match = re.match(HISTORY_RELEASE_HEAD_REGEX, line)
+            if match:
+                break
+        else:
+            raise ValueError('Latest version not found in changelog')
+
+        release_notes_li: list[str] = []
+        for line in f:
+            if re.match(HISTORY_RELEASE_HEAD_REGEX, line):
+                break
+            release_notes_li.append(line)
+    return ''.join(release_notes_li)
 
 
-def test_str_no_warnings():
-    s = SchemaSerializer(core_schema.str_schema())
-    assert s.to_python(123, warnings=False) == 123
-    assert s.to_python(123, warnings='none') == 123
-    assert s.to_python(123, mode='json', warnings=False) == 123
-    assert s.to_python(123, mode='json', warnings='none') == 123
-    assert s.to_json(123, warnings=False) == b'123'
-    assert s.to_json(123, warnings='none') == b'123'
+def commit_and_push_changes(rl_version: str) -> None:
+    """Commit and push changes to a new branch."""
+    branch_name = f'release/v{rl_version}'
+    run_command('git', 'checkout', '-b', branch_name)
+    run_command('git', 'add', '-A')
+    try:
+        run_command('git', 'commit', '-m', f'Bump version to v{rl_version}')
+    except CalledProcessError as e:
+        print('No changes related to version bump. Are you sure that you have run prepare.py?')
+        raise e
+    run_command('git', 'push', 'origin', branch_name)
 
 
-def test_str_errors():
-    s = SchemaSerializer(core_schema.str_schema())
-    with pytest.raises(
-        PydanticSerializationError,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_python(123, warnings='error') == 123
-    with pytest.raises(
-        PydanticSerializationError,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_python(123, mode='json', warnings='error') == 123
-    with pytest.raises(
-        PydanticSerializationError,
-        match=r'Expected `str` - serialized value may not be as expected \[input_value=123, input_type=int\]',
-    ):
-        assert s.to_json(123, warnings='error') == b'123'
+def open_pull_request(rl_version: str):
+    """Open a pull request on GitHub."""
+    url = f'https://api.github.com/repos/{REPO}/pulls'
+    headers = {'Authorization': f'token {GITHUB_TOKEN}'}
+    data = {
+        'title': f'Release v{rl_version}',
+        'head': f'release/v{rl_version}',
+        'base': 'main',
+        'body': f'Bumping version to v{rl_version}.',
+    }
+    response = requests.post(url, json=data, headers=headers, timeout=10)
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print(f'HTTP error occurred: {e}')
+        print(f'Response content: {response.content.decode()}')
+        raise e
+    return response.json()['html_url']
 
 
-class StrSubclass(str):
-    pass
+def create_version_tag(rl_version: str):
+    """Create a version tag."""
+    run_command('git', 'tag', f'v{rl_version}')
+    run_command('git', 'push', 'origin', f'v{rl_version}')
 
 
-class BasicClass:
-    pass
+def create_github_release(new_version: str, notes: str):
+    """Create a new release on GitHub."""
+    url = f'https://api.github.com/repos/{REPO}/releases'
+
+    data = {
+        'tag_name': f'v{new_version}',
+        'name': f'v{new_version}',
+        'body': notes,
+        'draft': True,
+    }
+
+    response = requests.post(
+        url,
+        headers={
+            'Authorization': f'Bearer {GITHUB_TOKEN}',
+            'Accept': 'application/vnd.github+json',
+        },
+        json=data,
+        timeout=10,
+    )
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print(f'HTTP error occurred: {e}')
+        print(f'Response content: {response.content.decode()}')
+        raise e
 
 
-class StrMixin(str, BasicClass):
-    pass
+def create_github_release_draft(rl_version: str, rl_release_notes: str):
+    """Create a GitHub release draft."""
+    url = f'https://api.github.com/repos/{REPO}/releases'
+    headers = {'Authorization': f'token {GITHUB_TOKEN}'}
+    data = {
+        'tag_name': f'v{rl_version}',
+        'name': f'v{rl_version}',
+        'body': rl_release_notes,
+        'draft': True,
+        'prerelease': False,
+    }
+    response = requests.post(url, json=data, headers=headers, timeout=10)
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print(f'HTTP error occurred: {e}')
+        print(f'Response content: {response.content.decode()}')
+        raise e
+    release_url = response.json()['html_url']
+    # Publishing happens in the edit page
+    edit_url = release_url.replace('/releases/tag/', '/releases/edit/')
+    return edit_url
 
 
-class StrEnum(str, Enum):
-    foo = 'foo-value'
-    bar = 'bar-value'
+if __name__ == '__main__':
+    version = get_latest_version_from_changelog()
+    release_notes = get_latest_release_notes_from_changelog()
 
+    commit_and_push_changes(version)
+    pr_url = open_pull_request(version)
+    print(f'Opened PR: {pr_url}')
 
-@pytest.mark.parametrize('schema_type', ['str', 'any'])
-@pytest.mark.parametrize(
-    'input_value,expected',
-    [
-        pytest.param(StrSubclass('foo'), 'foo', id='StrSubclass'),
-        pytest.param(StrMixin('foo'), 'foo', id='StrMixin'),
-        pytest.param(StrEnum.foo, 'foo-value', id='StrEnum'),
-    ],
-)
-def test_subclass_str(schema_type, input_value, expected):
-    s = SchemaSerializer({'type': schema_type})
-    v = s.to_python(input_value)
-    assert v == input_value
-    assert type(v) == type(input_value)
+    create_version_tag(version)
+    draft_url = create_github_release_draft(version, release_notes)
+    print(f'Release draft created: {draft_url}')
 
-    v = s.to_python(input_value, mode='json')
-    assert v == expected
-    assert type(v) == str
-
-    assert s.to_json(input_value) == json.dumps(expected).encode('utf-8')
+    print(f'SUCCESS: Completed release process for v{version}')

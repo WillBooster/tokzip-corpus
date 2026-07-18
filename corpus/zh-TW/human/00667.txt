@@ -1,11 +1,139 @@
----
-title: 'CORS is not as simple as I thought'
-date: 2018-08-18 22:10
-tags: [Front-end]
-categories:
-  - Front-end
----
+Calling `IsValidClassicScriptTypeAndLanguage` is just the first step, there are other `type` as well, and it's the answer to question two.
 
-# Introduction
+## Question 2: Acceptable types of <script&gt;
 
-CORS (Cross-Origin Resource Sharing) has always been a classic problem in front-end development. Simply put, due to some security considerations of the browser, you will encounter some restrictions when loading resources from other domains. The solution is simple, just add some response headers such as `Access-Control-Allow-Origin` on the server side. With this header, the browser will recognize that you have been verified and there will be no problem.
+Like previous question, it's also about a CTF challenge. There is a challenge called YACA in PlaidCTF 2022, here is the offical writeup: https://github.com/zwade/yaca/tree/master/solution
+
+We know from the code I just posted that  the answer to this question is the answer to the first question (that pile of MIME types) plus the following four types:
+
+1. module
+2. importmap
+3. speculationrules
+4. webbundle
+
+We already know `module` and `webbundle`, so let's take a look at importmap and specificationrules.
+
+The specification of import map is here: https://github.com/WICG/import-maps
+
+What is the problem import map wants to solve?
+
+Although the browser already supports module and import, you still can't do this on the browser:
+
+``` js
+import moment from "moment";
+import { partition } from "lodash";
+```
+
+You can only write like this:
+
+``` js
+import moment from "/node_modules/moment/src/moment.js";
+import { partition } from "/node_modules/lodash-es/lodash.js";
+```
+
+import map want to solve this problem by introducing a mapping table:
+
+``` html
+<script type="importmap">
+{
+  "imports": {
+    "moment": "/node_modules/moment/src/moment.js",
+    "lodash": "/node_modules/lodash-es/lodash.js"
+  }
+}
+</script>
+```
+
+The challenge we mentioned can be solve by changing the file like this:
+
+``` html
+
+ <script type="importmap">
+{
+  "imports": {
+     "/js/ast-to-js.mjs": "/js/eval-code.mjs"
+  }
+}
+</script>
+```
+
+Let's take a look at speculationrules, here is the spec: https://github.com/WICG/nav-speculation
+
+This feature is mainly to solve some problems caused by pre-rendering, I haven't delved into it. It works like this:
+
+``` html
+<script type="speculationrules">
+{
+  "prerender": [
+    {"source": "list",
+     "urls": ["/page/2"],
+     "score": 0.5},
+    {"source": "document",
+     "if_href_matches": ["https://*.wikipedia.org/**"],
+     "if_not_selector_matches": [".restricted-section *"],
+     "score": 0.1}
+  ]
+}
+</script>
+```
+
+It uses a JSON file for the pre-render rule, quite different from `<link rel="prerender">`.
+
+## Question 3: content type
+
+It's from a challenge called [PlanetSheet](https://ctf.zeyu2001.com/2022/securinets-ctf-quals-2022/planetsheet) in Securinets CTF Quals 2022. When the content type is `text/xsl` , we can run script via `<x:script>`.
+
+This classic research is mentioned in each writeup: [Content-Type Research
+](https://github.com/BlackFan/content-type-research/blob/master/XSS.md), you can find the detail in it.
+
+The following five content types can execute XSS in all browsers:
+
+1. text/html	
+2. application/xhtml+xml	
+3. application/xml	
+4. text/xml	
+5. image/svg+xml
+
+I was curious about this behavior, so I checked the source code of Chromium a bit, and found other two content types that are always put together with the others:
+
+1. application/rss+xml
+2. application/atom+xml
+
+Code: [xsl_style_sheet_resource.cc](https://chromium.googlesource.com/chromium/src.git/+/refs/tags/103.0.5012.1/third_party/blink/renderer/core/loader/resource/xsl_style_sheet_resource.cc#45)
+
+``` c++
+static void ApplyXSLRequestProperties(FetchParameters& params) {
+  params.SetRequestContext(mojom::blink::RequestContextType::XSLT);
+  params.SetRequestDestination(network::mojom::RequestDestination::kXslt);
+  // TODO(japhet): Accept: headers can be set manually on XHRs from script, in
+  // the browser process, and... here. The browser process can't tell the
+  // difference between an XSL stylesheet and a CSS stylesheet, so it assumes
+  // stylesheets are all CSS unless they already have an Accept: header set.
+  // Should we teach the browser process the difference?
+  DEFINE_STATIC_LOCAL(const AtomicString, accept_xslt,
+                      ("text/xml, application/xml, application/xhtml+xml, "
+                       "text/xsl, application/rss+xml, application/atom+xml"));
+  params.MutableResourceRequest().SetHTTPAccept(accept_xslt);
+}
+```
+
+However, these two will not be loaded as XML, so I searched and found this bug: [Issue 104358: Consider allowing more types to parse as XML](https://bugs.chromium.org/p/chromium/issues/detail?id=104358), which mentioned a [commit](https://chromium.googlesource.com/chromium/src/+/b4599a15c90a853930187cc751c951beb819c02d%5E%21/#F0) in 2009:
+
+``` c++
+if (mime_type == "application/rss+xml" ||
+    mime_type == "application/atom+xml") {
+  // Sad face.  The server told us that they wanted us to treat the response
+  // as RSS or Atom.  Unfortunately, we don't have a built-in feed previewer
+  // like other browsers.  We can't just render the content as XML because
+  // web sites let third parties inject arbitrary script into their RSS
+  // feeds.  That leaves us with little choice but to practically ignore the
+  // response.  In the future, when we have an RSS feed previewer, we can
+  // remove this logic.
+  mime_type.assign("text/plain");
+  response_->response_head.mime_type.assign(mime_type);
+}
+```
+
+Because the RSS feed may contain third-party cotnent, it's vulnerable to XSS if it is rendered as XML, so these two are forcibly turned off.
+
+By the way, there is a awesome tool for searching source code: https://sourcegraph.com/search

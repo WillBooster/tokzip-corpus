@@ -1,111 +1,78 @@
-import {TextEncoder} from 'util';
-import {Readable} from 'stream';
-import utils from "../utils.js";
-import readBlob from "./readBlob.js";
+import fs from 'fs/promises';
+import path from 'path';
+import {renderContributorsList, getTagRef, renderPRsList} from './contributors.js';
+import asyncReplace from 'string-replace-async';
+import {fileURLToPath} from "url";
+import {colorize} from "./helpers/colorize.js";
 
-const BOUNDARY_ALPHABET = utils.ALPHABET.ALPHA_DIGIT + '-_';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const textEncoder = new TextEncoder();
+const CONTRIBUTORS_TEMPLATE = path.resolve(__dirname, '../templates/contributors.hbs');
+const PRS_TEMPLATE = path.resolve(__dirname, '../templates/prs.hbs');
 
-const CRLF = '\r\n';
-const CRLF_BYTES = textEncoder.encode(CRLF);
-const CRLF_BYTES_COUNT = 2;
+const injectSection = async (name, contributorsRE, injector, infile = '../CHANGELOG.md') => {
+  console.log(colorize()`Checking ${name} sections in ${infile}`);
 
-class FormDataPart {
-  constructor(name, value) {
-    const {escapeName} = this.constructor;
-    const isStringValue = utils.isString(value);
+  infile = path.resolve(__dirname, infile);
 
-    let headers = `Content-Disposition: form-data; name="${escapeName(name)}"${
-      !isStringValue && value.name ? `; filename="${escapeName(value.name)}"` : ''
-    }${CRLF}`;
+  const content = String(await fs.readFile(infile));
+  const headerRE = /^#+\s+\[([-_\d.\w]+)].+?$/mig;
 
-    if (isStringValue) {
-      value = textEncoder.encode(String(value).replace(/\r?\n|\r\n?/g, CRLF));
-    } else {
-      headers += `Content-Type: ${value.type || "application/octet-stream"}${CRLF}`
+  let tag;
+  let index = 0;
+  let isFirstTag = true;
+
+  const newContent = await asyncReplace(content, headerRE, async (match, nextTag, offset) => {
+    const releaseContent = content.slice(index, offset);
+
+    const hasSection = contributorsRE.test(releaseContent);
+
+    const currentTag = tag;
+
+    tag = nextTag;
+    index = offset + match.length;
+
+    if(currentTag) {
+      if (hasSection) {
+        console.log(colorize()`[${currentTag}]: ✓ OK`);
+      } else {
+        const target = isFirstTag && (!await getTagRef(currentTag)) ? '' : currentTag;
+
+        console.log(colorize()`[${currentTag}]: ❌ MISSED` + (!target ? ' (UNRELEASED)' : ''));
+
+        isFirstTag = false;
+
+        console.log(`Generating section...`);
+
+        const section = await injector(target);
+
+        if (!section) {
+          return match;
+        }
+
+        console.log(colorize()`\nRENDERED SECTION [${name}] for [${currentTag}]:`);
+        console.log('-------------BEGIN--------------\n');
+        console.log(section);
+        console.log('--------------END---------------\n');
+
+        return section + '\n' + match;
+      }
     }
 
-    this.headers = textEncoder.encode(headers + CRLF);
-
-    this.contentLength = isStringValue ? value.byteLength : value.size;
-
-    this.size = this.headers.byteLength + this.contentLength + CRLF_BYTES_COUNT;
-
-    this.name = name;
-    this.value = value;
-  }
-
-  async *encode(){
-    yield this.headers;
-
-    const {value} = this;
-
-    if(utils.isTypedArray(value)) {
-      yield value;
-    } else {
-      yield* readBlob(value);
-    }
-
-    yield CRLF_BYTES;
-  }
-
-  static escapeName(name) {
-      return String(name).replace(/[\r\n"]/g, (match) => ({
-        '\r' : '%0D',
-        '\n' : '%0A',
-        '"' : '%22',
-      }[match]));
-  }
-}
-
-const formDataToStream = (form, headersHandler, options) => {
-  const {
-    tag = 'form-data-boundary',
-    size = 25,
-    boundary = tag + '-' + utils.generateString(size, BOUNDARY_ALPHABET)
-  } = options || {};
-
-  if(!utils.isFormData(form)) {
-    throw TypeError('FormData instance required');
-  }
-
-  if (boundary.length < 1 || boundary.length > 70) {
-    throw Error('boundary must be 10-70 characters long')
-  }
-
-  const boundaryBytes = textEncoder.encode('--' + boundary + CRLF);
-  const footerBytes = textEncoder.encode('--' + boundary + '--' + CRLF + CRLF);
-  let contentLength = footerBytes.byteLength;
-
-  const parts = Array.from(form.entries()).map(([name, value]) => {
-    const part = new FormDataPart(name, value);
-    contentLength += part.size;
-    return part;
+    return match;
   });
 
-  contentLength += boundaryBytes.byteLength * parts.length;
+  await fs.writeFile(infile, newContent);
+}
 
-  contentLength = utils.toFiniteNumber(contentLength);
+await injectSection(
+  'PRs',
+  /^\s*### PRs/mi,
+  (tag) => tag ? '' : renderPRsList(tag, PRS_TEMPLATE, {awesome_threshold: 5, comments_threshold: 7}),
+);
 
-  const computedHeaders = {
-    'Content-Type': `multipart/form-data; boundary=${boundary}`
-  }
-
-  if (Number.isFinite(contentLength)) {
-    computedHeaders['Content-Length'] = contentLength;
-  }
-
-  headersHandler && headersHandler(computedHeaders);
-
-  return Readable.from((async function *() {
-    for(const part of parts) {
-      yield boundaryBytes;
-      yield* part.encode();
-    }
-
-    yield footerBytes;
-  })());
-};
-
-export default formDataToStream;
+await injectSection(
+  'contributors',
+  /^\s*### Contributors/mi,
+  (tag) => renderContributorsList(tag, CONTRIBUTORS_TEMPLATE)
+);

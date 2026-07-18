@@ -1,172 +1,84 @@
 {-# LANGUAGE NoImplicitPrelude   #-}
+{-# LANGUAGE NoFieldSelectors    #-}
 {-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings   #-}
 
--- | A module which exports all package-level file-gathering logic.
-module Stack.PackageFile
-  ( getPackageFile
-  , stackPackageFileFromCabal
+module Stack.Types.Dependency
+  ( DepValue (..)
+  , DepType (..)
+  , DepLibrary (..)
+  , cabalToStackDep
+  , cabalExeToStackDep
+  , cabalSetupDepsToStackDep
+  , libraryDepFromVersionRange
+  , isDepTypeLibrary
+  , getDepSublib
   ) where
 
-import qualified Data.Map.Strict as M
-import qualified Data.Set as S
-import           Distribution.CabalSpecVersion ( CabalSpecVersion )
+import qualified Data.Map as Map
+import qualified Data.Set as Set
 import qualified Distribution.PackageDescription as Cabal
-import           Distribution.Simple.Glob ( matchDirFileGlob )
-import           Path ( parent, (</>) )
-import           Path.Extra ( forgivingResolveFile, rejectMissingFile )
-import           Path.IO ( doesFileExist )
-import           Stack.ComponentFile
-                   ( ComponentFile (..), resolveOrWarn, stackBenchmarkFiles
-                   , stackExecutableFiles, stackLibraryFiles
-                   , stackTestSuiteFiles
-                   )
-import           Stack.Constants
-                   ( relFileHpackPackageConfig, relFileSetupHs, relFileSetupLhs
-                   )
-import           Stack.Constants.Config ( distDirFromDir )
+import           Distribution.Types.VersionRange ( VersionRange )
 import           Stack.Prelude
-import           Stack.Types.BuildConfig ( HasBuildConfig (..) )
-import           Stack.Types.CompilerPaths ( cabalVersionL )
-import           Stack.Types.EnvConfig ( HasEnvConfig (..) )
-import           Stack.Types.NamedComponent ( NamedComponent (..) )
-import           Stack.Types.Package ( Package(..) )
-import           Stack.Types.PackageFile
-                   ( GetPackageFileContext (..), PackageComponentFile (..)
-                   , StackPackageFile (..)
-                   )
-import qualified System.FilePath as FilePath
-import           System.IO.Error ( isUserError )
+import           Stack.Types.ComponentUtils
+                   ( StackUnqualCompName (..), fromCabalName )
 
--- | Resolve the file, if it can't be resolved, warn for the user
--- (purely to be helpful).
-resolveFileOrWarn :: FilePath.FilePath
-                  -> RIO GetPackageFileContext (Maybe (Path Abs File))
-resolveFileOrWarn = resolveOrWarn "File" f
+-- | The value for a map from dependency name. This contains both the version
+-- range and the type of dependency.
+data DepValue = DepValue
+  { versionRange :: !VersionRange
+  , depType :: !DepType
+  }
+  deriving (Show, Typeable)
+
+-- | Is this package being used as a library, or just as a build tool? If the
+-- former, we need to ensure that a library actually exists. See
+-- <https://github.com/commercialhaskell/stack/issues/2195>
+data DepType
+  = AsLibrary !DepLibrary
+  | AsBuildTool
+  deriving (Eq, Show)
+
+data DepLibrary = DepLibrary
+  { main :: !Bool
+  , subLib :: Set StackUnqualCompName
+  }
+  deriving (Eq, Show)
+
+getDepSublib :: DepValue -> Maybe (Set StackUnqualCompName)
+getDepSublib val = case val.depType of
+  AsLibrary libVal -> Just libVal.subLib
+  _ -> Nothing
+
+defaultDepLibrary :: DepLibrary
+defaultDepLibrary = DepLibrary True mempty
+
+isDepTypeLibrary :: DepType -> Bool
+isDepTypeLibrary AsLibrary{} = True
+isDepTypeLibrary AsBuildTool = False
+
+cabalToStackDep :: Cabal.Dependency -> DepValue
+cabalToStackDep (Cabal.Dependency _ verRange libNameSet) =
+  DepValue { versionRange = verRange, depType = AsLibrary depLibrary }
  where
-  f p x = forgivingResolveFile p x >>= rejectMissingFile
+  depLibrary = DepLibrary finalHasMain filteredItems
+  (finalHasMain, filteredItems) = foldr' iterator (False, mempty) libNameSet
+  iterator LMainLibName (_, newLibNameSet) = (True, newLibNameSet)
+  iterator (LSubLibName libName) (hasMain, newLibNameSet) =
+    (hasMain, Set.insert (fromCabalName libName) newLibNameSet)
 
--- | Get all files referenced by the package.
-packageDescModulesAndFiles ::
-     Package
-  -> RIO
-       GetPackageFileContext
-       PackageComponentFile
-packageDescModulesAndFiles pkg = do
-  packageExtraFile <- resolveGlobFilesFromStackPackageFile
-              pkg.cabalSpec pkg.file
-  let initialValue = mempty{packageExtraFile=packageExtraFile}
-  let accumulator f comp st = (insertComponentFile <$> st) <*> f comp
-  let gatherCompFileCollection createCompFileFn getCompFn res =
-        foldr' (accumulator createCompFileFn) res (getCompFn pkg)
-  gatherCompFileCollection stackLibraryFiles (.library)
-    . gatherCompFileCollection stackLibraryFiles (.subLibraries)
-    . gatherCompFileCollection stackExecutableFiles (.executables)
-    . gatherCompFileCollection stackTestSuiteFiles (.testSuites)
-    . gatherCompFileCollection stackBenchmarkFiles (.benchmarks)
-    $ pure initialValue
+cabalExeToStackDep :: Cabal.ExeDependency -> DepValue
+cabalExeToStackDep (Cabal.ExeDependency _ _name verRange) =
+  DepValue { versionRange = verRange, depType = AsBuildTool }
 
-resolveGlobFilesFromStackPackageFile ::
-     CabalSpecVersion
-  -> StackPackageFile
-  -> RIO GetPackageFileContext (Set (Path Abs File))
-resolveGlobFilesFromStackPackageFile
-    csvV
-    (StackPackageFile extraSrcFilesV dataDirV dataFilesV)
-  = resolveGlobFiles
-      csvV
-      (extraSrcFilesV ++ map (dataDirV FilePath.</>) dataFilesV)
-
--- | Resolve globbing of files (e.g. data files) to absolute paths.
-resolveGlobFiles ::
-     CabalSpecVersion -- ^ Cabal file version
-  -> [String]
-  -> RIO GetPackageFileContext (Set (Path Abs File))
-resolveGlobFiles cabalFileVersion =
-  fmap (S.fromList . concatMap catMaybes) . mapM resolve
+cabalSetupDepsToStackDep :: Cabal.SetupBuildInfo -> Map PackageName DepValue
+cabalSetupDepsToStackDep setupInfo =
+  foldr' inserter mempty (Cabal.setupDepends setupInfo)
  where
-  resolve name =
-    if '*' `elem` name
-      then explode name
-      else fmap pure (resolveFileOrWarn name)
-  explode name = do
-    dir <- asks (parent . (.file))
-    names <- matchDirFileGlob' (toFilePath dir) name
-    mapM resolveFileOrWarn names
-  matchDirFileGlob' dir glob =
-    catch
-      (liftIO (matchDirFileGlob minBound cabalFileVersion dir glob))
-      ( \(e :: IOException) ->
-        if isUserError e
-          then do
-            prettyWarnL
-              [ flow "Wildcard does not match any files:"
-              , style File $ fromString glob
-              , line <> flow "in directory:"
-              , style Dir $ fromString dir
-              ]
-            pure []
-          else throwIO e
-      )
+  inserter d@(Cabal.Dependency packageName _ _) =
+    Map.insert packageName (cabalToStackDep d)
 
--- | Gets all of the modules, files, build files, and data files that constitute
--- the package. This is primarily used for dirtiness checking during build, as
--- well as use by "stack ghci"
-getPackageFile ::
-     ( HasEnvConfig s, MonadReader s m, MonadThrow m, MonadUnliftIO m )
-  => Package
-  -> Path Abs File
-  -> m PackageComponentFile
-getPackageFile pkg cabalFP =
-  debugBracket ("getPackageFiles" <+> pretty cabalFP) $ do
-    let pkgDir = parent cabalFP
-    distDir <- distDirFromDir pkgDir
-    bc <- view buildConfigL
-    cabalVer <- view cabalVersionL
-    packageComponentFile <-
-      runRIO
-        (GetPackageFileContext cabalFP distDir bc cabalVer)
-        (packageDescModulesAndFiles pkg)
-    setupFiles <-
-      if pkg.buildType == Cabal.Custom
-        then do
-          let setupHsPath = pkgDir </> relFileSetupHs
-              setupLhsPath = pkgDir </> relFileSetupLhs
-          setupHsExists <- doesFileExist setupHsPath
-          if setupHsExists
-            then pure (S.singleton setupHsPath)
-            else do
-              setupLhsExists <- doesFileExist setupLhsPath
-              if setupLhsExists
-                then pure (S.singleton setupLhsPath)
-                else pure S.empty
-        else pure S.empty
-    moreBuildFiles <- fmap (S.insert cabalFP . S.union setupFiles) $ do
-      let hpackPath = pkgDir </> relFileHpackPackageConfig
-      hpackExists <- doesFileExist hpackPath
-      pure $ if hpackExists then S.singleton hpackPath else S.empty
-    pure packageComponentFile
-      { packageExtraFile =
-          moreBuildFiles <> packageComponentFile.packageExtraFile
-      }
-
-stackPackageFileFromCabal :: Cabal.PackageDescription -> StackPackageFile
-stackPackageFileFromCabal cabalPkg =
-  StackPackageFile
-    (Cabal.extraSrcFiles cabalPkg)
-    (Cabal.dataDir cabalPkg)
-    (Cabal.dataFiles cabalPkg)
-
-insertComponentFile ::
-     PackageComponentFile
-  -> (NamedComponent, ComponentFile)
-  -> PackageComponentFile
-insertComponentFile packageCompFile (name, compFile) =
-  PackageComponentFile nCompFile nDotCollec packageExtraFile nWarnings
- where
-  (ComponentFile moduleFileMap dotCabalFileList warningsCollec) = compFile
-  (PackageComponentFile modules files packageExtraFile warnings) =
-    packageCompFile
-  nCompFile = M.insert name moduleFileMap modules
-  nDotCollec = M.insert name dotCabalFileList files
-  nWarnings = warningsCollec ++ warnings
+libraryDepFromVersionRange :: VersionRange -> DepValue
+libraryDepFromVersionRange range = DepValue
+  { versionRange = range
+  , depType = AsLibrary defaultDepLibrary
+  }

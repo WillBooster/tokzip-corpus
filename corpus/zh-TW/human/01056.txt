@@ -1,104 +1,687 @@
-The most troublesome permission management also teaches you how to implement it. Basically, you need to create a `Service Account`, set it to have permission to the Google Drive API, and then generate a token for this account. You can use that token.
+<img width="660" alt="p4" src="https://user-images.githubusercontent.com/2755720/61093627-440a6d00-a400-11e9-9489-1eb6b1e49d62.png">
 
-What the main program needs to do is basically to filter the data, then find the account from the data sent over from GitHub, and pass the account and date to another function I wrote separately. Finally, return the result to end:
+Try changing the `limit` value, and it seems that the maximum value should be 25, and 25 pieces of data can be obtained at a time. Changing the `page` value has no effect, so change the `to` value, and new data can be successfully obtained. It seems that the pagination mechanism is cursor-based.
+
+After several attempts, we finally got two API URLs, one for obtaining detailed personal information and the other for obtaining a list of followers!
+
+After determining the data source, we can start thinking about the crawler architecture.
+
+## Crawler Architecture
+
+How can we crawl as many Taiwanese writers as possible?
+
+The first problem is that we need to expand the scope a bit, because there may be writers from Hong Kong or China among Chinese writers, and it is difficult for the program to distinguish where they come from, especially Hong Kong and Taiwan, because they both use traditional Chinese.
+
+To avoid making the problem more complicated, we only need to be able to capture "Chinese users".
+
+So how can we capture the most Chinese users? A very simple strategy is that we assume that the followers of Chinese users should all be Chinese users, so we just need to start from a user and put all of his followers into a queue, and keep doing this.
+
+In text, it is simplified as follows:
+
+1. Take a user out of the queue
+2. Write his data to the database
+3. Put all of his followers into the queue
+4. Go back to step 1
+
+This way, we can infinitely extend from one user, and theoretically, we can obtain data from a large number of users. The reason why we choose followers (people who follow me) instead of following (people I follow) is that the users I follow may come from other countries, such as foreign engineers, but because I don't write in English, foreign engineers should not come to follow me. This way, we can limit users to Chinese, which meets our goals.
+
+Next is the system architecture part, which will have different methods depending on the efficiency you want to achieve.
+
+For me, the most efficient way is to find a service that is very suitable for use as a queue, such as redis, and the database part can use MySQL or any software you are familiar with. The advantage of this is that you can open different machines, and each machine is a worker. For example, if you open five machines, there will be five workers constantly taking things out of the queue and putting followers in.
+
+The reason why so many machines are opened instead of many threads or processes is because of the problem of rate limiting. Generally, APIs have traffic restrictions. If you send too many requests from the same IP, you will be banned or unable to get a response for a period of time. Therefore, opening more processes and threads is useless, and only different machines can be opened to solve the problem (or if there is a way to change the IP).
+
+Later, because I didn't care about efficiency and was too lazy to open many machines, I only planned to open one and let it crawl slowly. If there is only one worker, the queue part can also be simplified. Here, I also use MySQL to implement a simple queue, making the entire crawler architecture very simple.
+
+Let's take a look at the database structure:
+
+### Users
+
+| id     | userId    | username                      | name       | bio  | follower | fr   | mediumMemberAt     | createdAt      | 
+|--------|-----------|-------------------------------|------------|------|----------|------|--------------------|----------------|
+| Auto-increment ID | User ID | Add @ in front to get the profile URL | Username | Bio | Number of followers | Category | Time of becoming a paid member | Time of joining |
+
+### Queue
+
+| id     | userId    |
+|--------|-----------|
+| Auto-increment ID | User ID |
+
+The execution process of the program is as follows:
+
+1. Take out a userId from the Queue.
+2. If the userId already exists in Users, go back to step 1.
+3. Write the user's data into Users.
+4. Put all of the user's followers into the Queue.
+5. Go back to step 1.
+
+When taking out from the queue, make sure that the user has not been crawled yet. If they have, skip them and put all of their followers back into the queue. This way, the program will keep running until there is nothing left in the queue.
+
+After designing the architecture, we can start coding!
+
+## First Version of the Crawler
+
+First, we need a queue that can push and pop, and can determine whether the current userId has already been crawled. This is very suitable for implementation using a class:
 
 ``` js
-var updateSheet = require('./lib')
+class Queue {
+  constructor(conn) {
+    this.conn = conn
+  }
   
-exports.handler = async (event, context, callback) => {
-    if (!event.body) return 'no body'
-    const body = JSON.parse(event.body) || {}
-    if (!body || body.action !== 'created') return response(callback)
-    const title = body.issue.title.split(' ')
-    if (!title.length) return response(callback)
-    const date = title[1]
-    const account = body.comment.user.login
-    console.log('log:', date, account)
-    try {
-        await updateSheet(date, account)
-        return callback(null, {
-            statusCode: 200,
-            body: date + account
+  get() {
+    return new Promise((resolve, reject) => {
+      this.conn.query('SELECT userId from Queues limit 1', (error, results) => {
+        if (error) {
+          console.log(error)
+          return reject(error)
+        }
+        if (results.length !== 1) {
+          return resolve(null)
+        }
+        const data = results[0]
+        this.conn.query('DELETE from Queues where userId=?', [data.userId], (err, results) => {
+          if (error) {
+            console.log(error)
+            return reject(error)
+          }
+          return resolve(data.userId)
         })
-    } catch (err) {
-        console.log('error:', err)
-    }
-      
-    return response(callback)
-};
-  
-const response = (cb) => {
-    cb(null, {
-        statusCode: 200,
-        body: 'ok'
+      });
     })
+  }
+  
+  check(uid) {
+    return new Promise((resolve, reject) => {
+      this.conn.query('SELECT userId from Users where userId=?', [uid], function (error, results) {
+        if (error) {
+          return reject(error)
+        }
+        if (results.length > 0) {
+          return resolve(false)
+        }
+        return resolve(true)
+      });
+    })
+  }
+  
+  push(list) {
+    return new Promise((resolve, reject) => {
+      const values = []
+      for (let item of list) {
+        values.push([item])
+      }
+      this.conn.query(`
+        INSERT IGNORE INTO Queues (userId) VALUES ?`, [values], (err) => {
+          if (err) {
+            // console.log(err)
+          }
+          resolve()
+        }
+      )
+    })
+  }
 }
 ```
 
-The `updateSheet` function does a simple job, which is to find the correct position based on the date and account, and change the value of that cell to O. Here is some sample code for your reference:
+After having the queue, we can write the main logic. The structure of the main program will look like this:
 
 ``` js
-async function searchAccount(sheet, account) {
-  const firstRow = await getCells(sheet, {
-    'min-row': 1,
-    'max-row': 1
-  })
-  const length = firstRow.length
-  for(var i=0; i<length; i++) {
-    if (firstRow[i].value === account) {
-      return {
-        col: firstRow[i].col,
-        batchId: firstRow[i].batchId
+var connection = mysql.createPool({
+  connectionLimit : 10,
+  host     : process.env.host,
+  user     : '',
+  password : '',
+  database : 'medium',
+  charset: 'utf8mb4'
+})
+
+async function main() {
+  const queue = new Queue(connection)
+  
+  // 不斷從 queue 拿東西出來
+  while(true) {
+    const userId = await queue.get()
+    if (!userId) {
+      console.log('no data from queue, end')
+      break;
+    }
+  
+    // 看看是否已經爬過，爬過就跳掉
+    const check = await queue.check(userId)
+    if (!check) {
+      continue
+    }
+  
+    // 拿 userId 做你想做的事
+    console.log('uid:', userId)
+  }
+}
+```
+
+Then, we just need to implement the following two functions:
+
+1. Fetch user data
+2. Write user data into the database
+3. Put followers back into the queue
+
+Since the Medium API response always has an anti-[json hijacking](https://medium.com/@jaydenlin/%E7%82%BA%E4%BD%95-facebook-api-%E8%A6%81%E5%9B%9E%E5%82%B3%E7%84%A1%E7%AA%AE%E8%BF%B4%E5%9C%88-%E8%AB%87%E6%8D%B2%E5%9C%9F%E9%87%8D%E4%BE%86%E7%9A%84-json-hijacking-bc220617ceba) header, we can wrap a function specifically to parse the API response:
+
+``` js
+async function getMediumResponse(url) {
+  try {
+    const response = await axios.get(url)
+    const json = JSON.parse(response.data.replace('])}while(1);</x>', ''))
+    return json
+  } catch(err) {
+    return null
+  } 
+}
+```
+
+Then, we can write two functions, one to fetch user data and one to fetch follower data (functions with an underscore are lodash functions):
+
+``` js
+async function getUserInfo(uid) {
+  const url = `https://medium.com/_/api/users/${uid}/profile/stream`
+  const json = await getMediumResponse(url)
+  if (!json) {
+    return {}
+  }
+  const userId = _.get(json, 'payload.user.userId')
+  const follower = _.get(json, `payload.references.SocialStats.${userId}.usersFollowedByCount`, 0)
+  
+  return {
+    followerCount: follower,
+    userId: userId,
+    name: _.get(json, 'payload.user.name'),
+    username: _.get(json, 'payload.user.username'),
+    bio: _.get(json, 'payload.user.bio'),
+    mediumMemberAt: _.get(json, 'payload.user.mediumMemberAt'),
+    isWriterProgramEnrolled: _.get(json, 'payload.user.isWriterProgramEnrolled'),
+    createdAt: _.get(json, 'payload.user.createdAt'),
+  }
+}
+
+async function getFollowers(uid, to) {
+  let url = `https://medium.com/_/api/users/${uid}/profile/stream?source=followers&limit=200`
+  if (to) {
+    url += '&to=' + to
+  }
+  const json = await getMediumResponse(url)
+  if (!json) {
+    return {}
+  }
+  const followers = _.keys(json.payload.references.Social) || []
+  const nextTo = _.get(json, 'payload.paging.next.to')
+  return {
+    followers,
+    nextTo
+  }
+}
+```
+
+Basically, we just call the API and process the data a little bit, then return what we are interested in.
+
+We only implemented the function to "fetch one follower" above, so we need to implement another function to "fetch all followers and put them into the queue":
+
+``` js
+async function getAllFollowers(uid, queue) {
+  const followers = []
+  let to = undefined
+  while (true) {
+    const data = await getFollowers(uid, to)
+    if (!data) {
+      break;
+    }
+    followers.push(...data.followers)
+    to = data.nextTo
+    console.log(uid, 'fetching...', followers.length)
+    if (data.followers.length === 0 || !to) {
+      break;
+    }
+    await queue.push(data.followers)
+  }
+  return followers
+}
+```
+
+This function will continuously fetch followers and put them into the queue, and print out how many followers have been fetched so far. Once all followers have been fetched, it will return all of the followers (it returns because I originally wrote the code to write all of the followers into the queue at once, but later found it to be less efficient, so I changed it to write them one by one).
+
+Finally, here is the code to write user data into the database:
+
+``` js
+function format(time) {
+  if (!time) return null
+  return moment(time).format('YYYY-MM-DD HH:mm:ss')
+}
+  
+function saveUserInfo(conn, info) {
+  conn.query(`
+    INSERT INTO Users
+    (
+      userId, username, name, bio, follower,
+      mediumMemberAt, createdAt, isWriterProgramEnrolled
+    ) VALUES ?`, [[[
+      info.userId, info.username, info.name, info.bio, info.followerCount,
+      format(info.mediumMemberAt), format(info.createdAt), info.isWriterProgramEnrolled
+    ]]], (err) => {
+      if (err) {
+        // console.log(err)
       }
     }
-  }
-  return null
+  )
 }
+```
+
+After writing these core functions, we just need to modify our main program to complete the entire crawler:
+
+``` js
+async function main() {
+  const queue = new Queue(connection)
   
-async function setValue(sheet, row, col, value) {
-  const cells = await getCells(sheet, {
-    'min-row': row,
-    'max-row': row,
-    'min-col': col,
-    'max-col': col,
-    'return-empty': true
-  })
-  if (cells && cells[0]) {
-    cells[0].value = value
-    cells[0].save(function(err) {
-      if (err) {
-        console.log('err', err)
+  while(true) {
+  
+    // 1. 從 Queue 裡面拿出一個 userId
+    const userId = await queue.get()
+    if (!userId) {
+      console.log('no data from queue, end')
+      break;
+    }
+  
+    // 2. 如果 userId 已存在 Users，回到步驟一
+    const check = await queue.check(userId)
+    if (!check) {
+      continue
+    }
+  
+    console.log('uid:', userId)
+    try {
+      const info = await getUserInfo(userId)
+      
+      // 如果沒抓到資料有可能是被擋了，先停個 3 秒
+      if (!info.userId) {
+        console.log('sleep...')
+        await sleep(3000)
       }
-    })
-  }
-}
   
-async function updateSheet(date, account) {
-  try {
-    const sheet = await getSheet()
-    const accountPosition = await searchAccount(sheet, account)
-    const datePosition = await searchDate(sheet, date)
-    console.log('position:', accountPosition, datePosition)
-    if (!accountPosition || !datePosition) return
-    await setValue(sheet, datePosition.row, accountPosition.col, 'O')
-  } catch (err) {
-    console.log('err', err)
+      // 3. 把他的資料寫進 Users
+      saveUserInfo(connection, info)
+  
+      // 4. 把他的所有 follower 丟進 Queue
+      if (info.followerCount > 0) {
+        // 把 followers 放到 queue 並印出總共幾筆資料
+        const followerList = await getAllFollowers(userId, queue)
+        console.log('Add ' + followerList.length + ' into queue.')
+      }
+    } catch(err) {
+      // 有錯誤就先睡個 3 秒
+      console.log('error...sleep')
+      await sleep(3000)
+    } 
   }  
 }
 ```
 
-Finally, just set the webhook URL on GitHub, and everything is done!
+The above code is what we wrote according to the previous logic:
 
-## How to debug on Lambda?
+1. Take out a userId from the Queue.
+2. If the userId already exists in Users, go back to step 1.
+3. Write the user's data into Users.
+4. Put all of the user's followers into the Queue.
+5. Go back to step 1.
 
-Although I wrote it lightly above, I actually encountered a few small problems during development. The first is that debugging is not as straightforward as on a computer, and webhooks are usually harder to debug.
+However, I added an additional logic that when there is a problem calling the API, it will pause for 3 seconds. This is to prevent being rate limited. However, this mechanism is not very good because there is no retry, so once an error occurs, the userId is skipped.
 
-Regarding this part, Lambda will actually send the log to CloudWatch, so you need to write logs in the app yourself, and then analyze those logs in CloudWatch. If it is a simple application, it should be quite easy. If it is more complex, the function should be divided into smaller ones, otherwise debugging will be quite troublesome.
+The original idea was that skipping one userId was not a big deal, after all, there may be 100,000 userIds in the queue, and even if it is skipped, it may still be thrown back into the queue later, so not implementing a retry mechanism is okay.
 
-Another problem I encountered is that the Google Sheet API is slower, and the entire process takes about 5 seconds. The default timeout is about 3 seconds, so remember to increase the timeout yourself, otherwise it will keep failing.
+After assembling all of the above code, we have the framework for the first version of the crawler. It runs okay, but it is just slower than expected. Also, the speed at which the queue grows is surprisingly fast. I ran it overnight and the queue had about 100,000 more data, but there were only four or five thousand in users.
 
-## Summary
+However, after running it overnight, I found a fatal error.
 
-This time, the experience of using AWS Lambda was pretty good. I didn't encounter any major difficulties during the development process, which may be related to the fact that what I wanted to implement was relatively simple. But I think this kind of simple thing is super suitable for this kind of serverless solution, because it is really convenient without a server, and it saves a lot of trouble.
+## Second Version of the Crawler: Judging Chinese
 
-In the future, if there are similar simple requirements, I think I will still use this solution, just connect one ready-made service to another, and everything will be done. I also recommend that if you want to do some small things, you might as well try to use these ready-made services to get things done, which can save a lot of time.
+The fatal error is that the original assumption: "The followers of Chinese authors are all Chinese authors" is problematic, and upon careful consideration, this assumption is indeed very unreliable.
+
+So after running the crawler overnight, I found that there were a lot of foreign users in the database. And once there is one, there will be a lot of foreign users in your queue.
+
+To avoid this situation, I decided to start with the self-introduction and nickname, and write a function to determine whether the self-introduction and nickname contain Chinese characters. If they do, then they will be put in. Here, I directly copied the code I found on Stack Overflow, which looks very magical:
+
+``` js
+function isChinese(text = '') {
+  // @see: https://stackoverflow.com/questions/44669073/regular-expression-to-match-and-split-on-chinese-comma-in-javascript/51941287#51941287
+  const regex = /(\p{Script=Hani})+/gu;
+  return text.match(regex)
+}
+```
+
+After fetching user data from the queue, we perform a check:
+
+``` js
+const info = await getUserInfo(userId)
+  
+// 非中文，直接略過
+if (!isChinese(info.bio) && !isChinese(info.name)) {
+  continue;
+}
+```
+
+When doing this check, I already thought of a potential issue. Some people like to use English in their self-introduction and nickname, even though they are writing in Chinese. This could cause them to be misjudged and not added to the queue.
+
+At the time, I didn't think it was a big deal since there weren't many people like that, and it would be troublesome to fix. I had a solution in mind, which was to fetch their recently clapped or published articles and check if the titles were in Chinese. This would be a more accurate way to judge. However, I was too lazy to implement it and decided to let the crawler run for another day.
+
+The next morning, I discovered another problem that I never thought I would encounter.
+
+## Crawler Version 3: Judging Japanese Users
+
+There were a lot of Japanese users in the user list.
+
+Some of them had nicknames or self-introductions in kanji, so they wouldn't be filtered out by the Chinese check. When I discovered this problem, my first thought was, "If this were an interview, I would definitely be rejected for not thinking of this case..."
+
+To solve this problem, I added a regular expression to check if there were any Japanese characters (excluding kanji):
+
+``` js
+function isJapanese(text = '') {
+  // @see: https://gist.github.com/ryanmcgrath/982242
+  const regexJP = /[\u3040-\u309F]|[\u30A0-\u30FF]/g; 
+  const jp = text.match(regexJP)
+  if (jp && jp.length >= 3) {
+    return true
+  }
+  return false
+}
+```
+
+If there were three or more Japanese characters, it would be considered Japanese. I set the quantity because I was afraid that some Taiwanese people might use characters like `の` and be misjudged. However, a better approach would be to look at the ratio, such as if 80-90% of a sentence was in Chinese, it would be considered Chinese.
+
+The updated check logic is as follows:
+
+``` js
+const info = await getUserInfo(userId)
+  
+// 非中文，直接略過
+if (!isChinese(info.bio) && !isChinese(info.name)) {
+  continue;
+}
+  
+if (isJapanese(info.bio) || isJapanese(info.name)) {
+    continue;
+}
+```
+
+If it's not Chinese, skip it. Then check if it's Japanese by looking at the self-introduction or nickname.
+
+Okay, now everything should be fine! So I cleared the data and let the crawler run for another night.
+
+The next day, I realized how naive I was.
+
+## Crawler Version 4: Refactoring
+
+When I opened the database, I found that there were still many Japanese users. The reason was that some of them had kanji nicknames and no self-introduction, or only a few words in their self-introduction, so they were still considered Chinese users.
+
+In the end, the unreliable judgment mechanism was the root cause of the problem.
+
+Since things had come to this point, I couldn't be lazy anymore. I had to implement the more accurate solution I mentioned earlier: "Check if the recently published or clapped articles are in Chinese." Fortunately, the API provided this data, and it was much easier to implement than I thought.
+
+In addition to this, because the queue was growing much faster than it was being consumed, I changed the method. I wrote another small program that removed the "add followers to the queue" step from the original process and fetched 10 user data at a time.
+
+In other words, this new program simply kept fetching user data and storing it in the database, so the queue would become smaller and the user data would accumulate. It could fetch 20,000 data in an hour, and the queue could be cleared in half a day.
+
+The advantage was that I could quickly accumulate user data. The original implementation was too slow, and I could only fetch about 10,000 data a day. The new implementation didn't need to add things to the queue, so the user data grew quickly.
+
+At that time, I copied and modified the code to create the new program, which made the code more and more messy. Considering that I wanted to open source it later, it was time to clean up the code, so I refactored the program.
+
+The refactored architecture is as follows:
+
+```
+.
+├── README.md     // 說明
+├── app.js        // 主程式
+├── getUsers.js   // 只抓使用者資料的小程式 
+├── config.js     // 設定檔
+├── db.js         // 資料庫相關
+├── medium.js     // medium API 相關
+├── package.json  
+├── queue.js     
+└── utils.js       
+```
+
+Let's start with config:
+
+``` js
+module.exports = {
+  db: {
+    connectionLimit: 10,
+    host     : '',
+    user     : '',
+    password : '',
+    database : 'medium',
+    charset: 'utf8mb4'
+  },
+  batchLimit: 1, // 一次抓多少筆使用者資料
+  randomDelay: function() {
+    return Math.floor(Math.random() * 200) + 100
+  },
+  errorRateTolerance: 0.2,
+  delayWhenError: 500
+}
+```
+
+This is where the configuration files are stored, including the database settings and some parameters for fetching data, most of which are related to the program that fetches user data, such as how many data to fetch and how long to wait between each fetch. These are measures to avoid being blocked by sending too many requests.
+
+Next is utils.js:
+
+``` js
+module.exports = {
+  // @see: https://stackoverflow.com/questions/44669073/regular-expression-to-match-and-split-on-chinese-comma-in-javascript/51941287#51941287
+  isChinese: (text = '') => {
+    const regex = /(\p{Script=Hani})+/gu;
+    return text.match(regex)
+  },
+  
+  // @see: https://gist.github.com/ryanmcgrath/982242
+  isJapanese: (text = '') => {
+    const regexJP = /[\u3040-\u309F]|[\u30A0-\u30FF]/g; 
+    const jp = text.match(regexJP)
+  
+    // more than 2 japanese char
+    if (jp && jp.length >= 2) {
+      return true
+    }
+    return false
+  },
+  
+  sleep: ms => new Promise(resolve => {
+    setTimeout(resolve, ms)
+  }),
+  
+  log: function () {
+    const args = Array.prototype.slice.call(arguments);
+    console.log.apply(console, args)
+  }
+}
+```
+
+This is where some functions used earlier are placed, including limiting the number of Japanese characters to two and wrapping console.log to make it easier to customize later.
+
+Then there's medium.js, which is related to the medium API and adds a function `isMandarinUser` to check if the user is Chinese:
+
+``` js
+const axios = require('axios')
+const _ = require('lodash')
+const utils = require('./utils')
+const JSON_HIJACKING_PREFIX = '])}while(1);</x>'
+  
+// wrapper function, return null instead of throwing error
+async function getMediumResponse(url) {
+  try {
+    const response = await axios.get(url)
+    const json = JSON.parse(response.data.replace(JSON_HIJACKING_PREFIX, ''))
+    return json
+  } catch(err) {
+    return null
+  }
+}
+  
+function isMandarinUser(name, bio, posts) {
+  
+  // if bio or name is japanese, must be japanese
+  if (utils.isJapanese(name) || utils.isJapanese(bio)) {
+    return false
+  }
+  
+   // this user has no activity on medium, decide by name and bio
+  if (!posts) {
+    return utils.isChinese(name) || utils.isChinese(bio)
+  }
+  
+  const contents = _.values(posts).map(item => item.title + _.get(item, 'content.subtitle'))
+  return Boolean(
+    contents.find(item => {
+      return utils.isChinese(item) && !utils.isJapanese(item)
+    })
+  )
+}
+  
+module.exports = {
+  getFollowers: async (uid, to) => {
+    let url = `https://medium.com/_/api/users/${uid}/profile/stream?source=followers&limit=200`
+    if (to) {
+      url += '&to=' + to
+    }
+    const json = await getMediumResponse(url)
+    if (!json) {
+      return null
+    }
+    const followers = _.keys(json.payload.references.Social) || []
+    const nextTo = _.get(json, 'payload.paging.next.to')
+    return {
+      followers,
+      nextTo
+    }
+  },
+  
+  getUserInfo: async (uid) => {
+    const url = `https://medium.com/_/api/users/${uid}/profile/stream`
+    const json = await getMediumResponse(url)
+    if (!json) {
+      return {}
+    }
+    const userId = _.get(json, 'payload.user.userId')
+    const follower = _.get(json, `payload.references.SocialStats.${userId}.usersFollowedByCount`, 0)
+  
+    const posts = _.get(json, 'payload.references.Post')
+    const name = _.get(json, 'payload.user.name')
+    const bio = _.get(json, 'payload.user.bio')
+  
+    return {
+      isMandarinUser: isMandarinUser(name, bio, posts),
+      userId,
+      name,
+      username: _.get(json, 'payload.user.username'),
+      bio,
+      followerCount: follower,
+      mediumMemberAt: _.get(json, 'payload.user.mediumMemberAt'),
+      isWriterProgramEnrolled: _.get(json, 'payload.user.isWriterProgramEnrolled'),
+      createdAt: _.get(json, 'payload.user.createdAt'),
+    }
+  }
+}
+```
+
+isMandarinUser is determined based on three parameters: nickname, self-introduction, and related articles. Related articles may be the most recently published or clapped articles or replies, and the titles and subtitles of the articles are used to determine if they are in Chinese.
+
+If the user has no activity, the self-introduction and nickname are used to judge, so there is still a possibility of misjudgment, but the misjudgment rate is already quite low in practice.
+
+Next, let's look at the database-related operations, db.js:
+
+``` js
+const mysql = require('mysql')
+const moment = require('moment')
+  
+function format(time) {
+  if (!time) return null
+  return moment(time).format('YYYY-MM-DD HH:mm:ss')
+}
+  
+function transform(info) {
+  return [
+    info.userId, info.username, info.name, info.bio, info.followerCount,
+    format(info.mediumMemberAt), format(info.createdAt), info.isWriterProgramEnrolled, null
+  ]
+}
+  
+class DB {
+  constructor(config) {
+    this.conn = mysql.createPool(config)
+  }
+  
+  getExistingUserIds() {
+    return new Promise((resolve, reject) => {
+      this.conn.query('SELECT userId from Users', (err, results) => {
+        if (err) {
+          return reject(err)
+        }
+       return resolve(results.map(item => item.userId))
+      });
+    })
+  } 
+  
+  getUserIds(limit) {
+    return new Promise((resolve, reject) => {
+      this.conn.query('SELECT userId from Users where fr="TW" order by follower desc limit ' + limit, (err, results) => {
+        if (err) {
+          return reject(err)
+        }
+       return resolve(results.map(item => item.userId))
+      });
+    })
+  } 
+  
+  deleteUserIds(userIds) {
+    return new Promise((resolve, reject) => {
+      this.conn.query('DELETE from Queues WHERE userId IN (?)', [userIds], (err, results) => {
+        if (err) {
+          return reject(err)
+        }
+        return resolve(userIds)
+      })
+    })
+  }
+  
+  insertUserData(info) {
+    if (!info) return
+    const data = Array.isArray(info) ? info.map(transform) : [transform(info)]
+    this.conn.query(`
+      INSERT INTO Users
+      (
+        userId, username, name, bio, follower,
+        mediumMemberAt, createdAt, isWriterProgramEnrolled, fr
+      ) VALUES ?`, [data], (err) => {
+        if (err) {
+          // console.log(err)
+        }
+      }
+    )
+  }
+  
+  insertIntoQueue(list) {
+    return new Promise((resolve, reject) => {
+      const values = []
+      for (let item of list) {
+        values.push([item])
+      }
+      this.conn.query(`
+        INSERT IGNORE INTO Queues (userId) VALUES ?`, [values], (err) => {
+          if (err) {
+            // console.log(err)
+          }
+          resolve()
+        }
+      )
+    })
+  }
+}
+  
+module.exports = DB
+```
