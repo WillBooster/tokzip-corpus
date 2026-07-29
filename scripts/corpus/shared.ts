@@ -150,7 +150,7 @@ function shinglesOf(content: string): Set<number> {
   // Deduplicate before truncating: a repeated window (boilerplate, padding) would otherwise
   // spend sketch slots on the same hash, leaving fewer distinct shingles to match on and
   // under-estimating the overlap between two documents.
-  const distinct = [...new Set(hashes)].sort((a, b) => a - b);
+  const distinct = [...new Set(hashes)].toSorted((a, b) => a - b);
   return new Set(distinct.slice(0, SHINGLES_PER_DOC));
 }
 
@@ -179,7 +179,8 @@ export function chunkDocument(text: string): { chunk: string; chunkIndex: number
     // Never split a surrogate pair: a dangling high surrogate would corrupt both chunks. The
     // end > offset + 1 guard keeps the offset advancing when a lone high surrogate is the
     // only remaining character, instead of looping forever.
-    const trailing = text.codePointAt(end - 1);
+    // oxlint-disable-next-line unicorn/prefer-code-point -- UTF-16 code units are required to detect a split surrogate pair
+    const trailing = text.charCodeAt(end - 1);
     if (trailing >= 0xD8_00 && trailing <= 0xDB_FF && end > offset + 1) end--;
     const chunk = text.slice(offset, end).trim();
     offset = end;
@@ -270,7 +271,7 @@ export function hasIncompatibleSpdx(content: string, license: string): boolean {
       MIT: ['MIT'],
       'MIT-like (curl)': ['curl'],
       'MIT/Apache-2.0': ['Apache-2.0', 'MIT'],
-    }[license]?.map((identifier) => identifier.toLowerCase()) ?? []
+    }[license]?.map((identifier) => identifier.toLowerCase())
   );
   for (const match of content.matchAll(/SPDX-License-Identifier:\s*([^\r\n]+)/gi)) {
     // Strip comment terminators instead of truncating at "*": stopping the capture there
