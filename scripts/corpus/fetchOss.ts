@@ -7,10 +7,10 @@
  * Usage: bun scripts/corpus/fetchOss.ts [--quick] [<language> ...]
  *   --quick  clone only the repo marked `quick` per language and cap the sample volume.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
-import nlSources from "./nl-sources.json";
-import sources from "./oss-sources.json";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import nlSources from './nl-sources.json';
+import sources from './oss-sources.json';
 import {
   appendManifest,
   CACHE_DIR,
@@ -26,26 +26,26 @@ import {
   sizeBucketOf,
   syncNoticeFiles,
   writeSample,
-} from "./shared.ts";
+} from './shared.ts';
 
 const EXTENSIONS: Record<string, string[]> = {
-  c: [".c", ".h"],
-  cpp: [".cc", ".cpp", ".cxx", ".hpp", ".hh"],
-  csharp: [".cs"],
-  css: [".css", ".scss"],
-  dart: [".dart"],
-  haskell: [".hs"],
-  html: [".html", ".htm"],
-  java: [".java"],
-  jsp: [".jsp"],
-  javascript: [".js", ".mjs", ".cjs", ".jsx"],
-  php: [".php"],
-  python: [".py"],
-  ruby: [".rb"],
-  rust: [".rs"],
-  text: [".md", ".txt"],
-  typescript: [".ts", ".tsx"],
-  zig: [".zig"],
+  c: ['.c', '.h'],
+  cpp: ['.cc', '.cpp', '.cxx', '.hpp', '.hh'],
+  csharp: ['.cs'],
+  css: ['.css', '.scss'],
+  dart: ['.dart'],
+  haskell: ['.hs'],
+  html: ['.html', '.htm'],
+  java: ['.java'],
+  jsp: ['.jsp'],
+  javascript: ['.js', '.mjs', '.cjs', '.jsx'],
+  php: ['.php'],
+  python: ['.py'],
+  ruby: ['.rb'],
+  rust: ['.rs'],
+  text: ['.md', '.txt'],
+  typescript: ['.ts', '.tsx'],
+  zig: ['.zig'],
 };
 /**
  * Dropped from the text corpus only. The code corpora deliberately keep tests — real projects are
@@ -56,38 +56,38 @@ const EXTENSIONS: Record<string, string[]> = {
 const NON_PROSE_TXT =
   /^(cmakelists|conanfile|robots|requirements(-[\w.]+)?|constraints|\.?[\w.-]*supp(ressions)?|package-list|\.?gitattributes)\.txt$/i;
 const PROSE_EXCLUDED_DIRS = new Set([
-  "test",
-  "tests",
-  "testing",
-  "fixtures",
-  "fixture",
-  "baselines",
-  "requirements",
-  "testdata",
-  "spec",
-  "specs",
+  'test',
+  'tests',
+  'testing',
+  'fixtures',
+  'fixture',
+  'baselines',
+  'requirements',
+  'testdata',
+  'spec',
+  'specs',
 ]);
 const EXCLUDED_DIRS = new Set([
-  "node_modules",
-  "vendor",
-  "vendored",
-  "dist",
-  "build",
-  "out",
-  "third_party",
-  "third-party",
-  "thirdparty",
-  "deps",
-  "external",
-  "extern",
-  ".git",
-  "generated",
-  "__generated__",
+  'node_modules',
+  'vendor',
+  'vendored',
+  'dist',
+  'build',
+  'out',
+  'third_party',
+  'third-party',
+  'thirdparty',
+  'deps',
+  'external',
+  'extern',
+  '.git',
+  'generated',
+  '__generated__',
 ]);
 const MAX_AVG_LINE_LENGTH = 200;
 const LANG_BUDGET_BYTES = 8 * 1024 * 1024;
 const QUICK_LANG_BUDGET_BYTES = 4 * 1024 * 1024;
-const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const fatalUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
 interface SourceEntry {
   repo: string;
@@ -103,15 +103,15 @@ main();
 
 function main(): void {
   const args = process.argv.slice(2);
-  const quick = args.includes("--quick");
-  const requested = args.filter((a) => !a.startsWith("--"));
+  const quick = args.includes('--quick');
+  const requested = args.filter((a) => !a.startsWith('--'));
   const languages = requested.length > 0 ? requested : Object.keys(sources.languages);
   mkdirSync(CACHE_DIR, { recursive: true });
   for (const language of languages) {
-    if (language === "text") continue; // Harvested after all clones below.
+    if (language === 'text') continue; // Harvested after all clones below.
     fetchLanguage(language, quick);
   }
-  if (languages.includes("text") || requested.length === 0) harvestText(quick);
+  if (languages.includes('text') || requested.length === 0) harvestText(quick);
 }
 
 function fetchLanguage(language: string, quick: boolean): void {
@@ -121,7 +121,7 @@ function fetchLanguage(language: string, quick: boolean): void {
     console.error(`skip ${language}: no sources or extensions defined`);
     return;
   }
-  resetOrigin(language, "human"); // Re-runs must not duplicate manifest rows over stale samples.
+  resetOrigin(language, 'human'); // Re-runs must not duplicate manifest rows over stale samples.
   const selected = quick ? entries.filter((e) => e.quick) : entries;
   const budget = quick ? QUICK_LANG_BUDGET_BYTES : LANG_BUDGET_BYTES;
   const repoCap = budget / selected.length;
@@ -136,13 +136,13 @@ function fetchLanguage(language: string, quick: boolean): void {
     let repoBytes = 0;
     for (const file of sampleFiles(checkout, extensions, entry.license, entry.excludePrefixes)) {
       if (total >= budget || repoBytes >= repoCap) break;
-      const content = readFileSync(file.path, "utf8");
-      const name = `${String(index++).padStart(5, "0")}.txt`;
-      writeSample(language, "human", name, content);
+      const content = readFileSync(file.path, 'utf8');
+      const name = `${String(index++).padStart(5, '0')}.txt`;
+      writeSample(language, 'human', name, content);
       appendManifest(language, {
         file: `human/${name}`,
         lang: language,
-        origin: "human",
+        origin: 'human',
         source: `${entry.repo}@${sha}:${file.relative}`,
         license: entry.license,
         notice: noticePathFor(entry.repo),
@@ -165,18 +165,15 @@ function repoFlagsByCacheDir(): Map<
   string,
   { excludePrefixes?: string[]; license: string; quick: boolean; trainable: boolean }
 > {
-  const flags = new Map<
-    string,
-    { excludePrefixes?: string[]; license: string; quick: boolean; trainable: boolean }
-  >();
+  const flags = new Map<string, { excludePrefixes?: string[]; license: string; quick: boolean; trainable: boolean }>();
   const register = (
     repo: string,
     license: string,
     trainable: boolean,
     quick: boolean,
-    excludePrefixes?: string[],
+    excludePrefixes?: string[]
   ): void => {
-    flags.set(repo.split("/").slice(-2).join("__"), {
+    flags.set(repo.split('/').slice(-2).join('__'), {
       excludePrefixes,
       license,
       quick,
@@ -185,14 +182,8 @@ function repoFlagsByCacheDir(): Map<
   };
   for (const entries of Object.values(sources.languages as Record<string, SourceEntry[]>)) {
     for (const entry of entries)
-      if (entry.repo.startsWith("http"))
-        register(
-          entry.repo,
-          entry.license,
-          entry.trainable,
-          entry.quick === true,
-          entry.excludePrefixes,
-        );
+      if (entry.repo.startsWith('http'))
+        register(entry.repo, entry.license, entry.trainable, entry.quick === true, entry.excludePrefixes);
   }
   const locales = nlSources.locales as Record<
     string,
@@ -216,7 +207,7 @@ function repoFlagsByCacheDir(): Map<
 function harvestText(quick: boolean): void {
   prepareTextSources(quick);
   if (!existsSync(CACHE_DIR)) return;
-  resetOrigin("text", "human");
+  resetOrigin('text', 'human');
   const flags = repoFlagsByCacheDir();
   const budget = quick ? QUICK_LANG_BUDGET_BYTES : LANG_BUDGET_BYTES;
   let total = 0;
@@ -240,14 +231,7 @@ function harvestText(quick: boolean): void {
     if (quick && !repoFlags.quick) continue;
     repos.push({
       dir,
-      files: sampleFiles(
-        dir,
-        EXTENSIONS.text!,
-        repoFlags.license,
-        repoFlags.excludePrefixes,
-        true,
-        true,
-      ),
+      files: sampleFiles(dir, EXTENSIONS.text!, repoFlags.license, repoFlags.excludePrefixes, true, true),
       flags: repoFlags,
       next: 0,
       repoDir,
@@ -260,13 +244,13 @@ function harvestText(quick: boolean): void {
       const file = repo.files[repo.next++];
       if (!file) continue;
       progressed = true;
-      const content = file.content ?? readFileSync(file.path, "utf8");
-      const name = `${String(index++).padStart(5, "0")}.txt`;
-      writeSample("text", "human", name, content);
-      appendManifest("text", {
+      const content = file.content ?? readFileSync(file.path, 'utf8');
+      const name = `${String(index++).padStart(5, '0')}.txt`;
+      writeSample('text', 'human', name, content);
+      appendManifest('text', {
         file: `human/${name}`,
-        lang: "text",
-        origin: "human",
+        lang: 'text',
+        origin: 'human',
         source: `${repo.repoDir}@${repo.sha}:${file.relative}`,
         license: repo.flags.license,
         notice: `THIRD_PARTY_NOTICES/${repo.repoDir}`,
@@ -291,20 +275,19 @@ function harvestText(quick: boolean): void {
 /** Text-only fetching must populate its own cache instead of depending on prior language runs. */
 function prepareTextSources(quick: boolean): void {
   const ossEntries = Object.values(sources.languages as Record<string, SourceEntry[]>).flat();
-  const localeEntries = Object.values(
-    nlSources.locales as Record<string, { gitDocs?: SourceEntry[] }>,
-  ).flatMap((locale) => (locale.gitDocs ?? []).map((entry) => ({ ...entry, quick: true })));
+  const localeEntries = Object.values(nlSources.locales as Record<string, { gitDocs?: SourceEntry[] }>).flatMap(
+    (locale) => (locale.gitDocs ?? []).map((entry) => ({ ...entry, quick: true }))
+  );
   for (const entry of [...ossEntries, ...localeEntries]) {
-    if (!entry.repo.startsWith("http") || (quick && entry.quick !== true)) continue;
+    if (!entry.repo.startsWith('http') || (quick && entry.quick !== true)) continue;
     const dir = cloneAtRef(entry.repo, entry.ref);
     if (dir) syncNoticeFiles(dir, entry.repo);
   }
 }
 
 function hashOf(text: string): number {
-  let hash = 0x81_1c_9d_c5;
-  for (let i = 0; i < text.length; i++)
-    hash = Math.imul(hash ^ text.codePointAt(i)!, 0x01_00_01_93);
+  let hash = 0x81_1C_9D_C5;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.codePointAt(i)!, 0x01_00_01_93);
   // oxlint-disable-next-line unicorn/prefer-math-trunc -- >>> 0 coerces to uint32, Math.trunc does not
   return hash >>> 0;
 }
@@ -331,7 +314,7 @@ function sampleFiles(
   license: string,
   excludedPrefixes: string[] = [],
   chunkOversized = false,
-  proseOnly = false,
+  proseOnly = false
 ): SampledFile[] {
   const files: SampledFile[] = [];
   const walk = (dir: string, prefix: string): void => {
@@ -342,14 +325,10 @@ function sampleFiles(
       return;
     }
     for (const entry of entries) {
-      if (entry.name.startsWith(".")) continue;
+      if (entry.name.startsWith('.')) continue;
       const path = join(dir, entry.name);
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (
-        excludedPrefixes.some(
-          (excluded) => relative === excluded || relative.startsWith(`${excluded}/`),
-        )
-      ) {
+      if (excludedPrefixes.some((excluded) => relative === excluded || relative.startsWith(`${excluded}/`))) {
         continue;
       }
       if (entry.isDirectory()) {
@@ -360,11 +339,11 @@ function sampleFiles(
         continue;
       }
       if (!extensions.some((ext) => entry.name.endsWith(ext))) continue;
-      if (entry.name.includes(".min.")) continue;
+      if (entry.name.includes('.min.')) continue;
       if (isNoticeFile(entry.name)) continue;
       // A `.txt` is prose only where documentation lives; elsewhere it is data (fixtures, pins).
-      if (proseOnly && entry.name.endsWith(".txt")) {
-        if (prefix !== "" && !relative.startsWith("docs/")) continue;
+      if (proseOnly && entry.name.endsWith('.txt')) {
+        if (prefix !== '' && !relative.startsWith('docs/')) continue;
         // Even at the root or under docs/, some .txt files are build or tool configuration
         // (CMakeLists.txt, requirements.txt, robots.txt) rather than documentation. Prose files
         // that happen to live beside them (BUILDING.txt, RUNNING.txt) are kept.
@@ -387,9 +366,9 @@ function sampleFiles(
       } catch {
         continue; // The corpus API consumes Unicode text, so non-UTF-8 fixtures are not samples.
       }
-      if (content.includes("\u0000")) continue;
+      if (content.includes('\u0000')) continue;
       if (hasIncompatibleSpdx(content, license)) continue;
-      const lines = content.split("\n");
+      const lines = content.split('\n');
       if (content.length / Math.max(lines.length, 1) > MAX_AVG_LINE_LENGTH) continue; // Minified/generated.
       if (buffer.byteLength > MAX_SAMPLE_BYTES) {
         // Oversized documentation still represents its repo: sample it as bounded chunks.
@@ -406,7 +385,7 @@ function sampleFiles(
       files.push({ path, relative, bytes: buffer.byteLength });
     }
   };
-  walk(root, "");
+  walk(root, '');
   // Stable pseudo-random order within each size bucket spreads samples across the tree.
   // Round-robin interleaving then prevents a repo's dominant file size from crowding the
   // other benchmark sizes out before the byte cap is reached.
@@ -418,11 +397,9 @@ function sampleFiles(
     buckets.set(bucket, values);
   }
   for (const values of buckets.values())
-    values.sort(
-      (a, b) => hashOf(a.relative) - hashOf(b.relative) || (a.relative < b.relative ? -1 : 1),
-    );
+    values.sort((a, b) => hashOf(a.relative) - hashOf(b.relative) || (a.relative < b.relative ? -1 : 1));
   const balanced: SampledFile[] = [];
-  const bucketOrder = ["0.25k", "0.5k", "2k", "8k", "24k"];
+  const bucketOrder = ['0.25k', '0.5k', '2k', '8k', '24k'];
   for (let index = 0; bucketOrder.some((bucket) => index < (buckets.get(bucket)?.length ?? 0)); index++) {
     for (const bucket of bucketOrder) {
       const file = buckets.get(bucket)?.[index];

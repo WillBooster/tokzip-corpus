@@ -1,7 +1,7 @@
 /** Fetches pinned, permissively licensed natural-language documentation. */
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
-import sources from "./nl-sources.json";
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
+import sources from './nl-sources.json';
 import {
   appendManifest,
   chunkDocument,
@@ -13,7 +13,7 @@ import {
   sizeBucketOf,
   syncNoticeFiles,
   writeSample,
-} from "./shared.ts";
+} from './shared.ts';
 
 interface GitDocsSource {
   repo: string;
@@ -35,7 +35,7 @@ function main(): void {
   for (const locale of locales) {
     const localeSources = (sources.locales as Record<string, LocaleSources>)[locale];
     if (!localeSources) throw new Error(`unknown locale: ${locale}`);
-    resetOrigin(locale, "human");
+    resetOrigin(locale, 'human');
     fetchGitDocs(locale, localeSources.gitDocs);
   }
 }
@@ -49,7 +49,7 @@ function fetchGitDocs(locale: string, entries: GitDocsSource[]): void {
     let bytes = 0;
     const walk = (current: string): void => {
       for (const dirent of readdirSync(current, { withFileTypes: true })) {
-        if (dirent.name.startsWith(".") || dirent.name === "node_modules") continue;
+        if (dirent.name.startsWith('.') || dirent.name === 'node_modules') continue;
         const path = join(current, dirent.name);
         if (dirent.isDirectory()) {
           walk(path);
@@ -58,11 +58,9 @@ function fetchGitDocs(locale: string, entries: GitDocsSource[]): void {
         // Manifest sources are POSIX paths on every platform: validate splits them on "/" to check
         // notice files and excluded prefixes, so a backslash from a Windows fetch would slip past
         // both checks and make the manifest unportable.
-        const sourcePath = relative(dir, path).split(sep).join("/");
+        const sourcePath = relative(dir, path).split(sep).join('/');
         if (
-          entry.excludePrefixes?.some(
-            (excluded) => sourcePath === excluded || sourcePath.startsWith(`${excluded}/`),
-          )
+          entry.excludePrefixes?.some((excluded) => sourcePath === excluded || sourcePath.startsWith(`${excluded}/`))
         ) {
           continue;
         }
@@ -75,13 +73,13 @@ function fetchGitDocs(locale: string, entries: GitDocsSource[]): void {
         } catch {
           continue;
         }
-        if (!dirent.name.endsWith(".md") || stat.size < 500) continue;
+        if (!dirent.name.endsWith('.md') || stat.size < 500) continue;
         bytes += saveChunks(
           locale,
-          readFileSync(path, "utf8"),
+          readFileSync(path, 'utf8'),
           `${entry.repo}@${sha}:${sourcePath}`,
           entry.license,
-          noticePathFor(entry.repo),
+          noticePathFor(entry.repo)
         );
       }
     };
@@ -90,22 +88,16 @@ function fetchGitDocs(locale: string, entries: GitDocsSource[]): void {
   }
 }
 
-function saveChunks(
-  locale: string,
-  text: string,
-  source: string,
-  license: string,
-  notice: string,
-): number {
+function saveChunks(locale: string, text: string, source: string, license: string, notice: string): number {
   let saved = 0;
   for (const { chunk, chunkIndex } of chunkDocument(text)) {
-    const name = `${String(counters.get(locale) ?? 0).padStart(5, "0")}.txt`;
+    const name = `${String(counters.get(locale) ?? 0).padStart(5, '0')}.txt`;
     counters.set(locale, (counters.get(locale) ?? 0) + 1);
-    writeSample(locale, "human", name, chunk);
+    writeSample(locale, 'human', name, chunk);
     appendManifest(locale, {
       file: `human/${name}`,
       lang: locale,
-      origin: "human",
+      origin: 'human',
       source: `${source}#chunk${chunkIndex}`,
       license,
       notice,

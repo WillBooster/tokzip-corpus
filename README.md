@@ -1,5 +1,9 @@
 # tokzip-corpus
 
+[![Test rust](https://github.com/WillBooster/tokzip-corpus/actions/workflows/test-rust.yml/badge.svg)](https://github.com/WillBooster/tokzip-corpus/actions/workflows/test-rust.yml)
+[![Test](https://github.com/WillBooster/tokzip-corpus/actions/workflows/test.yml/badge.svg)](https://github.com/WillBooster/tokzip-corpus/actions/workflows/test.yml)
+[![wbfy](https://img.shields.io/badge/wbfy-12.4.0-1e90ff.svg)](https://github.com/WillBooster/shared/tree/main/packages/wbfy)
+
 Public, versioned corpus data and generation tooling for training and evaluating
 [tokzip](https://github.com/WillBooster/tokzip).
 
