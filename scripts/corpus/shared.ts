@@ -1,5 +1,5 @@
-import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   appendFileSync,
   copyFileSync,
@@ -11,20 +11,20 @@ import {
   rmSync,
   statSync,
   writeFileSync,
-} from "node:fs";
-import { join, sep } from "node:path";
+} from 'node:fs';
+import { join, sep } from 'node:path';
 
-export const CORPUS_DIR = join(import.meta.dir, "../../corpus");
-export const CACHE_DIR = join(import.meta.dir, "../../.cache");
+export const CORPUS_DIR = join(import.meta.dir, '../../corpus');
+export const CACHE_DIR = join(import.meta.dir, '../../.cache');
 const SHINGLE_LENGTH = 32;
 const SHINGLES_PER_DOC = 64;
 const NEAR_DUP_THRESHOLD = 0.5;
 
 const git = (args: string[]): boolean =>
-  spawnSync("git", args, { stdio: ["ignore", "ignore", "pipe"], timeout: 600_000 }).status === 0;
+  spawnSync('git', args, { stdio: ['ignore', 'ignore', 'pipe'], timeout: 600_000 }).status === 0;
 
 const gitOutput = (args: string[]): string | undefined => {
-  const result = spawnSync("git", args, { encoding: "utf8", timeout: 600_000 });
+  const result = spawnSync('git', args, { encoding: 'utf8', timeout: 600_000 });
   return result.status === 0 ? result.stdout.trim() : undefined;
 };
 
@@ -35,16 +35,16 @@ const gitOutput = (args: string[]): string | undefined => {
  * failed clone never leaves a partial directory behind to poison later runs.
  */
 export function cloneAtRef(repo: string, ref: string): string | undefined {
-  const dir = join(CACHE_DIR, repo.split("/").slice(-2).join("__"));
+  const dir = join(CACHE_DIR, repo.split('/').slice(-2).join('__'));
   if (existsSync(dir)) {
     // A cached checkout may predate a pin change (or be a partial clone): verify HEAD
     // actually matches the requested ref before reusing it.
-    const head = gitOutput(["-C", dir, "rev-parse", "HEAD"]);
-    const pinned = gitOutput(["-C", dir, "rev-parse", `${ref}^{commit}`]);
+    const head = gitOutput(['-C', dir, 'rev-parse', 'HEAD']);
+    const pinned = gitOutput(['-C', dir, 'rev-parse', `${ref}^{commit}`]);
     if (head && (head === ref || head === pinned)) return dir;
     if (
-      git(["-C", dir, "fetch", "--depth", "1", "origin", ref]) &&
-      git(["-C", dir, "checkout", "--detach", "FETCH_HEAD"])
+      git(['-C', dir, 'fetch', '--depth', '1', 'origin', ref]) &&
+      git(['-C', dir, 'checkout', '--detach', 'FETCH_HEAD'])
     ) {
       return dir;
     }
@@ -52,13 +52,13 @@ export function cloneAtRef(repo: string, ref: string): string | undefined {
   }
   mkdirSync(CACHE_DIR, { recursive: true });
   console.log(`cloning ${repo}@${ref} ...`);
-  if (git(["clone", "--depth", "1", "--branch", ref, "--single-branch", repo, dir])) return dir;
+  if (git(['clone', '--depth', '1', '--branch', ref, '--single-branch', repo, dir])) return dir;
   // The pinned ref is not a branch/tag name (e.g. a commit SHA): fetch it explicitly.
   rmSync(dir, { recursive: true, force: true });
   if (
-    git(["clone", "--depth", "1", repo, dir]) &&
-    git(["-C", dir, "fetch", "--depth", "1", "origin", ref]) &&
-    git(["-C", dir, "checkout", "--detach", "FETCH_HEAD"])
+    git(['clone', '--depth', '1', repo, dir]) &&
+    git(['-C', dir, 'fetch', '--depth', '1', 'origin', ref]) &&
+    git(['-C', dir, 'checkout', '--detach', 'FETCH_HEAD'])
   ) {
     return dir;
   }
@@ -70,15 +70,15 @@ export function cloneAtRef(repo: string, ref: string): string | undefined {
 
 /** Resolved commit of a cached clone, recorded in manifests for reproducibility. */
 export function resolvedSha(dir: string): string {
-  const result = spawnSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" });
-  return result.stdout?.trim() || "unknown";
+  const result = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
+  return result.stdout?.trim() || 'unknown';
 }
 
 /** One manifest line per sample; split.ts fills in the `split` field. */
 export interface ManifestEntry {
   file: string;
   lang: string;
-  origin: "human" | "llm";
+  origin: 'human' | 'llm';
   source: string;
   license: string;
   notice: string;
@@ -86,23 +86,21 @@ export interface ManifestEntry {
   sizeBucket: string;
   /** Samples require explicit training approval even when redistribution is permitted. */
   trainable: boolean;
-  split?: "train" | "bench";
+  split?: 'train' | 'bench';
 }
 
 /** Canonical pinned upstream file identity shared by URL-based and clone-cache sources. */
 export function sourceProvenance(source: string): string | undefined {
   const parsed = parsePinnedSource(source);
   if (!parsed) return undefined;
-  const sourceRepo = parsed.repo.replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "");
-  const repo = sourceRepo.includes("/") ? sourceRepo : sourceRepo.replace("__", "/");
-  const sourcePath = parsed.path.replace(/#chunk\d+$/, "");
+  const sourceRepo = parsed.repo.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '');
+  const repo = sourceRepo.includes('/') ? sourceRepo : sourceRepo.replace('__', '/');
+  const sourcePath = parsed.path.replace(/#chunk\d+$/, '');
   return `${repo}@${parsed.commit}:${sourcePath}`;
 }
 
 /** Parses a manifest source without assuming that a valid Git path is single-line. */
-export function parsePinnedSource(
-  source: string,
-): { commit: string; path: string; repo: string } | undefined {
+export function parsePinnedSource(source: string): { commit: string; path: string; repo: string } | undefined {
   const match = /^(.*)@([0-9a-f]{40}):([\s\S]*)$/.exec(source);
   return match ? { repo: match[1]!, commit: match[2]!, path: match[3]! } : undefined;
 }
@@ -143,7 +141,7 @@ function shinglesOf(content: string): Set<number> {
   if (content.length < SHINGLE_LENGTH) return new Set();
   const hashes: number[] = [];
   for (let index = 0; index + SHINGLE_LENGTH <= content.length; index++) {
-    let hash = 0x81_1c_9d_c5;
+    let hash = 0x81_1C_9D_C5;
     for (let offset = 0; offset < SHINGLE_LENGTH; offset++)
       hash = Math.imul(hash ^ content.codePointAt(index + offset)!, 0x01_00_01_93);
     // oxlint-disable-next-line unicorn/prefer-math-trunc -- >>> 0 coerces to uint32, Math.trunc does not
@@ -152,7 +150,7 @@ function shinglesOf(content: string): Set<number> {
   // Deduplicate before truncating: a repeated window (boilerplate, padding) would otherwise
   // spend sketch slots on the same hash, leaving fewer distinct shingles to match on and
   // under-estimating the overlap between two documents.
-  const distinct = [...new Set(hashes)].sort((a, b) => a - b);
+  const distinct = [...new Set(hashes)].toSorted((a, b) => a - b);
   return new Set(distinct.slice(0, SHINGLES_PER_DOC));
 }
 
@@ -171,7 +169,7 @@ export function chunkDocument(text: string): { chunk: string; chunkIndex: number
   while (offset < text.length) {
     const target = CHUNK_TARGETS[chunkIndex % CHUNK_TARGETS.length]!;
     let end = Math.min(offset + target, text.length);
-    const paragraphBreak = text.indexOf("\n\n", end);
+    const paragraphBreak = text.indexOf('\n\n', end);
     if (paragraphBreak !== -1 && paragraphBreak - end < target) end = paragraphBreak + 2;
     // Paragraph extension and multi-byte characters must not break the per-sample byte cap;
     // the remainder simply becomes the next chunk.
@@ -181,8 +179,9 @@ export function chunkDocument(text: string): { chunk: string; chunkIndex: number
     // Never split a surrogate pair: a dangling high surrogate would corrupt both chunks. The
     // end > offset + 1 guard keeps the offset advancing when a lone high surrogate is the
     // only remaining character, instead of looping forever.
+    // oxlint-disable-next-line unicorn/prefer-code-point -- UTF-16 code units are required to detect a split surrogate pair
     const trailing = text.charCodeAt(end - 1);
-    if (trailing >= 0xd8_00 && trailing <= 0xdb_ff && end > offset + 1) end--;
+    if (trailing >= 0xD8_00 && trailing <= 0xDB_FF && end > offset + 1) end--;
     const chunk = text.slice(offset, end).trim();
     offset = end;
     chunkIndex++;
@@ -192,54 +191,44 @@ export function chunkDocument(text: string): { chunk: string; chunkIndex: number
 }
 
 export function sizeBucketOf(bytes: number): string {
-  if (bytes <= 512) return "0.25k";
-  if (bytes <= 1024) return "0.5k";
-  if (bytes <= 4096) return "2k";
-  if (bytes <= 16 * 1024) return "8k";
-  return "24k";
+  if (bytes <= 512) return '0.25k';
+  if (bytes <= 1024) return '0.5k';
+  if (bytes <= 4096) return '2k';
+  if (bytes <= 16 * 1024) return '8k';
+  return '24k';
 }
 
-export function writeSample(
-  language: string,
-  origin: "human" | "llm",
-  name: string,
-  content: string,
-): void {
+export function writeSample(language: string, origin: 'human' | 'llm', name: string, content: string): void {
   const dir = join(CORPUS_DIR, language, origin);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, name), content);
 }
 
-export function appendManifest(language: string, entry: Omit<ManifestEntry, "sha256">): void {
+export function appendManifest(language: string, entry: Omit<ManifestEntry, 'sha256'>): void {
   mkdirSync(join(CORPUS_DIR, language), { recursive: true });
   const content = readFileSync(join(CORPUS_DIR, language, entry.file));
-  const sha256 = createHash("sha256").update(content).digest("hex");
-  appendFileSync(
-    join(CORPUS_DIR, language, "manifest.jsonl"),
-    JSON.stringify({ ...entry, sha256 }) + "\n",
-  );
+  const sha256 = createHash('sha256').update(content).digest('hex');
+  appendFileSync(join(CORPUS_DIR, language, 'manifest.jsonl'), JSON.stringify({ ...entry, sha256 }) + '\n');
 }
 
 export function noticePathFor(repo: string): string {
-  return `THIRD_PARTY_NOTICES/${repo.split("/").slice(-2).join("__")}`;
+  return `THIRD_PARTY_NOTICES/${repo.split('/').slice(-2).join('__')}`;
 }
 
 /** Copies root-level license and attribution material verbatim into the redistribution bundle. */
 export function syncNoticeFiles(checkout: string, repo: string): void {
-  const noticeDir = join(import.meta.dir, "../..", noticePathFor(repo));
+  const noticeDir = join(import.meta.dir, '../..', noticePathFor(repo));
   rmSync(noticeDir, { recursive: true, force: true });
   mkdirSync(noticeDir, { recursive: true });
   // Some upstreams ship their root LICENSE as a symlink; resolve it instead of skipping, which
   // would otherwise abort the fetch with "no root-level license or notice files" — but only when
   // it stays inside the checkout, so a pin cannot link a notice at a host file.
   const files = readdirSync(checkout, { withFileTypes: true }).filter(
-    (entry) => isNoticeFile(entry.name) && isContainedFile(checkout, join(checkout, entry.name)),
+    (entry) => isNoticeFile(entry.name) && isContainedFile(checkout, join(checkout, entry.name))
   );
   if (files.length === 0) throw new Error(`${repo}: no root-level license or notice files`);
   for (const file of files) {
-    const name = /licen[cs]e/i.test(file.name) && !/^licen[cs]e/i.test(file.name)
-      ? `LICENSE-${file.name}`
-      : file.name;
+    const name = /licen[cs]e/i.test(file.name) && !/^licen[cs]e/i.test(file.name) ? `LICENSE-${file.name}` : file.name;
     copyFileSync(join(checkout, file.name), join(noticeDir, name));
   }
 }
@@ -268,26 +257,28 @@ export function isContainedFile(root: string, path: string): boolean {
 }
 
 export function isNoticeFile(name: string): boolean {
-  return /^(authors|copying|copyright|licen[cs]es?|notices?)(\.|$|[-_])|^third[-_ ]?party[-_ ]?notices?(?:text)?(\.|$|[-_ ])|[-_](licen[cs]es?|notices?)(\.|$|[-_])/i.test(name);
+  return /^(authors|copying|copyright|licen[cs]es?|notices?)(\.|$|[-_])|^third[-_ ]?party[-_ ]?notices?(?:text)?(\.|$|[-_ ])|[-_](licen[cs]es?|notices?)(\.|$|[-_])/i.test(
+    name
+  );
 }
 
 /** Rejects file-level license declarations that are not covered by the source allowlist entry. */
 export function hasIncompatibleSpdx(content: string, license: string): boolean {
   const compatible = new Set(
     {
-      "Apache-2.0": ["Apache-2.0"],
-      "BSD-3-Clause": ["BSD-3-Clause"],
-      MIT: ["MIT"],
-      "MIT-like (curl)": ["curl"],
-      "MIT/Apache-2.0": ["Apache-2.0", "MIT"],
-    }[license]?.map((identifier) => identifier.toLowerCase()) ?? [],
+      'Apache-2.0': ['Apache-2.0'],
+      'BSD-3-Clause': ['BSD-3-Clause'],
+      MIT: ['MIT'],
+      'MIT-like (curl)': ['curl'],
+      'MIT/Apache-2.0': ['Apache-2.0', 'MIT'],
+    }[license]?.map((identifier) => identifier.toLowerCase())
   );
   for (const match of content.matchAll(/SPDX-License-Identifier:\s*([^\r\n]+)/gi)) {
     // Strip comment terminators instead of truncating at "*": stopping the capture there
     // would silently read "MIT*" (or "MIT OR GPL-3.0*") as plain "MIT".
     const expression = match[1]!
-      .replace(/\s*\*\/\s*$/, "")
-      .replace(/\s*-->\s*$/, "")
+      .replace(/\s*\*\/\s*$/, '')
+      .replace(/\s*-->\s*$/, '')
       .trim();
     if (!isCompatibleSpdxExpression(expression, compatible)) return true;
   }
@@ -301,9 +292,9 @@ function isCompatibleSpdxExpression(expression: string, compatible: Set<string>)
   const parsePrimary = (): boolean | undefined => {
     const token = tokens[position++];
     if (!token) return undefined;
-    if (token === "(") {
+    if (token === '(') {
       const value = parseOr();
-      if (tokens[position++] !== ")") return undefined;
+      if (tokens[position++] !== ')') return undefined;
       return value;
     }
     if (/^(?:AND|OR|WITH|\))$/i.test(token)) return undefined;
@@ -314,7 +305,7 @@ function isCompatibleSpdxExpression(expression: string, compatible: Set<string>)
   const parseAnd = (): boolean | undefined => {
     let value = parsePrimary();
     if (value === undefined) return undefined;
-    while (/^AND$/i.test(tokens[position] ?? "")) {
+    while (/^AND$/i.test(tokens[position] ?? '')) {
       position++;
       const right = parsePrimary();
       if (right === undefined) return undefined;
@@ -325,7 +316,7 @@ function isCompatibleSpdxExpression(expression: string, compatible: Set<string>)
   const parseOr = (): boolean | undefined => {
     let value = parseAnd();
     if (value === undefined) return undefined;
-    while (/^OR$/i.test(tokens[position] ?? "")) {
+    while (/^OR$/i.test(tokens[position] ?? '')) {
       position++;
       const right = parseAnd();
       if (right === undefined) return undefined;
@@ -342,16 +333,14 @@ function isCompatibleSpdxExpression(expression: string, compatible: Set<string>)
  * Clears one origin's samples and manifest rows before a re-fetch. Without this, re-running a
  * fetcher would overwrite sample files but keep appending manifest rows, duplicating entries.
  */
-export function resetOrigin(language: string, origin: "human" | "llm"): void {
+export function resetOrigin(language: string, origin: 'human' | 'llm'): void {
   rmSync(join(CORPUS_DIR, language, origin), { recursive: true, force: true });
-  const manifestPath = join(CORPUS_DIR, language, "manifest.jsonl");
+  const manifestPath = join(CORPUS_DIR, language, 'manifest.jsonl');
   if (!existsSync(manifestPath)) return;
-  const kept = readFileSync(manifestPath, "utf8")
-    .split("\n")
-    .filter(
-      (line) => line.trim() && !(JSON.parse(line) as ManifestEntry).file.startsWith(`${origin}/`),
-    );
-  writeFileSync(manifestPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+  const kept = readFileSync(manifestPath, 'utf8')
+    .split('\n')
+    .filter((line) => line.trim() && !(JSON.parse(line) as ManifestEntry).file.startsWith(`${origin}/`));
+  writeFileSync(manifestPath, kept.length > 0 ? kept.join('\n') + '\n' : '');
 }
 
 /** Deterministic seeded RNG (mulberry32) shared by split and generation sampling. */
@@ -359,7 +348,7 @@ export function resetOrigin(language: string, origin: "human" | "llm"): void {
 export function seededRandom(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
-    state = (state + 0x6d_2b_79_f5) >>> 0;
+    state = (state + 0x6D_2B_79_F5) >>> 0;
     let t = state;
     t = Math.imul(t ^ (t >>> 15), t | 1);
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);

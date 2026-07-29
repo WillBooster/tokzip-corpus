@@ -10,8 +10,8 @@
  *
  * Usage: bun scripts/corpus/split.ts [<language> ...]
  */
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   CORPUS_DIR,
   nearDuplicatePairs,
@@ -19,16 +19,16 @@ import {
   seededRandom,
   sourceProvenance,
   type ManifestEntry,
-} from "./shared.ts";
+} from './shared.ts';
 
-const SPLIT_SEED = 0xbe_9c_11;
+const SPLIT_SEED = 0xBE_9C_11;
 const BENCH_RATIO = 0.15;
 function splitLanguage(language: string): void {
   const dir = join(CORPUS_DIR, language);
-  const manifestPath = join(dir, "manifest.jsonl");
+  const manifestPath = join(dir, 'manifest.jsonl');
   if (!existsSync(manifestPath)) return;
-  const entries: ManifestEntry[] = readFileSync(manifestPath, "utf8")
-    .split("\n")
+  const entries: ManifestEntry[] = readFileSync(manifestPath, 'utf8')
+    .split('\n')
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line) as ManifestEntry);
 
@@ -37,9 +37,8 @@ function splitLanguage(language: string): void {
   // cluster always lands in one split (a bench doc must never have a near-copy in training).
   const parent = entries.map((_, i) => i);
   const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i]!)));
-  const contents = entries.map((entry) => readFileSync(join(dir, entry.file), "utf8"));
-  for (const [index, previous] of nearDuplicatePairs(contents))
-    parent[find(previous)] = find(index);
+  const contents = entries.map((entry) => readFileSync(join(dir, entry.file), 'utf8'));
+  for (const [index, previous] of nearDuplicatePairs(contents)) parent[find(previous)] = find(index);
   const firstByProvenance = new Map<string, number>();
   for (let index = 0; index < entries.length; index++) {
     const provenance = sourceProvenance(entries[index]!.source);
@@ -56,14 +55,14 @@ function splitLanguage(language: string): void {
     indices.push(i);
     clusters.set(root, indices);
   }
-  const clusterSplit = new Map<number, "train" | "bench">();
+  const clusterSplit = new Map<number, 'train' | 'bench'>();
   const priority = new Map<number, number>();
   for (const [root, indices] of clusters) {
     const value = random();
     priority.set(root, value);
-    clusterSplit.set(root, value < BENCH_RATIO ? "bench" : "train");
+    clusterSplit.set(root, value < BENCH_RATIO ? 'bench' : 'train');
     // License policy: non-trainable sources are benchmark-only (and drag their cluster along).
-    if (indices.some((index) => !entries[index]!.trainable)) clusterSplit.set(root, "bench");
+    if (indices.some((index) => !entries[index]!.trainable)) clusterSplit.set(root, 'bench');
   }
 
   ensureBenchmarkCoverage(
@@ -71,22 +70,22 @@ function splitLanguage(language: string): void {
     clusterSplit,
     priority,
     (entry) => parsePinnedSource(entry.source)?.repo ?? entry.source,
-    entries,
+    entries
   );
   ensureBenchmarkCoverage(clusters, clusterSplit, priority, (entry) => entry.sizeBucket, entries);
   ensureBothSplits(clusters, clusterSplit, priority, entries);
 
   for (let i = 0; i < entries.length; i++) entries[i]!.split = clusterSplit.get(find(i))!;
-  writeFileSync(manifestPath, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  writeFileSync(manifestPath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
 }
 
 /** Gives every sufficiently diverse source or size stratum benchmark representation. */
 function ensureBenchmarkCoverage(
   clusters: Map<number, number[]>,
-  clusterSplit: Map<number, "train" | "bench">,
+  clusterSplit: Map<number, 'train' | 'bench'>,
   priority: Map<number, number>,
   keyOf: (entry: ManifestEntry) => string,
-  entries: ManifestEntry[],
+  entries: ManifestEntry[]
 ): void {
   const rootsByKey = new Map<string, Set<number>>();
   for (const [root, indices] of clusters) {
@@ -98,11 +97,11 @@ function ensureBenchmarkCoverage(
     }
   }
   for (const roots of rootsByKey.values()) {
-    if (roots.size < 2 || [...roots].some((root) => clusterSplit.get(root) === "bench")) continue;
+    if (roots.size < 2 || [...roots].some((root) => clusterSplit.get(root) === 'bench')) continue;
     const candidate = [...roots]
       .filter((root) => clusters.get(root)!.every((index) => entries[index]!.trainable))
       .toSorted(smallestClusterFirst(clusters, priority))[0];
-    if (candidate !== undefined) clusterSplit.set(candidate, "bench");
+    if (candidate !== undefined) clusterSplit.set(candidate, 'bench');
   }
 }
 
@@ -113,28 +112,27 @@ function ensureBenchmarkCoverage(
  */
 function smallestClusterFirst(
   clusters: Map<number, number[]>,
-  priority: Map<number, number>,
+  priority: Map<number, number>
 ): (a: number, b: number) => number {
-  return (a, b) =>
-    clusters.get(a)!.length - clusters.get(b)!.length || priority.get(a)! - priority.get(b)!;
+  return (a, b) => clusters.get(a)!.length - clusters.get(b)!.length || priority.get(a)! - priority.get(b)!;
 }
 
 /** A usable language corpus needs at least one held-out and one trainable cluster. */
 function ensureBothSplits(
   clusters: Map<number, number[]>,
-  clusterSplit: Map<number, "train" | "bench">,
+  clusterSplit: Map<number, 'train' | 'bench'>,
   priority: Map<number, number>,
-  entries: ManifestEntry[],
+  entries: ManifestEntry[]
 ): void {
   const roots = [...clusters.keys()];
   if (roots.length < 2) return;
-  if (!roots.some((root) => clusterSplit.get(root) === "bench"))
-    clusterSplit.set(roots.toSorted(smallestClusterFirst(clusters, priority))[0]!, "bench");
-  if (!roots.some((root) => clusterSplit.get(root) === "train")) {
+  if (!roots.some((root) => clusterSplit.get(root) === 'bench'))
+    clusterSplit.set(roots.toSorted(smallestClusterFirst(clusters, priority))[0]!, 'bench');
+  if (!roots.some((root) => clusterSplit.get(root) === 'train')) {
     const candidate = roots
       .filter((root) => clusters.get(root)!.every((index) => entries[index]!.trainable))
       .toSorted((a, b) => smallestClusterFirst(clusters, priority)(b, a))[0];
-    if (candidate !== undefined) clusterSplit.set(candidate, "train");
+    if (candidate !== undefined) clusterSplit.set(candidate, 'train');
   }
 }
 
@@ -143,7 +141,7 @@ function coalesceGlobalDuplicates(): Set<string> {
   const manifests = new Map<string, { entries: ManifestEntry[]; manifestPath: string }>();
   const values: { entry: ManifestEntry; language: string }[] = [];
   for (const language of corpusLanguages()) {
-    const manifestPath = join(CORPUS_DIR, language, "manifest.jsonl");
+    const manifestPath = join(CORPUS_DIR, language, 'manifest.jsonl');
     if (!existsSync(manifestPath)) continue;
     const entries = readManifest(manifestPath);
     manifests.set(language, { entries, manifestPath });
@@ -151,8 +149,7 @@ function coalesceGlobalDuplicates(): Set<string> {
   }
 
   const parent = values.map((_, index) => index);
-  const find = (index: number): number =>
-    parent[index] === index ? index : (parent[index] = find(parent[index]!));
+  const find = (index: number): number => (parent[index] === index ? index : (parent[index] = find(parent[index]!)));
   const unionBy = (keyOf: (entry: ManifestEntry) => string | undefined): void => {
     const firstByKey = new Map<string, number>();
     for (let index = 0; index < values.length; index++) {
@@ -173,7 +170,7 @@ function coalesceGlobalDuplicates(): Set<string> {
   }
   for (const [language, indices] of indicesByLanguage) {
     const contents = indices.map((index) =>
-      readFileSync(join(CORPUS_DIR, language, values[index]!.entry.file), "utf8"),
+      readFileSync(join(CORPUS_DIR, language, values[index]!.entry.file), 'utf8')
     );
     for (const [index, previous] of nearDuplicatePairs(contents))
       parent[find(indices[index]!)] = find(indices[previous]!);
@@ -188,11 +185,11 @@ function coalesceGlobalDuplicates(): Set<string> {
   }
   const changed = new Set<string>();
   for (const indices of indicesByRoot.values()) {
-    if (!indices.some((index) => values[index]!.entry.split === "bench")) continue;
+    if (!indices.some((index) => values[index]!.entry.split === 'bench')) continue;
     for (const index of indices) {
       const value = values[index]!;
-      if (value.entry.split !== "bench") {
-        value.entry.split = "bench";
+      if (value.entry.split !== 'bench') {
+        value.entry.split = 'bench';
         changed.add(value.language);
       }
     }
@@ -201,58 +198,53 @@ function coalesceGlobalDuplicates(): Set<string> {
   // training data only from a component confined to that language (promoting a cross-language
   // component would reintroduce the train/bench contamination this pass exists to prevent).
   for (const [language, indices] of indicesByLanguage) {
-    if (indices.some((index) => values[index]!.entry.split === "train")) continue;
+    if (indices.some((index) => values[index]!.entry.split === 'train')) continue;
     const candidate = [...new Set(indices.map((index) => find(index)))]
       .map((root) => indicesByRoot.get(root)!)
       .filter((members) =>
-        members.every(
-          (index) => values[index]!.language === language && values[index]!.entry.trainable,
-        ),
+        members.every((index) => values[index]!.language === language && values[index]!.entry.trainable)
       )
       .toSorted((a, b) => b.length - a.length || a[0]! - b[0]!)[0];
     if (!candidate) {
       throw new Error(
-        `${language}: global duplicate coalescing left no training split and no language-local trainable cluster can restore one`,
+        `${language}: global duplicate coalescing left no training split and no language-local trainable cluster can restore one`
       );
     }
-    for (const index of candidate) values[index]!.entry.split = "train";
+    for (const index of candidate) values[index]!.entry.split = 'train';
     changed.add(language);
   }
   for (const language of changed) {
     const { entries, manifestPath } = manifests.get(language)!;
-    writeFileSync(manifestPath, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    writeFileSync(manifestPath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
   }
   return changed;
 }
 
 function printCounts(languages: Iterable<string>): void {
   for (const language of [...languages].toSorted()) {
-    const entries = readManifest(join(CORPUS_DIR, language, "manifest.jsonl"));
-    const trainCount = entries.filter((entry) => entry.split === "train").length;
+    const entries = readManifest(join(CORPUS_DIR, language, 'manifest.jsonl'));
+    const trainCount = entries.filter((entry) => entry.split === 'train').length;
     console.log(
-      `${language}: ${trainCount} train / ${entries.length - trainCount} bench (bench-v2, seed ${SPLIT_SEED})`,
+      `${language}: ${trainCount} train / ${entries.length - trainCount} bench (bench-v2, seed ${SPLIT_SEED})`
     );
   }
 }
 
 function readManifest(manifestPath: string): ManifestEntry[] {
-  return readFileSync(manifestPath, "utf8")
-    .split("\n")
+  return readFileSync(manifestPath, 'utf8')
+    .split('\n')
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line) as ManifestEntry);
 }
 
 function corpusLanguages(): string[] {
   return readdirSync(CORPUS_DIR, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
     .map((entry) => entry.name);
 }
 
 const requested = process.argv.slice(2);
-const languages =
-  requested.length > 0
-    ? requested
-    : corpusLanguages();
+const languages = requested.length > 0 ? requested : corpusLanguages();
 for (const language of languages) splitLanguage(language);
 const globalDuplicateChanges = coalesceGlobalDuplicates();
 printCounts(new Set([...languages, ...globalDuplicateChanges]));
