@@ -1,5 +1,4 @@
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import {
   appendFileSync,
   copyFileSync,
@@ -13,6 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join, sep } from 'node:path';
+import { sha256Hex } from '@willbooster/shared-lib-node';
 
 export const CORPUS_DIR = join(import.meta.dir, '../../corpus');
 export const CACHE_DIR = join(import.meta.dir, '../../.cache');
@@ -207,7 +207,7 @@ export function writeSample(language: string, origin: 'human' | 'llm', name: str
 export function appendManifest(language: string, entry: Omit<ManifestEntry, 'sha256'>): void {
   mkdirSync(join(CORPUS_DIR, language), { recursive: true });
   const content = readFileSync(join(CORPUS_DIR, language, entry.file));
-  const sha256 = createHash('sha256').update(content).digest('hex');
+  const sha256 = sha256Hex(content);
   appendFileSync(join(CORPUS_DIR, language, 'manifest.jsonl'), JSON.stringify({ ...entry, sha256 }) + '\n');
 }
 

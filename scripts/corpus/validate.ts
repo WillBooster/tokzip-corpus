@@ -1,7 +1,7 @@
 /** Fails when committed corpus bytes lack approved provenance or redistribution notices. */
-import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
+import { sha256Hex } from '@willbooster/shared-lib-node';
 import nlSources from './nl-sources.json';
 import ossSources from './oss-sources.json';
 import {
@@ -125,7 +125,7 @@ function validateEntry(dir: string, label: string, entry: ManifestEntry, errors:
     return;
   }
   const content = readFileSync(samplePath);
-  const actualHash = createHash('sha256').update(content).digest('hex');
+  const actualHash = sha256Hex(content);
   if (actualHash !== entry.sha256) errors.push(`${label}: content hash mismatch`);
   if (content.byteLength > MAX_SAMPLE_BYTES) errors.push(`${label}: sample exceeds the ${MAX_SAMPLE_BYTES}-byte cap`);
   const actualSizeBucket = sizeBucketOf(content.byteLength);
