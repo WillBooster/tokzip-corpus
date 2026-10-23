@@ -12,16 +12,17 @@
  */
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+
 import {
   CORPUS_DIR,
+  type ManifestEntry,
   nearDuplicatePairs,
   parsePinnedSource,
   seededRandom,
   sourceProvenance,
-  type ManifestEntry,
 } from './shared.ts';
 
-const SPLIT_SEED = 0xBE_9C_11;
+const SPLIT_SEED = 0xbe_9c_11;
 const BENCH_RATIO = 0.15;
 function splitLanguage(language: string): void {
   const dir = join(CORPUS_DIR, language);

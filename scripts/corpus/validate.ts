@@ -1,20 +1,22 @@
 /** Fails when committed corpus bytes lack approved provenance or redistribution notices. */
 import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
+
 import { sha256Hex } from '@willbooster/shared-lib-node';
+
 import nlSources from './nl-sources.json';
 import ossSources from './oss-sources.json';
 import {
   CORPUS_DIR,
   hasIncompatibleSpdx,
   isNoticeFile,
+  type ManifestEntry,
   MAX_SAMPLE_BYTES,
   nearDuplicatePairs,
   noticePathFor,
   parsePinnedSource,
   sizeBucketOf,
   sourceProvenance,
-  type ManifestEntry,
 } from './shared.ts';
 
 const ROOT = resolve(import.meta.dir, '../..');

@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join, sep } from 'node:path';
+
 import { sha256Hex } from '@willbooster/shared-lib-node';
 
 export const CORPUS_DIR = join(import.meta.dir, '../../corpus');
@@ -141,7 +142,7 @@ function shinglesOf(content: string): Set<number> {
   if (content.length < SHINGLE_LENGTH) return new Set();
   const hashes: number[] = [];
   for (let index = 0; index + SHINGLE_LENGTH <= content.length; index++) {
-    let hash = 0x81_1C_9D_C5;
+    let hash = 0x81_1c_9d_c5;
     for (let offset = 0; offset < SHINGLE_LENGTH; offset++)
       hash = Math.imul(hash ^ content.codePointAt(index + offset)!, 0x01_00_01_93);
     // oxlint-disable-next-line unicorn/prefer-math-trunc -- >>> 0 coerces to uint32, Math.trunc does not
@@ -181,7 +182,7 @@ export function chunkDocument(text: string): { chunk: string; chunkIndex: number
     // only remaining character, instead of looping forever.
     // oxlint-disable-next-line unicorn/prefer-code-point -- UTF-16 code units are required to detect a split surrogate pair
     const trailing = text.charCodeAt(end - 1);
-    if (trailing >= 0xD8_00 && trailing <= 0xDB_FF && end > offset + 1) end--;
+    if (trailing >= 0xd8_00 && trailing <= 0xdb_ff && end > offset + 1) end--;
     const chunk = text.slice(offset, end).trim();
     offset = end;
     chunkIndex++;
@@ -348,7 +349,7 @@ export function resetOrigin(language: string, origin: 'human' | 'llm'): void {
 export function seededRandom(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
-    state = (state + 0x6D_2B_79_F5) >>> 0;
+    state = (state + 0x6d_2b_79_f5) >>> 0;
     let t = state;
     t = Math.imul(t ^ (t >>> 15), t | 1);
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
