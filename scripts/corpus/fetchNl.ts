@@ -1,6 +1,7 @@
 /** Fetches pinned, permissively licensed natural-language documentation. */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
+
 import sources from './nl-sources.json';
 import {
   appendManifest,

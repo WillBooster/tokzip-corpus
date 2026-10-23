@@ -9,6 +9,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+
 import nlSources from './nl-sources.json';
 import sources from './oss-sources.json';
 import {
@@ -286,7 +287,7 @@ function prepareTextSources(quick: boolean): void {
 }
 
 function hashOf(text: string): number {
-  let hash = 0x81_1C_9D_C5;
+  let hash = 0x81_1c_9d_c5;
   for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.codePointAt(i)!, 0x01_00_01_93);
   // oxlint-disable-next-line unicorn/prefer-math-trunc -- >>> 0 coerces to uint32, Math.trunc does not
   return hash >>> 0;
